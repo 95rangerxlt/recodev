@@ -1,0 +1,314 @@
+
+
+
+Created attachment 736999
+use a content script to listen for pageshow events
+
+I took a look at bug 516755 again and thought we could take part by part from that and clean up a little while we're at it. I started with a single tiny event to see if everything's working.
+
+I discovered that by completely removing the 'pageshow' event I didn't break a single test so I added a new one covering it. We should be able to iteratively build on top of this and move more code into the content script.
+Looking good on try:
+
+https://tbpl.mozilla.org/?tree=Try&rev=5d007b671f42
+Comment on attachment 736999
+use a content script to listen for pageshow events
+
+Review of attachment 736999:
+-----------------------------------------------------------------
+
+The content-sessionStore.js/content.js change came up on IRC - r+ from me on that.
+Comment on attachment 736999
+use a content script to listen for pageshow events
+
+Review of attachment 736999:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +615,5 @@
+> +
+> +    switch (aMessage.name) {
+> +      case "SessionStore:pageshow":
+> +        if (aMessage.json.persisted)
+> +          this.onTabLoad(win, browser);
+
+This check could actually be done in the content script before sending the message. Moving it there. Just imagine it would be in the content script :)
+Comment on attachment 736999
+use a content script to listen for pageshow events
+
+Review of attachment 736999:
+-----------------------------------------------------------------
+
+Looks good to me, but lacks documentation.
+
+::: browser/base/content/content-sessionStore.js
+@@ +1,5 @@
+> +/* This Source Code Form is subject to the terms of the Mozilla Public
+> + * License, v. 2.0. If a copy of the MPL was not distributed with this
+> + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+> +
+> +const SessionStoreListener = {
+
+Nit: Some documentation would be nice.
+
+::: browser/base/content/content.js
+@@ +28,5 @@
+>      container.hidden = true;
+>    }
+>  });
+> +
+> +#include content-sessionStore.js
+
+Is that the best way to maintain some modularity in the code?
+I know that it is painful for tracking line numbers in exceptions, so if there is a good alternative, I would prefer it.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +608,5 @@
+>          break;
+>      }
+>    },
+>  
+> +  receiveMessage: function ssi_receiveMessage(aMessage) {
+
+Documentation would be nice. I have no certainty who it's supposed to receive messages from.
+
+@@ +616,5 @@
+> +    switch (aMessage.name) {
+> +      case "SessionStore:pageshow":
+> +        if (aMessage.json.persisted)
+> +          this.onTabLoad(win, browser);
+> +        break;
+
+Shouldn't we log an error if we don't recognize the message?
+
+@@ +619,5 @@
+> +          this.onTabLoad(win, browser);
+> +        break;
+> +    }
+> +
+> +    this._clearRestoringWindows();
+
+Why do we clear restoring windows?
+
+@@ +1310,5 @@
+>      // following "load" is too late for deleting the data caches)
+>      // It's possible to get a load event after calling stop on a browser (when
+>      // overwriting tabs). We want to return early if the tab hasn't been restored yet.
+> +    if (aBrowser.__SS_restoreState &&
+> +        aBrowser.__SS_restoreState == TAB_STATE_NEEDS_RESTORE) {
+
+I don't follow that change.
+(In reply to David Rajchenbach Teller [:Yoric] from comment #5)
+> > +/* This Source Code Form is subject to the terms of the Mozilla Public
+> > + * License, v. 2.0. If a copy of the MPL was not distributed with this
+> > + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+> > +
+> > +const SessionStoreListener = {
+> 
+> Nit: Some documentation would be nice.
+
+Will do.
+
+> ::: browser/base/content/content.js
+> @@ +28,5 @@
+> >      container.hidden = true;
+> >    }
+> >  });
+> > +
+> > +#include content-sessionStore.js
+> 
+> Is that the best way to maintain some modularity in the code?
+> I know that it is painful for tracking line numbers in exceptions, so if
+> there is a good alternative, I would prefer it.
+
+We can modify browser.js to load a second frame script which would probably be nicer. I'll do that and re-request review from Blair.
+
+> ::: browser/components/sessionstore/src/SessionStore.jsm
+> @@ +608,5 @@
+> >          break;
+> >      }
+> >    },
+> >  
+> > +  receiveMessage: function ssi_receiveMessage(aMessage) {
+> 
+> Documentation would be nice. I have no certainty who it's supposed to
+> receive messages from.
+
+Will do.
+
+> @@ +616,5 @@
+> > +    switch (aMessage.name) {
+> > +      case "SessionStore:pageshow":
+> > +        if (aMessage.json.persisted)
+> > +          this.onTabLoad(win, browser);
+> > +        break;
+> 
+> Shouldn't we log an error if we don't recognize the message?
+
+We won't receive messages we didn't add a listener for so there's no real need to add a debug message here. We also don't do that for observers where we know which notifications we want to receive.
+
+> @@ +619,5 @@
+> > +          this.onTabLoad(win, browser);
+> > +        break;
+> > +    }
+> > +
+> > +    this._clearRestoringWindows();
+> 
+> Why do we clear restoring windows?
+
+When closing windows in succession without doing anything meaningful in between we'll restore all those windows because we then figure that the user closed the whole browser and not just a single window. As before, every handled event clears the list of restoring windows (see at the bottom of handleEvent) which basically means that the user continued to use Firefox and meant to close just a single window, not to quit the whole browser by closing all windows one after the other.
+
+> @@ +1310,5 @@
+> >      // following "load" is too late for deleting the data caches)
+> >      // It's possible to get a load event after calling stop on a browser (when
+> >      // overwriting tabs). We want to return early if the tab hasn't been restored yet.
+> > +    if (aBrowser.__SS_restoreState &&
+> > +        aBrowser.__SS_restoreState == TAB_STATE_NEEDS_RESTORE) {
+> 
+> I don't follow that change.
+
+Before the patch, SS.onTabLoad() got called by "load" and "pageshow" events and we passed the event as the third argument. If the event was of type=pageshow with persisted=false (i.e. not loaded from bfcache) then we just returned early. That condition is now checked in the content script before we even send the SessionStore:pageshow message. There are no other call sites for onTabLoad() so that just removes an unnecessary check.
+Created attachment 738047
+use a content script to listen for pageshow events
+
+Asking for re-review for the browser.js change that now includes a separate content script for session store. The overhead should be small and it's actually nicer because the line numbers are correct for debugging. I wish we had our own scope but that's unfortunately not the case - maybe that gets fixed one day.
+Comment on attachment 738047
+use a content script to listen for pageshow events
+
+Review of attachment 738047:
+-----------------------------------------------------------------
+
+Canceling review because I believe you forgot a file.
+
+::: browser/base/content/browser.js
+@@ +759,5 @@
+>  
+>      window.addEventListener("AppCommand", HandleAppCommandEvent, true);
+>  
+>      messageManager.loadFrameScript("chrome://browser/content/content.js", true);
+> +    messageManager.loadFrameScript("chrome://browser/content/content-sessionStore.js", true);
+
+I may be missing something, but I don't see content-sessionStore.js in your patch.
+
+::: browser/components/sessionstore/content/content.js
+@@ +17,5 @@
+> +      case "pageshow":
+> +        if (aEvent.persisted)
+> +          sendAsyncMessage("SessionStore:pageshow");
+> +        break;
+> +    }
+
+I would still be more confident if we had a |default| clause. This will be helpful for catching future bugs.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +620,5 @@
+> +    switch (aMessage.name) {
+> +      case "SessionStore:pageshow":
+> +        this.onTabLoad(win, browser);
+> +        break;
+> +    }
+
+I would still be more confident if we had a |default| clause. This will be helpful for catching future bugs.
+Oh, I realize that the r? was not intended for me. Sorry about that.
+(In reply to David Rajchenbach Teller [:Yoric] from comment #8)
+> >      messageManager.loadFrameScript("chrome://browser/content/content.js", true);
+> > +    messageManager.loadFrameScript("chrome://browser/content/content-sessionStore.js", true);
+> 
+> I may be missing something, but I don't see content-sessionStore.js in your
+> patch.
+
+That's done in the jar.mn file. It takes the content.js file from the sessionstore component and stores it under browser/content/content-sessionStore.js
+
+> > +      case "pageshow":
+> > +        if (aEvent.persisted)
+> > +          sendAsyncMessage("SessionStore:pageshow");
+> > +        break;
+> > +    }
+> 
+> I would still be more confident if we had a |default| clause. This will be
+> helpful for catching future bugs.
+
+Ok, will do.
+
+> ::: browser/components/sessionstore/src/SessionStore.jsm
+> @@ +620,5 @@
+> > +    switch (aMessage.name) {
+> > +      case "SessionStore:pageshow":
+> > +        this.onTabLoad(win, browser);
+> > +        break;
+> > +    }
+> 
+> I would still be more confident if we had a |default| clause. This will be
+> helpful for catching future bugs.
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #9)
+> Oh, I realize that the r? was not intended for me. Sorry about that.
+
+Heh, no problem. More reviews > fewer reviews.
+Created attachment 738978
+use a content script to listen for pageshow events, v3
+
+Handling default cases now.
+Comment on attachment 738978
+use a content script to listen for pageshow events, v3
+
+Review of attachment 738978:
+-----------------------------------------------------------------
+
+Looks good to me.
+Comment on attachment 738978
+use a content script to listen for pageshow events, v3
+
+Review of attachment 738978:
+-----------------------------------------------------------------
+
+Still waiting for review of the browser.js and jar.mn changes from a browser peer.
+Comment on attachment 738978
+use a content script to listen for pageshow events, v3
+
+Review of attachment 738978:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/content/content.js
+@@ +15,5 @@
+> +  init: function EL_init() {
+> +    addEventListener("pageshow", this, true);
+> +  },
+> +
+> +  handleEvent: function EL_handleEvent(event) {
+
+nit: These function names aren't necessary since Fx17, see http://javascript-reverse.tumblr.com/post/34328529526/javascript-function-name-inference-aka-stop-function
+
+::: browser/components/sessionstore/jar.mn
+@@ +4,5 @@
+>  
+>  browser.jar:
+>  *   content/browser/aboutSessionRestore.xhtml             (content/aboutSessionRestore.xhtml)
+>  *   content/browser/aboutSessionRestore.js                (content/aboutSessionRestore.js)
+> +    content/browser/content-sessionStore.js               (content/content.js)
+
+I found this rename a little confusing, but if this is more consistent then I guess it's fine with me. Why not name the file content-sessionStore.js?
+(In reply to Jared Wein [:jaws] from comment #14)
+> > +  handleEvent: function EL_handleEvent(event) {
+> 
+> nit: These function names aren't necessary since Fx17, see
+> http://javascript-reverse.tumblr.com/post/34328529526/javascript-function-
+> name-inference-aka-stop-function
+
+Good point, I almost forgot about that. Especially good for a new file.
+
+> >  *   content/browser/aboutSessionRestore.js                (content/aboutSessionRestore.js)
+> > +    content/browser/content-sessionStore.js               (content/content.js)
+> 
+> I found this rename a little confusing, but if this is more consistent then
+> I guess it's fine with me. Why not name the file content-sessionStore.js?
+
+Ok, I'll rename it as you suggested.
+https://hg.mozilla.org/integration/fx-team/rev/8167e719f2c6
+https://hg.mozilla.org/mozilla-central/rev/8167e719f2c6
+
+
+Use a content script to listen for pageshow events
+
+
+
+Bug 861409 - Use a content script to listen for pageshow events; r=yoric,jaws 

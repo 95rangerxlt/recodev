@@ -1,0 +1,124 @@
+From bug 384872 comment#4:
+> hmm, there are differences between what SetCookieString and Add do - in
+> particular the former might prompt the user for each cookie, if they have the
+> "ask me" pref set. it'll also do permissionmanager lookups for each host, etc.
+
+The main question IMO is whether to move from the cookie string serialization format currently used to a JSON-like JS Object serialization as used for most of the rest of the data saved by SessionStore. I'd prefer to err on the side of backwards compatibility, but that would either require us to write our own (RegEx based) cookie string parser or to allow access to the cookie service's through a new API (e.g. nsICookieManager2::AddFromCookieString).
+
+From bug 384872 comment#4:
+> hmm, there are differences between what SetCookieString and Add do - in
+> particular the former might prompt the user for each cookie, if they have the
+> "ask me" pref set. it'll also do permissionmanager lookups for each host, etc.
+
+The main question IMO is whether to move from the cookie string serialization format currently used to a JSON-like JS Object serialization as used for most of the rest of the data saved by SessionStore. I'd prefer to err on the side of backwards compatibility, but that would either require us to write our own (RegEx based) cookie string parser or to allow access to the cookie service's through a new API (e.g. nsICookieManager2::AddFromCookieString).
+i'd personally just drop the previously serialized cookies; we're only talking about a few session cookies here, and it's not going to be fun to parse that stuff out. i presume we'd have a line of code or so to detect the serialized data and remove it?
+
+the JSON-like approach sounds really nice. the code to grab an nsICookie2 and later put it back via nsICM2::Add() would be trivial.
+
+regarding permlist lookups, in https://bugzilla.mozilla.org/show_bug.cgi?id=384872#c5 you mentioned it might be desired. since we're dealing with cookies that existed at time of last shutdown, and we're writing them back on first startup, it's analogous to what the cookieservice already does. (note that blacklisting a site won't cause the cookieservice to go through its list and purge affected cookies).
+
+do you want to work on this?
+Created attachment 268931
+fix
+
+(In reply to comment #1)
+> i'd personally just drop the previously serialized cookies;
+
+Not if I can help it - especially since users using session managing extensions might actually depend on them (and I'd prefer not letting them find out when it's too late). This patch just parses the serialization we've produced so far through a fairly simple regex. Worked reliably in my ad-hoc tests.
+
+> regarding permlist lookups
+
+Point taken.
+
+The only issue I've encountered is that the maximum value for expiry (LL_MAXINT = 2^63-1) can't be expressed precisely in JavaScript. Any ideas for what to set expiry to when we don't have a value (resp. when it was LL_MAXINT)?
+Note to self: remove the " ?" bits from the regex since that format never even made it into the tree.
+fyi js "jams" an int64 into a double, so you lose a few bits:
+http://lxr.mozilla.org/seamonkey/source/js/src/xpconnect/src/xpcconvert.cpp#248
+
+anything large is okay, so i'm fine with 2^62 or somesuch, with a little comment saying "pick a large number for expiry that js can handle".
+Created attachment 269080
+fix
+Comment on attachment 269080
+fix
+
+so, i'm most certainly rusty at js, if i say silly things please correct me. ;)
+
+>+    var MAX_EXPIRY = Math.pow(2, 62); // actually 2^63-1 but JavaScript can't handle that precision
+
+maybe s/actually/should be/, sounds a little clearer to me?
+
+>-      if (cookie.isSession && cookie.host) {
+>-        var url = "", value = "";
+>+      if (cookie.isSession && cookie.host && this._checkPrivacyLevel(cookie.isSecure)) {
+
+not quite sure why you need to check cookie.host here, it should never be empty.
+
+>+        var jscookie = null;
+>         aWindows.forEach(function(aWindow) {
+>           if (aWindow._hosts && aWindow._hosts[cookie.rawHost]) {
+
+cookie.rawHost isn't necessarily identical to the site host; e.g. in the case of domain cookies the site that set the cookie could be "weather.yahoo.com" while cookie.rawHost is the entire "yahoo.com" domain. if you want to catch those, you should test whether the site host string ends with cookie.rawHost. in future, i may add a cookie interface method getCookiesForHost that returns a list of cookies that would be sent to a given URI, which might be useful to you here.
+
+>+            // make sure to serialize the cookie only once
+>+            if (!jscookie) {
+>+              jscookie = { host: cookie.host, value: cookie.value };
+>+              if (cookie.path) jscookie.path = cookie.path;
+>+              if (cookie.name) jscookie.name = cookie.name;
+>+              if (cookie.isSecure) jscookie.secure = true;
+>+              if (cookie.isHttpOnly) jscookie.httponly = true;
+>+              if (cookie.expiry < MAX_EXPIRY) jscookie.expiry = cookie.expiry;
+
+not sure why you do all the if checks here; can you not just set each variable directly? also, the cookie.expiry check seems wrong, for the common case of cookie.expiry == LL_MAXINT you'll leave jscookie.expiry at zero, right? (expiry = 0 is a valid case, so you shouldn't overload it here.) maybe for that case you could explicitly set jscookie.expiry to MAX_EXPIRY, or just let js use the largest value it can (if that works).
+
+>+            if (jscookie)
+>+              aWindow.cookies.push(jscookie);
+
+does this mean you'll push the same cookie for each window that contains the same host? that seems like you're serializing it more than once. if that's indeed intended, maybe change the comment above to "construct the cookie only once".
+
+>+        cookieManager.add(cookie.host, cookie.path || "", cookie.name || "", cookie.value, !!cookie.secure, !!cookie.httponly, true, cookie.expiry || MAX_EXPIRY);
+
+do you need the || ""? won't js provide empty strings for you? also (per above) cookie.expiry || MAX_EXPIRY shouldn't be necessary (if you suitably limit the expiry when regex'ing the old format too). i don't mind how you do it, as long as cookie.expiry = 0 behaves correctly.
+
+i'll reiterate my starting comment that my js is rusty, so if you can justify/fix these points, r=me. since alpha freeze is tomorrow, if you can post an updated patch before then, i promise i'll get to it in time so you can land. sorry for the delay ;)
+Created attachment 269867
+fix
+
+(In reply to comment #6)
+> maybe s/actually/should be/
+Adjusted.
+
+> not quite sure why you need to check cookie.host here
+Indeed. Although it can be empty (cookies set from file://), we'd actually want to preserve those as well. As you can see, I've added some code to make sure that we correctly handle file:// URLs.
+
+> cookie.rawHost isn't necessarily identical to the site host;
+That's OK, since the _hosts hash would contain "weather.yahoo.com", "yahoo.com" and "com", thus ensuring that cookies from the main domain are saved for subdomains as well.
+
+> in future, i may add a cookie interface method getCookiesForHost that returns a
+> list of cookies that would be sent to a given URI
+Not sure which would be the faster alternative: iterating over all cookies or iterating over all currently loaded URLs.
+
+> not sure why you do all the if checks here;
+Because I don't want unneeded properties inside sessionstore.js for size reasons.
+
+> the cookie.expiry check seems wrong
+That's OK. We'll leave cookie.expire undefined when it's set to the default value (LL_MAXINT). I've adjusted the restoration bit, though, so that cookie.expiry = 0 is correctly restored as well.
+
+> does this mean you'll push the same cookie for each window that contains the
+> same host?
+Yes. We currently save cookies per window so that saving/restoring/reopening windows can happen through a single operation. It's somewhat a compromise however, since we don't do the same for single tabs (again for size reasons).
+
+> do you need the || ""?
+Yes, otherwise we would get |undefined| instead of |""|.
+Comment on attachment 269867
+fix
+
+sounds good. land land land! ;)
+Checking in browser/components/sessionstore/src/nsSessionStore.js;
+new revision: 1.64; previous revision: 1.63
+
+
+Use nsICookieManager2::Add instead of nsICookieService::SetCookieString for cookie restoration
+
+
+
+Bug 384944 - Use nsICookieManager2::Add instead of nsICookieService::SetCookieString for cookie restoration.  Patch by Simon Bünzli <zeniko@gmail.com>.  r=dwitte 

@@ -1,0 +1,136 @@
+
+
+
+Measuring how long a GL draw call takes for the GPU to process is a tricky task for two reasons:
+  1) such functionality is hardware-specific and not part of OpenGL ES core. The basic functionality is provided by a GL extension https://www.khronos.org/registry/gles/extensions/EXT/EXT_disjoint_timer_query.txt
+  2) on some hardware timer queries cause considerable impact to GPU driver performance, so such timing can be difficult to do as an interactive profiler.
+
+WebGL does have a draft extension of https://www.khronos.org/registry/webgl/extensions/EXT_disjoint_timer_query/ , but I don't think it's implemented in the wild. Backing on that extension might be a start.
+In CanvasDebugger, call-watcher stores webgl function calls in its _functionCalls array and then asks Canvas to handle animationFrame and drawCall functions. _handleDrawCall costs a lot performance on generating thumb nails. So we can't get the exact time on measuring WebGL functions.
+
+I think we can let the functions in _functionCalls array to be executed again to measure their time spent. In this way, we could catch the time spent of webgl draw calls and animation time as well.
+I find there is a problem to inspector the time spent of webgl call based on the current architecture of CanvasDebugger. The steps of CanvasDebugger are: record -> wrap webgl functions -> snapshot01 --- snapshotN.
+
+But if we use the wrapped webgl function to capture time spent, the performance would be huge difference. In my personal experiment, it almost spend around 150ms to finish a frame.
+
+I think we should adjust CanvasDebugger's architecture to assist us to do this stuff. We can make the progress like this way: record -> profile01 -> wrap webgl functions -> snapshot01 -> unwrap webgl functions. <new profile>  --->  back to record step.
+
+Although it will spend some redundant time on wrap/unwrap webgl functions, for general users, they should just capture around 4 frames. In my humble opinion, it is acceptable.
+Not sure I fully understand what you're saying.
+
+The two actors, canvas.js and webgl.js serve two completely different purposes.
+
+The former deals with a canvas on a fairly high level, gathering information about what's going on, generating thumbnails and being able to retrace calls. It works on both webgl and canvas 2d contexts.
+
+The latter is a specific actor implementation for a webgl context, that specializes on webgl-specific operations (such as dealing with shaders).
+
+That being said, both actors have one thing in common: they use the call watcher actor to instrument methods and getters/setters. Therefore, for a consistent implementation, that's where we should add our measurements. The two utility functions there, "overrideFunction" and "overrideAccessor" respectively, first call the original methods, and then invoke the provided callbacks. The webgl actor only sends "getContext" for instrumentation, to keep things lightweight, then overrides only some specific methods as necessary. On the other hand, the canvas actor sends *all* context methods for instrumentation. 
+
+For our purposes, time measurement should be done in the call watcher actor, specifically where the original canvas context method is called. This avoids measuring any time spent in the other "parasite" actors. No need to change the current architecture, it's all a matter of finding out where we should put the time measuring code.
+Created attachment 8656948
+[WIP] Measuring time spent of WebGL context functions and requestAnimationFrame.
+
+In this patch, WebGL context related functions and rAF have been added timeStamp via Performance API. We can list these timeStamples on graph timeline to let developers know which functions would hurt performance. Also, we can use the two rAfs at animationFrameBegin and animationFrameEnd to get the time spent between a frame (a rAF loop time + vSync + waiting for GPU). If we could know the end time of a rAF loop, we could know the rough CPU and GPU time spent.
+
+I also notice that call-watcher.js does some redundant computation, for example, it will go to get stack that will cost a lot. That is why a frame time has to spend around 400ms.
+Comment on attachment 8656948
+[WIP] Measuring time spent of WebGL context functions and requestAnimationFrame.
+
+There is a lot of duplicated code here from canvas.js. I also don't really understand why this logic needs to be in webgl.js, since ideally we'd like to support both webgl and canvas 2d rendering contexts, if possible.
+
+As suggested in comment 4, the time measuring code should be added in the call watcher actor, specifically where the original canvas context method is called. Since canvas.js instruments all the draw calls anyway, time could be measured in "overrideFunction" and "overrideAccessor" respectively, and passed on to interested parties. This way, we avoid doing any computation for irrelevant calls done by the other actors.
+Created attachment 8657772
+[WIP] Gathering time stamp at the call watcher actor
+
+In this patch, it gathers the time stamps of WebGL and Canvas2D's related draw functions as Comment 6, and CanvasDebugger can display these time stamps at the callslist panel. In the future, we can show these time stamps on graphic timeline to make developers know which functions would spends lots of time.
+Comment on attachment 8657772
+[WIP] Gathering time stamp at the call watcher actor
+
+Review of attachment 8657772:
+-----------------------------------------------------------------
+
+Much better. Do we want to display actual duration, or just timestamps?
+
+Needs a test.
+Yep. That is what I want to discuss with you. Because it is nearly impossible to get the time spent of webgl functions unless we use gl.flush. If we want to display the duration that we can minus it with the next webgl function, but we can't guarantee if there is other non-webgl functions in this duration. I also notice getStack() and generating thumbnails in canvas.js will spend lots of time that would affect the measuring. We should adjust the scenario while we are measuring the timestamps.
+
+Currently, I think that would be better to show just timestamps on Timeline. How do you think?
+Timestamps would be more accurate indeed, since we can't accurately measure GL time afaik (even without the additional costs of function wrapping).
+
+Let's go ahead and display timestamps only. However, it'd be nice to use the frame start time as epoch.
+If one wants to measure how much the GPU took time to process a draw operation, then one has to use GPU timer queries to do it. In desktop OpenGL, timer queries are in core starting from OpenGL 3.3, and before that, governed by the extension ARB_timer_query (likely available only in desktop GL 3.2 and higher). In mobile OpenGL ES, timer queries are governed by the extension EXT_disjoint_timer_query, written against OpenGL ES2.0, the extension has not yet been promoted to core even in GLES 3.1. In WebGL, timer queries are governed by an extension with the same name EXT_disjoint_timer_query, https://www.khronos.org/registry/webgl/extensions/EXT_disjoint_timer_query/ , and it is not planned to be adopted in core WebGL 2. Neither Firefox or Chrome currently implement this WebGL extension. (btw it would be cool if Firefox did!)
+
+Ignoring the performance issue, using gl.flush() is not correct way to measure how long the GPU took to render a draw call, since draw operations are not necessarily finished at the time gl.flush() returns. The correct way would be to use gl.finish(), but the overhead with this approach is so big that it is not feasible. (and syncing between every draw call would skew the results since it breaks GPU pipelining).
+
+Nevertheless, measuring how long in CPU ticks particular WebGL calls took has had its uses, mostly in debugging and comparing different WebGL implementations across browsers to find performance bugs in the WebGL implementations. For web developers however, there is not that much value in it. A more useful metric is to know how many times different WebGL calls were made (e.g. "I rendered 5000 objects per frame", or "I changed shaders 1000 times per frame"), and to easily find how many of those are redundant. Presenting the CPU side timings in conjunction with the metrics info, it might be useful to see "oh, I set this many uniforms here, and those took 5 milliseconds of my CPU time per frame, so if I could optimize those out, I could gain up to 5 msecs of CPU time".
+Created attachment 8660311
+Part 1: Gathering timestamps at the call watcher actor
+
+Part1:
+ - Add timestamp in the call watcher actor.
+ - Initialize frameStartTimestamp as epoch while starting to record a snapshot.
+Created attachment 8660316
+Part 2: Add timestamps tests for CanvasDebugger. r=vporof
+
+Part 2:
+ - Add tests for timestamps in WebGL and Canvas snapshoots.
+Comment on attachment 8660311
+Part 1: Gathering timestamps at the call watcher actor
+
+Review of attachment 8660311:
+-----------------------------------------------------------------
+
+Looks good!
+
+I'd like this to have a test, but I don't feel too strongly about it if you want to add it for the frontend bits instead.
+
+As a side-note, please make your patches have 8 lines of context in the future for easier reviewing.
+
+::: toolkit/devtools/server/actors/call-watcher.js
+@@ +55,4 @@
+>     *        The called function's name.
+>     * @param array stack
+>     *        The called function's stack, as a list of { name, file, line } objects.
+> +   * @param double timestamp
+
+Technically this is correct, but it's more idiomatic to say "number" instead of "double" in javascript.
+
+@@ +83,5 @@
+>          window: Cu.getWeakReference(window),
+>          caller: Cu.getWeakReference(caller),
+>          result: Cu.getWeakReference(result),
+> +        args: Cu.getWeakReference(args),
+> +        timestamp: Cu.getWeakReference(timestamp),
+
+Since these timestamps are just numbers, I don't think you need weak reference wrappers around them.
+Comment on attachment 8660316
+Part 2: Add timestamps tests for CanvasDebugger. r=vporof
+
+Review of attachment 8660316:
+-----------------------------------------------------------------
+
+Oh and here are the tests! Nice!
+Created attachment 8660559
+Part 1: Gathering timestamps at the call watcher actor. r=vporof
+
+Part1:
+ - Add timestamps in the call watcher actor.
+ - Initialize frameStartTimestamp as epoch while starting to record a snapshot.
+
+V2:
+ - According to Comment 14, making some corrections.
+Try link, https://treeherder.mozilla.org/#/jobs?repo=try&revision=fdff68022a37.
+Please land Attachment #8660559 and Attachment #8660316 to m-c.
+https://hg.mozilla.org/integration/fx-team/rev/4ba1955735ce
+https://hg.mozilla.org/integration/fx-team/rev/993ae08a8759
+https://hg.mozilla.org/mozilla-central/rev/4ba1955735ce
+https://hg.mozilla.org/mozilla-central/rev/993ae08a8759
+
+
+Measure time spent in draw-related webgl call
+
+
+
+Bug 981183 - Part 1 - Gathering timestamps at the call watcher actor. r=vporof 
+
+Bug 981183 - Part 2 - Add timestamps tests for CanvasDebugger. r=vporof 

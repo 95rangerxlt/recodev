@@ -1,0 +1,106 @@
+Pull out the fps logic from the framerate actor, so it can be consumed by other actors that do not want to expose the actual actor itself.
+
+Pull out the fps logic from the framerate actor, so it can be consumed by other actors that do not want to expose the actual actor itself.
+Created attachment 8616335
+1172183-framerate-actor.patch
+
+Pull out Framerate actor into a standalone class that can be consumed by other actors without requiring RDP.
+
+Honza, pinging for feedback on the name change of "actor-registry-utils" for a more general "actor-utils" -- does this sound ok to you? Figure it wouldn't be a bad idea for a general utils file for actor things.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=40b9810dcb9c
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #1)
+> Created attachment 8616335
+> 1172183-framerate-actor.patch
+> 
+> Pull out Framerate actor into a standalone class that can be consumed by
+> other actors without requiring RDP.
+
+You can kinda' do this already can't you? Can you briefly describe why we need a separate `Framerate` class, other than elegance?
+We did this before; the TimelineActor was spinning up a MemoryActor (and the FramerateActor), and was having lifetime issues IIRC -- since we instantiate new actors for all these child actors, but there's no reason to, as they don't need to be managed via actor pools, or communicate over RDP, easier to reason about, and less overhead for protocol
+I think fitzgen had a better argument that I can't recall; but one of the reasons was actor events didn't work well (or at all?) When NOT going over RDP
+
+Pinging jryans on thoughts of actors being consumed like this (because as a PerfActor would consume these as not actors, keeping the actor portion is only for developer HUD or whatever uses them, plus the transition to a real PerfActor)
+
+https://github.com/mozilla/gecko-dev/commit/7d601ec5b34ab089b5b4cf683604ba5fcad966cd
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #1)
+> Created attachment 8616335
+> 1172183-framerate-actor.patch
+> 
+> Pull out Framerate actor into a standalone class that can be consumed by
+> other actors without requiring RDP.
+> 
+> Honza, pinging for feedback on the name change of "actor-registry-utils" for
+> a more general "actor-utils" -- does this sound ok to you? Figure it
+> wouldn't be a bad idea for a general utils file for actor things.
+> 
+> https://treeherder.mozilla.org/#/jobs?repo=try&revision=40b9810dcb9c
+
+Sounds good to me.
+
+However, there are extensions using the module (path). Can we create a simple loader-mapping that translates: devtools/server/actors/utils/actor-registry-utils -> devtools/server/actors/utils/actor-utils ?
+
+There might be more such cases in the future, so dedicated place where we can put these mappings would be handy.
+
+Honza
+In the case of addons using that module, I'll just make a new actor-utils file in that case -- I didn't know of any contracts with addons for using these server-actor side modules
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #4)
+> I think fitzgen had a better argument that I can't recall; but one of the
+> reasons was actor events didn't work well (or at all?) When NOT going over
+> RDP
+
+Actor events are just regular SDK events.  For the event names you tell protocol.js about (in the "events" block of an actor), it binds handlers to send them over the RDP.  But, it should not block internal handlers from working.  So, if that does fail, it sounds like a bug to be fixed.
+
+One thing to be aware of is the handler method signature: protocol.js is using SDK events, which use a different handler signature that event-emitter which is typically used in other DevTools code.
+
+> Pinging jryans on thoughts of actors being consumed like this (because as a
+> PerfActor would consume these as not actors, keeping the actor portion is
+> only for developer HUD or whatever uses them, plus the transition to a real
+> PerfActor)
+> 
+> https://github.com/mozilla/gecko-dev/commit/
+> 7d601ec5b34ab089b5b4cf683604ba5fcad966cd
+
+Could you explain more of the context here?  What is the connection between the commit you linked at the patch we are reviewing here?
+We have a memory actor that was emitting events. On the server side, the timeline actor wanted to consume the memory actor locally (it's method and events). There was an issue subscribing to the GC events on the memory actor without having a subscriber on the client end, IIRC. So that patch pulls out the logic from memory actor into a different file, with the memory actor wrapping it.
+
+In the memory/timeline example, the timeline actor (for the GC event) just wants to listen to an event, and serialize that data, and send it over RDP on its own, not using any actor/rdp things from the memory actor.
+
+I guess the high level question is -- should actors be consumable by other actors, when no actorish/RDP things are used? Is there overhead to instantiating actors for this purpose? In this patch, it just is a FPS module that gets the frame rate for a window. The timeline actor then can just use this module. And for consumers (dev hud?) that want just the framerate stuff, they can use the Framerate actor, which just wraps the FPS module with RDP/actor methods.
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #8)
+> We have a memory actor that was emitting events. On the server side, the
+> timeline actor wanted to consume the memory actor locally (it's method and
+> events). There was an issue subscribing to the GC events on the memory actor
+> without having a subscriber on the client end, IIRC. So that patch pulls out
+> the logic from memory actor into a different file, with the memory actor
+> wrapping it.
+
+Okay.  As I mentioned above, it should work just fine for events from an actor to only be consumed by other server-side modules, so this behavior sounds like a bug.
+
+If this events issue was the only reason to break up the memory actor, then it sounds like we should just fix the real bug.  However...
+
+> In the memory/timeline example, the timeline actor (for the GC event) just
+> wants to listen to an event, and serialize that data, and send it over RDP
+> on its own, not using any actor/rdp things from the memory actor.
+> 
+> I guess the high level question is -- should actors be consumable by other
+> actors, when no actorish/RDP things are used? Is there overhead to
+> instantiating actors for this purpose? In this patch, it just is a FPS
+> module that gets the frame rate for a window. The timeline actor then can
+> just use this module. And for consumers (dev hud?) that want just the
+> framerate stuff, they can use the Framerate actor, which just wraps the FPS
+> module with RDP/actor methods.
+
+...if you want actors to share some functionality, it seems logical to break that out into a non-actor module.  I don't think there would be much overhead really if we were to instantiate the actor, but from a code organization perspective the following approach seems most logical to me:
+
+* actors implement the RDP methods
+* shared functionality comes from non-actor modules
+
+It seems like that's exactly what you are doing here, so seems good to me.
+Created attachment 8617058
+1172183-framerate-actor.patch
+
+Leave actor-registry-utils unchanged
+Move FPS implementation to devtools/toolkit/shared/framerate
+https://hg.mozilla.org/integration/fx-team/rev/adb74c3fcb17
+https://hg.mozilla.org/mozilla-central/rev/adb74c3fcb17

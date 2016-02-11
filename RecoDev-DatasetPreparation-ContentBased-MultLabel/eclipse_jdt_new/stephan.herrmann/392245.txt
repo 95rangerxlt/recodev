@@ -1,0 +1,425 @@
+From bug 392099 comment 4:
+> How will @NonNullByDefault be applied to TYPE_USE annotations?
+
+Repeating my own comment:
+
+Tricky case is
+  @NonNullByDefault
+  void takeList(List<String> list) { }
+
+Worst case scenario: we may have to introduce another parameter to the @NonNullByDefault annotation, s.t. like:
+  @NonNullByDefault(location={PARAMETER, TYPE_USE})
+
+Assuming, we'll have this parameter, what should be its default?
+Then if we agree on the default and agree that this default makes sense *always*, we can spare the parameter :)
+
+From bug 392099 comment 4:
+> How will @NonNullByDefault be applied to TYPE_USE annotations?
+
+Repeating my own comment:
+
+Tricky case is
+  @NonNullByDefault
+  void takeList(List<String> list) { }
+
+Worst case scenario: we may have to introduce another parameter to the @NonNullByDefault annotation, s.t. like:
+  @NonNullByDefault(location={PARAMETER, TYPE_USE})
+
+Assuming, we'll have this parameter, what should be its default?
+Then if we agree on the default and agree that this default makes sense *always*, we can spare the parameter :)
+Here's a new twist to this bug:
+
+Depending on the final decision regarding bug 392099 comment 17 we may end up having *only* TYPE_USE null annotations at level 1.8.
+
+This needn't and shouldn't bring any changes in semantics, but in that light it would look funny to use s.t. like "@NonNullByDefault(location=PARAMETER)" despite the fact that @NonNull is no longer an annotation for parameters, but only for types (in the positions of parameters, ...).
+See also bug 400420 for pre 1.8 times.
+Let me collect some aspects for null-defaults that potentially are of interest for fine-tuning (see also prev. disc. in bug 400420 comment 9):
+
+Coarse grained location 
+-----------------------
+(distinctions that would already apply to SE5 annotations):
+
+ - method parameter
+ - method return
+ - field
+
+Separating the default for fields from the rest has been explicitly requested, I'm not particular sure if parameters and return need separate treatment, probably not.
+Defaults for local variables is explicitly *not* desired. Here inference does a better job than a default possibly could.
+
+ - public methods
+ - non-public methods
+
+I can't recall any request (I think scientific publications mention this distinction, but I don't have a reference at hand). I'd consider this as a possible future extension. For the time being we might just try to avoid any incompatible design decisions.
+
+Other locations like type parameter declaration, superclass, superinterfaces are possible candidates, too. However, I don't believe that a default could help here, and after all, these are much smaller in number than other kinds of type uses. Defaults are intended to reduce the sheer number of necessary annotations; not much to be gained by defaults for "extends" clause etc.
+
+Explicitly not affected by defaults will be casts and instanceof expressions.
+
+
+File grained location
+---------------------
+Each type use to which a @NonNullByDefault could possibly apply, may be structured
+ - type arguments
+ - type argument bounds
+ - array dimensions & leaf type
+
+I assume that normally users will expect the default to apply to the outer type only, i.e, not to type arguments & bounds, and only to the outermost dimension of an array type.
+
+Considering, however, the effort of writing 
+  Map<@NonNull String, @NonNull Person>
+at each occurrence, suggests that defaults would be very useful also in this realm.
+
+Theoretically, it could be interesting to control the depth of types, so that nested generics (at a given depth) could be excluded from the default. But the potential gain may not balance the complexity this would bring. Perhaps s.t. for the future, not for now.
+Given the above analysis (comments welcome, of course), what kind of annotation design would possibly meet those requirements?
+
+
+One design option is to treat coarse/fine grained topics as orthogonal, so the annotation should have two independent attributes.
+
+Coarse grain:
+-------------
+As a low-cost version we could indeed use the existing ElementType enum, but
+- this contains more elements than make sense in our case
+- we cannot add more elements (now or in the future)
+- the constant METHOD is actually a bad match for saying "return type" :)
+
+Hence, I propose we introduce our own TypeLocation type, s.t. like
+
+  public enum TypeLocation { PARAMETER, RETURN_TYPE, FIELD }
+
+If later we want to distinguish more (e.g., public/non-public) this might be added using new constants. Of course, if we want to be very specific, just one enumeration is not a very rich model, but for the sake of usability / comprehensibility I wouldn't suggest more complexity than this enum.
+
+
+Given an annotation attribute of type TypeLocation, we no longer need the boolean value, since
+  @NonNullByDefault(false)
+will be written as
+  @NonNullByDefault(locations={})
+
+
+Fine grain:
+-----------
+
+We certainly don't want the full wealth of the 'target_type' as of JVMS 4.7.20-A.  And no official enum exists for that anyway.
+
+My first guess would be to use s.t. like
+
+    public enum TypeAnnotationTarget {
+	TYPE_PARAMETER, TYPE_BOUND, TYPE_ARGUMENT, ARRAY_DETAIL;
+    }
+
+----
+
+Putting the above together, we'd have s.t. like this annotation declaration:
+
+@Documented
+@Retention(RetentionPolicy.CLASS)
+@Target({ PACKAGE, TYPE, METHOD, CONSTRUCTOR, FIELD })
+public @interface NonNullByDefault {
+	TypeLocation[] value() default { PARAMETER, RETURN_TYPE, FIELD };
+	TypeAnnotationTarget[] detail() default {};
+}
+
+By way of the attribute defaults a plain @NonNullByDefault would have the same meaning as in previous versions. Using the standard name 'value' for the first argument allows the @NonNullByDefault(false) idiom to be written as @NonNullByDefault({}).
+The model of two orthogonal attributes relies on the assumption that null-defaults should only ever apply to locations mentioned in the first (TypeLocation) attribute.
+
+We might want to briefly challenge this assumption, e.g. by asking: is flow analysis really strong enough to infer nullness at all type details? What if we have:
+
+  List<@NonNull Person> persons() { ... }
+  List<@Nullable Person> maybePersons() { ... }
+  
+  List<Person> l = b ? persons() : maybePersons();
+
+Can flow analysis make any sense of this?
+
+Ideally I'd like to flag such code as bogus, because strictly speaking variable 'l' would change its type depending on the value of b, but this will surely offend _some_ users (I'm not predicting their number :) ).
+
+Asked differently, what rules would allow us to infer null annotations for type details in a way that those annotations don't need to be explicitly mentioned in most cases?
+
+We might borrow from the concept of effectively final locals: we could start resolution with the hypothesis that all assignments to a variable have the same nullness type details (so 'l' could be List<@NonNull Person> or null, but never List<@Nullable Person>). If this hypothesis holds during resolution of the entire method body we're good. If, OTOH, we encounter two assignments with different nullness type details, the type is inferred as having unspecified nullness for its details.
+
+_Should_ we come to the conclusion that for type details we still need many annotations even on local variables, than we might consider using default nullness on type details regardless of the (coarse grain) location.
+This could be encoded by blending both enums into one.
+
+My current thinking, however, is that the top-priority regarding locals should be to make nullness type details inferrable, and discourage too much variance in this regard (e.g., flag 'l' above as erroneous indeed).
+@NonNull remains the most useful default for every location, both because that is the common case and for compatibility across the source code.  So, @NonNullByDefault should apply to these locations that you mentioned:
+ - type arguments
+ - type argument bounds
+ - array dimensions & leaf type
+A programmer can override these wherever desired.
+
+On the other hand, there are a few places that should not be defaulted to @NonNull, because inference can do a better job.  You already mentioned local variables.  Here is a more complete list of the locations that should not be defaulted to @NonNull:
+  casts
+  local variables, including resource variables in the try-with-resources construct
+  instanceof
+Also, these locations should not be defaulted to @NonNull for consistency with the programmer-specified intention:
+  implicit upper bounds
+
+The Checker Framework calls the above policy "CLIMB to top", and its manual explains the rationale for these choices: http://types.cs.washington.edu/checker-framework/current/checkers-manual.html#climb-to-top .
+
+These choices work well for the Checker Framework, so Eclipse can take advantage of that experience.  (The Checker Framework tried two other defaulting strategies in the past, but they didn't work as well as CLIMB-to-top.)  It will also benefit users for the different @NonNull annotations to be treated consistently by different tools.  It would be unfortunate for the defaulting rules to differ between Eclipse, IntelliJ, the Checker Framework, etc.
+
+I don't have a strong preference as to the syntax to express the defaults, so long as the CLIMB-to-top policy is expressible.  It should probably be the default, too.  The link above shows how the Checker Framework expresses this default.
+
+
+I don't see any benefit to making the defaults different for public vs. private methods.  The same thing goes for changing the default at some level of generic arguments.  Both of those seem merely confusing.  They would lead to confusion as the programmer refactored, and they would complicate refactoring tools.
+
+
+I'm not very fond of your  "fine-grained" vs. "coarse-grained" terminology (and I think you aren't either; it was just a strawman for discussion.)  For one thing, the names are not very informative.  Equally importantly, they seem to me to address different, orthogonal issues, but the current names imply that fine-grained would refine coarse-grained.
+
+
+I agree that this code needs to be flagged as bogus:
+  List<Person> l = b ? persons() : maybePersons();
+Thanks for weighing in, Mike!
+
+I think there's much convergence already. Before going into detail I should ask one question, where I'm not sure whether we speak of the same:
+
+If, e.g., the default affects type arguments but not locals, what does this mean for a type argument in a local variable declaration? Is it affected (because all type arguments are affected) or not (because local variables are left alone)?
+
+My idea is indeed a master-detail concept, where the option for local variables would override the option for type arguments in this example. As you disagree with the "coarse/fine-grained" terminology (which is a strawman, indeed), could this be more than a matter of names?
+
+Let's take maybe the example of fields because these are more likely to be affected by nonnull default than locals: what rationale exists, when selecting default for type arguments but not for fields to interpret
+  List<Person> personField;
+one way or the other (List<Person> vs. List<@NonNull Person>).
+
+Thinking about this example, I'm surprised to realize that the @NonNull type argument is actually easier to guarantee than the '@NonNull List' part would be. Interesting ... so the combination List<@NonNull Person> does make sense in a way. OTOH, I'm anticipating users who want to express "just leave me alone with any @NonNull business on any of my (field|locals)". Would that be a reasonable request, or should we convince them otherwise?
+
+
+BTW, I couldn't find the definition of your type DefaultLocation. What options does it provide?
+After thinking more about defaults on type arguments, I'm now convinced that such defaults should apply everywhere, i.e. if you say
+   @NonNullByDefault({...,TYPE_ARGUMENT,...})
+   ...
+   List<Person>
+the type argument should be interpreted as '@NonNull Person', no matter _where_ in the code this type occurs.
+Rationale: (I) It would be unnecessarily difficult to assign values between different locations, if types have different specification simply due to how the null default is applied. (II) Reasons why fields, parameters, locals should be treated separately only really concern the entire value (can it be null or not?), not the details of its type.
+
+Next via bug 429384 I ensured that upper and lower bounds correctly consider null annotations, e.g.,
+OK:
+   List<? super @NonNull Person> l1 = new ArrayList<@Nullable Person>();
+ERROR:
+   List<? extends @NonNull Person> l2 = new ArrayList<@Nullable Person>();
+This transports the inherent asymmetry between upper and lower bounds into the matter at hand. So if we apply a @NonNull default on all type bounds, it has the following implications for lower bounds:
+- no effective constraint added, the type parameter can still match the corresponding @Nullable type
+- this default, however, implies a change from "legacy" types, where we only report  "unchecked" warnings to fully specified types where problems are reported as errors.
+
+
+
+At this point it indeed suffices to define @NonNullByDefault roughly like this:
+
+@Target({ PACKAGE, TYPE, METHOD, CONSTRUCTOR })
+public @interface NonNullByDefault {
+	DefaultLocation value() default { PARAMETER, RETURN_TYPE, FIELD, TYPE_ARGUMENT, TYPE_BOUND };
+}
+
+
+Three questions remain: 
+(A) Do we want to admit this annotation to more locations?
+(B) What are the exact values of enum DefaultLocation?
+(C) What is the default for the 'value' attribute?
+
+
+Ad (A):
+I imagine that for interfacing with legacy code, it would be useful to turn off defaults in various locations, so I want to be able to express the following, no matter where this code would occur:
+  @NonNullByDefault({}) List<Person> l = getPersonsFromLegacyAPI();
+Thus I'd like to add to the above list:
+  FIELD, CONSTRUCTOR, LOCAL_VARIABLE
+as locations where the @NonNullByDefault can be specified. I don't expect this to be used for positively defining defaults (should happen at higher levels), but for cancelling defaults from outer scopes.
+
+Ad (B):
+My list currently is:
+ - PARAMETER (method parameter declaration)
+ - RETURN_TYPE
+ - FIELD
+ - TYPE_PARAMETER (declaration in a class or method declaration)
+ - TYPE_BOUND
+ - TYPE_ARGUMENT
+ - ARRAY_ELEMENTS (at any dimension except the top level array itself)
+
+I see one special case that should not normally be subject to the default: application of a type parameter as a type argument:
+  <T> List<T> singleton(T t)
+Here it would be bad to imply that the return type is List<@NonNull T>. If T itself is unconstrained so should be its applications. We could accommodate this by adding one more constant to DefaultLocation:
+ - TYPE_PARAMETER_USE
+which would mainly serve the purpose of documenting that this animal is not covered by any of the other constants. I prefer this approach over hiding such details in the javadoc of the other constants.
+
+More constants can be added later, if desired, e.g., CAST (a faithful implementation of which would require to generate additional runtime checks, which, however, is a no go for ecj), LOCAL_VARIABLE (not recommended) etc.
+
+Maybe I should add that wildcards do accept null annotations, but I would never put them under the control of @NonNullByDefault, i.e., "@NonNull ?" is s.t. you can write explicitly (interesting, e.g., if a wildcard has multiple bounds), but it will never be achieved by using @NonNullByDefault.
+
+Ad (C):
+Here my proposal is:
+
+  { PARAMETER, RETURN_TYPE, FIELD, TYPE_PAREMETER, TYPE_BOUND, TYPE_ARGUMENT }
+
+From the proposed constants this only omits ARRAY_ELEMENTS and TYPE_PARAMETER_USE.
+
+The elements covered by the CLIMB-to-top rule are excluded as we wouldn't even have a constant representing those locations :) (could be added later, but certainly not to be included in the default).
+(In reply to Stephan Herrmann from comment #8)
+
+TLDR;
+
+Here's my proposal for @NonNullByDefault for the upcoming release (minus javadoc, to be added once the proposal gets an initial +1):
+
+public enum DefaultLocation {
+	PARAMETER,
+	RETURN_TYPE,
+	FIELD,
+	TYPE_PARAMETER,
+	TYPE_BOUND,
+	TYPE_ARGUMENT,
+	TYPE_PARAMETER_USE,
+	ARRAY_ELEMENTS
+}
+
+@Documented
+@Retention(RetentionPolicy.CLASS)
+@Target({ PACKAGE, TYPE, METHOD, CONSTRUCTOR, FIELD, LOCAL_VARIABLE })
+public @interface NonNullByDefault {
+    DefaultLocation value() default { PARAMETER, RETURN_TYPE, FIELD, TYPE_PAREMETER, TYPE_BOUND, TYPE_ARGUMENT };
+}
+
+
+If nested contexts have @NonNullByDefault annotations with different attribute values, the inner most applicable default takes over completely, i.e., lists of DefaultLocation will *never* be merged / filtered in any way, but completely override.
+(In reply to Stephan Herrmann from comment #9)
+This direction is fine for me if it matches the available research results.
+
+The type of NonNullByDefault#value() should be DefaultLocation[].
+Please spell-check TYPE_PAREMETER.
+Shouldn't ARRAY_ELEMENTS be called ARRAY_COMPONENTS by the nomenclature in JLS8 10? ARRAY_CONTENTS would also be OK.
+(In reply to Markus Keller from comment #10)
+> (In reply to Stephan Herrmann from comment #9)
+> This direction is fine for me if it matches the available research results.
+> 
+> The type of NonNullByDefault#value() should be DefaultLocation[].
+> Please spell-check TYPE_PAREMETER.
+> Shouldn't ARRAY_ELEMENTS be called ARRAY_COMPONENTS by the nomenclature in
+> JLS8 10? ARRAY_CONTENTS would also be OK.
+
+Thanks for weighing in Markus and Mike.
+
+Stephan, I have studied this and have no objections to the proposal. Please 
+proceed. Thanks.
+Created attachment 240568
+DefaultLocation with javadoc
+Created attachment 240569
+NonNullByDefault with javadoc
+
+Thanks all,
+
+I've uploaded the two files DefaultLocation.java (new) and NonNullByDefault.java (updated) with javadoc.
+
+I adopted the name ARRAY_CONTENTS, thanks Markus!
+
+To prevent premature introduction of any constants which might turn out to be unsound I omitted TYPE_PARAMETER_USE for now. The name wasn't chosen very well, and in the end it felt more consistent to just mention wildcards and type variable use as never being affected by the default.
+
+Also listing TYPE_PARAMETER as part of the default was bogus, since it would overrule the exclusion of implicit bounds (according to the CLIMB-to-top rule).
+
+
+Once more, comments are welcome. I will also give it another round of proof-reading tomorrow.
+Per private communication from Stephan, we are doing this just after Java 8 GA.
+Adjusting target to reflect that.
+Created attachment 240682
+annotation update with minimal changes in the compiler
+
+Please consider this patch for BETA_JAVA8 GA.
+
+It updates the annotations so we don't have to make breaking API changes just after releasing 2.0.0 of the annotation bundle.
+
+Adjustment in the compiler: alternatively interpret an empty annotation argument ({}) in the same way as we interpreted "false" in the old model, viz. as canceling defaults from outer scopes (both source and binary types).
+
+Adjustment in tests: when testing against 1.8 replace "@NonNullByDefault(false)" with "@NonNullByDefault({})". Updated test jars will follow in a sec.
+
+Additional warning: when explicitly using some of the new detail arguments, the compiler currently issues this warning:
+"Arguments controling the details of the nullness default are not yet evaluated by the analysis."
+
+This is to be removed, once we release the real implementation.
+
+A test for the new warning has been added.
+Created attachment 240683
+Test jar
+
+Test jar (1/2) to be placed into org.eclipse.jdt.core.tests.compiler/workspace
+Created attachment 240684
+Test jar (2)
+
+Test jar (2/2) to be placed into org.eclipse.jdt.core.tests.compiler/workspace
+Jay, thanks also for reviewing the changes.
++1 for the patch.
+Stephan, proceed to release - I tried releasing it, but noticed that the
+new test is passing without the jars being downloaded and placed in the
+right directories suggested - so didn't want to take a chance committing
+some operator error. Thanks. (not saying this indicates a problem)
+(In reply to Srikanth Sankaran from comment #20)
+> Stephan, proceed to release - I tried releasing it, but noticed that the
+> new test is passing without the jars being downloaded and placed in the
+> right directories suggested - so didn't want to take a chance committing
+> some operator error. Thanks. (not saying this indicates a problem)
+
+Tests passing without the updated jars indicates we leniently accept the old annotation from class files, which I believe is good. Just the new code paths wouldn't be exercised during tests without the new jars.
+
+The patch has been released via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=1fd3c9fc562cda07c874ee80cb4f5d32730433f0
+
+I filed a new bug 429958 for the compiler part of evaluating the new annotation details (targeting 4.4 M7). Thus the current bug regarding update of the annotations themselves is resolved.
+
+Thanks!
+
+
+PS: I converted the +1 from comment 19 into a review +, I hope you don't mind this little protocol violation :)
+(Sorry for the slow response; much of this goes to junk mail because I'm not interested in the implementation details, only the specification.) 
+
+> If, e.g., the default affects type arguments but not locals, what does this
+> mean for a type argument in a local variable declaration? Is it affected
+> (because all type arguments are affected) or not (because local variables are
+> left alone)?
+
+By "locals", I meant the top-level type.  Type arguments are not treated
+differently depending on the location where they appear.
+
+> After thinking more about defaults on type arguments, I'm now convinced
+> that such defaults should apply everywhere, i.e. if you say
+>    @NonNullByDefault({...,TYPE_ARGUMENT,...})
+>    ...
+>    List<Person>
+> the type argument should be interpreted as '@NonNull Person', no matter
+> _where_ in the code this type occurs.
+
+Right, we agree.
+
+> I'm anticipating users who want to express "just leave me alone
+> with any @NonNull business on any of my (field|locals)".
+
+If a user doesn't want to use any automated checking for null pointer
+errors, then they don't have to use the system.  If that is not what you
+are talking about, then I think I'm not understanding what you mean by
+"just leave me alone"; can you make that more specific so that we can have
+a discussion about it?
+(In reply to Michael Ernst from comment #22)
+>(Sorry for the slow response; much of this goes to junk mail because I'm not 
+> interested in the implementation details, only the specification.) 
+
+Yea, sorry for the volume of bugzilla mails. That's BTW one reason why I separated compiler issues into their own bug 429958  :)
+
+The released "specification" in terms of documented annotations can be found here:
+- http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/tree/org.eclipse.jdt.annotation/src/org/eclipse/jdt/annotation/DefaultLocation.java?h=BETA_JAVA8&id=1fd3c9fc562cda07c874ee80cb4f5d32730433f0
+- http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/tree/org.eclipse.jdt.annotation/src/org/eclipse/jdt/annotation/NonNullByDefault.java?h=BETA_JAVA8&id=1fd3c9fc562cda07c874ee80cb4f5d32730433f0
+
+
+> > I'm anticipating users who want to express "just leave me alone
+> > with any @NonNull business on any of my (field|locals)".
+> 
+> If a user doesn't want to use any automated checking for null pointer
+> errors, then they don't have to use the system.  If that is not what you
+> are talking about, then I think I'm not understanding what you mean by
+> "just leave me alone"; can you make that more specific so that we can have
+> a discussion about it?
+
+You dropped the important part of that ficticious citation :)
+  "... on any of my (fields|locals)"
+
+I was expecting that some users might prefer to continue using null annotations as contracts on method signatures and only there.
+
+But since all this is speculation and since I came to agree with your version, let's just wait what users _will_ complain about (they will find something, I'm sure) :)
+
+
+[1.8][compiler][null] Define whether / how @NonNullByDefault applies to TYPE_USE locations
+
+
+
+Bug 392245 - [1.8][compiler][null] Define whether / how @NonNullByDefault applies to TYPE_USE locations 

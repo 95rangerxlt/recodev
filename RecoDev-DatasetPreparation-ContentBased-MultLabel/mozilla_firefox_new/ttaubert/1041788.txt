@@ -1,0 +1,323 @@
+Created attachment 8459854
+buggy.mp4
+
+User Agent: Mozilla/5.0 (X11; Linux x86_64; rv:33.0) Gecko/20100101 Firefox/33.0 (Beta/Release)
+Build ID: 20140721030205
+
+Steps to reproduce:
+
+1. Have multiple website tabs open.
+2. click closing [x] on specific tab.
+
+
+Actual results:
+
+Unable to close individual tab
+
+
+Expected results:
+
+tab should have closed on clicking the close button
+
+Created attachment 8459854
+buggy.mp4
+
+User Agent: Mozilla/5.0 (X11; Linux x86_64; rv:33.0) Gecko/20100101 Firefox/33.0 (Beta/Release)
+Build ID: 20140721030205
+
+Steps to reproduce:
+
+1. Have multiple website tabs open.
+2. click closing [x] on specific tab.
+
+
+Actual results:
+
+Unable to close individual tab
+
+
+Expected results:
+
+tab should have closed on clicking the close button
+Created attachment 8459859
+bug2.mp4
+
+i guess you can extend this problem to closing any tabs after this problem occurs.
+Unable to reproduce, 33.0a1 (2014-07-20) Win 7 x64
+Please check if the issue occurs using Firefox in safe mode (with your addons disabled):
+http://support.mozilla.com/kb/Safe+Mode
+
+And on a new, empty profile:
+http://support.mozilla.org/en-US/kb/Managing-profiles#w_starting-the-profile-manager
+This happens after a certain time of usage, it occurs randomly. 
+Ive got raw data and about:memory if that helps to diagnose the issue.
+this again happens out of the blue on the latest Nightly 34.0a1 (2014-07-26)
+i had reddit, imgur, nightly start page and an empty tab active.
+Created attachment 8463016
+popup.png
+
+Not sure if this might help, but AT-TIMES i get this pop-up before the problem starts.
+(In reply to bull500 from comment #6)
+> Created attachment 8463016
+> popup.png
+> 
+> Not sure if this might help, but AT-TIMES i get this pop-up before the
+> problem starts.
+
+That's very interesting - would you mind browsing to chrome://browser/content/tabbrowser.xml in your Firefox, viewing source, and hitting Ctrl-L? A dialog should come up asking you to enter a line number to jump to - type in 1989 and press enter.
+
+Wherever it hops you to, would you mind copying it and the surrounding code, and pasting it in here? When you do that, can you also indicate which of the lines you're pasting is 1989?
+
+Thanks!
+Also, do you see anything in your browser console when you attempt and fail to close a tab? (You can open up the console with Ctrl-Shift-J).
+The following pasted output is from tabbrowser.xml. Follows:
+
+<method name="_endRemoveTab">  ----> LINE [1985]
+        <parameter name="aTab"/>
+        <body>
+          <![CDATA[
+            if (!aTab || !aTab._endRemoveArgs) ----> LINE [1989]
+              return;
+
+            var [aCloseWindow, aNewTab] = aTab._endRemoveArgs;
+            aTab._endRemoveArgs = null;
+
+            if (this._windowIsClosing) {
+              aCloseWindow = false;
+              aNewTab = false;
+            }
+
+            this._lastRelatedTab = null;
+
+            // update the UI early for responsiveness
+            aTab.collapsed = true;
+            this.tabContainer._fillTrailingGap();
+            this._blurTab(aTab);
+
+            this._removingTabs.splice(this._removingTabs.indexOf(aTab), 1);
+
+            if (aCloseWindow) {
+              this._windowIsClosing = true;
+              while (this._removingTabs.length)
+                this._endRemoveTab(this._removingTabs[0]);
+            } else if (!this._windowIsClosing) {
+              if (aNewTab)
+                focusAndSelectUrlBar();
+
+              // workaround for bug 345399
+              this.tabContainer.mTabstrip._updateScrollButtonsDisabledState();
+            }      ----> LINE [2019]
+Also about the browser console info - when the https://bugzilla.mozilla.org/attachment.cgi?id=8463016 pop up came up; i hit the debug button and it showed me an empty browser console. 
+
+Do you want to create the tab close situation again? Its randomly occurs but i can try my luck.
+Hm, that 1989 line is just a conditional, and wouldn't be expensive, which suggests that some kind of loop was being executed and when the slow-script warning came up, you just happened to be at that line of code.
+
+Do you happen to have any add-ons installed and enabled?
+The addons are DownloadHelper, DownThemALL, Gnotifier, HTitle, Lightbeam, Japanese Tattoo - (persona).
+
+When i first submitted the bug i had - DownloadHelper, DownThemALL, HTitle,Japanese Tattoo - (persona).
+So, as luck would have it, I reproduced this!
+
+Some facts:
+
+1) I had a large number (~200) tabs open at the time.
+2) I attempted to close most of them by selecting a tab and choosing "Close Other Tabs"
+3) I got the slow script warning as Firefox tried to close all my tabs, and I chose to stop the script.
+
+After that, I couldn't close any tabs. Flipping open my browser debugger, I saw that the reason I couldn't close a tab was because we were failing this conditional in _beginRemoveTab:
+
+            if (aTab.closing ||
+                this._windowIsClosing)
+              return false;
+
+this._windowIsClosing is stuck set at "true". I imagine this is likely because I stopped the slow script while I was closing all of those tabs.
+
+Here's a plausible explanation: with many tabs open, I choose "Close Other Tabs". This causes me to enter "removeAllTabsBut" in tabbrowser.xml, which loops through all tabs that aren't pinned and aren't the one I selected, and calls removeTab on them.
+
+For each of these tabs, we enter _beginRemoveTab, which adds them to the "_removingTabs" array, as tabs we're in the process of removing.
+
+This function also sets "_endRemoveArgs" on the closing tab. One of those args is "closeWindow", which on my profile gets set to true here in "_beginRemoveTab":
+
+           var closeWindow = false;
+            var newTab = false;
+            if (this.tabs.length - this._removingTabs.length == 1) {
+              closeWindow = aCloseWindowWithLastTab != null ? aCloseWindowWithLastTab :
+                            !window.toolbar.visible ||
+                              Services.prefs.getBoolPref("browser.tabs.closeWindowWithLastTab");
+              // ... The rest of the code in this block doesn't matter, so I omitted it
+            }
+
+I must eventually iterate to the last tab in removeTab, and so this.tabs.length - this._removingTabs.length will equal 1. By the way I've traced it, aCloseWIndowWithLastTab will be passed as null from "removeTab", so the reason closeWindow gets set to true is because my browser.tabs.closeWindowWithLastTab pref is set to true, which is the default.
+
+Ok, so I've got all of those tabs starting to close, and they're all _animating_ closed, which means we're waiting for the transition to complete. That's a ton of animation. I have a feeling we never make it for most of them, and hit the timeout fallback handler at the bottom of "removeTab".
+
+At this point, we have a huge number of tabs closing, and one of those tabs has the "closeWindow" _endRemoveArg set to true.
+
+So each tab now gets "_endRemoveTab" called for it.
+
+In that function, there's this code:
+
+            if (aCloseWindow) {
+              this._windowIsClosing = true;
+              while (this._removingTabs.length)
+                this._endRemoveTab(this._removingTabs[0]);
+            } else if (!this._windowIsClosing) {
+
+aCloseWindow will be true in one case - the case of the second-to-last tab closing. We set this._windowIsClosing to true, and then we... we iterate all of the tabs still in this._removingTabs, and try to _endRemoveTab them as well (this is after we've removed the current tab from the _removingTabs array).
+
+I suspect this while-loop is the hot-loop that's causing the slow-script warning to come up.
+
+And then the user chooses to stop the slow script, and this._windowIsClosing is stuck at true, and closing tabs is totally busted.
+
+TL;DR:  This seems pretty hairy, and I suspect it might be related to having many, many tabs open at once, and attempting to close most of them. This can cause a slow-script warning for tabbrowser.xml, which, if the user chooses to stop the script, puts the user in a bad state which prevents them from closing other tabs.
+
+I also do not think this is an e10s-specific bug or restricted to Linux, as I didn't run into any of the above while using an e10s window, and I was on OS X.
+bull500 - do you remember attempting to close many, many tabs before the slow script warning came up?
+Ah forgive my knowledge of coding. i know C/C++ but ive only used in school projects, hardly have any idea of how projects work in the real world. I can understand to the situation of a fine extent though :)
+
+And yes i use a single browser window from day to night, so i keep opening up tabs and closing them.
+At times i do close tabs in a very fast manner in a single go, and i close them individually by clicking the 'x' icon on the tabs.
+Putting this in the Firefox backlog.
+Removing myself as assignee, since this doesn't appear to be e10s-related.
+Today it brought me with
+Script: chrome://browser/content/tabbrowser.xml:2023
+
+Firefox 34.0a1 (2014-07-29)
+
+Code Snippet 
+
+if (aCloseWindow) {
+              this._windowIsClosing = true;
+              while (this._removingTabs.length)
+                this._endRemoveTab(this._removingTabs[0]);   <--- LINE [2023]
+            } else if (!this._windowIsClosing) {
+              if (aNewTab)
+                focusAndSelectUrlBar();
+Hey Tim - any idea what might be happening here?
+This seems very similar to bug 585813. The code that landed for this bug [1] was removed by [2] in bug 616853. I don't actually remember why that was removed there, maybe we should add it back? The onunload dialog is tab modal now but that doesn't prevent us from re-entering _beginRemoveTab() with a full event queue, no?
+
+[1] https://hg.mozilla.org/integration/fx-team/rev/39f8849e89c5
+[2] https://hg.mozilla.org/mozilla-central/diff/8a7368027aad/browser/base/content/tabbrowser.xml
+Pushed a patch with the reentrancy check to try:
+
+https://tbpl.mozilla.org/?tree=Try&rev=b90219ee360c
+I accidentally cancelled the wrong try run :| But it looks like the patch is good.
+
+bull500, could you maybe check whether you're hitting the same problems with the try builds? An opt build for Linux 64-bit can be found here:
+
+https://ftp.mozilla.org/pub/mozilla.org/firefox/try-builds/ttaubert@mozilla.com-b90219ee360c/try-linux64/firefox-34.0a1.en-US.linux-x86_64.tar.bz2
+
+Thanks!
+Im typing this through your build! That is one Kick-ass patch! :D
+I've tested individually closing down hundreds of tabs in a single go and also using the 'Close other tabs' option.
+Didn't break a sweat! Bravo! It'll be cool if somebody else can also verify and push this into the upstream package.
+ive tried a lot to recreate the situation. looks like its fine. will need somebody else to verify again.
+(In reply to bull500 from comment #24)
+> ive tried a lot to recreate the situation. looks like its fine. will need
+> somebody else to verify again.
+
+Thanks for verifying! Mike, can you please try again with this patch given that you were able to reproduce in comment #13? Thanks!
+I wasn't able to reliably reproduce it - I just experienced it once - but I'll run with this for a while to see if I can cause it again.
+Created attachment 8466171
+0001-Bug-1041788-Don-t-enter-_beginRemoveTab-when-a-.perm.patch
+
+Submitting for review in the meantime, Dão already reviewed this once before :)
+Marco, can you please add this to the iteration?
+[Tracking Requested - why for this release]:
+Added to Iteration 34.1
+I wasn't able to reproduce with the try build, after running with it for a day.
+https://hg.mozilla.org/integration/fx-team/rev/a784cb5f193e
+https://hg.mozilla.org/mozilla-central/rev/a784cb5f193e
+Hi Tim, should this bug be marked as [qa+] or [qa-] for verification.
+Comment on attachment 8466171
+0001-Bug-1041788-Don-t-enter-_beginRemoveTab-when-a-.perm.patch
+
+Approval Request Comment
+[Feature/regressing bug #]: Regression from bug 	616853.
+[User impact if declined]: Quickly closing a lot of tabs in succession can make tabs uncloseable and bring the browser to an unusable state.
+[Describe test coverage new/current, TBPL]: Landed on Nightly, works. No automated tests because that's unfortunately hard to do.
+[Risks and why]: Very low risk and small patch, the same code was in for 18 releases before but was removed by accident.
+[String/UUID change made/needed]: None.
+
+If this is not a sec:{high,crit} bug, please state case for ESR consideration: This bug is easy to fix and makes the browser quite unusable if it ever occurs. Has in the past been reported when closing tabs with Flash (bug 585813).
+Fix Landed on Version: 34 (Hopefully we'll uplift to 32 + 33.)
+Comment on attachment 8466171
+0001-Bug-1041788-Don-t-enter-_beginRemoveTab-when-a-.perm.patch
+
+We only accept security and top critical bugs for ESR. Not sure it fits here...
+Hi Florin, can a QA contact be assigned for verification of this bug.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/1ab4b8c5333e
+https://hg.mozilla.org/releases/mozilla-beta/rev/faf3b10d4868
+(In reply to Mike Conley (:mconley) from comment #13)
+> 1) I had a large number (~200) tabs open at the time.
+> 2) I attempted to close most of them by selecting a tab and choosing "Close
+> Other Tabs"
+> 3) I got the slow script warning as Firefox tried to close all my tabs, and
+> I chose to stop the script.
+Unfortunately, I couldn't make the slow script warning show up and also couldn't reproduce the initial problem. Tested on Win 7, OS X 10.8.5, both on normal and e10s windows, nightly 34.0a1 (2014-08-01) 
+(before the fix)
+okay, im not sure if this belongs here again but, ive got this issue back with and Unresponsive Script
+Script: chrome://browser/content/tabbrowser.xml:2061
+Firefox 35.0a1 (2014-09-22), Fedora 20
+Hrm. bull500, can you please repeat the steps in comment 7 and show me what is at line 2061 in tabbrowser.xml in your build?
+Im on the 35.0a1 (2014-09-29) version, auto-updated. Don't know if things changed.
+
+
+2049->      if (aCloseWindow) {
+              this._windowIsClosing = true;
+              while (this._removingTabs.length)
+                this._endRemoveTab(this._removingTabs[0]);
+            } else if (!this._windowIsClosing) {
+              if (aNewTab)
+                focusAndSelectUrlBar();
+
+              // workaround for bug 345399
+              this.tabContainer.mTabstrip._updateScrollButtonsDisabledState();
+            }
+
+2061->      // We're going to remove the tab and the browser now.
+            // Clean up mTabFilters and mTabListeners now rather than in
+            // _beginRemoveTab, so that their size is always in sync with the
+            // number of tabs and browsers (the xbl destructor depends on this).
+            this.mTabFilters.splice(aTab._tPos, 1);
+            this.mTabListeners.splice(aTab._tPos, 1);
+
+2068->      var browser = this.getBrowserForTab(aTab);
+Hm, yes, it looks like tabbrowser.xml got replaced. If and when you see the message again, can you please repeat the steps with the same build?
+Sorry it didnt strike me that time to do the same steps again.
+Will report with data incase this happens again. :)
+REPRODUCED - Slow Script - chrome://browser/content/tabbrowser.xml:2029
+
+2025  <method name="_endRemoveTab">
+        <parameter name="aTab"/>
+        <body>
+          <![CDATA[
+2029         if (!aTab || !aTab._endRemoveArgs)
+              return;
+
+            var [aCloseWindow, aNewTab] = aTab._endRemoveArgs;
+            aTab._endRemoveArgs = null;
+
+            if (this._windowIsClosing) {
+              aCloseWindow = false;
+              aNewTab = false;
+            }
+
+            this._lastRelatedTab = null;
+
+            // update the UI early for responsiveness
+            aTab.collapsed = true;
+            this.tabContainer._fillTrailingGap();
+2045        this._blurTab(aTab);
+
+
+This is causing tabs to get stuck in between while moving, and slightly non responsive when closing the tab. After hitting debug script, tabs dont move at all
+35.0a1 (2014-10-04) - forgot to mention
+I've opened a new bug - bug 1078280.
+
+
+Unable to close tab after slow script warning at chrome://browser/content/tabbrowser.xml:1989
+
+regression
+
+Bug 1041788 - Don't enter _beginRemoveTab() when a .permitUnload() call is pending r=dao 

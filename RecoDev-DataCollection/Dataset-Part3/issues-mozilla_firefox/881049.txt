@@ -1,0 +1,331 @@
+We should switch to the new implementation compliant with "Promises/A+".
+
+At present, the nsISessionStore.init call in the browser's _delayedStartup
+function always completes synchronously, because it calls "then" on a
+promise that is already resolved. With the new behavior of "then", the
+completion would always be delayed after the "init" function returns.
+
+Thus, "init" should be changed in order to return a promise (easy), and
+the _delayedStartup call should wait on it (less easy, because some
+browser-chrome tests relied on the synchronous behavior, for example
+because they called executeSoon).
+
+We should switch to the new implementation compliant with "Promises/A+".
+
+At present, the nsISessionStore.init call in the browser's _delayedStartup
+function always completes synchronously, because it calls "then" on a
+promise that is already resolved. With the new behavior of "then", the
+completion would always be delayed after the "init" function returns.
+
+Thus, "init" should be changed in order to return a promise (easy), and
+the _delayedStartup call should wait on it (less easy, because some
+browser-chrome tests relied on the synchronous behavior, for example
+because they called executeSoon).
+Steven, while doing some preliminary investigation on this bug I found that the
+following change was useful for fixing some browser-chrome tests:
+
+   function testOnWindow(options, callback) {
+     var win = OpenBrowserWindow(options);
+     win.addEventListener("load", function onLoad() {
+       win.removeEventListener("load", onLoad, false);
+       windowsToClose.push(win);
+-      executeSoon(function() callback(win));
++      win.BrowserChromeTest.runWhenReady(function () callback(win));
+
+Hope this helps!
+(In reply to Paolo Amadini [:paolo] from comment #1)
+> +      win.BrowserChromeTest.runWhenReady(function () callback(win));
+
+Hmm, that's kind of an abuse of that function (which is really specifically designed for browser chrome tests). For this particular use case whenDelayedStartupFinished should be sufficient, I think?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #2)
+> (In reply to Paolo Amadini [:paolo] from comment #1)
+> > +      win.BrowserChromeTest.runWhenReady(function () callback(win));
+> 
+> Hmm, that's kind of an abuse of that function (which is really specifically
+> designed for browser chrome tests). For this particular use case
+> whenDelayedStartupFinished should be sufficient, I think?
+
+That's in a browser-chrome test. Forgot to mention the file name, sorry!
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/test/browser_save_link-perwindowpb.js#78
+
+Hope this helps more :-)
+Uh, maybe I see what you mean here... runWhenReady is only called in the test
+harness itself. whenDelayedStartupFinished may actually be better.
+
+In any case, that file is the place to look at :-)
+(In reply to Paolo Amadini [:paolo] from comment #4)
+> Uh, maybe I see what you mean here... runWhenReady is only called in the test
+> harness itself.
+
+Exactly - it wasn't meant to be used by tests (or anyone else, really).
+Created attachment 772757
+Patch 1- Update SessionStore to Promise.jsm
+
+This is an initial rough patch which has the SessionStore init return a promise, which the remaining code in _delayedStartup will wait on. Since the rest of the function waits on this promise, it's hackish and emulates the previous behavior.
+Created attachment 772758
+Patch 2 - Fix Broken Tests
+Comment on attachment 772757
+Patch 1- Update SessionStore to Promise.jsm
+
+Review of attachment 772757:
+-----------------------------------------------------------------
+
+As discussed on IRC, the patch looks really good so far. What we shouldn't do is delay everything until sessionstore has been initialized but only the things that need SS to operate. The first thing I see is:
+
+> if (ss.canRestoreLastSession &&
+>     !PrivateBrowsingUtils.isWindowPrivate(window))
+>   goSetCommandEnabled("Browser:RestoreLastSession", true);
+
+Another is:
+
+> TabView.init()
+
+Sending notifcations and Telemetry should also happen after the promise has been resolved:
+
+> Services.obs.notifyObservers(window, "browser-delayed-startup-finished", "");
+> setTimeout(function () { BrowserChromeTest.markAsReady(); }, 0);
+> TelemetryTimestamps.add("delayedStartupFinished");
+
+Unfortunately, there are lots of tests that will need to be fixed. They all rely on delayedStartup() being finished one tick after the window's 'load' event has been handled. So they all just listen for 'load' and use executeSoon() to continue with their testing. :/ The right thing to do is obivously to listen for the browser-delayed-startup-finished notification and then do your stuff like it's done here:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/test/head.js#10
+
+::: browser/components/sessionstore/nsISessionStore.idl
+@@ +26,3 @@
+>   */
+>  
+>  [scriptable, uuid(59bfaf00-e3d8-4728-b4f0-cc0b9dfb4806)]
+
+Always, when touching an IDL file, we need to update the uuid. I usually just do a duckduckgo search for 'uuid' but there are other options, too.
+Comment on attachment 772758
+Patch 2 - Fix Broken Tests
+
+Review of attachment 772758:
+-----------------------------------------------------------------
+
+Having the test changes in a separate patch is definitely a good idea!
+Created attachment 773514
+Patch 1- Update SessionStore to Promise.jsm
+
+This updated patch now has only select portions of _delayedStartup waiting on the Session Store Promise.
+Comment on attachment 773514
+Patch 1- Update SessionStore to Promise.jsm
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+>+    ssPromise.then(() =>{
+>+      Services.obs.notifyObservers(window, "browser-delayed-startup-finished", "");
+>+      setTimeout(function () { BrowserChromeTest.markAsReady(); }, 0);
+>+      TelemetryTimestamps.add("delayedStartupFinished");
+>+    });
+
+I assume this is necessary because some tests assume that browser-delayed-startup-finished means session store init is complete?
+
+This is somewhat changing what delayedStartupFinished is measuring, so we may want to leave that where it was (or add another timestamp to measure both).
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #11)
+> I assume this is necessary because some tests assume that
+> browser-delayed-startup-finished means session store init is complete?
+
+Yes, a couple (many) tests assume that after browser-delayed-startup-finished they can call ss.getWindowValue() and what not.
+
+> This is somewhat changing what delayedStartupFinished is measuring, so we
+> may want to leave that where it was (or add another timestamp to measure
+> both).
+
+Good point.
+Comment on attachment 773514
+Patch 1- Update SessionStore to Promise.jsm
+
+Review of attachment 773514:
+-----------------------------------------------------------------
+
+Looks good to me! Tentative r+ until we know that there's no other stuff that needs to wait for sessionstore initialization as well - i.e. with all tests passing.
+
+::: browser/base/content/browser.js
+@@ +1283,5 @@
+>  #endif
+>  #endif
+>  
+> +    ssPromise.then(() =>{
+> +      Services.obs.notifyObservers(window, "browser-delayed-startup-finished", "");
+
+There's nothing wrong with calling .then() multiple times but I think this may be easier to read if we move the goSetCommandEnabled() and TabView.init() lines to here, to the bottom, and have one place for it all.
+
+@@ +1285,5 @@
+>  
+> +    ssPromise.then(() =>{
+> +      Services.obs.notifyObservers(window, "browser-delayed-startup-finished", "");
+> +      setTimeout(function () { BrowserChromeTest.markAsReady(); }, 0);
+> +      TelemetryTimestamps.add("delayedStartupFinished");
+
+Like Gavin said, this should probably be left where it is.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #11)
+> This is somewhat changing what delayedStartupFinished is measuring, so we
+> may want to leave that where it was (or add another timestamp to measure
+> both).
+
+If we move the |TelemetryTimestamps.add("delayedStartupFinished");| back outside the |then(...)|, but leave the |Services.obs.notifyObservers(window, "browser-delayed-startup-finished", "");| inside, that will cause a disconnect between when the timestamp is taken, and when we notify. Will this be an issue?
+Thinking about this a little more, I believe we should keep "delayedStartupFinished" where I have it. I think it really comes down to if we want it to be measuring when we finish |_dealyedStartup()|, or when "browser-delayed-startup-finished" is notified.
+
+I believe the latter makes more sense. That's kind of what it was measuring before anyways, just now we are ensuring that the session store is initialized before notifying "browser-delayed-startup-finished". Thoughts?
+(In reply to Steven MacLeod [:smacleod] from comment #15)
+> Thinking about this a little more, I believe we should keep
+> "delayedStartupFinished" where I have it. I think it really comes down to if
+> we want it to be measuring when we finish |_dealyedStartup()|, or when
+> "browser-delayed-startup-finished" is notified.
+
+I think the intent was to measure the former, but I suppose it's not clear-cut. Measuring the latter now that it happens off a later tick of the event loop changes the measurement and makes the measurement more dependent on event loop responsiveness (i.e. the numbers would be less consistent). Measuring the former, however, will exclude code run from "browser-delayed-startup-finished" observers from the measurement. So either way we're ending up redefining what this measurement means.
+
+"browser-delayed-startup-finised" was created for use in tests, so in theory excluding its handlers from the measurement shouldn't be a big deal. Except that apparently some (popular) add-ons use it:
+
+https://mxr.mozilla.org/addons/search?string=browser-delayed-startup-finished
+
+Perhaps we should just kill delayedStartupFinished in favor of a more complete set of measurements that cover all intervals we care about (time spent in _delayedStartup, time until we notify, time spent under notifyObserver, etc.).
+(What Gavin said.)
+Created attachment 777917
+Patch 1 - Update sessionStore to Promise.jsm v3
+
+Changed the telemetry a bit.
+
+Pushed to try, still appears to have many test breakages even after Tim's change: https://tbpl.mozilla.org/?tree=Try&rev=8eb3737df492
+Yeah, there's still lots of sessionstore tests not at all ready for this change. Also, SocialUI.init() must wait for sessionstore to be initialized as well.
+
+To give some guidance here I started to investigate why these tests fail and started fixing them. I guess it doesn't make sense to let you write this all again :) I'll post the patch here and push it to try and I'll let you do the rest should there still be failures. Sorry for stealing this ;)
+Created attachment 778004
+fix broken tests
+
+This patch contains lots of test fixes. I'm not sure that's all we need but we'll see. social and sessionstore tests seem to pass locally for me at least.
+
+https://tbpl.mozilla.org/?tree=Try&rev=ea4af513f685
+Comment on attachment 777917
+Patch 1 - Update sessionStore to Promise.jsm v3
+
+Review of attachment 777917:
+-----------------------------------------------------------------
+
+Looks good to me. We need to fix the tests of course before landing.
+
+::: browser/base/content/browser.js
+@@ +1281,5 @@
+> +      if (ss.canRestoreLastSession &&
+> +          !PrivateBrowsingUtils.isWindowPrivate(window))
+> +        goSetCommandEnabled("Browser:RestoreLastSession", true);
+> +
+> +      TabView.init();
+
+We need to move SocialUI.init() to here as well.
+Comment on attachment 777917
+Patch 1 - Update sessionStore to Promise.jsm v3
+
+Review of attachment 777917:
+-----------------------------------------------------------------
+
+Looks good to me. We need to fix the tests of course before landing.
+
+::: browser/base/content/browser.js
+@@ +1281,5 @@
+> +      if (ss.canRestoreLastSession &&
+> +          !PrivateBrowsingUtils.isWindowPrivate(window))
+> +        goSetCommandEnabled("Browser:RestoreLastSession", true);
+> +
+> +      TabView.init();
+
+We need to move SocialUI.init() to here as well.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +584,2 @@
+>        function onSuccess() {
+>          self._initWindow(aWindow);
+
+Ok, so I just had a sudden flash of inspiration. I think lots (all?) of these test failures come from the fact that when a test opens *and closes* a window before the promises even get resolved we call SS.onLoad() for a window that has already been closed. What we really need to do here is to check aWindow.closed before calling self._initWindow().
+(Sorry for the confusing double posting of my review comments.)
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #5)
+> (In reply to Paolo Amadini [:paolo] from comment #4)
+> > Uh, maybe I see what you mean here... runWhenReady is only called in the test
+> > harness itself.
+> 
+> Exactly - it wasn't meant to be used by tests (or anyone else, really).
+
+Sigh. I wish it wasn't exposed in the first place.
+Created attachment 779291
+Patch - Update sessionStore to Promise.jsm v4
+
+Updated patch implements Tim's suggested fix, which appears to fix my tests locally without the additional patch.
+
+Try Push here: https://tbpl.mozilla.org/?tree=Try&rev=b96a189ef48a
+\o/ That looks pretty good to me. I still expect this to maybe cause some intermittent failures for a few tests out there but I think we can fix those along the way. Should be easy to fix them by just waiting for browser-delayed-startup-finished.
+browser-delayed-startup-finished shouldn't wait for the session restore service to be initialized asynchronously. If code depends the session store service, it should poke it directly (e.g. ss.ensureInitialized.then()).
+
+Arguably "initialize the session-restore service (in case it's not already running)" shouldn't happen in browser.js in the first place, because it's session rather than browser window specific.
+(In reply to Dão Gottwald [:dao] from comment #27)
+> Arguably "initialize the session-restore service (in case it's not already
+> running)" shouldn't happen in browser.js in the first place, because it's
+> session rather than browser window specific.
+
+Well, there's nsSessionStartup which is initialized before a window is opened and asynchronously starts reading the session file. The part we're initializing in browser.js is the one that's actually tied to the UI and needs a window to proceed.
+
+I tend to agree with you, though. browser-delayed-startup-finished isn't much used anywhere outside the browser. Even in the browser it's mostly tests.
+
+The one thing we would be breaking with the current patch is the slow startup detection. As nothing else really depends on and listens for the notification I think it is safe to pull it out of .then() and just leave it untouched.
+
+We might be breaking more tests with that approach or maybe not. We found out that most of them don't wait for the notification anyway.
+Created attachment 779806
+Patch - Updated sessionStore to Promise.jsm v5
+
+Moved browser-delayed-startup-finished so it's no longer waiting on the ssPromise.
+
+Try here: https://tbpl.mozilla.org/?tree=Try&rev=81b86efc8e54
+(In reply to Tim Taubert [:ttaubert] from comment #28)
+> (In reply to Dão Gottwald [:dao] from comment #27)
+> > Arguably "initialize the session-restore service (in case it's not already
+> > running)" shouldn't happen in browser.js in the first place, because it's
+> > session rather than browser window specific.
+> 
+> Well, there's nsSessionStartup which is initialized before a window is
+> opened and asynchronously starts reading the session file. The part we're
+> initializing in browser.js is the one that's actually tied to the UI and
+> needs a window to proceed.
+
+SessionStore.jsm observes domwindowopened, so this shouldn't be necessary. (It might make sense to let it observe browser-delayed-startup-finished instead, though.)
+(In reply to Dão Gottwald [:dao] from comment #30)
+> SessionStore.jsm observes domwindowopened, so this shouldn't be necessary.
+> (It might make sense to let it observe browser-delayed-startup-finished
+> instead, though.)
+
+It does that as soon as it was initialized with the first browser window.
+Right, so ss.init() will be called needlessly in other browser windows. This seems like it fits better in nsBrowserGlue.js (_onFirstWindowLoaded).
+(In reply to Dão Gottwald [:dao] from comment #32)
+> Right, so ss.init() will be called needlessly in other browser windows. This
+> seems like it fits better in nsBrowserGlue.js (_onFirstWindowLoaded).
+
+Totally, I was already investigating doing something like this, in a follow-up bug.
+Created attachment 780475
+Patch - Updated sessionStore to Promise.jsm v6
+
+Added a fix for the broken test, and changed the conditional for |self._initWindow(aWindow)| in |ss.init()|
+
+try: https://tbpl.mozilla.org/?tree=Try&rev=9a8e977e2bd6
+Comment on attachment 780475
+Patch - Updated sessionStore to Promise.jsm v6
+
+Review of attachment 780475:
+-----------------------------------------------------------------
+
+Thanks!
+Created attachment 781165
+Patch - Update sessionStore to Promise.jsm v7
+
+Rebased on mc.
+https://hg.mozilla.org/integration/fx-team/rev/1cb62de4332d
+https://hg.mozilla.org/mozilla-central/rev/1cb62de4332d
+(In reply to Tim Taubert [:ttaubert] from comment #33)
+> (In reply to Dão Gottwald [:dao] from comment #32)
+> > Right, so ss.init() will be called needlessly in other browser windows. This
+> > seems like it fits better in nsBrowserGlue.js (_onFirstWindowLoaded).
+> 
+> Totally, I was already investigating doing something like this, in a
+> follow-up bug.
+
+Is that bug already filed?
+It is now. Bug 898308.

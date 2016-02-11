@@ -1,0 +1,284 @@
+I kind of dislike having to do refactoring... but I promise to refactor existing code to use AppActorFront when introducing it. Today we have duplicated code (more than twice!) that does the exact same thing.
+Instead, we should factorize the logic to talk to the webapps actor inside AppActorFront and share all the tweaks/hacks in it.
+
+This refactoring will have to benefit to break some dependencies between WebIDE and old app-manager codebase (webapps-store and magic proxy objects for ex!)
+
+Also, while working on this, I figured out yet another way to test the webapps actors,
+that wouldn't involve hacking gaia integration tests.
+I wrote a test covering most of webapps actors requests and especially the getAppActor one, long time ago in bug 1025828, but gaia folks disliked using gaia tests for devtools codebase. The test was left on the side.
+My new approach would be to write a mochitest with a very small mock for AppFrames module. It wouldn't cover gaia's code but would have turned red for the vast majority of our regressions on the webapps actor...
+
+I kind of dislike having to do refactoring... but I promise to refactor existing code to use AppActorFront when introducing it. Today we have duplicated code (more than twice!) that does the exact same thing.
+Instead, we should factorize the logic to talk to the webapps actor inside AppActorFront and share all the tweaks/hacks in it.
+
+This refactoring will have to benefit to break some dependencies between WebIDE and old app-manager codebase (webapps-store and magic proxy objects for ex!)
+
+Also, while working on this, I figured out yet another way to test the webapps actors,
+that wouldn't involve hacking gaia integration tests.
+I wrote a test covering most of webapps actors requests and especially the getAppActor one, long time ago in bug 1025828, but gaia folks disliked using gaia tests for devtools codebase. The test was left on the side.
+My new approach would be to write a mochitest with a very small mock for AppFrames module. It wouldn't cover gaia's code but would have turned red for the vast majority of our regressions on the webapps actor...
+Created attachment 8490039
+patch v1
+
+https://tbpl.mozilla.org/?tree=Try&rev=1ede60529d28
+Comment on attachment 8490039
+patch v1
+
+Review of attachment 8490039:
+-----------------------------------------------------------------
+
+So with this patch, we can drop the dependency to webapps-store.js (and its nested deps to observable-object and the magic proxy objects).
+And pull off from app-manager.js some webapps actor logic.
+
+In order to achieve this refactoring, I improve AppActorFront:
+- backported appInstall event listening when trying to install an app from webapps-store.
+When calling installHosted/installPackaged, we don't resolve the related promise once the install request is done,
+but only once we receive the related appInstall event.
+- introduced launch/reload/close on AppActorFront,
+- automagically fetch app icons when calling watchApps so that apps object immediatly have iconURL attribute set.
+I'll look at this tomorrow.
+Comment on attachment 8490039
+patch v1
+
+Review of attachment 8490039:
+-----------------------------------------------------------------
+
+Thanks for doing this work, it makes things much nicer!
+
+::: browser/devtools/webide/modules/app-manager.js
+@@ +239,5 @@
+>      }
+>  
+> +    let app = this.getProjectFront(this.selectedProject);
+> +    if (!app) {
+> +      console.error("Can't find app front for selected project");
+
+Change |getTarget| callers to call console.error on rejection, and then pass this message as the rejection value.
+
+@@ +250,5 @@
+>        // We have to keep trying to get app tab actors required to create its target.
+>  
+>        for (let i = 0; i < 10; i++) {
+>          try {
+> +          let target = yield app.getTarget();
+
+Seems like we can just return directly.
+
+@@ +281,5 @@
+>  
+>      return manifest;
+>    },
+>  
+> +  getProjectFront: function(project) {
+
+Mark this private with _.
+
+::: toolkit/devtools/apps/app-actor-front.js
+@@ +219,5 @@
+> + * The progress object contains:
+> + *  * bytesSent:  The number of bytes sent so far
+> + *  * totalBytes: The total number of bytes to send
+> + */
+> +function installPackaged(client, webappsActor, packagePath, appId, emitInstallProgress) {
+
+For all these function you modified, |emitInstallProgress| is really just a callback, since there's no longer a global function being referenced.  So, let's name the variable |progressCb| or something like this.
+
+Also, update your comment talk about it as a callback that gets and object passed to it.  Nothing is "emitted" for sure until later when |AppActorFront.installPackage| passes a callback.
+
+@@ +484,5 @@
+>    this.client = client;
+>    this.actor = form.webappsActor;
+>  
+>    this._clientListener = this._clientListener.bind(this);
+> +  this._listenersForAppEvents = 0;
+
+This seems unused.  Wouldn't it be equal to |this._listeners.length| anyway?
+
+@@ +607,5 @@
+> +        return this._listenAppEvents(listener);
+> +      })
+> +      .then(() => {
+> +        // On demand, automatically retrieve apps icons on load
+> +        if (options && options.fetchIcons) {
+
+This method already does enough things...  Maybe expose a |getAllIcons| method, and then callers can chain it after this one with |then| if they want the icons?
+
+@@ +720,5 @@
+>    unwatchApps: function (listener) {
+> +    return this._unlistenAppEvents(listener);
+> +  },
+> +
+> +  installPackaged: function (packagePath, appId) {
+
+Add a comment about the progress events here.
+
+@@ +735,5 @@
+> +    // the matching app object
+> +    let listener = (type, app) => {
+> +      if (type == "appInstall") {
+> +        if (app.manifest.manifestURL === manifestURL) {
+> +          resolve(app);
+
+So why are there two paths to |resolve|?  Is there an ordering problem?
+
+@@ +741,5 @@
+> +          installs[app.manifest.manifestURL] = app;
+> +        }
+> +      }
+> +    };
+> +    this._listenAppEvents(listener);
+
+For correctness, it seems you should wait for this promise to resolved before proceeding, right?
+
+@@ +744,5 @@
+> +    };
+> +    this._listenAppEvents(listener);
+> +
+> +    installPackaged(this.client, this.actor, packagePath, appId,
+> +      progress => {
+
+You could move this callback onto the Front and just pass the function.  No need to make a fresh callback each time.
+
+@@ +750,5 @@
+> +      })
+> +      .then(response => {
+> +        finalAppId = response.appId;
+> +        manifestURL = "app://" + finalAppId + "/manifest.webapp";
+> +        if (manifestURL in installs) {
+
+So what happens if it's not in |installs|?  We shouldn't let the promise be unresolved forever...
+
+@@ +758,5 @@
+> +
+> +    return deferred.promise;
+> +  },
+> +
+> +  installHosted: function (appId, metadata, manifest) {
+
+A lot of this seems duplicated from |installPackaged| above.  Can we share more of it?
+
+::: toolkit/devtools/apps/tests/unit/test_webappsActor.js
+@@ +237,5 @@
+>    let manifest = {
+>      name: "My hosted app",
+>      csp: "script-src: http://foo.com"
+>    };
+> +  gActorFront.installHosted(gAppId, metadata, manifest).then(
+
+Nit: Change .then formatting to match installPackaged above
+Created attachment 8494306
+interdiff
+Created attachment 8494317
+patch v2
+
+https://tbpl.mozilla.org/?tree=Try&rev=d4fb44bc355a
+
+(In reply to J. Ryan Stinnett [:jryans] from comment #4)
+> Comment on attachment 8490039
+> @@ +735,5 @@
+> > +    // the matching app object
+> > +    let listener = (type, app) => {
+> > +      if (type == "appInstall") {
+> > +        if (app.manifest.manifestURL === manifestURL) {
+> > +          resolve(app);
+> 
+> So why are there two paths to |resolve|?  Is there an ordering problem?
+
+Yes, appInstall might be received while we are waiting for the request response :/
+So that we have to support both scenarios:
+  Receive request response first or receive appInstall message first.
+I added some more comment in the related code...
+Without waiting for appInstall I get some race/dead lock when installing the app from webide.
+
+> 
+> @@ +741,5 @@
+> > +          installs[app.manifest.manifestURL] = app;
+> > +        }
+> > +      }
+> > +    };
+> > +    this._listenAppEvents(listener);
+> 
+> For correctness, it seems you should wait for this promise to resolved
+> before proceeding, right?
+
+Right! Fixed.
+
+> 
+> @@ +750,5 @@
+> > +      })
+> > +      .then(response => {
+> > +        finalAppId = response.appId;
+> > +        manifestURL = "app://" + finalAppId + "/manifest.webapp";
+> > +        if (manifestURL in installs) {
+> 
+> So what happens if it's not in |installs|?  We shouldn't let the promise be
+> unresolved forever...
+
+See previous comment about waiting for appInstall.
+This if condition only cover the case where we received an appInstall before we got the request's response.
+If (manifestURL in installs) isn't true, it most likely means that we are about to receive the appInstall request right after.
+
+But yes, the promise won't be resolved if for some unexpected reason we never receive the related appInstall message, with the correct manifestURL...
+
+> 
+> @@ +758,5 @@
+> > +
+> > +    return deferred.promise;
+> > +  },
+> > +
+> > +  installHosted: function (appId, metadata, manifest) {
+> 
+> A lot of this seems duplicated from |installPackaged| above.  Can we share
+> more of it?
+
+I tried to share more code.
+Comment on attachment 8494317
+patch v2
+
+Review of attachment 8494317:
+-----------------------------------------------------------------
+
+Looking good!  I am curious about |_listenAppEvents|, so would like to see one more round for that.
+
+::: toolkit/devtools/apps/app-actor-front.js
+@@ +765,5 @@
+> +    // Listen for appInstall event, in order to resolve with
+> +    // the matching app object.
+> +    let listener = (type, app) => {
+> +      if (type == "appInstall") {
+> +        if (app.manifest.manifestURL === manifestURL) {
+
+Add a comment that this checks whether the request has already resolved (since that is what sets |manifestURL|).
+
+@@ +772,5 @@
+> +          installs[app.manifest.manifestURL] = app;
+> +        }
+> +      }
+> +    };
+> +    this._listenAppEvents(listener);
+
+You said you fixed this to wait for the promise, but it seems unfixed here...
+
+@@ +776,5 @@
+> +    this._listenAppEvents(listener);
+> +
+> +    // Execute the request
+> +    request().then(response => {
+> +        finalAppId = response.appId;
+
+Nit: This block is indented too far.
+
+@@ +779,5 @@
+> +    request().then(response => {
+> +        finalAppId = response.appId;
+> +        manifestURL = response.manifestURL;
+> +
+> +        // Resolves immediatly if the appInstall event
+
+immediatly -> immediately
+Created attachment 8494572
+patch v3
+
+https://tbpl.mozilla.org/?tree=Try&rev=3f1229154122
+https://hg.mozilla.org/integration/fx-team/rev/144206ede559
+https://hg.mozilla.org/mozilla-central/rev/144206ede559

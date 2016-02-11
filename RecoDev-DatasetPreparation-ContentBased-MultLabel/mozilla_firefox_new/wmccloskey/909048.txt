@@ -1,0 +1,316 @@
+Created attachment 795102
+session-save
+
+Bug 894595 collects almost everything from the content script. However, there are still a few pieces that are collected from SessionStore.jsm. Tim, I'm not sure if you have a patch for this or not. If you do, we can close this bug. Otherwise, I want to see if this looks okay.
+
+Created attachment 795102
+session-save
+
+Bug 894595 collects almost everything from the content script. However, there are still a few pieces that are collected from SessionStore.jsm. Tim, I'm not sure if you have a patch for this or not. If you do, we can close this bug. Otherwise, I want to see if this looks okay.
+Comment on attachment 795102
+session-save
+
+Review of attachment 795102:
+-----------------------------------------------------------------
+
+Sorry, the patch in bug changed a lot in its last version. However this looks almost like the right approach but we should make sure to move all code that's currently used in SessionStore's sync collection to a module first and then reuse it from the content script. We get lots of test coverage by doing so and will probably break less.
+
+Thanks for doing this, I hadn't prepared a patch yet. This is one of the follow-up bugs I planned to file once we got the initial async collection landed.
+Created attachment 808915
+text-and-scroll
+
+This patch moves text-and-scroll collection into a separate module.
+Created attachment 808917
+small-index-fix
+
+This is just a small inconsistency I found in the collection code. It seems that we don't set history.index in some cases, so we shouldn't set it in tabData either.
+Created attachment 808921
+text-and-scroll-remote
+
+This patch moves the collection of text and scroll attributes (as well as page style) to a content script. There are two difficult parts:
+
+1. There are a couple things that can go wrong with tabData.entries/tabData.index. The data collection for session history (in SessionHistory.jsm) sometimes doesn't set index. And sometimes it sets it to a value beyond the length of tabData.entries (this happens when the code catches an exception). I decided to check if tabData.index is set in all cases. I didn't want to have to check if it's in range as well, so I decided to limit it to the bounds of the array. I don't think this should affect anything in an important way.
+
+2. Sometimes _updateTextAndScrollDataForTab returns false. In that case we're not supposed to cache the tab data. I don't totally understand why, but I've tried to preserve this behavior. I just moved the checks to TabState.collect. Luckily we don't need to collect anything from the content process in this case, so it's not too complicated.
+Comment on attachment 808915
+text-and-scroll
+
+Review of attachment 808915:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ -2979,5 @@
+> -      }
+> -      for (var i = 0; i < aContent.frames.length; i++) {
+> -        if (aData.children && aData.children[i] &&
+> -          hasExpectedURL(aContent.document, aData.url)) {
+> -          restoreTextDataAndScrolling(aContent.frames[i], aData.children[i], aPrefix + i + "|");
+
+As we need this check for pageStyle data as well, how about moving the collection of restorable frames to a function that is then called before we start to restore form or pageStyle data and returns a map of {DOMWindow => restoreData}.
+
+We could then just iterate over the map and call TextAndScrollData.restoreFrame(frame, data) as well as PageStyle.restore(frame, pageStyle) for every frame.
+
+What I would also like about this solution is that the PageStyle and TextScrollData modules don't have to know about how frames are organized. They're just passed a single frame and can then restore appropriate data.
+Comment on attachment 808917
+small-index-fix
+
+Review of attachment 808917:
+-----------------------------------------------------------------
+
+Where exactly do we not set the index? Wouldn't it be better to fix those places instead to fix the symptom here?
+(In reply to Bill McCloskey (:billm) from comment #4)
+> 2. Sometimes _updateTextAndScrollDataForTab returns false. In that case
+> we're not supposed to cache the tab data. I don't totally understand why,
+> but I've tried to preserve this behavior. I just moved the checks to
+> TabState.collect. Luckily we don't need to collect anything from the content
+> process in this case, so it's not too complicated.
+
+Honestly, I don't understand why either. I wanted to remove this for quite some time now and I think we should find out when we should not cache and whether we can just remove this. It really just obfuscates the code.
+Comment on attachment 808921
+text-and-scroll-remote
+
+Review of attachment 808921:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +12,5 @@
+>  
+>  XPCOMUtils.defineLazyModuleGetter(this, "DocShellCapabilities",
+>    "resource:///modules/sessionstore/DocShellCapabilities.jsm");
+> +XPCOMUtils.defineLazyModuleGetter(this, "PageStyle",
+> +  "resource:///modules/sessionstore/PageStyle.jsm");
+
+I see you merged patches here. Can we move that to a separate patch in bug 910668?
+
+@@ +106,5 @@
+> +        break;
+> +      case "SessionStore:collectTextAndScrollData":
+> +        let textAndScroll = TextAndScrollData.collectFrame(content,
+> +                                                           false /* includePrivateData */,
+> +                                                           docShell.isAppTab);
+
+includePrivateData is always false here because it's only true when duplicating tabs. Can you please add a comment that explains this? Also it feels like includePrivateData should be an optional parameter with a default value and we should move it to the end of the argument list.
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ +74,5 @@
+>          debug("SessionStore failed gathering complete history " +
+>                "for the focused window/tab. See bug 669196.");
+>        }
+> +
+> +      data.index = Math.min(history.index + 1, data.entries.length);
+
+That's a great catch. Maybe add a comment that says the index might be off bounds when we catch an exception above? Also maybe file a new bug for this? It feels strange to hide this in here. Would be great if this references bug 669196 then as well.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4270,5 @@
+> +    // No need for asynchronous operation in these simple cases.
+> +    if (!browser.currentURI || (browser.__SS_data && browser.__SS_tabStillLoading)) {
+> +      let tabData = new TabData(this._collectBaseTabData(tab, {}));
+> +      return Promise.resolve(tabData);
+> +    }
+
+Good point. I think that collecting data in those cases is even the wrong thing to do. We currently will not end up putting data into the cache because _updateTextAndScrollDataForTab() will return false but the data that collect() resolves to is wrong/incomplete.
+
+Can we move this to a separate bug as well? Thanks for catching this!
+(In reply to Tim Taubert [:ttaubert] from comment #6)
+> Comment on attachment 808917
+> small-index-fix
+> 
+> Review of attachment 808917:
+> -----------------------------------------------------------------
+> 
+> Where exactly do we not set the index? Wouldn't it be better to fix those
+> places instead to fix the symptom here?
+
+This is where we don't set the index:
+http://mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/SessionHistory.jsm#80
+
+The comment is pretty clear that we shouldn't set "index". It doesn't say why we shouldn't though. Maybe the comment will jog your memory; it looks like you wrote it :-).
+(In reply to Tim Taubert [:ttaubert] from comment #7)
+> (In reply to Bill McCloskey (:billm) from comment #4)
+> > 2. Sometimes _updateTextAndScrollDataForTab returns false. In that case
+> > we're not supposed to cache the tab data. I don't totally understand why,
+> > but I've tried to preserve this behavior. I just moved the checks to
+> > TabState.collect. Luckily we don't need to collect anything from the content
+> > process in this case, so it's not too complicated.
+> 
+> Honestly, I don't understand why either. I wanted to remove this for quite
+> some time now and I think we should find out when we should not cache and
+> whether we can just remove this. It really just obfuscates the code.
+
+I'm setting needinfo on David since he wrote the caching code.
+
+Now that I think about the code, I think what we have now is wrong. Here's my analysis. _updateTextAndScrollDataForTab returns false for two different reasons:
+
+1. !browser.currentURI
+I don't really know what this one is for. It seems like we should just collect normally in this case. Perhaps some of the history objects will throw in this case or something? Even so, I see no reason to avoid caching whatever data we collect.
+
+2. browser.__SS_data && browser.__SS_tabStillLoading
+This one is pretty clear: we have a tab that hasn't been restored yet. In this case, _collectBaseTabData fills in the complete session data that we read from disk for the given tab, including the data that would normally be collected by SessionHistory.jsm and the other modules. In this case, we don't want to do any collection outside of _collectBaseTabData, because we'll just be overwriting good data with bad. The current code is broken in this respect I think. If we fixed it so that we *only* collect data via _collectBaseTabData (i.e., basically just take what's in browser.__SS_data), then I don't think there's any reason not to use the TabStateCache.
+
+David, does this make sense?
+Created attachment 810917
+text-and-scroll v2
+
+I fixed up this patch to use the frame list like you asked.
+Created attachment 810918
+text-and-scroll-remote v2
+
+I just figured out that what you were saying in the last paragraph of comment 8 is the same as what I talked about in comment 10. So I filed bug 921310 for that. Hopefully David can still comment on the cacheability issue. I also filed bug 921311 for the index thing.
+(In reply to Bill McCloskey (:billm) from comment #10)
+> Now that I think about the code, I think what we have now is wrong. Here's
+> my analysis. _updateTextAndScrollDataForTab returns false for two different
+> reasons:
+
+When adding the cache, I assumed that caching data collected from a tab that is still being restored is a bad idea because we could end up with weird data (which is basically what you write for 2.). Now, I didn't go to great lengths to determine whether a tab is still being restored: I simply kept the checks that had been present before I introduced the cache. That's where !browser.currentURI comes from.
+
+> 2. browser.__SS_data && browser.__SS_tabStillLoading
+> This one is pretty clear: we have a tab that hasn't been restored yet. In
+> this case, _collectBaseTabData fills in the complete session data that we
+> read from disk for the given tab, including the data that would normally be
+> collected by SessionHistory.jsm and the other modules. In this case, we
+> don't want to do any collection outside of _collectBaseTabData, because
+> we'll just be overwriting good data with bad. The current code is broken in
+> this respect I think. If we fixed it so that we *only* collect data via
+> _collectBaseTabData (i.e., basically just take what's in browser.__SS_data),
+> then I don't think there's any reason not to use the TabStateCache.
+
+This sounds ok, although I now know better than to trust my intuition when it comes to Session Restore. However, this might possibly have the side-effect of killing some tests that introduce an incomplete JSON object as state and let Session Restore turn it into something complete. If we cache the incomplete JSON, we are in trouble.
+
+> David, does this make sense?
+(In reply to David Rajchenbach Teller [:Yoric] from comment #13)
+> This sounds ok, although I now know better than to trust my intuition when
+> it comes to Session Restore. However, this might possibly have the
+> side-effect of killing some tests that introduce an incomplete JSON object
+> as state and let Session Restore turn it into something complete. If we
+> cache the incomplete JSON, we are in trouble.
+
+Oh, that last part makes sense. I didn't realize that was a feature of session restore. Anyway, the patches I have posted avoid caching in this case. Maybe we should just keep it that way, but with a comment saying what you said.
+
+I did discover another unrelated problem though. I filed it as bug 921762.
+Created attachment 814001
+text-and-scroll v3
+
+I'm updating these patches to deal with the problem in bug 921762. Now the text and scroll data is collected at the same time as the session history.
+Created attachment 814002
+text-and-scroll-remote
+Comment on attachment 814001
+text-and-scroll v3
+
+Review of attachment 814001:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/TextAndScrollData.jsm
+@@ +20,5 @@
+> +/**
+> + * The external API exported by this module.
+> + */
+> +this.TextAndScrollData = Object.freeze({
+> +  collectFrame: function (entry, content, isPinned, options) {
+
+How about updateFrame() to tell that we're actually modifying |entry|.
+
+@@ +25,5 @@
+> +    return TextAndScrollDataInternal.collectFrame(entry, content, isPinned, options);
+> +  },
+> +
+> +  restoreFrames: function (frameList) {
+> +    return TextAndScrollDataInternal.restoreFrames(frameList);
+
+nit: nothing to return here
+
+@@ +41,5 @@
+> +   *        frame reference
+> +   * @param isPinned
+> +   *        the tab is pinned and should be treated differently for privacy
+> +   * @param includePrivateData
+> +   *        {includePrivateData:true} always return privacy sensitive data (use with care)
+
+nit: always return -> include?
+
+@@ +48,5 @@
+> +    let includePrivateData = options && options.includePrivateData;
+> +
+> +    for (let i = 0; i < content.frames.length; i++) {
+> +      if (entry.children && entry.children[i])
+> +        this.collectFrame(entry.children[i], content.frames[i], includePrivateData, isPinned);
+
+nit: brackets
+
+@@ +73,5 @@
+> +      }
+> +
+> +      // designMode is undefined e.g. for XUL documents (as about:config)
+> +      if ((content.document.designMode || "") == "on" && content.document.body)
+> +        entry.innerHTML = content.document.body.innerHTML;
+
+nit: brackets
+
+@@ +124,5 @@
+> +
+> +      // for about:sessionrestore we saved the field as JSON to avoid
+> +      // nested instances causing humongous sessionstore.js files.
+> +      // cf. bug 467409
+> +      if ((data.url == "about:sessionrestore" || data.url == "about:welcomeback") &&
+
+This and line 58 should be moved into a helper function.
+
+@@ +139,5 @@
+> +
+> +    if (data.innerHTML) {
+> +      setTimeout(function() {
+> +        if (content.document.designMode == "on" &&
+> +            this.hasExpectedURL(content.document, data.url) &&
+
+We shouldn't include hasExpectedURL() here again and duplicate it. |content| was in the |frameList| argument passed to restoreFrames(), that means it has passed the hasExpectedURL check already. All we need to do here is check that the URL didn't change between now and when the timeout fires, right?
+
+@@ +144,5 @@
+> +            content.document.body) {
+> +          content.document.body.innerHTML = data.innerHTML;
+> +        }
+> +      }, 0);
+> +    }
+
+nit: newline please
+> @@ +139,5 @@
+> > +
+> > +    if (data.innerHTML) {
+> > +      setTimeout(function() {
+> > +        if (content.document.designMode == "on" &&
+> > +            this.hasExpectedURL(content.document, data.url) &&
+> 
+> We shouldn't include hasExpectedURL() here again and duplicate it. |content| was in the
+> |frameList| argument passed to restoreFrames(), that means it has passed the hasExpectedURL
+> check already. All we need to do here is check that the URL didn't change between now and when
+> the timeout fires, right?
+
+The problem is that this code runs within setTimeout. In between the time when we did the first hasExpectedURL check and when the setTimeout handler runs, the user might have navigated the page. That's why I kept this code.
+(In reply to Bill McCloskey (:billm) from comment #18)
+> The problem is that this code runs within setTimeout. In between the time
+> when we did the first hasExpectedURL check and when the setTimeout handler
+> runs, the user might have navigated the page. That's why I kept this code.
+
+But when the user navigates away, hasExpectedURL() fails because data.url doesn't change. So why not just store the url when setting the timeout and comparing the current url to the stored value when the timeout fires?
+(In reply to Tim Taubert [:ttaubert] (limited availability, work week) from comment #19)
+> But when the user navigates away, hasExpectedURL() fails because data.url
+> doesn't change. So why not just store the url when setting the timeout and
+> comparing the current url to the stored value when the timeout fires?
+
+Oh, yes, I see. I should have read your comment more carefully.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/7038db003661
+https://hg.mozilla.org/integration/mozilla-inbound/rev/65a3d9172a6b
+https://hg.mozilla.org/integration/mozilla-inbound/rev/dc567d1ab408
+https://hg.mozilla.org/mozilla-central/rev/7038db003661
+https://hg.mozilla.org/mozilla-central/rev/65a3d9172a6b
+https://hg.mozilla.org/mozilla-central/rev/dc567d1ab408
+
+
+[Session Restore] Collect text and scroll data from content script
+
+
+
+Bug 909048 - Don't set "index" property on session history when not needed (r=ttaubert) 
+
+Bug 909048 - Move text and scroll data handling to a module (r=ttaubert) 
+
+Bug 909048 - Collect text and scroll data from content script (r=ttaubert) 

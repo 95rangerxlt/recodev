@@ -1,0 +1,318 @@
+So that the devtools timeline can show (with a new highlighter?) what has been painted in the page.
+
+So that the devtools timeline can show (with a new highlighter?) what has been painted in the page.
+I have a patch in progress.
+Created attachment 8520937
+add paint details to timeline
+
+Here's the first draft.
+
+This has a debugging hack in waterfall.js to make it easy to see what
+data is emitted.
+
+I haven't written tests.  I'm not sure that the generated data is
+correct.  But at least it does something!
+
+This approach required treating Layer markers specially in
+PopProfileTimelineMarkers.  That is, they were already special, but
+now they are extra special, in that detail data is collected from them
+in a slightly different way.
+Created attachment 8525502
+add paint details to timeline
+
+Here's a new version.  It applies on fx-team now that the fix for
+bug 1069661 has gone in.
+
+Instead of a waterfall.js hack, this version also assumes you have the
+patch from bug 1074106 (plus the DOM Event addendum) applied, and so
+adds a hack to marker-details.js.
+
+I haven't tried to wire up the rectangle marker details to the
+rectangle highlighter.
+(In reply to Tom Tromey :tromey from comment #3)
+> I haven't tried to wire up the rectangle marker details to the
+> rectangle highlighter.
+
+I'll do that part in a separate patch.
+(In reply to Tom Tromey :tromey from comment #3)
+> Instead of a waterfall.js hack, this version also assumes you have the
+> patch from bug 1074106 (plus the DOM Event addendum) applied, and so
+> adds a hack to marker-details.js.
+Added a dependency to bug 1074106 since its patches need to be applied first.
+Created attachment 8525957
+bug1050770-init-rect-highlighter-in-sidebar v1.patch
+
+RectHighlighter integration part 1 - Just adds a new function to retrieve and init the RectHighlighter from marker-details.js, so that it's then easy to add mouseover/out listeners to paint markers details.
+Created attachment 8525962
+bug1050770-use-rect-highlighter-in-sidebar v1.patch
+
+This isn't up for review, I'm just throwing this out there to get a discussion started. I guess the things to answer are:
+
+- do we want to highlight on mouseover?
+- should we refactor the sidebar structure a bit so rectangles aren't just printed out in a label value attribute, but as separate elements, so we can add mouseover on each of them?
+- should we also have mouseover highlighting in the waterfall?
+Created attachment 8526268
+add paint details to timeline
+
+This version adds some tests and removes the UI hacks.
+Comment on attachment 8525962
+bug1050770-use-rect-highlighter-in-sidebar v1.patch
+
+Review of attachment 8525962:
+-----------------------------------------------------------------
+
+I think at the meeting we discussed some kind of mouseover highlighting from the timeline itself,
+perhaps with a short delay.
+https://tbpl.mozilla.org/?tree=Try&rev=fd91fcaba2a5
+Comment on attachment 8525957
+bug1050770-init-rect-highlighter-in-sidebar v1.patch
+
+Marking as obsolete, it just makes more sense to highlight on marker hover in the waterfall graph as discussed at our last perf meeting.
+I'll work on a new patch soon.
+Comment on attachment 8525962
+bug1050770-use-rect-highlighter-in-sidebar v1.patch
+
+Marking obsolete as well, see previous comment.
+Comment on attachment 8526268
+add paint details to timeline
+
+>+  virtual void AddLayerRectangles(mozilla::dom::Sequence<mozilla::dom::ProfileTimelineLayerRect>& aRectangles)
+>+  {
+>+    nsIntRegionRectIterator it(mRegion);
+>+    while (const nsIntRect* iterRect = it.Next()) {
+>+      mozilla::dom::ProfileTimelineLayerRect rect;
+>+      rect.mX = iterRect->X();
+>+      rect.mY = iterRect->Y();
+>+      rect.mWidth = iterRect->Width();
+>+      rect.mHeight = iterRect->Height();
+>+      aRectangles.AppendElement(rect);
+>+    }
+>+  }
+>+
+>+private:
+>+  nsIntRegion mRegion;
+...
+> 
+>   if (presContext && presContext->GetDocShell() && isActiveLayerManager) {
+>     nsDocShell* docShell = static_cast<nsDocShell*>(presContext->GetDocShell());
+>-    docShell->AddProfileTimelineMarker("Layer", TRACING_EVENT);
+>+    bool isRecording;
+>+    docShell->GetRecordProfileTimelineMarkers(&isRecording);
+>+    if (isRecording) {
+>+      mozilla::UniquePtr<nsDocShell::TimelineMarker> marker =
+>+        MakeUnique<LayerTimelineMarker>(docShell, aRegionToDraw);
+>+      docShell->AddProfileTimelineMarker(marker);
+>+    }
+
+Someone more familiar with gfx/layout should review this, since I don't know which coordinate space we're dealing with here, and whether
+it makes sense to store that or do we need to take care of zoom levels and such.
+Comment on attachment 8526268
+add paint details to timeline
+
+># HG changeset patch
+># User Tom Tromey <tom@tromey.com>
+>
+>Bug 1050770 - add paint details to timeline
+>
+>diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+>index 7d38ed2..6fde5b2 100644
+>--- a/docshell/base/nsDocShell.cpp
+>+++ b/docshell/base/nsDocShell.cpp
+>@@ -2888,16 +2888,21 @@ nsDocShell::PopProfileTimelineMarkers(JSContext* aCx,
+>   // this array.
+>   nsTArray<TimelineMarker*> keptMarkers;
+> 
+>   for (uint32_t i = 0; i < mProfileTimelineMarkers.Length(); ++i) {
+>     TimelineMarker* startPayload = mProfileTimelineMarkers[i];
+>     const char* startMarkerName = startPayload->GetName();
+> 
+>     bool hasSeenPaintedLayer = false;
+>+    bool isPaint = strcmp(startMarkerName, "Paint") == 0;
+>+
+>+    // If we are processing a Paint marker, we append information from
+>+    // all the embedded Layer markers to this array.
+>+    mozilla::dom::Sequence<mozilla::dom::ProfileTimelineLayerRect> layerRectangles;
+> 
+>     if (startPayload->GetMetaData() == TRACING_INTERVAL_START) {
+>       bool hasSeenEnd = false;
+> 
+>       // DOM events can be nested, so we must take care when searching
+>       // for the matching end.  It doesn't hurt to apply this logic to
+>       // all event types.
+>       uint32_t markerDepth = 0;
+>@@ -2905,40 +2910,44 @@ nsDocShell::PopProfileTimelineMarkers(JSContext* aCx,
+>       // The assumption is that the devtools timeline flushes markers frequently
+>       // enough for the amount of markers to always be small enough that the
+>       // nested for loop isn't going to be a performance problem.
+>       for (uint32_t j = i + 1; j < mProfileTimelineMarkers.Length(); ++j) {
+>         TimelineMarker* endPayload = mProfileTimelineMarkers[j];
+>         const char* endMarkerName = endPayload->GetName();
+> 
+>         // Look for Layer markers to stream out paint markers.
+>-        if (strcmp(endMarkerName, "Layer") == 0) {
+>+        if (isPaint && strcmp(endMarkerName, "Layer") == 0) {
+>           hasSeenPaintedLayer = true;
+>+          endPayload->AddLayerRectangles(layerRectangles);
+>         }
+> 
+>         if (!startPayload->Equals(endPayload)) {
+>           continue;
+>         }
+>-        bool isPaint = strcmp(startMarkerName, "Paint") == 0;
+> 
+>         // Pair start and end markers.
+>         if (endPayload->GetMetaData() == TRACING_INTERVAL_START) {
+>           ++markerDepth;
+>         } else if (endPayload->GetMetaData() == TRACING_INTERVAL_END) {
+>           if (markerDepth > 0) {
+>             --markerDepth;
+>           } else {
+>             // But ignore paint start/end if no layer has been painted.
+>             if (!isPaint || (isPaint && hasSeenPaintedLayer)) {
+>               mozilla::dom::ProfileTimelineMarker marker;
+> 
+>               marker.mName = NS_ConvertUTF8toUTF16(startPayload->GetName());
+>               marker.mStart = startPayload->GetTime();
+>               marker.mEnd = endPayload->GetTime();
+>-              startPayload->AddDetails(marker);
+>+              if (isPaint) {
+>+                marker.mRectangles.Construct(layerRectangles);
+>+              } else {
+>+                startPayload->AddDetails(marker);
+>+              }
+Hmm, this special casing is annoying.
+Could we somehow call
+endPayload->AddDetails() and it would construct mRectangles?
+
+
+
+>+        virtual void AddLayerRectangles(mozilla::dom::Sequence<mozilla::dom::ProfileTimelineLayerRect> &)
+Drop the extra space before &
+
+
+
+>+++ b/dom/webidl/ProfileTimelineMarker.webidl
+r+ for the .webidl
+Comment on attachment 8526268
+add paint details to timeline
+
+I can't review this code (let's ask Matt).
+
+Some questions though (Patrick might be able to answer too): these rectangles, do they represent the result of DLBI? And what do we want to show? Rectangles after or before DLBI? Do we need to translate and scale these values according to the zoom level and the scroll position (as they might have changed after recording)? What about the fact that rectangles are likely to have no sense after recording (objects have moved around, after recording the layout might be different)? What does Chrome do in this case?
+
+Matt, some context: in the Firefox Timeline (open the devtools, in the preferences, enable "Timeline"), we record paint operations. We want to show areas that have been painted by Gecko. A bit like paint flashing. This patch does the recording.
+(In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from comment #15)
+> Do we need to translate and scale
+> these values according to the zoom level and the scroll position (as they
+> might have changed after recording)? What about the fact that rectangles are
+> likely to have no sense after recording (objects have moved around, after
+> recording the layout might be different)? What does Chrome do in this case?
+My understanding after playing a little bit with the timeline in Chrome is that when rectangles are displayed, they're displayed only according the the coordinates captured during the recording. Those coordinates aren't changed based on zoom. Even if the page has completely changed in the meantime, the rectangles still appear where paint occurred (in fact, rects are fixed positioned, so a rect at x:0,y:0 will always appear top left of the *viewport* even if you scroll the page down).
+I like this simple approach.
+Comment on attachment 8526268
+add paint details to timeline
+
+r+ for the non-graphics related parts, but think about not special cases 
+rectangles construction in nsDocShell. We don't want that code to become
+spaghetti ;)
+(In reply to Olli Pettay [:smaug] from comment #17)
+
+> r+ for the non-graphics related parts, but think about not special cases 
+> rectangles construction in nsDocShell. We don't want that code to become
+> spaghetti ;)
+
+I think the problem is fundamental -- a "paint" marker is emitted conditional
+upon whether a "layer" marker appears between the paint-start and paint-end;
+and the rectangle information is available only where the layer marker is emitted.
+
+One way to remove the special case would be to always pass "layerRectangles"
+to the AddDetails method.  This would make the call site in PopProfileTimelineMarkers
+cleaner -- but I chose not to do this because I thought it made the meaning
+of AddDetails less clean.
+
+Another option would have been to emit some kind of Layer marker object
+and then clean things up on the javascript side.  However, that also seemed
+less clean to me, as the paint/layer special treatment already existed
+in the C++ code.
+
+Well... that's more or less the reasoning that led me to this patch.  If it helps
+any, I don't think we're on a slippery slope -- at least, I'm not aware of any
+more special cases that are needed by upcoming planned changes.
+(In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from comment #15)
+> Comment on attachment 8526268
+> add paint details to timeline
+> 
+> I can't review this code (let's ask Matt).
+> 
+> Some questions though (Patrick might be able to answer too): these
+> rectangles, do they represent the result of DLBI? And what do we want to
+> show? Rectangles after or before DLBI? Do we need to translate and scale
+> these values according to the zoom level and the scroll position (as they
+> might have changed after recording)? What about the fact that rectangles are
+> likely to have no sense after recording (objects have moved around, after
+> recording the layout might be different)? What does Chrome do in this case?
+> 
+> Matt, some context: in the Firefox Timeline (open the devtools, in the
+> preferences, enable "Timeline"), we record paint operations. We want to show
+> areas that have been painted by Gecko. A bit like paint flashing. This patch
+> does the recording.
+
+The rectangles are the result of what DLBI (we should probably just call this 'invalidation' now) computes.
+
+There isn't really a useful definition of rects 'before' DLBI, so this current approach seems fine. fwiw, this is the same region that we use for paint flashing.
+Created attachment 8531704
+add paint details to timeline
+
+This version fixes the extra space.
+
+I don't think there is a particularly clean way to eliminate the
+special case.
+(In reply to Olli Pettay [:smaug] from comment #17)
+> Comment on attachment 8526268
+> add paint details to timeline
+> 
+> r+ for the non-graphics related parts, but think about not special cases 
+> rectangles construction in nsDocShell. We don't want that code to become
+> spaghetti ;)
+
+Hi.  I wasn't sure whether you meant this as "definitely find another way" or
+"please look and either find a way or justify the current way"; hence the needinfo.
+
+I think comment #18 explains why this can't be done more cleanly; and also why
+there isn't any danger of (more) spaghettification.  If that's a word.
+It was like "think about if there is some better way, but if not, the patch is ok"
+Thanks!
+https://hg.mozilla.org/integration/fx-team/rev/51ee43190135
+Backed out in https://hg.mozilla.org/integration/fx-team/rev/a4f02951aea9 for failing on WinXP like https://treeherder.mozilla.org/logviewer.html#?job_id=1411324&repo=fx-team
+Created attachment 8535098
+add paint details to timeline
+
+I looked into the failure.
+
+I think the test was too strict.  It seems that different platforms
+may render differently, and what the test is primarily concerned with
+is whether some data was captured -- not whether exactly a particular
+rectangle was chosen for painting.
+
+This patch loosens the test a bit while, I think, maintaining its
+basic purpose.
+https://tbpl.mozilla.org/?tree=Try&rev=d0170d2053f1
+I think the updated test looks reasonable.
+
+The try results are a bit of a mess but they all seem to be pre-existing issues of one sort or another.  I clicked a lot of star buttons.
+https://hg.mozilla.org/integration/fx-team/rev/d639e397f2f0
+https://hg.mozilla.org/mozilla-central/rev/d639e397f2f0
+Sorry for the spam. Moving bugs to Firefox :: Developer Tools: Performance Tools (Profiler/Timeline).
+
+dkl
+
+
+[timeline] record painted rect as metadata of the paint marker
+
+
+
+Bug 1050770 - add paint details to timeline; r=smaug,mattwoodrow 
+
+Back out 51ee43190135 (bug 1050770) for WinXP bc2 failures 
+
+Bug 1050770 - Add paint details to timeline. r=smaug, r=mattwoodrow 

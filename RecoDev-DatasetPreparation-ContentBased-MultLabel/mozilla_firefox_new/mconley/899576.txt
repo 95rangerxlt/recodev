@@ -1,0 +1,233 @@
+My gut tells me that we're losing time in CustomizableUI.buildArea, which might be contributing to the tpaint regression (bug 889758), since we have to build all toolbars each time a window opens before the paint.
+
+With our fancy new XP machines, I'm going to see how much buildArea costs us, and try to see if there's anything else to optimize in there.
+
+My gut tells me that we're losing time in CustomizableUI.buildArea, which might be contributing to the tpaint regression (bug 889758), since we have to build all toolbars each time a window opens before the paint.
+
+With our fancy new XP machines, I'm going to see how much buildArea costs us, and try to see if there's anything else to optimize in there.
+Created attachment 783969
+Possible optimization 1
+
+I think we might be able to skip buildArea altogether if the area is in its default state, and we manually set its attributes (and the attributes of its children) to reflect reality.
+
+Worth trying anyway - local testing suggested a possible win of several milliseconds.
+Possible optimization 1 pushed to try.
+
+Baseline: https://tbpl.mozilla.org/?tree=Try&rev=28bbd53c760e
+Patch: https://tbpl.mozilla.org/?tree=Try&rev=4735013ce09c
+And to quantify, with local testing, I saw an improvement of about 5-7ms on average.
+I think this will depend on bug 892809 for the removable attribute to have the correct default value. Or are you still setting that?
+(In reply to Matthew N. [:MattN] from comment #4)
+> I think this will depend on bug 892809 for the removable attribute to have
+> the correct default value. Or are you still setting that?
+
+I'm not sure that's true - all of those removable attributes were being set to false - but isWidgetRemovable treats the *absence* of the removable attribute as meaning removable="false". So it looks like widgets need to opt-in to removability.
+Created attachment 784412
+Optimization 1 - Patch v1.1
+
+Try shows a gain somewhere in the ~2 ms range, which is kinda disappointing, but a win is a win.
+Comment on attachment 784412
+Optimization 1 - Patch v1.1
+
+Either Gijs or Jared - does this make any sense?
+Comment on attachment 784412
+Optimization 1 - Patch v1.1
+
+Review of attachment 784412:
+-----------------------------------------------------------------
+
+f+ because I'd really like to understand the _areaInDefaultState bit and whether that's actually true... E.g. if I'm an add-on and I overlay stuff into a toolbar, does currentPlacements match defaultPlacements? How?
+
+::: browser/base/content/browser.xul
+@@ +435,5 @@
+>  #endif
+>               context="toolbar-context-menu">
+> +      <toolbaritem id="menubar-items" align="center"
+> +                   customizableui-areatype="toolbar"
+> +                   customizableui-anchorid="">
+
+Can we just not set the anchorid if we're not in a toolbar? Seems like that'd make more sense.
+
+@@ +466,5 @@
+>              flex="1"
+>              setfocus="false"
+>              tooltip="tabbrowser-tab-tooltip"
+> +            customizableui-areatype="toolbar"
+> +            customizableui-anchorid=""
+
+Can we just not set them and ensure that our code deals with that, rather than setting them to empty strings?
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +288,5 @@
+>        aToolbar.overflowable = new OverflowableToolbar(aToolbar);
+>      }
+>  
+>      this.registerBuildArea(area, aToolbar);
+> +    if (!this._areaInDefaultState(area)) {
+
+This depends on currentPlacements matching the contents of the area. I suspect that isn't always true. Can you convince me otherwise? :-)
+
+@@ -308,5 @@
+>  
+>      let currentNode = container.firstChild;
+>      for (let id of aPlacements) {
+>        if (currentNode && currentNode.id == id) {
+> -        this._addParentFlex(currentNode);
+
+Why do/did we need to do this (and, presumably, not m-c)?
+Comment on attachment 784412
+Optimization 1 - Patch v1.1
+
+jaws is on vacation, so I'll bat this one back and forth with Gijs.
+Created attachment 784460
+Optimization 1 - Patch v1.2
+
+(In reply to :Gijs Kruitbosch from comment #8)
+> Comment on attachment 784412
+> Optimization 1 - Patch v1.1
+> 
+> Review of attachment 784412:
+> -----------------------------------------------------------------
+> 
+> f+ because I'd really like to understand the _areaInDefaultState bit and
+> whether that's actually true... E.g. if I'm an add-on and I overlay stuff
+> into a toolbar, does currentPlacements match defaultPlacements? How?
+> 
+
+Yeah, dropping that whole thing completely. Might as well just do the comparison in buildArea.
+
+> ::: browser/base/content/browser.xul
+> @@ +435,5 @@
+> >  #endif
+> >               context="toolbar-context-menu">
+> > +      <toolbaritem id="menubar-items" align="center"
+> > +                   customizableui-areatype="toolbar"
+> > +                   customizableui-anchorid="">
+> 
+> Can we just not set the anchorid if we're not in a toolbar? Seems like
+> that'd make more sense.
+> 
+
+Not sure - I think Blair was the one who initially suggested setting the anchorid attribute on the XUL nodes. I'd want to needinfo him first before removing it.
+
+> @@ +466,5 @@
+> >              flex="1"
+> >              setfocus="false"
+> >              tooltip="tabbrowser-tab-tooltip"
+> > +            customizableui-areatype="toolbar"
+> > +            customizableui-anchorid=""
+> 
+> Can we just not set them and ensure that our code deals with that, rather
+> than setting them to empty strings?
+> 
+
+Sure, but maybe as a separate bug?
+
+> ::: browser/components/customizableui/src/CustomizableUI.jsm
+> @@ +288,5 @@
+> >        aToolbar.overflowable = new OverflowableToolbar(aToolbar);
+> >      }
+> >  
+> >      this.registerBuildArea(area, aToolbar);
+> > +    if (!this._areaInDefaultState(area)) {
+> 
+> This depends on currentPlacements matching the contents of the area. I
+> suspect that isn't always true. Can you convince me otherwise? :-)
+> 
+
+I'm not convinced myself - hence, I dropped it. :D
+
+> @@ -308,5 @@
+> >  
+> >      let currentNode = container.firstChild;
+> >      for (let id of aPlacements) {
+> >        if (currentNode && currentNode.id == id) {
+> > -        this._addParentFlex(currentNode);
+> 
+> Why do/did we need to do this (and, presumably, not m-c)?
+
+Unsure! It's possible that the parent flex stuff we're doing is no longer necessary now that the customization target is not restricted to a little nubbin on the toolbar. I'd want to needinfo jaws to find out if the parent flex stuff is still required.
+Created attachment 784472
+Optimization 1 - Patch v1.3
+
+As Gijs rightly pointed out in #fx-team, having empty customizableui-anchorid attributes is rather silly and unnecessary.
+Comment on attachment 784472
+Optimization 1 - Patch v1.3
+
+Ok, let's try this again.
+Comment on attachment 784472
+Optimization 1 - Patch v1.3
+
+Review of attachment 784472:
+-----------------------------------------------------------------
+
+Alright, LGTM!
+Comment on attachment 784472
+Optimization 1 - Patch v1.3
+
+>     <toolbar id="nav-bar" class="toolbar-primary chromeclass-toolbar"
+>              aria-label="&navbarCmd.label;"
+>              fullscreentoolbar="true" mode="icons" customizable="true"
+>              iconsize="large"
+>              defaultset="urlbar-container,search-container,webrtc-status-button,bookmarks-menu-button,downloads-button,home-button,social-share-button,social-toolbar-item"
+>              customizationtarget="nav-bar-customizationtarget"
+>              overflowbutton="nav-bar-overflow-button"
+>              overflowtarget="widget-overflow-list"
+>+             flex="501"
+>              context="toolbar-context-menu">
+
+I don't understand how this would be useful layout-wise in any way.
+(In reply to Dão Gottwald [:dao] from comment #14)
+> Comment on attachment 784472
+> Optimization 1 - Patch v1.3
+> 
+> >     <toolbar id="nav-bar" class="toolbar-primary chromeclass-toolbar"
+> >              aria-label="&navbarCmd.label;"
+> >              fullscreentoolbar="true" mode="icons" customizable="true"
+> >              iconsize="large"
+> >              defaultset="urlbar-container,search-container,webrtc-status-button,bookmarks-menu-button,downloads-button,home-button,social-share-button,social-toolbar-item"
+> >              customizationtarget="nav-bar-customizationtarget"
+> >              overflowbutton="nav-bar-overflow-button"
+> >              overflowtarget="widget-overflow-list"
+> >+             flex="501"
+> >              context="toolbar-context-menu">
+> 
+> I don't understand how this would be useful layout-wise in any way.
+
+It's the result of what current UX code does anyway, just static. For discussion of that, whether it's necessary, etc., please see bug 900593. Let's not have that keep this bug back.
+Comment on attachment 784472
+Optimization 1 - Patch v1.3
+
+Optimization 1 (attachment 784472) has landed in UX as https://hg.mozilla.org/projects/ux/rev/cb4eee977849
+We might be approaching our limit on what we can optimize in buildArea. I've expanded my scope to include all of CustomizableUI.
+As this is still an ongoing investigation, can we split this out to a separate bug? If one of the many patches were to get backed out, it would make it harder to track/understand the target milestone of this bug.
+(In reply to Mike Conley (:mconley) from comment #10)
+> > @@ -308,5 @@
+> > >  
+> > >      let currentNode = container.firstChild;
+> > >      for (let id of aPlacements) {
+> > >        if (currentNode && currentNode.id == id) {
+> > > -        this._addParentFlex(currentNode);
+> > 
+> > Why do/did we need to do this (and, presumably, not m-c)?
+> 
+> Unsure! It's possible that the parent flex stuff we're doing is no longer
+> necessary now that the customization target is not restricted to a little
+> nubbin on the toolbar. I'd want to needinfo jaws to find out if the parent
+> flex stuff is still required.
+
+The parent flex is needed because we want the customize-target to have the same flex as it would have had prior to Australis, in case something else gets placed in the toolbar and the author had set a flex relative to the previous values. Setting the parent flex here would set the flex on the customization-target, satisfying this invariant.
+(In reply to Jared Wein [:jaws] from comment #18)
+> As this is still an ongoing investigation, can we split this out to a
+> separate bug? If one of the many patches were to get backed out, it would
+> make it harder to track/understand the target milestone of this bug.
+
+Yeah, that's fine.
+https://hg.mozilla.org/mozilla-central/rev/cb4eee977849
+
+
+Optimize CustomizableUI.buildArea and browser.xul for the default case
+
+
+
+Bug 899576 - Fast-path the default case for CustomizableUI.buildArea, and preset node attributes in browser.xul. r=Gijs. 

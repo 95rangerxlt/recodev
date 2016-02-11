@@ -1,0 +1,326 @@
+User-Agent:       Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1; .NET CLR 1.1.4322)
+Build Identifier: Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.7.7) Gecko/20050414 Firefox/1.0.3
+
+Using a couple of my previous vulnerabilities, a malicious website owner can 
+compromise a victim's machine. All the victim must do is visit the malicious 
+page and click anywhere within the page (link, text, etc)
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. http://greyhatsecurity.org/vulntests/ffrc.htm
+2. Click anywhere on screen
+
+Actual Results:  
+Batch file is written to hard drive and launched
+
+Expected Results:  
+Javascript should not be stored in history. Also, the security dialog for 
+installing addons should filter images being passed as the addon icon
+
+User-Agent:       Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1; .NET CLR 1.1.4322)
+Build Identifier: Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.7.7) Gecko/20050414 Firefox/1.0.3
+
+Using a couple of my previous vulnerabilities, a malicious website owner can 
+compromise a victim's machine. All the victim must do is visit the malicious 
+page and click anywhere within the page (link, text, etc)
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. http://greyhatsecurity.org/vulntests/ffrc.htm
+2. Click anywhere on screen
+
+Actual Results:  
+Batch file is written to hard drive and launched
+
+Expected Results:  
+Javascript should not be stored in history. Also, the security dialog for 
+installing addons should filter images being passed as the addon icon
+So now someone is claiming a 0day that looks a lot like this.  See bug 293302.
+
+/be
+Created attachment 182921
+simplified and cleaned up testcase
+
+
+The big issue here is that we fire onload as another page loads when we click
+on an <a> link -- filing a separate bug on this.
+
+However, JSInstallTriggerGlobal also doesn't do any checking on the icon URI;
+it should also disallow javascript URIs for both passed-in URIs (perhaps only
+file, http, ftp).
+Created attachment 182930
+patch disallowing javascript and data URIs in InstallTrigger
+
+This patch at least prevents the specific bit of the code that's executing with
+chrome privs, by disallowing javascript: and data: URIs for being used as xpi
+or image URLs by InstallTrigger.
+
+I originally did this patch by adding a flags param to secman
+CheckLoadURIFromScript, which would get passed down to CheckLoadURI instead of
+always using STANDARD (so that InstallTrigger could specify
+DISALLOW_SCRIPT_OR_DATA); if that approach is preferred, I have that patch as
+well.  (This one touches less code, but it introduces javascript/data rejection
+logic here instead of keeping it all in secman.)
+Comment 2 first paragraph talks about a separate bug, which was bug 293326, but
+that's invalid.
+
+The feature of javascript: URLs, whereby they load against the current doc, is a
+feature.  We need to secure it by tracking the origin of the javascript: URL.
+
+/be
+Created attachment 182990
+testcase for the XSS part of this vulnerability
+
+This XSS hole reminds me of bug 88167.
+The XSS testcase works against both Firefox 1.0.3 and Firefox trunk (May 7).
+The XSS testcase works reliably in 1.0.3, but on trunk, you might have to try it
+several times before it will work.  I don't know why.
+Created attachment 183002
+Make javascript from session history execute in intermittent about:blank page and not in the current page.
+
+This fixes this by making it so that javascript in session history URLs don't
+ever have a chance to execute in the current page, in stead they execute in a
+temporary about:blank page to prevent any sort of data leakage from the current
+page.
+Comment on attachment 183002
+Make javascript from session history execute in intermittent about:blank page and not in the current page.
+
+r=bzbarsky
+Comment on attachment 183002
+Make javascript from session history execute in intermittent about:blank page and not in the current page.
+
+sr=dveditz
+Comment on attachment 183002
+Make javascript from session history execute in intermittent about:blank page and not in the current page.
+
+a=brendan for 1.0.4.
+
+/be
+Comment on attachment 182930
+patch disallowing javascript and data URIs in InstallTrigger
+
+- In InstallTriggerCheckLoadURIFromScript():
+
++    nsCOMPtr<nsIScriptSecurityManager> secman(
++	 do_GetService(NS_SCRIPTSECURITYMANAGER_CONTRACTID));
++
++    if (secman)
++    {
+[...]
++    }
++
++    return NS_OK;
++}
+
+Unless there's a reason not to, I'd like to flip this around to failing all
+loads if we can't get a security manager (other code already does this).
+dveditz probably knows whether this code ever runs someplace where there's no
+security manager, if not, I'd like to see this pass &rv to do_GetService() and
+returning that if it failed. Otherwise one could theoretically get around the
+security checks in low memory conditions or whatever.
+
+sr=jst either way though.
+Comment on attachment 182930
+patch disallowing javascript and data URIs in InstallTrigger
+
+Special-casing javascript: checks invites workarounds (view-source, jar) as we
+saw with the favicon bug
+
+>+InstallTriggerCheckLoadURIFromScript(JSContext *cx, const nsAString& uriStr)
+>+{
+>+    nsCOMPtr<nsIScriptSecurityManager> secman(
+>+        do_GetService(NS_SCRIPTSECURITYMANAGER_CONTRACTID));
+>+
+>+    if (secman)
+
+I think Johnny's right, if no security manager we should fail.
+
+>+        rv = secman->CheckLoadURIFromScript(cx, uri);
+>+        if (NS_FAILED(rv))
+>+            return rv;
+
+Instead of this, get the codebase from the context and call CheckLoadURI with
+the disallow-script-or-data flag.
+
+	 nsCOMPtr<nsIURI> scriptURI;
+	 nsCOMPtr<nsIPrincipal> principal;
+	 rv = secman->GetSubjectPrincipal(getter_AddRefs(principal));
+	 NS_ENSURE_SUCCESS(rv, rv);
+	 if (!principal)
+	    return NS_ERROR_FAILURE;
+
+	 rv = principal->GetURI(getter_AddRefs(scriptURI));
+	 NS_ENSURE_SUCCESS(rv, rv);
+
+	 rv = secman->CheckLoadURI(scriptURI, uri,
+nsIScriptSecurityManager::DISALLOW_SCRIPT_OR_DATA);
+	 return rv;
+
+Something like this I think. Don't need to pass in cx because
+getSubjectPrincipal() should grab the right one
+Created attachment 183020
+disallow script urls in InstallTrigger (v2)
+
+This variation on vlad's patch incorporates my review comments and fixes the
+bug 292499 aspect of this exploit. Can be tested with
+javascript:InstallTrigger.install({'blah':{URL:'http://www.mozilla.org',
+IconURL:"javascript:eval('alert(Components.stack)')"}});void(0)
+The site you run the URL on must be whitelisted of course.
+
+Expected behavior: throw an exception (see js console)
+Actual behavior (pre patch): alert demonstrates running with chrome privilege
+(In reply to comment #8)
+> Created an attachment (id=183002) [edit]
+> Make javascript from session history execute in intermittent about:blank page
+> and not in the current page.
+
+how does frame history differ from full pages? javascript urls do not appear to
+execute if I navigate back from a full page (bug 88167 that Jesse mentioned).
+Comment on attachment 183020
+disallow script urls in InstallTrigger (v2)
+
+r=vladimir, with one comment..
+
+>+    // are we allowed to load this one?
+>+    rv = secman->CheckLoadURI(scriptURI, uri,
+>+                    nsIScriptSecurityManager::DISALLOW_SCRIPT_OR_DATA);
+
+If we just call CheckLoadURI here, we don't honor UniversalFileRead for
+file/resource access like CheckLoadURIFromScript does; probably not a big deal,
+as I can't think of any usage when a remote app might want to actually enable
+that and use InstallTrigger with a local file: URI.
+Yeah, probably not a big deal. Seems like we should have a checkloaduri function
+that takes a JS context, uri, and flags. But that's not for this bug... I'll
+land the change as is.
+Comment on attachment 183020
+disallow script urls in InstallTrigger (v2)
+
+sr=jst
+Comment on attachment 183020
+disallow script urls in InstallTrigger (v2)
+
+a=asa
+other than the attached test case, are there other areas or things we could test
+to ensure that this didn't regress anything? thanks!
+Both fixes are now on the aviary and 1.7 branches.
+QA found that theme installation is broken in builds that include these changes.
+I tracked the problem down to the new InstallTriggerCheckLoadURIFromScript()
+code, the problem is that it gets the URL out of the running principal, which in
+the theme case is the system principal and the system principal has no URL. 
+Created attachment 183106
+Get the URI from the caller if we can't get one from the principal (i.e. if it's the system principal).
+Comment on attachment 183106
+Get the URI from the caller if we can't get one from the principal (i.e. if it's the system principal).
+
+r=vladimir
+Comment on attachment 183106
+Get the URI from the caller if we can't get one from the principal (i.e. if it's the system principal).
+
+sr=shaver
+Comment on attachment 183106
+Get the URI from the caller if we can't get one from the principal (i.e. if it's the system principal).
+
+Marking vlad's r=
+Comment on attachment 183106
+Get the URI from the caller if we can't get one from the principal (i.e. if it's the system principal).
+
+a=dveditz
+Fixed on the aviary branch. I'll land on the 1.7 branch later tonight unless
+someone beats me to it.
+I can not reproduce the failure I mentioned using Jesse's testcase in comment 5
+using Firefox 1.0.4. I was able to crash once again using 1.0.4 by clicking the
+link in the lower iframe and reloading a couple of times. It was not
+reproducible in a debug build. Unfortunately, talkback won't send my incident or
+at least won't tell me the incident id...
+
+I think the testcase at
+<http://test.bclary.com/tests/mozilla.org/security/292691-01.html> is flawed. I
+will fix it and report back.
+Ok, I fixed <http://test.bclary.com/tests/mozilla.org/security/292691-01.html>
+and it now agrees with Jesse's case. Firefox 1.0.4/Mozilla 1.7.8 both pass it,
+but Firefox trunk/Mozilla trunk both fail it. MSIE6/Opera both pass it.
+Created attachment 183185
+followup to jst's docshell fix
+
+We should never forget view-source: evil-ness again.  I won't.
+
+/be
+Comment on attachment 183185
+followup to jst's docshell fix
+
+sr=shaver.
+Comment on attachment 183185
+followup to jst's docshell fix
+
+r=jst
+I checked attachment 183185 into the AVIARY_1_0_1_20050124_BRANCH and the
+MOZILLA_1_7_BRANCH.
+
+/be
+What about javascript: inside jar: ?  Should we expose
+nsScriptSecurityManager::GetBaseURIScheme ?
+Created attachment 183209
+followup to followup
+
+dveditz is working on a standalone testcase for the suggestion in my previous
+comment, but I think he has determined that that vulnerability exists.
+
+(I even untangled this from my patch to bug 293671.)
+Created attachment 183210
+testcase variations
+
+testcase with a few variations.
+Comment on attachment 183209
+followup to followup
+
+OK, tested this on dveditz's testcase; requesting reviews.
+The testcase unfortunately reveals bug 290982. Since we have bug 293302 as the
+public face of this bug please leave this bug hidden until bug 290982 is fixed.
+Comment on attachment 183209
+followup to followup
+
+r=dveditz
+Comment on attachment 183209
+followup to followup
+
+We don't need this; darin's working on a better fix.
+Hmm, nsJARChannel.cpp is present in both modules/libjar/ and
+netwerk/protocol/jar/src/ but only copy in modules/libjar/ was patched.
+Shouldn't both files be patched (and kept in sync) ?
+oops, sorry, wrong bug, my comment was for bug 290982.
+Created attachment 183291
+stack for reproducible crash 
+
+I now reproducibly crash at
+<http://test.bclary.com/tests/mozilla.org/security/292691-01.html> using
+1.0.4/winxp
+I don't see any crashes in Talkback data with "nsIDocument::GetParentDocument"
+as the stack signature.  If anyone is able to reproduce this with a Talkback
+enabled build, that will be great.  I have not been able to crash myself using
+bclary's steps to reproduce.
+Created attachment 183306
+This should fix that crash (branch patch; that code is gone on trunk)
+> Created an attachment (id=183306) [edit]
+> This should fix that crash (branch patch; that code is gone on trunk)
+
+This patch has been checked into the Aviary 1.0.1 and Mozilla 1.7 branches.  It
+could not be applied to the trunk, so I did not land it on the trunk.
+Verified that all testcases pass at
+https://bugzilla.mozilla.org/attachment.cgi?id=183210 from comment #37 (exploits
+fail) using the latest Win32 Aviary 1.0.4 build from this afternoon (Talkback
+Build ID: 2005051112).
+Verified that all testcases pass at
+https://bugzilla.mozilla.org/attachment.cgi?id=183210 from comment #37 (exploits
+fail) using the latest Win32 1.7.8 build from this afternoon
+Fix checked into trunk
+*** Bug 293302 has been marked as a duplicate of this bug. ***
+Clearing security flag from announced vulnerabilities fixed in Firefox
+1.0.4/Mozilla 1.7.8
+So the docshell part of this patch is not quite right (though probably the best we could do on branches).  I'll make some changes to this code in bug 337260.
+
+
+Full Remote Compromise using some of my previous vulns
+
+fixed-aviary1.0.4, fixed1.7.8

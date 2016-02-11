@@ -1,0 +1,542 @@
+Given the good progress in supporting JSR 308 by the compiler I'm going to investigate what it takes to consume such type annotations for null analysis.
+
+This will also serve as the first field study to challenge the JSR 308 implementation in use.
+
+Given the good progress in supporting JSR 308 by the compiler I'm going to investigate what it takes to consume such type annotations for null analysis.
+
+This will also serve as the first field study to challenge the JSR 308 implementation in use.
+Really looking forward to this one!
+Created attachment 222435
+WIP
+
+And now for some good news:
+
+With the attached patch the most obvious cases already work! :)
+Feel free to peek into the test to see what's alread working.
+
+Based on the solid foundation of the JSR 308 work this was much easier so far than I'd expected, cool.
+(In reply to comment #0)
+> Given the good progress in supporting JSR 308 by the compiler I'm going to
+> investigate what it takes to consume such type annotations for null analysis.
+> 
+> This will also serve as the first field study to challenge the JSR 308
+> implementation in use.
+
+That is very welcome. For our part, Jay and I will work on providing rapid
+fixes to issues found (beginning with bug 392119 which just got resolved)
+
+(In reply to comment #2)
+> Created attachment 222435 [details]
+> WIP
+> 
+> And now for some good news:
+> 
+> With the attached patch the most obvious cases already work! :)
+> Feel free to peek into the test to see what's alread working.
+> 
+> Based on the solid foundation of the JSR 308 work this was much easier so
+> far than I'd expected, cool.
+
+Terrific. Thanks.
+How will @NonNullByDefault be applied to TYPE_USE annotations?
+
+Consider the following:
+
+@NonNullByDefault(false)
+void takeList(@NonNull List<String> list) { }
+
+Is that equivalent to
+
+void takeList(@NonNull List<@Nullable String> list)
+void takeList(@NonNull List<@NonNull String> list)
+void takeList(@NonNull List</* unknown */ String> list)
+
+Will @NonNullByDefault be available on TYPE_USE, too, e.g. for
+
+@NonNullByDefault(true) 
+Map<A, Map<B, C>> to denote that all keys, values etc have to be non-null?
+
+Another on about @NonNullByDefault: How is that applied to local variables in method bodies? Is it evaluated at all?
+(In reply to comment #3)
+> ... For our part, Jay and I will work on providing rapid
+> fixes to issues found (beginning with bug 392119 which just got resolved)
+
+Thanks, cool (so the potential red herring *was* fishy in the end :) )
+
+
+Before diving into more details, let me document the key design in this bug, which may or may not appear obvious:
+
+With null annotations applied to types *per use* we no longer get away by a coarse grained representation in MethodBindings, we need to encode this information into the TypeBindings, which means for each ReferenceBinding 'X' we potentially get additional bindings '@NonNull X' and '@Nullable X'.
+
+Technically, this instantiation from 'X' to '@NonNull X' is the exact same business as instantiating 'Y<Z>' into 'Y<String>'.
+
+Correspondingly, the central addition is just one more argument in 
+  LookupEnvironment.createParameterizedType(... long annotationTagBits ...)
+where these tagbits can potentially hold any of TagBits.Annotation*, practically at this point only AnnotationNonNull and AnnotationNullable are used. By integrating with the existing infrastructure we get caching/re-use of instantiated type bindings for free.
+
+One reason for documenting this here is: team members debugging this area will find instances of ParameterizedTypeBinding that in fact have zero arguments and are distinguished from their original just by the tagBits.
+
+The same naturally follows for ParameterizedMethodBinding - with differences in tagBits plus parameterNonNullness.
+
+
+I will soon release the bulk of the positive handling in this bug. Bug 392238 has been opened for detecting and rejecting nonsensical declarations and more sub-tasks will be opened for issues like null annotations on array dimensions etc.
+(In reply to comment #4)
+> How will @NonNullByDefault be applied to TYPE_USE annotations?
+> 
+> Consider the following:
+> 
+> @NonNullByDefault(false)
+> void takeList(@NonNull List<String> list) { }
+
+This one is easy: since any default is cancelled (by saying 'false') the signature is evaluated verbatim as written.
+
+Tricky case is
+  @NonNullByDefault
+  void takeList(List<String> list) { }
+
+Worst case scenario: we may have to introduce another parameter to the @NonNullByDefault annotation, s.t. like:
+  @NonNullByDefault(location={PARAMETER, TYPE_USE})
+
+Assuming, we'll have this parameter, what should be its default?
+Then if we agree on the default and agree that this default makes sense *always*, we can spare the parameter :)
+
+> Will @NonNullByDefault be available on TYPE_USE, too, e.g. for
+> 
+> @NonNullByDefault(true) 
+> Map<A, Map<B, C>> to denote that all keys, values etc have to be non-null?
+
+With the above location parameter you'd be able to express this exactly.
+
+> Another on about @NonNullByDefault: How is that applied to local variables
+> in method bodies? Is it evaluated at all?
+
+This one is already answered by the javadoc of NonNullByDefault:
+
+  Entities affected by <code>@NonNullByDefault</code> are:
+  <ul>
+  <li>method return values</li>
+  <li>parameters of a method or constructor.</li>
+  </ul>
+  Local variables are <em>not</em> affected.
+ 
+Reason being: for local variables analysis is already good enough.
+Explicit annotations for locals should be relevant only rarely.
+
+Thanks for raising this question, indeed.
+(In reply to comment #4)
+> How will @NonNullByDefault be applied to TYPE_USE annotations?
+
+To be continued in bug 392245.
+(In reply to comment #6)
+
+> 
+> This one is already answered by the javadoc of NonNullByDefault:
+> 
+
+Sorry about that, I somehow had jdt.annotation from 201203xx in my target platform. JavaDoc was different at that time. Thanks for clarifying this.
+One more implementation note on what's brewing:
+
+Inside ParameterizedQualifiedTypeReference.internalResolveType(..) I'm changing the order of:
+
+		TypeBinding type = internalResolveLeafType(scope, checkBounds);
+		createArrayType(scope);
+		resolveAnnotations(scope);
+
+pulling the last line to the front, because type resolution already needs access to resolved annotations, now.
+
+Mentioning this here, because changed-order things are always slightly more delicate than, e.g., adding new code.
+(In reply to comment #9)
+It seems this actually fixed a bug: Previously GrammarCoverageTests308.test039() was reporting unresolved annotations only 10 times, but there are 14 unresolved locations. Fixed with my change from comment 9 :)
+I've pushed the first bulk to JAVA_BETA8 via commit 63af609b0c4ca15a76568f63423f1cb23d7be92e
+
+to be continued in sub-tasks.
+(In reply to comment #10)
+> (In reply to comment #9)
+> It seems this actually fixed a bug: Previously
+> GrammarCoverageTests308.test039() was reporting unresolved annotations only
+> 10 times, but there are 14 unresolved locations. 
+
+I would say that was deliberate - where type annotations are illegal, we are
+nulling it out after complaining, because we don't want to report additional
+errors.
+
+I am OK with the double reporting though.
+
+I distinctly remember moving it around and leaving it there because there
+were some failures otherwise, but I am not able to reconstruct the scenario
+now.
+
+Could you please see if PSTR needs harmonizing too ?
+
+Code of the form:
+
+this.resolvedType = captureTypeAnnotations(scope, previousType, this.resolvedType, this.annotations[tokenIndex]);
+
+and
+
+argTypes[j] = captureTypeAnnotations(scope, qualifyingType, argType, arg.annotations[0]);
+
+makes for jarring reading. Can't this be arranged so that capturing
+type annotations is act in itself without the side of effect of doing
+something in addition and returning ?
+(In reply to comment #12)
+> (In reply to comment #10)
+> > (In reply to comment #9)
+> > It seems this actually fixed a bug: Previously
+> > GrammarCoverageTests308.test039() was reporting unresolved annotations only
+> > 10 times, but there are 14 unresolved locations. 
+> 
+> I would say that was deliberate - where type annotations are illegal, we are
+> nulling it out after complaining, because we don't want to report additional
+> errors.
+
+I see, thanks.
+ 
+> I am OK with the double reporting though.
+
+I think for "unresolved" errors it makes sense to report despite the wrong position. I'll keep an eye on other duplication of errors that might be more confusing than this one.
+ 
+> I distinctly remember moving it around and leaving it there because there
+> were some failures otherwise, but I am not able to reconstruct the scenario
+> now.
+
+I was afraid there might be some invisible dependencies...
+
+> Could you please see if PSTR needs harmonizing too ?
+
+I will take a look. Either I'm missing some relevant test or the situation for PSTR is simpler...
+
+> Code of the form:
+> 
+> this.resolvedType = captureTypeAnnotations(scope, previousType,
+> this.resolvedType, this.annotations[tokenIndex]);
+> 
+> and
+> 
+> argTypes[j] = captureTypeAnnotations(scope, qualifyingType, argType,
+> arg.annotations[0]);
+> 
+> makes for jarring reading. Can't this be arranged so that capturing
+> type annotations is act in itself without the side of effect of doing
+> something in addition and returning ?
+
+Is this a matter of naming? Would it be clearer to you if the method were named s.t. like "createAnnotatedTypeBinding", "convertTo..."? Did you see the comment before the declaration of that method? Does it help any? The returned type binding is the only effect of this method, aside from caching inside LookupEnvironment.
+(In reply to comment #13)
+
+> > makes for jarring reading. Can't this be arranged so that capturing
+> > type annotations is act in itself without the side of effect of doing
+> > something in addition and returning ?
+> 
+> Is this a matter of naming? Would it be clearer to you if the method were
+> named s.t. like "createAnnotatedTypeBinding", "convertTo..."? Did you see
+> the comment before the declaration of that method? Does it help any? The
+> returned type binding is the only effect of this method, aside from caching
+> inside LookupEnvironment.
+
+OK, I was mistaken - I thought it wrapping some existing code also.
+
+createAnnotatedTypeBinding is a much better choice IMO. Thanks.
+(In reply to comment #12)
+> Could you please see if PSTR needs harmonizing too ?
+
+I tried to create a test that would require such adjustment in PSTR, but so far I failed, the difference being:
+
+PQTR: For "Outer. @Nullable Inner<T>" we need the resolved annotation already inside PQTR.internalResolveLeafType(..).
+
+PSTR: For "@Nullable X<T>" we have two situations:
+A the annotation is seen as a SE7 annotation
+  => resolving and analysing annotations happens outside the PSTR node
+B the annotation makes no sense :), like in
+  - cast "(@Nullable X<T>)x" (cannot insert dynamic check)
+  - (x instanceof @Nullable X<T>) (if it succeeds value cannot be null)
+  - alloc: "new @Nullable X<T>()" - cannot be null :)
+
+There ought to be a non-SE7 position, where null annotations on PSTR can be used, but we'll get there when we get there, I guess.
+(In reply to comment #15)
+> There ought to be a non-SE7 position, where null annotations on PSTR can be
+> used, but we'll get there when we get there, I guess.
+
+How about this: "Foo<S,T extends @NonNull Bar<S>>"
+
+=> need to evaluate null annotations on type bounds and check instantiations of such generic types -> additional constraint on actual type argument.
+A heads-up from work regarding annotations on array types (bug 392862 and friends):
+
+Considering how a declaration like "@NonNull Object [] var" should be evaluated it seems that we cannot accept @NonNull as a declaration annotation *and* a type annotation simultaneously (see bug 394539 comment 1).
+
+In this matter I currently see two options:
+(1) *Change* the existing annotations from @Target({ METHOD, PARAMETER, LOCAL_VARIABLE }) to @Target(TYPE_USE), i.e., *replace* previous targets with TYPE_USE.
+(2) Create a new set of annotations for 1.8 code
+
+While (2) would completely avoid any issues of incompatibility it would make migration from SE7 annotations to JSR308 annotations pretty painful.
+
+OTOH, for (1) to work smoothly we'd need to
+(a) address how to tell the two versions of annotations apart
+(b) ensure that re-interpretation of SE7 null annotations as JSR308 annotations preserves the original semantics (such as to simulate that these annotations simply become more powerful, while in reality they're replaced entirely).
+
+Does anyone see another more compelling option?
+
+Issue (a) can easily be solved for OSGi contexts by creating a bundle org.eclipse.jdt.annotation_2.0.0 with BREE 1.8. However, for non-OSGi contexts I don't see an easy way how projects can make sure they're using the right set of annotations.
+
+I'll start investigating by looking into (b).
+I just wanted say that I am also looking forward to get this feature and an as early integration as possible with JSR 308. Even the current version of Nullness analysis provided in Eclipse (with experimental field support) works quite solid and I am looking forward for even more expressiveness.
+
+Thanks and keep up the good job!
+(In reply to comment #18)
+
+Thanks for your kind words :)
+I'm trying to get my head around JSR308. e.g.
+
+public class X {
+	@Nullable String nullable = null;
+	@NonNull Integer nonnull = 1;
+
+	@NonNullByDefault(false)
+	<S extends Object> S magic(S param) {
+		return param;
+	}
+
+	public void test() {
+		nullable = magic(nullable);	// A
+		nonnull = magic(nonnull);	// B
+	}
+}
+
+I cannot say either:
+<S extends @NonNull Object> as this won't accept the parameter at A
+<S extends @Nullable Object> as this won't assign correctly at B
+
+Is there some type-variable to propagate nullness, deriving the result of a method from the parameter?
+Could the nullness of a parameter also be inverted?
+
+Is <@NonNull S extends @Nullable Object & @NonNull Serializable> prohibited? If the mixture is illegal, a single annotation in front of S would suffice, right (saves some verbose typing)?
+
+Thanks!
+(In reply to comment #20)
+> I'm trying to get my head around JSR308. e.g.
+
+Sorry, we're busy *implementing* Java 8, we cannot provide support for
+all subtleties of *using* those new features.
+Preparing to address bug 392384 I stumbled upon this:
+The strategy outlined in comment 5 produced illegal signatures in byte code for methods like this:
+  List<@Nullable String> getSomeStrings() { ... }
+which would cause this error:
+  The class file X contains a signature '()Ljava/util/List<Ljava/lang/String<>;>;' ill-formed at position 36
+
+The problem is that we generate a generic signature for the type argument String - due to the type annotation. To fix this we need to avoid setting ExtraCompilerModifiers.AccGenericSignature if only tagBits but no type arguments motivated the creation of a ParameterizedTypeBinding. This is easily achieved by passing null type arguments instead of Binding.NO_TYPES. Checks to cope with null type arguments are already present in PTB. (Note that an empty array of type arguments is used to denote a diamond binding prior to inferences).
+
+Released for BETA_JAVA8 via commit 1351b74cfa5cac286b3d17f0119e045000dd6ce3
+Created attachment 234400
+Changes to NullAnnotationTests
+
+This patch illustrates the effect of those changes I have in my workspace.
+
+Many expected error messages are no longer given directly, but using the
+indirection of a tiny function that assembles the expected error based on
+the current compliance.
+
+This part only shows how existing diagnostics change.
+In 1.8 mode a few  messages are marked with "(type annotations)". I'm not sure
+if this addition is useful for the user, but during development it helps me see
+which part of the implementation generated the diagnostic :)
+
+The patch also shows some shy efforts of aligning different messages.
+E.g., the words "specify" and "declare" where used inconsistently, 
+I'm now preferring "specify" in contexts referring to nullness
+(e.g., "specified as @Nullable").
+My pending change also introduces a few new diagnostics, collected here for
+reference:
+
+For syntactic analysis (to distinguish from other messages):
+
+- RedundantNullCheckOnField:
+  Redundant null check: The field {0} cannot be null at this location (ignoring concurrency)
+
+- FieldComparisonYieldsFalse
+  Null comparison always yields false: The field {0} cannot be null at this location (ignoring concurrency)
+
+Type annotations:
+
+- NullityUncheckedTypeAnnotationDetail
+  Null type safety (type annotations): The expression of type ''{1}'' needs unchecked conversion to conform to ''{0}''
+  Example: ...'List<Object>' needs unchecked conversion to conform to 'List<@NonNull Object>'
+
+- RedundantNullCheckAgainstNonNullType
+  Redundant null check: comparing ''{0}'' against null
+  Example: ...'comparing '@NonNull String' against null
+
+- NullAnnotationUnsupportedLocation
+  The nullness annotation ''{0}'' is not applicable at this location
+  Reported against TypeDeclaration, ConstructorDeclaration
+Documenting the central mechanism behind the "deep encoding" of null type
+annotations into TypeBindings:
+
+The central function for encoding is:
+- LookupEnvironment.createAnnotatedType()
+  which works for 
+  - ReferenceBinding 
+    specific treatment for ParameterizedTypeBinding, UnresolvedReferenceBinding
+  - ArrayBinding
+  Not yet: PolyTypeBinding (see bug 415043 item (6)).
+
+This function uses the existing infra structure in LookupEnvironment for
+sharing equal bindings.
+
+Since the duplication of TypeBindings for the sake of type annotations
+influences type comparison using "==", I introduced a new function:
+- TypeBinding.unannotated() 
+  which removes differences due only to null type annotations,
+  after application of this function regular "==" comparison is restored.
+So far I only found one location needing to call unannotated():
+- LambdaExpression.resolveType() 
+  (when comparing parameters of descriptor and binding)
+Additionally, this function is used to wipe annotations which have been
+detected as bogus (e.g., contradictory).
+
+I'm sure that more locations need to follow suite, but I'm hopeful that these
+locations will be few.
+I released the bulk of this via commit https://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=8a1621e802c664e59aba36b8a87f59ae57902e37
+
+I'm open to any comments, ranging from white box code review to comments on
+error messages (see comment 23 and comment 24).
+
+I'll continue to "harden" the implementation via bug 415043.
+After bug 415043 has been resolved let me summarize my experience so far, also as input for the discussion in bug 409586.
+
+The deep encoding as employed for null type annotations well serves its purpose for analysis, but for the price of two levels of complication:
+
+Binding identity:
+Since 'String' and '@NonNull String' are now represented by different type bindings, any code doing == or != comparison can possibly draw the wrong conclusion when finding those types to be different. This risk is reduced by two independent measures:
+ - isCompatibleWith() retrieves the unannotated() binding before comparison
+ - many locations call erasure() or original() before comparison. Since these methods
+   implicitly answer the unannotated type, identity comparison is OK
+This doesn't fully eliminate the risk, the remains have to be dealt with via testing.
+OTOH, I don't see any alternative to this design.
+
+Binding classification:
+Normally, being annotated would be a property that does not impact the classification of a type binding, i.e., an annotated STB be an STB, an annotated ArrayBinding an ArrayBinding etc. This is relevant for
+ - instanceof checks
+ - queries like isParameterizedType()
+ - query kind()
+For various reasons, however, I've implemented an exception: annotated STB and BTB are not encoded as STB/BTB but as PTB instead. For most aspects this design does "the right thing", e.g., in terms of caching, structural combinatorics and calling erasure() / original() were appropriate. Remaining issues relate to "what do we conclude, when we see a type as parameterized?" 
+So far I found one conclusion which is wrong for annotated types without arguments:
+ - a type needs an instance context to have access to a class level type variable
+For this (and potentially similar) aspects, we will have to add more specific queries (in addition to queries like isParameterized()), and apply these on a case-by-case basis.
+
+This issue bears an unavoidable difficulty: many code locations perform a switch over kind() which requires that all relevant kinds of types can be enumerated in a linear fashion. This can only ever be an approximation that cannot truly reflect the underlying combinatorics. Thus, kind() can only show the most relevant property of a type, not all of its properties (would require a multi dimensional answer instead of int).
+
+Interestingly, this difficulty is very similar to a situation we have in Object Teams, where all kinds of ReferenceBinding are further classified into plain-Java, Roles, Teams and Role-and-Team. For OT the solution was found in two steps:
+ - create a hierarchy of binding types that is able to structurally represent all legal combinations
+ - add the necessary queries to distinguish type properties relevant for different tasks during compilation
+
+Over time I will compare both situations (JDT+308 vs. OT) more in detail to see if the existing impl for OT bears more lessons that are relevant for JDT.
+
+
+Level of confidence:
+I admit that the design has a non-null risk, so I'm happy that annotation based null analysis can be disabled per a compiler option :)
+However, I've run all of RunJDTCoreTest with this analysis *enabled* and fixed all bugs demonstrated by this exercise. As the next level of hardening I'm thinking of running all tests even with tweaking @NonNullByDefault to apply globally. This will force null annotations to be seen *everywhere*, and should reveal the majority of remaining bugs.
+Commit e097bd9e8b95f2f5601006e28238301c69bf5baf has been booked on this bug,
+which is a pure refactoring / cleanup change.
+Suitable quick assist/fix have been requested in bug 415180 and bug 424802.
+Some good news due to recent changes in the implementation:
+
+(In reply to Holger Klene from comment #20)
+> I'm trying to get my head around JSR308. e.g.
+> 
+> public class X {
+> 	@Nullable String nullable = null;
+> 	@NonNull Integer nonnull = 1;
+> 
+> 	@NonNullByDefault(false)
+> 	<S extends Object> S magic(S param) {
+> 		return param;
+> 	}
+> 
+> 	public void test() {
+> 		nullable = magic(nullable);	// A
+> 		nonnull = magic(nonnull);	// B
+> 	}
+> }
+> 
+> I cannot say either:
+> <S extends @NonNull Object> as this won't accept the parameter at A
+> <S extends @Nullable Object> as this won't assign correctly at B
+
+The above example is now accepted by the compiler!
+ 
+> Is there some type-variable to propagate nullness, deriving the result of a
+> method from the parameter?
+
+For all type parameters that have no null annotation of their own, inference now tries to infer the nullness along with the type.
+
+> Could the nullness of a parameter also be inverted?
+
+Sorry, no, type inference has no concept of negation.
+ 
+> Is <@NonNull S extends @Nullable Object & @NonNull Serializable> prohibited?
+
+
+Compiler says:
+
+    <@NonNull S extends @Nullable Object & @NonNull Serializable> S m(S s) { return s; }
+                        ^^^^^^^^^
+This nullness annotation conflicts with a '@NonNull' annotation which is effective on the same type parameter 
+
+> If the mixture is illegal, a single annotation in front of S would suffice,
+> right (saves some verbose typing)?
+
+right
+FYI: Bug 392245 has some discussion about the details of @NonNullByDefault in the era of type annotations.
+
+My current proposal can be found in bug 392245 comment 9.
+With no more open subtasks this RFE is resolved.
+
+Follow-up tasks (like bug 429958) will be managed on their own right.
+
+Folks, we have the option to handle nullness as an integral part of the type system :)
+
+Thanks for all support!
+(In reply to Stephan Herrmann from comment #32)
+
+> Folks, we have the option to handle nullness as an integral part of the type
+> system :)
+
+Hearty congratulations on this terrific job !
+
+> Thanks for all support!
+
+Hey, Thank you,
+
+
+[1.8][compiler][null] Apply null annotation on types for null analysis
+
+
+
+Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis - refactoring and cleanup (after bug 416307) 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 - (9) nullness conflict formal/actual type parameter   - incl. fixes for annotated type variables 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 - (8) nullAnnotatedReadableName(): remove from RB, improve for PTB   - incl. a fix for detecting mismatch due to enclosing 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 - (7) tidy: include ArrayBinding in this treatment 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 - (4) only reduced flow analysis here (only NON_NULL) 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 - (3) report detailed typing issues in ReturnExpression 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 - (2) ConditionalExpression: always use unannotated() unless identical 
+
+Bug 415043 - [1.8][null] Follow-up re null type annotations after bug 392099 - (1): remove residue of intermediate work 
+
+Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis - fixed CompilerInvocationTests 
+
+Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis 
+
+Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis - avoid generating illegal signatures 
+
+Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis Bug 403216 - [1.8][null] TypeReference#captureTypeAnnotations treats type annotations as type argument annotations Bug 403457 - [1.8][compiler] NPE in WildcardBinding.signature 
+
+Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis - fixed a regression after merging with bug 388281 
+
+Bug 392099 - [1.8][compiler][null] Apply null annotation on types for null analysis 

@@ -1,0 +1,310 @@
+Tabbrowser's useDefaultIcon can't check browser.contentDocument instanceof ImageDocument or use browser.contentDocument.imageRequest with e10s enabled.
+
+This seems like something children should notify the parent about ("I am an image document"). The validation of the image size could also be done in the child process (e.g. the message could have a "useAsFavicon" boolean property).
+
+Tabbrowser's useDefaultIcon can't check browser.contentDocument instanceof ImageDocument or use browser.contentDocument.imageRequest with e10s enabled.
+
+This seems like something children should notify the parent about ("I am an image document"). The validation of the image size could also be done in the child process (e.g. the message could have a "useAsFavicon" boolean property).
+Created attachment 568259
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+Summary of Changes:
+- Dispatched new event ImageContentLoaded from ImageDocument.cpp
+- Picked up ImageContentLoaded / DOMContentLoaded from content.js
+- content.js does business logic for deciding favicon and sends AsyncMessage
+- Message is picked up by tabbrowser.xml and sets the favicon
+Comment on attachment 568259
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+>+  sendAsyncMessage("Content:SetFavicon", { icon : icon });
+
+What exactly is the meaning of the Content prefix?
+Comment on attachment 568259
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+Approach looks good overall, but there are a couple issues:
+
+>diff --git a/browser/base/content/content.js b/browser/base/content/content.js
+
+>+addEventListener("ImageContentLoaded", function (event) {
+>+  let icon = null;
+>+  let doc = content.document;
+>+  let docURI = doc.documentURIObject;
+
+You don't need to get this eagerly up here, just get it directly below. You could also get rid of "icon" and just put the sendAsyncMessage call directly in that if() block.
+
+>+  sendAsyncMessage("Content:SetFavicon", { icon : icon });
+
+I agree with Dao's implication that "Content" isn't a good prefix. Tabbrowser, perhaps? Also, the message should probably reflect the fact that we're notifying about a fallback - if there's already an explicit <link rel> defined favicon, we'll favor that. So something like "Tabbrowser:SetFaviconFallback" maybe?
+
+>+addEventListener("DOMContentLoaded", function (event) {
+
+>+  let icon = null;
+
+This seems unnecessary as well.
+
+>diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrowser.xml
+
+>-      <method name="shouldLoadFavIcon">
+
+We might not want to remove this function, since it has the potential to be used by addons.
+
+>+      <field name="_messageListener"><![CDATA[
+
+>+              case "Content:SetFavicon":
+>+                if (!browser.mIconURL) {
+>+                  let tab = self.getTabForBrowser(browser);
+>+                  dump(json.icon + "\n");
+>+                  self.setIcon(tab, json.icon);
+
+setIcon ends up just calling getBrowserForTab on its argument, so calling getTabForBrowser here isn't optimal. We should probably just switch setIcon's signature, or add an alternative.
+
+>diff --git a/content/html/document/src/ImageDocument.cpp b/content/html/document/src/ImageDocument.cpp
+
+>@@ -234,16 +234,20 @@ ImageListener::OnStartRequest(nsIRequest
+
+>+  nsContentUtils::DispatchTrustedEvent(imgDoc, static_cast<nsIDocument*>(imgDoc),
+>+                                       NS_LITERAL_STRING("ImageContentLoaded"),
+>+                                       true, true);
+
+Seems like this will fire much earlier than the previous code would have run (before the document starts loading, rather than after it has completed). Does that affect the code's ability to get the proper image size?
+Created attachment 568980
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+Additional Changes:
+- Above requested changes
+
+Minus:
+- Kept "let icon = null" because we still want to sendAsyncMessage with null as the data argument. Going from a page with a tab icon to a page that does not needs to clear the existing tab icon.
+- Didn't change call to setIcon. setIcon needs _both_ a tab and a browser so you'd need to getTabFromBrowser anyways. This way, we keep existing signatures in place.
+Comment on attachment 568980
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+>+      <field name="_messageListener"><![CDATA[
+>+        ({
+>+          self : this,
+>+          receiveMessage : function receiveMessage(aMessage) {
+>+            let self = this.self;
+>+            let json = aMessage.json;
+>+            let browser = aMessage.target;
+>+
+>+            switch (aMessage.name) {
+>+              case "Tabbrowser:SetFaviconFallback":
+>+                if (!browser.mIconURL) {
+>+                  let tab = self.getTabForBrowser(browser);
+>+                  self.setIcon(tab, json.icon);
+>+                }
+>+                break;
+>+            }
+>+          }
+>+        })
+>+      ]]></field>
+
+>@@ -2531,16 +2528,18 @@
+
+>+          window.messageManager.addMessageListener("Tabbrowser:SetFaviconFallback", this._messageListener);
+
+Can tabbrowser itself implement receiveMessage?
+(In reply to Felix Fung (:felix) from comment #4)
+> - Kept "let icon = null" because we still want to sendAsyncMessage with null
+> as the data argument. Going from a page with a tab icon to a page that does
+> not needs to clear the existing tab icon.
+
+Ah - that's true for DOMContentLoaded, but not for ImageContentLoaded (for image documents both events should be firing).
+
+This raises the question of exactly how icon-clearing should work - I guess at the moment it happens via useDefaultIcon on STATE_STOP, whereas with your patch it happens on DOMContentLoaded. That's probably fine.
+
+The latest patch still seems like it's firing the event early - there can be many onDataAvailable calls for a given load (did you test with a very large image?). It seems to me like you'd want to fire it once the load is complete. Maybe in OnStopDecode? Roc or bz would know better.
+(In reply to Gavin Sharp (use gavin@gavinsharp.com for email) from comment #6)
+> (In reply to Felix Fung (:felix) from comment #4)
+> Ah - that's true for DOMContentLoaded, but not for ImageContentLoaded (for
+> image documents both events should be firing).
+
+Are you sure? This doesn't seem to be true as far as I can tell...
+Created attachment 569757
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+Additional Changes
+- Moved event firing for image documents from OnDataAvail -> OnStopRequest
+(In reply to Felix Fung (:felix) from comment #7)
+> Are you sure? This doesn't seem to be true as far as I can tell...
+
+Yeah, I guess it isn't. That brings up the fact that relying on these events for icon clearing might not be optimal (what happens for non-ImageDocument MediaDocuments, like fullscreen video?). I think we should find some other more generic strategy for icon clearing (in browser.js's onStopRequest, for example - of course that won't work for e10s until bug 666801 is fixed).
+Comment on attachment 569757
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+>--- a/browser/base/content/content.js
+>+++ b/browser/base/content/content.js
+>@@ -56,8 +56,58 @@ addMessageListener("Browser:HideSessionR
+>   // Hide session restore button on about:home
+>   let doc = content.document;
+>   let container;
+>   if (doc.documentURI.toLowerCase() == "about:home" &&
+>       (container = doc.getElementById("sessionRestoreContainer"))){
+>     container.hidden = true;
+>   }
+> });
+>+
+>+addEventListener("ImageContentLoaded", function (event) {
+>+  let icon = null;
+>+
+>+  if (Services.prefs.getBoolPref("browser.chrome.site_icons")) {
+>+    let sz = Services.prefs.getIntPref("browser.chrome.image_icons.max_size");
+
+Afaik the prefs service doesn't work in the content process, or it reads only default values since it can't access the profile... or something like that.
+Nope. Reading preferences in the content process is fine; attempting to set them is the only operation that fails.
+Comment on attachment 569757
+e10s: Replace tabbrowser.xml's useDefaultIcon
+
+Cancelling e10s review request since we're not going to be pursuing e10s on desktop.
+I kind of dislike that we have to take this rather complex route, just because of ImageDocuments. At the moment useDefaultIcon would be insanely easy to fix, if we didn't have keep this working.
+We need a way to identify image documents anyway, so maybe that part can be generalized.
+Created attachment 778067
+v1
+
+So this implements favicon support.
+- Add loadType (from docShell) on WebProgress, similar to what we did for isTopLevel.
+- Uses code from previous patch to introduce an ImageContentLoaded event.
+- Attaches an imageDocument property to browser, which makes it possible to check if something is an ImageDocument. This can be useful for other cases and we can easily put more properties in that.
+- Also sends documentURIObject, because currentURI is sometimes wrong. (I really would like a better solution for this, it would be nice if currentURI was always correct).
+Comment on attachment 778067
+v1
+
+Please pass on the review.
+Comment on attachment 778067
+v1
+
+Review of attachment 778067:
+-----------------------------------------------------------------
+
+All the browser parts looks good to me. Please ask smaug to r+sr the nsDocLoader part and the interface change in nsIWebProgress. It'd also be good if he can take a look at the ImageDocument change as I don't recall right now if using DispatchTrustedEvent is enough to avoid that the webpage doesn't see the event
+
+::: toolkit/content/widgets/browser.xml
+@@ +251,5 @@
+> +            if (!document || !(document instanceof Ci.nsIImageDocument))
+> +              return null;
+> +
+> +            try {
+> +                return {width: document.imageRequest.image.width, height: document.imageRequest.image.height };
+
+nit: proper formatting here:
+
+return {
+  width: doc...,
+  height: doc...
+};
+
+::: toolkit/modules/RemoteWebProgress.jsm
+@@ +107,4 @@
+>      case "Content:LocationChange":
+>        let loc = Cc["@mozilla.org/network/io-service;1"]
+>                  .getService(Ci.nsIIOService)
+>                  .newURI(aMessage.json.location, null, null);
+
+nit: while you're here, replace this with the newURI func
+Comment on attachment 778067
+v1
+
+Olli could you please review the mentioned changes? Thanks.
+>Please ask smaug to r+sr the nsDocLoader part and the interface change in nsIWebProgress. >It'd also be good if he can take a look at the ImageDocument change as I don't recall right >now if using DispatchTrustedEvent is enough to avoid that the webpage doesn't see the event.
+I am not sure if the imageload event would be noticeable, because ImageDocuments have no scripts, maybe with iframes?
+Comment on attachment 778067
+v1
+
+>+NS_IMETHODIMP
+>+nsDocLoader::GetLoadType(uint32_t *aLoadType)
+>+{
+>+  *aLoadType = 0;
+>+
+>+  nsCOMPtr<nsIDOMWindow> window;
+>+  GetDOMWindow(getter_AddRefs(window));
+>+  if (window) {
+>+    nsCOMPtr<nsPIDOMWindow> piwindow = do_QueryInterface(window);
+>+    NS_ENSURE_STATE(piwindow);
+>+
+>+    nsCOMPtr<nsIDocShell> docshell = piwindow->GetDocShell();
+>+    if (docshell)
+>+      return docshell->GetLoadType(aLoadType);
+>+  }
+>+
+>+  return NS_OK;
+>+}
+
+This part doesn't make much sense.
+nsDocShell extends nsDocLoader, and nsIDocShell has loadType, so
+nsDocShell has GetLoadType too. And since these are virtual methods...
+And in the very rare case we create nsDocLoader which isn't nsDocShell, GetDOMWindow() fails.
+Interesting, I basically just followed GetIsTopLevel.
+Created attachment 779410
+v2
+
+So I removed the implementation form nsDocLoader and return NS_ERROR_NOT_IMPLEMENTED. I also changed an other use to aWebProgess.loadType, which makes the "Connecting.." in tab titles work.
+Comment on attachment 779410
+v2
+
+>+NS_IMETHODIMP
+>+ImageListener::OnStopRequest(nsIRequest* request, nsISupports* ctxt, nsresult status)
+aRequest, aCtxt, aStatus
+
+>+{
+>+  ImageDocument *imgDoc = static_cast<ImageDocument*>(mDocument.get());
+ImageDocument* imgDoc, and you don't need static_cast
+
+>+  nsContentUtils::DispatchTrustedEvent(imgDoc, static_cast<nsIDocument*>(imgDoc),
+>+                                       NS_LITERAL_STRING("ImageContentLoaded"),
+>+                                       true, true);
+>+  return MediaDocumentStreamListener::OnStopRequest(request, ctxt, status);
+>+}
+We certainly don't want this. Dispatch event to chrome only using DispatchChromeEvent.
+This needs some tests.
+
+
+>+NS_IMETHODIMP
+>+nsBrowserStatusFilter::GetLoadType(uint32_t *aLoadType)
+uint32_t* aLoadType
+
+>+NS_IMETHODIMP
+>+nsDocLoader::GetLoadType(uint32_t *aLoadType)
+uint32_t* aLoadType
+
+I'll give r+ once we have some tests for the new event.
+> >+NS_IMETHODIMP
+> >+nsBrowserStatusFilter::GetLoadType(uint32_t *aLoadType)
+> uint32_t* aLoadType
+> 
+
+> >+NS_IMETHODIMP
+> >+nsDocLoader::GetLoadType(uint32_t *aLoadType)
+> uint32_t* aLoadType
+> 
+> I'll give r+ once we have some tests for the new event.
+They are all on the right here.
+Oh and the other thing:
+ error: invalid conversion from ‘mozilla::dom::MediaDocument*’ to ‘mozilla::dom::ImageDocument*’ [-fpermissive]
+Created attachment 780607
+v3
+https://hg.mozilla.org/mozilla-central/rev/4c3a59049130
+We picked up about a 15ms new tab open regression right around the time this landed. Would this be expected?
+I am not sure if that is 15ms but we now have to go through an indirection for
+https://hg.mozilla.org/mozilla-central/rev/4c3a59049130#l1.65 and https://hg.mozilla.org/mozilla-central/rev/4c3a59049130#l1.68. I am not really sure if that is 15ms worth or if it's something else.
+(In reply to Jim Mathies [:jimm] from comment #27)
+> We picked up about a 15ms new tab open regression right around the time this
+> landed. Would this be expected?
+
+Measured how?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #29)
+> (In reply to Jim Mathies [:jimm] from comment #27)
+> > We picked up about a 15ms new tab open regression right around the time this
+> > landed. Would this be expected?
+> 
+> Measured how?
+
+A tab open perf tests we run with mochitest in metrofx - 
+http://www.mathies.com/mozilla/mochiperf.html?testid=FBD7A532-D63A-44B5-9744-5CB07CFD131A
+
+
+e10s support for useDefaultIcon
+
+
+
+Bug 691610 - e10s support for useDefaultIcon. r=felipe sr=smaug 

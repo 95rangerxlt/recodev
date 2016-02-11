@@ -1,0 +1,242 @@
+User-Agent:       Mozilla/5.0 (X11; U; Linux i686 (x86_64); en-US; rv:1.8.0.4) Gecko/20060508 Firefox/1.5.0.4
+Build Identifier: Mozilla/5.0 (X11; U; Linux i686 (x86_64); en-US; rv:1.8.0.4) Gecko/20060508 Firefox/1.5.0.4
+
+Current search suggestion timeout is 50ms. This is very short, and means that if you quickly type something, lots of suggest requests are made while you type.
+For instance, while typing "firefox" as fast as I can, I could rarely get less that 4 requests to the search service.
+
+Less traffic could be wasted if the timeout was a bit longer, so that it would not ask for completion requests while writing a search phrase.
+
+Of course, this is a compromise between bandwidth consumption and interactivity, but I think the current situation is not optimal (150ms could be a good compromise).
+
+Reproducible: Always
+
+User-Agent:       Mozilla/5.0 (X11; U; Linux i686 (x86_64); en-US; rv:1.8.0.4) Gecko/20060508 Firefox/1.5.0.4
+Build Identifier: Mozilla/5.0 (X11; U; Linux i686 (x86_64); en-US; rv:1.8.0.4) Gecko/20060508 Firefox/1.5.0.4
+
+Current search suggestion timeout is 50ms. This is very short, and means that if you quickly type something, lots of suggest requests are made while you type.
+For instance, while typing "firefox" as fast as I can, I could rarely get less that 4 requests to the search service.
+
+Less traffic could be wasted if the timeout was a bit longer, so that it would not ask for completion requests while writing a search phrase.
+
+Of course, this is a compromise between bandwidth consumption and interactivity, but I think the current situation is not optimal (150ms could be a good compromise).
+
+Reproducible: Always
+*** Bug 339830 has been marked as a duplicate of this bug. ***
+Created attachment 224143
+Patch that adds delay before sending request and backoff on 503 response
+Created attachment 224244
+Supports more status codes, fixes self-assignment bug
+Comment on attachment 224244
+Supports more status codes, fixes self-assignment bug
+
+I haven't fully reviewed this yet, but here are some preliminary comments:
+- Use Date.now() instead of (new Date()).getTime() ?
+- I am pretty confident that all code that uses Cc/Ci in /browser uses the following alignement/indent style:
+var foo = Cc["foo-bar-baz-propeller"].
+          getService(Ci.nsICricket);
+- How about named constants for the HTTP codes? HTTP_BAD_GATEWAY, HTTP_OK, etc?
+- s/implemenation/implementation/ :)
+- the few instances of |const nsITimer = Ci.nsITimer;| aren't necessary, Ci.nsITimer is short enough
+- Was the SuggestionURL change for google.xml just for testing? I'm guessing the "strip HTML tags" part is part of another patch?
+- can _isBackoffError and _noteServerError be combined? you could simplify the code in onReadyStateChange to something like:
+if (!this._requestSucceeded(status) || responseText == "")
+  return;
+<...>
+_requestSucceeded could return true if status == 200, or record the error and return false if the status is one of the 50* codes. That also allows you to unindent the big else block.
+Created attachment 224454
+Addresses most of Gavin's comments on the last round.
+(In reply to comment #4)
+> (From update of attachment 224244 [edit])
+> I haven't fully reviewed this yet, but here are some preliminary comments:
+
+Fixed most of these...
+
+> - Was the SuggestionURL change for google.xml just for testing? I'm guessing
+> the "strip HTML tags" part is part of another patch?
+
+Moved these to bug 340421 and bug 340420, respectively.
+
+> - can _isBackoffError and _noteServerError be combined? you could simplify the
+> code in onReadyStateChange to something like:
+> if (!this._requestSucceeded(status) || responseText == "")
+>   return;
+
+I sympathize with what you're trying to do there, but I feel like that would make it harder to see what's going on in this code.  Specifically, I don't think side effects in boolean condition methods are a good idea.  (I've even gone back and separated out the side-effect from _okToRequest into a separate method for this round.)
+
+Comment on attachment 224454
+Addresses most of Gavin's comments on the last round.
+
+>+  _firstServerErrorTime: null,
+nit: initialize to 0
+
+>   /** 
+>+   * Makes a note of the fact that we've recieved a 503 response,
+>+   * so that we can adjust the backoff behavior appropriately.
+>+   */
+>+  _noteServerError: function SAC__noteServeError() {
+
+nit: typo in function name. Maybe say "a backoff-triggering error", because it's not only 503s.
+
+>+    var withinPeriod = (currentTime - this._firstServerErrorTime) >
+>+                       this._serverErrorPeriod;
+
+Isn't this check reversed? withinPeriod is true if the time since the first error is greater than _serverErrorPeriod.
+
+>+    if ((this._serverErrorCount > 3) && withinPeriod) {
+
+Change this to something like _maxErrorsBeforeBackoff instead of hardcoding 3, or add a comment?
+
+>       var responseText = this._request.responseText;
+>-      if (status == 200 && responseText != "") {
+>+      if (this._isBackoffError(status)) {
+>+        this._noteServerError();
+>+        return;
+>+      } else if (status == HTTP_OK && responseText != "") {
+>+        this._clearServerErrors();
+
+Can you get rid of the else after return, and invert the status/responseText check and return early? The big indented block in here has been bugging me :)
+
+>+        var sandboxHost =
+>+          "http://" + searchService.currentEngine.suggestionURI.host;
+
+Can you make this just suggestionURI.prePath while you're here?
+
+>+  _requestDelay: 250,  // send request 250ms after last character typed
+>+
+>+  _requestDelayTimer: null,
+>
+>   /**
+>    * Initiates the search result gathering process. Part of 
+>-   * nsIAutoCompleteSearch implementation.
+>+   * nsIAutoCompleteSearch implementation.  This implementation actually
+>+   * starts a timer so that we're not sending every keystroke to the server,
+>+   * and then calls _internalStartSearch when enough time has elapsed
+>+   * without the user typing anything.
+
+I don't think any of this code is needed. You can just set the "timeout" attribute on the search bar (default is 50 ms), since it extends autocomplete.xml which implements nsIAutocompleteInput. There's code in nsAutoCompleteController that will do this for you (see nsAutoCompleteController::StartSearchTimer). r- because of that, unless there's some reason that the attribute is unsuitable. Patch looks good otherwise.
+Created attachment 224486
+Further iteration
+(In reply to comment #7)
+> (From update of attachment 224454 [edit])
+> >+    var withinPeriod = (currentTime - this._firstServerErrorTime) >
+> >+                       this._serverErrorPeriod;
+> 
+> Isn't this check reversed? withinPeriod is true if the time since the first
+> error is greater than _serverErrorPeriod.
+
+Yeah, thanks for catching that.
+
+> Can you get rid of the else after return, and invert the status/responseText
+> check and return early? The big indented block in here has been bugging me :)
+
+Yeah, me too--thanks for pushing me on it.  I ended up changing a couple of things to early returns and cutting down on the indentation a lot.  (Though this is a -w diff, so it won't show well.)
+
+Comment on attachment 224486
+Further iteration
+
+>+  /**
+>+   * Time (in unixtime) after which we're allowed to try requesting again.
+>+   */
+>+  _nextRequestTime: 0,
+>+
+>+
+>+  /**
+
+nit: kill the extra newline here?
+
+>+  _noteServerError: function SAC__noteServeError() {
+>+    var currentTime = Date.now();
+>+
+>+    if (this._serverErrorCount == 0)
+>+      this._firstServerErrorTime = currentTime;
+>+
+>+    this._serverErrorCount++;
+>+
+>+    var enoughErrors = (this._serverErrorCount > this._maxErrorsBeforeBackoff);
+
+This should be >=, I guess.
+
+>+    var withinPeriod = (currentTime - this._firstServerErrorTime) <
+>+                       this._serverErrorPeriod;
+>+    if (enoughErrors && withinPeriod) {
+>+      // increase timeout, and then don't request until timeout is over
+
+It seems to me as though this logic can lead to some trouble in the cases where withinPeriod is not true. I tested this out with http://gavinsharp.com/tmp/503.php?v= as a suggestionURL. If I make less than four requests (three if the change I mention above is made), and then wait 10 minutes, I can then continue making as many requests as I want for the rest of the app's lifetime, since withinPeriod is no longer true, so_nextRequestTime is never updated, and _okToRequest is always true.
+
+I think this problem could be solved by checking that the time since the last error is less than a minute or so, instead of checking that the time since the first error in less than ten minutes.
+
+>+  /**
+>+   * Resets the backoff behavior; called when we get a successful response.
+>+   */
+>+  _clearServerErrors: function SAC__clearServerErrors() {
+>+    if (this._serverErrorCount == 0)
+>+      return;
+
+You can remove this check right? This is called after a successful request, or if the engine has changed, so it doesn't hurt to set them all to zero unconditionally here.
+
+It might make sense to save backoff state per-engine, to avoid the potential issue of having the backoff timer being nullified by engine switching. It wouldn't be too hard to make a backoffState helper object that holds on to errorCount, nextRequestTime, etc for each engine, keyed by URI. That can be done in another bug if you think it's worth doing.
+
+>+    this._checkForEngineSwitch(suggestionURI);
+>+
+>+    if (!suggestionURI || !this._okToRequest()) {
+>       // This engine has no suggestion URI. Just send the form history results.
+
+Can you add "|| !searchString" to this, and adjust the comment appropriately? Just pressing "down" in an empty search box shouldn't wait for suggest since the results won't be useful.
+(In reply to comment #10)
+> (From update of attachment 224486 [edit])
+> >+    var withinPeriod = (currentTime - this._firstServerErrorTime) <
+> >+                       this._serverErrorPeriod;
+> >+    if (enoughErrors && withinPeriod) {
+> >+      // increase timeout, and then don't request until timeout is over
+> 
+> It seems to me as though this logic can lead to some trouble in the cases where
+> withinPeriod is not true. I tested this out with
+> http://gavinsharp.com/tmp/503.php?v= as a suggestionURL. If I make less than
+> four requests (three if the change I mention above is made), and then wait 10
+> minutes, I can then continue making as many requests as I want for the rest of
+> the app's lifetime, since withinPeriod is no longer true, so_nextRequestTime is
+> never updated, and _okToRequest is always true.
+> 
+> I think this problem could be solved by checking that the time since the last
+> error is less than a minute or so, instead of checking that the time since the
+> first error in less than ten minutes.
+
+Yeah, I had considered that, but I didn't think that would be a very common occurrence.  I'll talk to some Google server guys and see what they think.
+
+> 
+> >+  /**
+> >+   * Resets the backoff behavior; called when we get a successful response.
+> >+   */
+> >+  _clearServerErrors: function SAC__clearServerErrors() {
+> >+    if (this._serverErrorCount == 0)
+> >+      return;
+> 
+> You can remove this check right? This is called after a successful request, or
+> if the engine has changed, so it doesn't hurt to set them all to zero
+> unconditionally here.
+
+Yeah, that must've been left over from an earlier logic structure.
+
+> It might make sense to save backoff state per-engine, to avoid the potential
+> issue of having the backoff timer being nullified by engine switching. It
+> wouldn't be too hard to make a backoffState helper object that holds on to
+> errorCount, nextRequestTime, etc for each engine, keyed by URI. That can be
+> done in another bug if you think it's worth doing.
+
+I don't think it's worth doing, since I think people would have do to a lot of switching back and forth to get to the point where engines would notice--considering that you can theoretically trigger backoff behavior again in under a second.
+
+Created attachment 225046
+Next iteration to address Gavin's feedback
+Comment on attachment 225046
+Next iteration to address Gavin's feedback
+
+>+  _noteServerError: function SAC__noteServeError() {
+
+>+    if ((this._serverErrorLog.length == this._maxErrorsBeforeBackoff) &&
+>+        ((currentTime - this._serverErrorLog[0]) > this._serverErrorPeriod)) {
+
+You got this backwards again :). Works fine once I made that change, and I much prefer keeping the array of the previous four error times over the old method. r=me with that check reversed.
+Created attachment 225352
+Fixed comparison bug
+Landed on branch, waiting for trunk to stop burning.
+Landed on trunk.

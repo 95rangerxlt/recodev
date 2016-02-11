@@ -1,0 +1,363 @@
+until we implement JSON extensions to the JS language, put our implementation in a js file that we can share with Components.utils.import?
+
+for the patch for bug #378558, we currently have an implementation of parseJSON and toJSONString.  Should we either leave it there, and remove it (once we have native support as described in bug #385349) or should we put it in a place that we can share for Firefox 3, using Components.utils.import()?
+
+the implementation in places's utils.js comes from nsSessionStore.js, which has some session store specific changes [like: if (key == "_tab")] 
+
+I am not sure if session store is our own implementation, or something based on http://www.json.org/json.js, or both.  (But see bug #344640)
+
+But if we put a shareable implementation in json.js, this would allow add on developers (for FX 3) use it, using Components.utils.import()
+
+until we implement JSON extensions to the JS language, put our implementation in a js file that we can share with Components.utils.import?
+
+for the patch for bug #378558, we currently have an implementation of parseJSON and toJSONString.  Should we either leave it there, and remove it (once we have native support as described in bug #385349) or should we put it in a place that we can share for Firefox 3, using Components.utils.import()?
+
+the implementation in places's utils.js comes from nsSessionStore.js, which has some session store specific changes [like: if (key == "_tab")] 
+
+I am not sure if session store is our own implementation, or something based on http://www.json.org/json.js, or both.  (But see bug #344640)
+
+But if we put a shareable implementation in json.js, this would allow add on developers (for FX 3) use it, using Components.utils.import()
+The search suggest code also implements parseJSON, so it could probably use this too.
+Created attachment 275362
+JSON.jsm
+
+Not sure where this should live, though; and for completeness, we should add some unit tests as well (e.g. by adapting the MochiTest ones from http://lxr.mozilla.org/mozilla/source/testing/mochitest/tests/test_Base.js )... will add them after the general bits have been reviewed.
+simon, thanks for working on this.  some review comments:
+
+1)
+ 
+-    // This is a modified version of Crockford's JSON sanitizer, obtained
+-    // from http://www.json.org/js.html.
+-    // This should use built-in functions once bug 340987 is fixed.
+-    const JSON_STRING = /^("(\\.|[^"\\\n\r])*?"|[,:{}\[\]0-9.\-+Eaeflnr-u \n\r\t])+?$/;
+-    var sandbox = new Cu.Sandbox(this._suggestURI.prePath);
+-    function parseJSON(aString) {
+-      try {
+-        if (JSON_STRING.test(aString))
+-          return Cu.evalInSandbox("(" + aString + ")", sandbox);
+-      } catch (e) {}
+-
+-      return [];
+-    };
+-
+-    var serverResults = parseJSON(responseText);
++    var serverResults = JSON.fromString(responseText);
+
+Aren't we losing this sandbox information?  (before:  this._suggestURI.prePath, after: 
+
+2)
+
++  fromString: function JSON_fromString(aJSONString) {
++    if (!this.canSavelyEval(aJSONString))
++      throw new SyntaxError("No valid JSON string!");
++    
++    return eval("(" + aJSONString + ")");
++  },
+
+Shouldn't we default to eval in the about:blank sandbox?
+
+3)
+
++    var str = JSON.toString(aJSObject, ["_tab", "_hosts"] /* keys to drop */);
+
+a) Why are we dropping "_hosts"?
+
+b) eventually, when we switch to a native JS version, it's not going to have toString() with a "keys to drop" argument. 
+ 
+So what about doing that work before calling JSON.toString()?  Something like:
+
+   _toJSONString: function sss_toJSONString(aJSObject) {
+     var objectWithoutTabs = removeKeys(aJSObject, ["_tab"] /* keys to drop */);
+     var str = JSON.toString(objectWithoutTabs);
+     // sanity check - so that API consumers can just eval this string
+     if (!JSON.canSavelyEval(str))
+       throw new Error("JSON conversion failed unexpectedly!");
+     return str;
+   },
+
+This way, we can re-use the JSON code from session store, and when it comes time to switch to native JS, it will be straightforward.
+(In reply to comment #3)
+> Aren't we losing this sandbox information?
+
+That's actually no relevant information for JSON and should have been about:blank to start with (that URL is mainly needed to determine which hosts the sandboxed code could connect to through XMLHttpRequest).
+
+> Shouldn't we default to eval in the about:blank sandbox?
+
+If the string passes the regex-test, then it can't contain any executable content. Theoretically, eval'ing in the sandbox doesn't gain us anything but a cosy feeling (plus the result won't be one of our Arrays any longer). We can of course still do it, but then we'd have to add the warning that there's simply no way of getting objects instanceof Object from our code...
+
+> a) Why are we dropping "_hosts"?
+
+Because it's only duplicate information for internal performance reasons which anybody who really need could easily generate themselves and which will be discarded when passed back to SessionStore. In fact, it should never have been passed out in the first place.
+
+> b) eventually, when we switch to a native JS version, it's not going to have
+> toString() with a "keys to drop" argument.
+
+Why not? That would be really nice to have! ;-) We've even got a use case:
+ 
+> So what about doing that work before calling JSON.toString()?
+
+The problem with your suggestion is that we'd have to clone the complete object first before pruning the keys - as we still need the whole object afterwards! Being able to drop keys during the serialization really is the most elegant solution (as in fact the cloning and pruning are themselves similarly complex as what we currently do).
+
+Should we ever want to switch SessionStore completely to JSON, an alternative be better performant (or we'll return to our own code)...
+
+Finally: any suggestions where this should live?
+based on simon's responses:
+
+1) I don't understand your argument as to why we'd want eval() over evalInSandbox() with a sandbox from Components.utils.Sandbox("about:blank").  Can you elaborate?
+
+2) about why not to add "keys to drop" to ECMAScript 4, JS 2, I am not sure that API is open for change (but perhaps brendan / rsayre know more?)
+
+3)  "any suggestions where this should live?"  all of our consumers are in browser, so why not there?  or where you thinking somewhere else, so that other toolkit apps could use it?  
+
+Alternatively, what about FUEL?  In current versions of fuel, we'd have our own implementation, and future versions would use the native JS version.  But this assumes having this sort of JSON support would be useful to extension authors.  
+
+mfinkle, what do you think?
+
+(In reply to comment #5)
+> Alternatively, what about FUEL?  In current versions of fuel, we'd have our own
+> implementation, and future versions would use the native JS version.  But this
+> assumes having this sort of JSON support would be useful to extension authors.  
+> 
+> mfinkle, what do you think?
+> 
+
+Extension developers will certainly benefit from JSON support. It has come up more than once and I usually point them to json.org
+
+Since this is a Component.utils.import style module, I'd consider putting it in with XPCOMUtils.jsm - especially since this would become native at some point.
+
+(In reply to comment #5)
+> 1) I don't understand your argument as to why we'd want eval() over
+> evalInSandbox() with a sandbox from Components.utils.Sandbox("about:blank").
+
+The only arguments I see are that (1) should something like bug 386635 ever be tried again, we'd have to move away from it anyway and (2) eval'ing "[]" in a sandbox will yield an object which isn't |instanceof Array|. Now if we put a note in there as to (2), we should be fine, alright.**
+
+> 2) about why not to add "keys to drop" to ECMAScript 4, JS 2,
+
+I'd have added it as an unofficial extension, of course, but as I said, lacking better alternatives, we could continue to roll our own for SessionStore. As long as we can share the code now, there should be no reason not to include this extension for the time being, though (maybe with a warning that authors shouldn't rely on it - although that'd even be a way to find out how useful it's in general).
+
+> 3)  all of our consumers are in browser, so why not there?
+
+Since the native JSON methods will be available everywhere, I'd have opted for Toolkit at least, or even better:
+
+(In reply to comment #6)
+> I'd consider putting it in with XPCOMUtils.jsm
+
+That lives in js/src/xpconnect. Brendan: any objections?
+
+** I was about to argue that eval'ing JSON should be provably save, but there is in fact at least one edge-case where users could shoot themselves in the foot when eval'ing in the context of very badly written code. And if we eval it ourselves, |instanceof Array| wouldn't work for the user, anyway. So better save than sorry...
+Created attachment 275610
+updated to comments
+
+Now with a sandbox and unit tests, and living in js/src/xpconnect/loader at the side of XPCOMUtils.js.
+1) "we could continue to roll our own for SessionStore"
+
+Yes, good point.  Going forward, if we have a native toJSONString() but it doesn't take keys to drop, we could do:
+
+toString: function JSON_toString(aJSObject, aKeysToDrop) {
+  if (aKeysToDrop) {
+    // your current code, used by session store
+  }
+  else {
+    return aJSOBject.toJSONString();
+  }
+}
+
+2) can you add back credit and a reference to Crockford and http://www.json.org/?
+
+3) the regex in isMostlyHarmless() is slightly different than the 4 other instances you have removed.  Is this a cause for concern?
+
+4) mfinkle, what do we need to do to expose this to FUEL?
+
+ES4 proposal is at
+
+http://developer.mozilla.org/es4/proposals/json_encoding_and_decoding.html
+
+It's kind of stuck. Seth, or anyone really: please (please!) join es4-discuss@mozilla.org (by the usual mailman protocol: "subscribe" in the subject sent to the -request alias) and propose what you've got here.
+
+/be
+(In reply to comment #9)
+> 2) can you add back credit and a reference to Crockford and
+> http://www.json.org/?
+
+The reference sits at the top of JSON.jsm. Where else do you want it (and should it be extended somehow or is it OK as is)?
+
+> 3) the regex in isMostlyHarmless() is slightly different than the 4 other
+> instances you have removed.
+
+It's the regex from SessionStore, just moved to a single line. I'll replace it with the latest version from http://www.json.org/json.js though, which seems slightly more reasonable (not allowing line-breaks inside strings).
+
+(In reply to comment #10)
+> http://developer.mozilla.org/es4/proposals/json_encoding_and_decoding.html
+
+Hm, the filter suggestion has been brought forward three times already (once as a filter function, once as the black list we have here and once as a whitelist). Looks good to me, as long as you manage to make up your mind...
+
+(FWIW: A blacklist might be slightly better performing as IME you'd usually just exclude a few keys while you potentially include quite many of them. On a different note: IMHO silently dropping non-serializable values [such as |undefined|] from Arrays [or in general] is asking for trouble).
+Created attachment 275682
+update to comment #9
+
+The regex still isn't the exact same: ours doesn't need the @-hack for Safari.
+Comment on attachment 275682
+update to comment #9
+
+>+   * (no parser, thus not 100% save! Best to use a Sandbox for evaluation)
+
+s/save/safe/
+Comment on attachment 275682
+update to comment #9
+
+1)  thanks for referencing http://www.json.org/json.js directly and giving credit to Douglas Crockford
+
+2)  should we indicate that we are using something based on the 8/5/07 version of json.js?
+
+3) "no parser, thus not 100% save!"
+
+s/save/safe
+
+4) thanks again for doing this work!
+Created attachment 275686
+for check-in
+
+(In reply to comment #14)
+> 2)  should we indicate that we are using something based on the 8/5/07 version
+> of json.js?
+
+Actually, we aren't anyway. I've written most of that code over a year ago, so it must have been an older, no longer available revision. OTOH the main resemblance is the regex in isMostlyHarmless - much of the rest is a combination of rewriting from scratch and major refactoring.
+Comment on attachment 275686
+for check-in
+
+Guess I need sr at least for the /js/ bits (if not, it'd be checkin-needed).
+Comment on attachment 275686
+for check-in
+
+Nice code. I'm still hoping you will join es4-discuss@mozilla.org and comment on the proposal which is now public at
+
+http://wiki.ecmascript.org/doku.php?id=proposals:json_encoding_and_decoding
+
+in a mail to that list. The keys blacklist when encoding at least seems worth a discussion.
+
+One comment, more of a question:
+
+>+      // if it looks like an array, treat it as such - this is required
+>+      // for all arrays from either outside this module or a sandbox
+>+      else if (aObj instanceof Array ||
+>+               typeof aObj == "object" && "length" in aObj &&
+>+               (aObj.length === 0 || aObj[aObj.length - 1] !== undefined)) {
+
+This is a both looser and tighter than, e.g., MochiKit's isArrayLike, which amounts to
+
+    ((typ == 'object' && o !== null) ||
+     (typ == 'function' && typeof(o.item) == 'function')) &&
+    typeof(o.length) == 'number'
+
+where typ = typeof(o).
+
+MochiKit does not require the last element to be non-undefined, and neither does Array.
+
+MochiKit does probe with a quick "shape test" for DOM nodelists (the function and .item jazz, I think -- or else this is a MochiKit-internal array-like object type test). OTOH it tests typeof(o.length) == 'number'.
+
+Just a point of comparison, but since Array instances can have a last element whose value === undefined and still be JSON-encoded (any null or undefined values will be skipped), this patch's test for "array-like" could be too restrictive.
+
+Apart from undefined being allowed because skipped, we ideally want *only* Array instances (whether from the sandbox or not) to be encoded as JSON arrays, so you might prefer to test like this:
+
+      else if (aObj instanceof Array ||
+               (typeof aObj == "object" &&
+                typeof aObj.length == "number" &&
+                typeof aObj.push == "function")) {
+
+In ES4/JS2, you'd just replace the entire if condition with "if (aObj is Array)". Wouldn't that be nice. It might be worth prototyping the ES4 "is" operator in JS1.8. Comments?
+
+/be
+(In reply to comment #17)
+> I'm still hoping you will join es4-discuss@mozilla.org
+
+I'll consider it once I've got some more time available.
+
+> MochiKit does not require the last element to be non-undefined, and neither
+> does Array.
+
+Well, our JSON-implementation does, as I'm still not convinced that silently dropping |undefined| is a good idea (see comment #11) -- why shouldn't we rather throw to inform the developer that we won't be able to correctly restore her object later?
+
+> we ideally want *only* Array instances to be encoded as JSON arrays,
+> so you might prefer to test like this:
+> 
+>       else if (aObj instanceof Array ||
+>                (typeof aObj == "object" &&
+>                 typeof aObj.length == "number" &&
+>                 typeof aObj.push == "function")) {
+> 
+
+That makes |{ length: -1, push: function() {} }| an array. We'd probably want
+
+      else if (aObj instanceof Array ||
+               typeof aObj == "object" && aObj.constructor &&
+               aObj.constructor.name == "Array")
+
+instead, but not before the |undefined| issue has been resolved, which I'd prefer to do in a follow up bug, so as to no longer block bug 384370.
+(In reply to comment #18)
+> (In reply to comment #17)
+> > I'm still hoping you will join es4-discuss@mozilla.org
+> 
+> I'll consider it once I've got some more time available.
+
+Thanks, whenever you can spare the time.
+
+> > MochiKit does not require the last element to be non-undefined, and neither
+> > does Array.
+> 
+> Well, our JSON-implementation does, as I'm still not convinced that silently
+> dropping |undefined| is a good idea (see comment #11) -- why shouldn't we
+> rather throw to inform the developer that we won't be able to correctly restore
+> her object later?
+
+To match the public-domain, long-standing json.org implementations? Up to you guys, I don't care.
+
+> > we ideally want *only* Array instances to be encoded as JSON arrays,
+> > so you might prefer to test like this:
+> > 
+> >       else if (aObj instanceof Array ||
+> >                (typeof aObj == "object" &&
+> >                 typeof aObj.length == "number" &&
+> >                 typeof aObj.push == "function")) {
+> > 
+> 
+> That makes |{ length: -1, push: function() {} }| an array.
+
+Sure, it's not a complete shape test. Anything that tries will be incomplete and too expensive. Wherefore my proposal to lift the |is| operator into JS1.8 -- but you didn't respond to that :-/.
+
+> We'd probably want
+> 
+>       else if (aObj instanceof Array ||
+>                typeof aObj == "object" && aObj.constructor &&
+>                aObj.constructor.name == "Array")
+
+That's ok by me too, even if {constructor:{name:"Array"}} defeats it ;-).
+
+Still looking for someone to say "do |is| in js1.8" -- please, egg me on here!
+
+/be
+Can someone w/ commit-privs in these areas check this in? Some Places bugs targeting M8 could use this, and we'd rather not continue duplicating this locally.
+The patch doesn't apply cleanly, any chance you could update it Simon?
+Created attachment 277659
+for check-in (unbitrotted)
+Comment on attachment 277659
+for check-in (unbitrotted)
+
+Looks like this needs approval at this point.
+mozilla/js/src/xpconnect/loader/JSON.jsm 	1.1
+mozilla/js/src/xpconnect/tests/unit/test_json.js 	1.1
+mozilla/js/src/xpconnect/loader/Makefile.in 	1.22
+mozilla/browser/components/places/content/utils.js 	1.57
+mozilla/browser/components/search/nsSearchSuggestions.js 	1.17
+mozilla/browser/components/sessionstore/src/nsSessionStore.js 	1.72
+I had to disable some of the tests because they're failing. See bug 393206.
+> Still looking for someone to say "do |is| in js1.8" -- please, egg me on here!
+
+Do it!
+
+
+
+until we implement JSON extensions to the JS language, put our implementation in a js file that we can share with Components.utils.import?
+
+
+
+Bug 386789: create JSON utilities module and use it for search suggest/sessionstore/Places, patch by Simon Bünzli <zeniko@gmail.com>, r=sspitzer, sr+a=brendan 

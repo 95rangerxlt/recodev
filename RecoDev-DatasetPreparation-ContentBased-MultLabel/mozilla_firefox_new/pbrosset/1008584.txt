@@ -1,0 +1,147 @@
+SVG has a lot of elements and attributes with mixed case, and if the case is wrong then the element/attribute is not recognized. When the Inspector initially displays a document's markup it will display it with the correct casing. However, if you try to edit the markup in the Inspector it will lowercase the names of elements and attributes that you enter, meaning that editing is broken.
+
+SVG has a lot of elements and attributes with mixed case, and if the case is wrong then the element/attribute is not recognized. When the Inspector initially displays a document's markup it will display it with the correct casing. However, if you try to edit the markup in the Inspector it will lowercase the names of elements and attributes that you enter, meaning that editing is broken.
+Created attachment 8420547
+testcase - try editing the viewBox attribute
+
+Notice that if you edit the value of the viewBox attribute the name of the attribute changes from "viewBox" to "viewbox".
+Joe, any chance of getting someone to look at this? I imagine there's a good chance the fix is simple for someone who knows the code. (I hope so anyway.)
+I suspect this is a relic of XHTML having opinions about the correct case. Is there any justification for altering the case today in any doctype?
+
+Thoughts Patrick?
+*** Bug 1060883 has been marked as a duplicate of this bug. ***
+I don't think the inspector should be changing the case at all. I'll check the code to see where is the .toLowerCase() done.
+The lowercasing comes from http://mxr.mozilla.org/mozilla-central/source/browser/devtools/markupview/markup-view.js#2200 where we use nsIDOMParser to parse the attribute string.
+
+We tell the parser that the string is "text/html" so that it returns a parsed HTML document, but that makes all attributes lowercase.
+
+If instead we parsed it with "text/xml", the case would be preserved. We would have to change `.body.childNodes[0]` to `.childNodes[0]`.
+
+I'm not too sure if this would cause other problems though...
+It's worth trying and running all the tests with it.
+Turns out we can't parse with contentType text/xml because that would remove badly formatted attributes which the HTML parser accepts. For instance, cases where the user enters 'class="""' work today, this produces 'class=""'. It wouldn't create the attribute at all if we parsed with XML.
+
+Ok, granted it's a rare use case, but there are probably other, more common, ones and I think it makes sense that the inspector tries its best to accept anything the user throws at it.
+
+So, to preserve the case, one thing we can do is try and restore it after parsing the attributes simply by searching for them in the original string.
+Say the user enters 'viewBox="1 1 0 0"', our parser is going to parse that out to 'viewbox="1 1 0 0"'. We could then simply search for 'viewbox' in the lower cased entered string and, if found, extract what was original entered.
+
+This isn't bulletproof though as there may be several attributes with different cases parsed at the same time. For example with 'viewbox="a" viewBox="b"' we wouldn't be able to know which of the viewbox attribute has been parsed. However, we can assume this usecase to be rare enough to ignore I think.
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #6)
+> We tell the parser that the string is "text/html" so that it returns a
+> parsed HTML document, but that makes all attributes lowercase.
+
+Should the parser really be doing that? This seems wrong to me if the lowercase attributes are not valid HTML anymore.
+I dislike the fact that the HTML parser lowercases SVG attributes, but whatever their case they are still valid _HTML_ (since HTML is case-insensitive).
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #7)
+> Turns out we can't parse with contentType text/xml because that would remove
+> badly formatted attributes which the HTML parser accepts.
+
+It shouldn't remove them. Rather you should get a parse error. So maybe you can try parsing them as text/xml and then, if you get a parse error, try text/html?
+(In reply to Jonathan Watt [:jwatt] from comment #9)
+> I dislike the fact that the HTML parser lowercases SVG attributes, but
+> whatever their case they are still valid _HTML_ (since HTML is
+> case-insensitive).
+
+Oh, ok. I guess I'm confused that it can be valid HTML while at the same time we ignore attributes which have the wrong case.
+(In reply to Jonathan Watt [:jwatt] from comment #10)
+> (In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #7)
+> > Turns out we can't parse with contentType text/xml because that would remove
+> > badly formatted attributes which the HTML parser accepts.
+> 
+> It shouldn't remove them. Rather you should get a parse error. So maybe you
+> can try parsing them as text/xml and then, if you get a parse error, try
+> text/html?
+You're right, I do get a <parsererror> node as childNodes[0] of the returned document.
+I think you're proposal sounds fine, the only thing is that when the user enters a malformed mixed-case attribute, it will result in a parsing error from the XML parser and then be lowercased by the HTML parser, so the bug persists. But of course, that's just if the user enters a malformed attribute, which is, I think, acceptable.
+Created attachment 8483521
+bug1008584-edit-svg-attributes v1.patch
+Comment on attachment 8483521
+bug1008584-edit-svg-attributes v1.patch
+
+Review of attachment 8483521:
+-----------------------------------------------------------------
+
+Assuming all of our existing attribute editing tests pass, I don't see any problems with this (just a few comments below)
+
+::: browser/devtools/markupview/markup-view.js
+@@ +2212,5 @@
+> +  // preserve the case.
+> +  let parsedAttributes = [];
+> +  for (let str of stringsToParse) {
+> +    let parsed = DOMParser.parseFromString(str, "text/xml");
+> +    if (parsed.childNodes[0].localName === "div") {
+
+Please comment why we need to check localName == div here
+
+@@ +2225,5 @@
+> +  if (parsedAttributes.length === 0) {
+> +    for (let str of stringsToParse) {
+> +      let parsed = DOMParser.parseFromString(str, "text/html");
+> +      if (parsed.body.childNodes[0] &&
+> +          parsed.body.childNodes[0].localName === "div") {
+
+Does this need the check for localName == "div"?  The original logic was just checking parsed.body.childNodes[0] - the text/html parsing will just not return a childNode if something went wrong
+
+::: browser/devtools/markupview/test/browser_markupview_tag_edit_09.js
+@@ +38,5 @@
+> +  assertAttributes("svg", {
+> +    "viewBox": "0 0 1 1",
+> +    "width": "200",
+> +    "height": "200"
+> +  });
+
+May as well explicitly add an assertion for the malformed + mixed case:
+
+viewBox="<>"
+
+turns into
+
+viewbox="<>"
+
+Not that it is ideal behavior, but that is what we are expecting in this case.
+
+::: browser/devtools/markupview/test/doc_markup_svg_attributes.html
+@@ +1,5 @@
+> +<!DOCTYPE html>
+> +<html>
+> +  <body>
+> +    <svg viewBox="0 0 2 2" width=200 height=200>
+> +      <circle cx=1 cy=1 r=1 fill=lime/>
+
+space before the / to get the fill attribute to be set correctly (otherwise it is showing up as <circle fill="lime/"></circle>)
+Green try build with the last patch: https://tbpl.mozilla.org/?tree=Try&rev=72fe9d8866b3
+
+Thanks Brian for the review, I'm going to address the comments now and attach a new patch.
+Created attachment 8484036
+bug1008584-edit-svg-attributes v2.patch
+
+Addressed review comments.
+Pushed to fx-team: https://hg.mozilla.org/integration/fx-team/rev/2f3b786b99c5
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #7)
+> So, to preserve the case, one thing we can do is try and restore it after
+> parsing the attributes simply by searching for them in the original string.
+> Say the user enters 'viewBox="1 1 0 0"', our parser is going to parse that
+> out to 'viewbox="1 1 0 0"'. We could then simply search for 'viewbox' in the
+> lower cased entered string and, if found, extract what was original entered.
+
+The problem is that you are trying to parse SVG attributes on an HTML element (<div>). When editing the attributes of a DOM node that's in the SVG namespace, you should use <svg> instead of <div> as the placeholder you use for parsing. If you do that, the HTML parser will case-correct the attributes to make sense for SVG.
+https://hg.mozilla.org/mozilla-central/rev/2f3b786b99c5
+Considering what I said in comment 17, I think the fix that got landed here is the wrong one. pbrosset, do you agree now that you have the info from comment 17 available?
+(In reply to Henri Sivonen (:hsivonen) from comment #19)
+> Considering what I said in comment 17, I think the fix that got landed here
+> is the wrong one. pbrosset, do you agree now that you have the info from
+> comment 17 available?
+Yes I did see comment 17. I didn't have time yet to revisit the bug, but will do shortly. It does look like a better solution indeed.
+(In reply to Henri Sivonen (:hsivonen) from comment #17)
+> If you do that, the HTML parser will case-correct the
+> attributes to make sense for SVG.
+
+Huh, I didn't know that. Sorry for the misleading information above.
+
+
+Editing is broken for SVG in the Inspector due to lack of case-sensitivity
+
+
+
+Bug 1008584 - Preserve case when editing attributes in the inspector; r=bgrins 

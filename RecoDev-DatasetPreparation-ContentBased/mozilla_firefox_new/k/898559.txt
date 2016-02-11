@@ -1,0 +1,611 @@
+This functionality should be implemented in toolkit/devtools/debug-metadata.jsm
+
+API:
+  + setMetadata(global, metadata)
+  + getMetadata(global, metadata)
+  + selectGlobals({ addonId: myAddonId })
+
+Metadata is an object that exposes the following properties:
+  + addonID: present on globals that belong to a particular add-on; the owning add-on's ID
+  + URI: location of the code loaded into this global
+  + SDKContentScript: present and true if this global holds SDK content script code
+  + scriptName: String used to label scripts in the debugger user interface
+
+This functionality should be implemented in toolkit/devtools/debug-metadata.jsm
+
+API:
+  + setMetadata(global, metadata)
+  + getMetadata(global, metadata)
+  + selectGlobals({ addonId: myAddonId })
+
+Metadata is an object that exposes the following properties:
+  + addonID: present on globals that belong to a particular add-on; the owning add-on's ID
+  + URI: location of the code loaded into this global
+  + SDKContentScript: present and true if this global holds SDK content script code
+  + scriptName: String used to label scripts in the debugger user interface
+Jim has proposed a Debugger.Object.prototype.hostAnnotations property in bug 801084 that seems similar in intent. We've been planning to use it to provide the developer with a way to select which global(s) to target with the debugger. Could we also use hostAnnotations to hold the metadata that is required for add-on debugging?
+I've been giving it some thought, and I think there are some problems with the
+metadata API as it stands. As I understand it, using this API requires the act
+of creating a sandbox/global and the act of associating metadata with it to be
+oh two separate actions.
+
+The act of creating a global triggers a call to the debugger API, which ends
+up calling any JS watchers registered with the onNewGlobalObject event. One of
+these watchers is the onNewGlobal function in the global manager of the thread
+actor, which needs to decide whether or not to add the global as a debuggee.
+The problem is that any metadata associated with the global has not yet been
+set at this point, so the thread actor can't use it to make that decision.
+
+The obvious solution would be to wrap the onNewGlobal callback on the thread
+actor in a setTimeout, so the thread gets a chance to set the metadata it needs.
+However, I'm unsure if doing so has any nasty side-effects from the perspective
+of the debugger (jim, can you dispell my worries?)
+
+I should also point out that the Components.utils.Sandbox constructor has
+several options to do things like set the prototype of the global to be created,
+but those options aren't handled until after the global is created either, i.e.
+using the Sandbox constructor has the same problem.
+
+I also considered the possibility of adding a JS_NewGlobalObjectWithOptions
+function to move the logic for customizing the global from XPConnect to JSAPI.
+However, none of that logic properly belongs in JSAPI, so that option is out.
+(In reply to Panos Astithas [:past] from comment #1)
+> Jim has proposed a Debugger.Object.prototype.hostAnnotations property in bug
+> 801084 that seems similar in intent. We've been planning to use it to
+> provide the developer with a way to select which global(s) to target with
+> the debugger. Could we also use hostAnnotations to hold the metadata that is
+> required for add-on debugging?
+
+We could. But I think hostAnnotations (which allows lazily generated annotations of any object) will be more work to implement than the API described here, because it's going to require a new JSClass method and corresponding support for defining such methods in XPCOM. As most of the annotations we find ourselves needing immediately seem to be on globals, it seems like this would be a quick 80% patch that would allow different projects to make progress earlier.
+(In reply to Eddy Bruel [:ejpbruel] from comment #2)
+
+Yeah, the onNewGlobalObject hook is running into all sorts of problems like this. We often build other things on top of JS global objects (sandboxes, DOM windows, etc.), but onNewGlobalObject is dispatched so early that it often sees globals that (in effect) aren't completely initialized yet. See bug 885301, for example: we can't even re-wrap some kinds of globals for use in other compartments until some post-JS_NewGlobalObject processing takes place.
+
+This does mean that it'll be difficult to attach the annotations in JS. However, adding a 'metadata' argument to Components.utils.Sandbox would be fine. That'd require a C++ implementation, but it's not hard.
+Created attachment 786363
+0001-Bug-89559-new-module-dbg-metadata.jsm.patch
+
+This is a quick-and-dirty implementation of attaching metadata to global objects that should suffice while we wait for more proper solution involving hostAnnotations in #801084.
+Created attachment 789669
+GH PR 1164
+Comment on attachment 789669
+GH PR 1164
+
+Looks good, please just make sure to do Cu.import with destrucutring everywhere before landing so it's clear where things are coming from. No need for another review. Also make sure that platform side is in nightly before actually merging this in.
+Created attachment 791582
+0001-Bug-89559-new-module-dbg-metadata.jsm.patch
+
+Added some tests.
+Bobby, could you please take a look at this patch? Would an intermittent object injected into sandbox prototype chain cause any problems for content-scripts (where the proto is the content window by default)? I remember some magic in that area...
+
+Also, the test looks a bit weird to me... shouldn't do_test_pending and do_test_finished be used?
+Comment on attachment 791582
+0001-Bug-89559-new-module-dbg-metadata.jsm.patch
+
+Review of attachment 791582:
+-----------------------------------------------------------------
+
+I'm going to have to r-, but mostly because I don't understand what you wanted to do with line 45. Otherwise, the patch looks fine. I should be able to give you a r+ next time, provided you've addressed all my comments. Keep up the good work!
+
+::: toolkit/devtools/server/dbg-metadata.jsm
+@@ +40,5 @@
+> + *
+> + * @param metadata Metadata to be set in the newly created dummy prototype. It
+> + *                 will be serialized to JSON.
+> + */
+> +function setMetadataForDebuggee(wrapper, metadata) {
+
+I think using 'debuggee' instead of 'wrapper' here would be clearer. Both terms have a very specific meaning in Firefox: wrappers generally don't have a proto property, but debuggees do. This confused me when I first looked at this code.
+
+@@ +41,5 @@
+> + * @param metadata Metadata to be set in the newly created dummy prototype. It
+> + *                 will be serialized to JSON.
+> + */
+> +function setMetadataForDebuggee(wrapper, metadata) {
+> +  wrapper.proto.getOwnPropertyDescriptor('__debug_metadata').value = '__debug_metadata';
+
+What is this line supposed to do? As it stands, you're assigning a value to the property descriptor you got from the call to wrapper.proto.getOwnPropertyDescriptor. But since that property descriptor is never used again after this line, this is effectively a no-op.
+
+@@ +43,5 @@
+> + */
+> +function setMetadataForDebuggee(wrapper, metadata) {
+> +  wrapper.proto.getOwnPropertyDescriptor('__debug_metadata').value = '__debug_metadata';
+> +  if(wrapper.proto.getOwnPropertyDescriptor('__debug_metadata')) {
+> +    wrapper.proto.deleteProperty('__debug_metadata');
+
+Deleting this property is redundant, since you are redefining it on the next line.
+
+@@ +45,5 @@
+> +  wrapper.proto.getOwnPropertyDescriptor('__debug_metadata').value = '__debug_metadata';
+> +  if(wrapper.proto.getOwnPropertyDescriptor('__debug_metadata')) {
+> +    wrapper.proto.deleteProperty('__debug_metadata');
+> +    wrapper.proto.defineProperty('__debug_metadata', {
+> +      value: wrapper.makeDebuggeeValue(JSON.stringify(metadata)) });
+
+According to vm/Debugger.cpp::5032, non-objects are already debuggee values. Since JSON.stringify always returns a non-object, the call to wrapper.makeDebuggeeValue can be omitted.
+
+@@ +63,5 @@
+> +    return undefined;
+> +  }
+> +
+> +  try {
+> +    return JSON.parse(descriptor.value);
+
+You don't need a try block here: since descriptor.value was created via JSON.stringify, this code should never fail.
+
+::: toolkit/devtools/server/tests/unit/test_dbg_metadata.js
+@@ +18,5 @@
+> +    dbg.onNewGlobalObject = undefined;
+> +
+> +    global = dbg.addDebuggee(global);
+> +    let metadata = getMetadataForDebuggee(global);
+> +    do_check_eq(metadata, 'test metadata');
+
+You also need a test for setMetadataForDebuggee here.
+(In reply to Gabor Krizsanits [:krizsa :gabor] (moving to Berlin: in and out for a few weeks) from comment #9)
+> Bobby, could you please take a look at this patch? Would an intermittent
+> object injected into sandbox prototype chain cause any problems for
+> content-scripts (where the proto is the content window by default)? I
+> remember some magic in that area...
+
+So the idea is that content scripts set sandboxPrototype to some intermediate JS object, whose prototype is the original object passed to sandboxPrototype? That'll break anyone using sandboxPrototype for DOM windows, yeah.
+
+Why do we need metadata to live on the prototype? It seems to me like we should should just add something to SandboxOptions and stick it in a reserved slot.
+(In reply to Bobby Holley (:bholley) from comment #11)
+> So the idea is that content scripts set sandboxPrototype to some
+> intermediate JS object, whose prototype is the original object passed to
+> sandboxPrototype? That'll break anyone using sandboxPrototype for DOM
+> windows, yeah.
+
+Yes, exactly. So I'm afraid this approach will not work.
+
+> 
+> Why do we need metadata to live on the prototype? It seems to me like we
+> should should just add something to SandboxOptions and stick it in a
+> reserved slot.
+
+Sounds good to me, but I don't know much about the story here.
+> Why do we need metadata to live on the prototype? It seems to me like we
+> should should just add something to SandboxOptions and stick it in a
+> reserved slot.
+
+That is entirely possible, of course. My goal with this patch was to create a simplest thing to work, an MVP if you will. I'm curious, could you explain to me in what cases an intermediate prototype breaks things?
+(In reply to Mike Hordecki [:mhordecki] from comment #13)
+> I'm curious, could you explain
+> to me in what cases an intermediate prototype breaks things?
+
+In the old days, people would set |sandbox.__proto__ = someDOMWindow| in order to make the sandbox scope look kinda-sorta like a DOM scope for script (so that you could do things like |alert('foopy')| and have it work). But at some point we made some changes in XPConnect that made that stop working, because the this-binding ends up being the sandbox global, and the DOM window methods ceased to be willing to go hunting for the appropriate object on the prototype chain.
+
+So we introduced a special mechanism whereby you pass {sandboxPrototype: someDOMWindow) to the Sandbox constructor, and we create a specialized proxy object that sits on the prototype chain and knows when to rebind |this| (and when not to).
+
+In general, stuff with the prototype chain is complicated, especially when you cross compartments. Relying on it is fragile and regression prone. I think we should stick the metadata in SandboxOptions. It should be quite straightforward, I'd think. We already store the URI, in fact. I'm assuming you're only interested in attaching metadata to XPC sandboxes, and not arbitrary globals?
+Created attachment 793113
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+I've attached the C++ implementation of the metadata API. This time, it provides an additional option in Cu.Sandbox called metadata that sets a reserved slot. The magic value of JSCLASS_GLOBAL_SLOT_COUNT + 2 looks kinda nasty, so I've been wondering where's the best place to put it as a named constant.
+
+I've also added a new function, Cu.getSandboxMetadata, that retrieves said reserved slot. When using Debugger API, the intended use case is to invoke unsafeDefererence on the global and then call the function. Given the fact that we're only calling this one harmless function, I think is reasonable to unwrap the debuggee object.
+Comment on attachment 793113
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Review of attachment 793113:
+-----------------------------------------------------------------
+
+So, in the current world, this will cause the sandbox to hold alive whatever global created it. Maybe we already do this, but it seems a little suboptimal. Should we structured-clone the metadata into the sandbox's compartment, rather than holding a cross-compartment reference? Assuming we only expect simple JS objects, strings, primitives, etc (and no DOM objects or other reflectors), this should be fine.
+
+::: js/xpconnect/idl/xpccomponents.idl
+@@ +171,2 @@
+>                          [optional] in jsval filename,
+>                          [optional] in long lineNo);
+
+This interface needs an IID rev.
+
+::: js/xpconnect/src/XPCComponents.cpp
+@@ +3722,4 @@
+>      // about:memory may use that information
+>      xpc::SetLocationForGlobal(sandbox, options.sandboxName);
+>  
+> +    JS_SetReservedSlot(sandbox, JSCLASS_GLOBAL_SLOT_COUNT + 2, options.metadata);
+
+As it stands, this is a bare cross-compartment reference from a reserved slot, which is forbidden. The metadata needs to be wrapped or cloned (and cloning is probably better).
+
+@@ +4329,5 @@
+> +}
+> +
+> +nsresult
+> +xpc_GetSandboxMetadata(JSContext *cx, JS::HandleObject sandboxArg, JS::MutableHandleValue rval) {
+> +    JS_AbortIfWrongThread(JS_GetRuntime(cx));
+
+MOZ_ASSERT(NS_IsMainThread());
+
+@@ +4332,5 @@
+> +xpc_GetSandboxMetadata(JSContext *cx, JS::HandleObject sandboxArg, JS::MutableHandleValue rval) {
+> +    JS_AbortIfWrongThread(JS_GetRuntime(cx));
+> +    rval.set(UndefinedValue());
+> +
+> +    bool waiveXray = xpc::WrapperFactory::HasWaiveXrayFlag(sandboxArg);
+
+Er, what?
+
+@@ +4342,5 @@
+> +    nsIScriptObjectPrincipal *sop =
+> +        (nsIScriptObjectPrincipal*)xpc_GetJSPrivate(sandbox);
+> +    MOZ_ASSERT(sop, "Invalid sandbox passed");
+> +    nsCOMPtr<nsIPrincipal> prin = sop->GetPrincipal();
+> +    NS_ENSURE_TRUE(prin, NS_ERROR_FAILURE);
+
+Why do you need to do this?
+
+::: js/xpconnect/src/xpcprivate.h
+@@ +3749,5 @@
+>                    JSVersion jsVersion, bool returnStringOnly,
+>                    JS::MutableHandleValue rval);
+>  
+> +nsresult
+> +xpc_GetSandboxMetadata(JSContext *cx, JS::HandleObject sandboxArg, JS::MutableHandleValue rval);
+
+All new functions should be in namespace xpc rather than xpc_ prefixed.
+
+::: js/xpconnect/src/xpcpublic.h
+@@ +76,4 @@
+>  
+>  }
+>  
+> +#define XPCONNECT_GLOBAL_FLAGS_WITH_SLOTS(n)                                  \
+
+So, it turns out this stuff is all a mess right now, and I fixed it up in bug 907508. Can you rebase on top of those patches and pass XPCONNECT_GLOBAL_WITH_EXTRA_SLOTS(1) for the sandbox class?
+
+::: js/xpconnect/tests/unit/test_sandbox_metadata.js
+@@ +10,5 @@
+> +    metadata: "test metadata"
+> +  });
+> +
+> +  do_check_eq(Components.utils.getSandboxMetadata(sandbox),
+> +              "test metadata");
+
+Please add a test with an object as well, like {foopy: { bar: 2}, baz: "hi"}, since that's handled quite differently on the C++ level.
+Be aware that I'm landing a patch that moves out the sandbox bits into a separate file, so you will likely have to re-base your patch again. Bug 886237.
+Created attachment 794955
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+I've refactored the code a little bit and rebased on top of the changes that you and Gabor have made. I'm using xpc::CloneNonReflectors to clone the object - is this the correct choice? Also, I've added C.u.setSandboxMetadata for parity. As far as I can tell, there are no cross-compartment pointers flying around. What do you think?
+tbpl: https://tbpl.mozilla.org/?tree=Try&rev=ab4ab353957c
+Comment on attachment 794955
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Review of attachment 794955:
+-----------------------------------------------------------------
+
+Nice job overall - just needs a couple of things.
+
+::: js/xpconnect/src/Sandbox.cpp
+@@ +1601,5 @@
+> +xpc::GetSandboxMetadata(JSContext *cx, HandleObject sandboxArg, MutableHandleValue rval)
+> +{
+> +    MOZ_ASSERT(NS_IsMainThread());
+> +
+> +    RootedObject sandbox(cx, js::CheckedUnwrap(sandboxArg));
+
+We need a check in here (and in set) to make sure that the object is actually a sandbox. I think the the _Utils entry point should do the unwrapping and throw if !IsSandbox, and this function should MOZ_ASSERT IsSandbox().
+
+@@ +1603,5 @@
+> +    MOZ_ASSERT(NS_IsMainThread());
+> +
+> +    RootedObject sandbox(cx, js::CheckedUnwrap(sandboxArg));
+> +
+> +    RootedValue metadata(cx, JS_GetReservedSlot(sandbox, XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET));
+
+You should probably enter the compartment of the sandbox before accessing its reserved slots.
+
+@@ +1604,5 @@
+> +
+> +    RootedObject sandbox(cx, js::CheckedUnwrap(sandboxArg));
+> +
+> +    RootedValue metadata(cx, JS_GetReservedSlot(sandbox, XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET));
+> +    if (!CloneNonReflectors(cx, &metadata)) {
+
+This works, but it uses complicated machinery to allow us to pass reflectors around as cross-compartment references. I don't think we really want to support that for metadata, so I think we should just do a simple JS_StructuredClone without any special callbacks.
+
+::: js/xpconnect/src/XPCComponents.cpp
+@@ +2853,5 @@
+> +    RootedValue metadata(cx);
+> +    nsresult rv = xpc::GetSandboxMetadata(cx, sandbox, &metadata);
+> +    NS_ENSURE_SUCCESS(rv, rv);
+> +    *rval = metadata;
+> +    
+
+Whitespace error.
+
+@@ +2869,5 @@
+> +
+> +    RootedValue metadata(cx, metadataVal);
+> +    nsresult rv = xpc::SetSandboxMetadata(cx, sandbox, metadata);
+> +    NS_ENSURE_SUCCESS(rv, rv);
+> +    
+
+Here too.
+Created attachment 795012
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Thanks for the review!
+
+The reason I didn't use JS_StructuredClone directly is that it explicitly disallows cross-compartment cloning (there's an assertion for that). Given this, in this patch I've added an utility function called Clone which is pretty much CloneNonReflectors minus the reflector stuff.
+Comment on attachment 795012
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Review of attachment 795012:
+-----------------------------------------------------------------
+
+::: js/xpconnect/src/Sandbox.cpp
+@@ +432,5 @@
+> + * to clone to, and that if val is an object is from the compartment we
+> + * clone from.
+> + */
+> +bool
+> +Clone(JSContext *cx, MutableHandleValue val)
+
+I think that this cross-compartment logic should be hoisted into JS_StructuredClone itself. I spoke with jorendorff and Waldo about this, and they were amenable. Please file a blocking bug, CC me, add the patch with this logic rolled into JS_StructuredClone, and flag jorendorff for review.
+
+@@ +1629,5 @@
+>  }
+> +
+> +
+> +nsresult
+> +xpc::GetSandboxMetadata(JSContext *cx, HandleObject sandbox, MutableHandleValue rval)
+
+So, we clone on set _and_ get?. Are those really the semantics we want? For example:
+
+var foo = Cu.getSandboxMetadata(sb);
+foo.someCounter++;
+
+Do we want to persist this state? In general, I think DOM semantics would say that it should persist. So I'd lean towards getting rid of the clone here, unless we have a compelling reason to do otherwise (like we do for set).
+
+@@ +1637,5 @@
+> +
+> +    RootedValue metadata(cx);
+> +    {
+> +      JSAutoCompartment ac(cx, sandbox);
+> +      metadata = JS_GetReservedSlot(sandbox, XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET);
+
+This slot offset should be a sandbox-specific #define next-to the Sandbox JSClass definition.
+
+@@ +1660,5 @@
+> +    JSAutoCompartment ac(cx, sandbox);
+> +    if (!Clone(cx, &metadata)) {
+> +        return NS_ERROR_UNEXPECTED;
+> +    }
+> +    JS_SetReservedSlot(sandbox, XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET, metadata);
+
+We should use the #define here as well.
+
+::: js/xpconnect/src/XPCComponents.cpp
+@@ +2846,5 @@
+> +nsXPCComponents_Utils::GetSandboxMetadata(const JS::Value &sandboxVal,
+> +                                          JSContext *cx, JS::Value *rval)
+> +{
+> +    RootedObject sandbox(cx);
+> +    if (!JS_ValueToObject(cx, sandboxVal, sandbox.address()) || !sandbox)
+
+Instead of JS_ValueToObject, just use .isObject() and .toObject() directly, here and below.
+
+@@ +2848,5 @@
+> +{
+> +    RootedObject sandbox(cx);
+> +    if (!JS_ValueToObject(cx, sandboxVal, sandbox.address()) || !sandbox)
+> +        return NS_ERROR_INVALID_ARG;
+> +    
+
+Whitespace error.
+(In reply to Bobby Holley (:bholley) from comment #22)
+> So, we clone on set _and_ get?. Are those really the semantics we want? For
+> example:
+> 
+> var foo = Cu.getSandboxMetadata(sb);
+> foo.someCounter++;
+> 
+
+Are we sure about the set part even? Like:
+
+var foo = {a:1}
+Cu.setSandboxMetadata(sb,foo);
+foo.a++;
+foo.somethingExtra = "more data";
+
+Can't we just use nukeSandbox for the debugger script, or just clean the SandboxMetadata in the right moment instead of cloning? I mean we know when does the debugger session ends, it should not be a problem to clean up the metadata of the debugged sandbox, instead of doing this cloning trick.
+Nuking seems a bit hacky. IMO the metadata should live in the compartment of the sandbox itself (hence the initial clone), but we shouldn't do any extra clones.
+Created attachment 799978
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+This one takes the JS_StructuredClone patch into account. Also, now Cu.getSandboxMetadata returns a wrapper, instead of a clone. This fact is reflected via an updated test.
+Comment on attachment 799978
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Review of attachment 799978:
+-----------------------------------------------------------------
+
+::: js/xpconnect/idl/xpccomponents.idl
+@@ +189,5 @@
+> +     *
+> +     * setSandboxMetadata sets the metadata associated with
+> +     * a sandbox object.
+> +     *
+> +     * Note that the metadata object will be copied before being used.
+
+I would expand this comment a little bit to indicate that the copy will happen with the structured cloning algorithm, and that the clone will throw if the object graph includes reflectors.
+
+::: js/xpconnect/src/Sandbox.cpp
+@@ +589,4 @@
+>      return JS_ConvertStub(cx, obj, type, vp);
+>  }
+>  
+> +#define XPCONNECT_SANDBOX_CLASS_METADATA_SLOT (XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET+1)
+
+Erm, why the +1? It seems like this should just be XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET, since this is the only extra slot we're dealing with. But the fact that this presumably ran without asserting makes me wonder if I'm missing something...
+
+@@ +1688,5 @@
+> +{
+> +    MOZ_ASSERT(NS_IsMainThread());
+> +    MOZ_ASSERT(IsSandbox(sandbox));
+> +
+> +    RootedValue metadata_(cx, metadataArg);
+
+Why is this necessary? Can't you just pass metadataArg directly to JS_StructuredClone?
+
+::: js/xpconnect/src/XPCComponents.cpp
+@@ +2851,5 @@
+> +        return NS_ERROR_INVALID_ARG;
+> +
+> +    RootedObject sandbox(cx, &sandboxVal.toObject());
+> +    sandbox = js::CheckedUnwrap(sandbox);
+> +    if (!xpc::IsSandbox(sandbox))
+
+IsSandbox is not null-safe, and CheckedUnwrap may return null if the unwrap was denied. In the current world it won't ever happen (since CheckedUnwrap always succeeds for system principal, and this function can only be called by chrome), but we should respect the semantics anyway. So make this:
+
+if (!sandbox || !xpc::IsSandbox(sandbox))
+    return NS_ERROR_INVALID_ARG;
+
+@@ +2872,5 @@
+> +        return NS_ERROR_INVALID_ARG;
+> +
+> +    RootedObject sandbox(cx, &sandboxVal.toObject());
+> +    sandbox = js::CheckedUnwrap(sandbox);
+> +    if (!xpc::IsSandbox(sandbox))
+
+same here.
+
+::: js/xpconnect/tests/unit/test_sandbox_metadata.js
+@@ +3,5 @@
+> + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+> +
+> +/* See https://bugzilla.mozilla.org/show_bug.cgi?id=898559 */
+> +
+> +function run_test()
+
+Please also add a test to make sure we throw appropriately when trying to set metadata whose object graph includes a reflector.
+(In reply to Bobby Holley (:bholley) from comment #26)
+> Erm, why the +1? It seems like this should just be
+> XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET, since this is the only extra slot we're
+> dealing with. But the fact that this presumably ran without asserting makes
+> me wonder if I'm missing something...
+
+I have no idea either. Code works in both cases, so I assume I meant it without the "+1"...
+Created attachment 802723
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+(In reply to Mike Hordecki [:mhordecki] (UTC-7) from comment #27)
+> (In reply to Bobby Holley (:bholley) from comment #26)
+> > Erm, why the +1? It seems like this should just be
+> > XPCONNECT_GLOBAL_EXTRA_SLOT_OFFSET, since this is the only extra slot we're
+> > dealing with. But the fact that this presumably ran without asserting makes
+> > me wonder if I'm missing something...
+> 
+> I have no idea either. Code works in both cases, so I assume I meant it
+> without the "+1"...
+
+I'm actually quite worried about this. The JS engine should assert if you ever try to set a slot greater than the number of slots allocated. Class.h defines JSCLASS_GLOBAL_FLAGS_WITH_SLOTS(n) to give us |JSCLASS_GLOBAL_SLOT_COUNT + n| slots. So if we've done all the math right, the +1 should have caused us to assert. Which, in turn, makes me worried that we're off-by-one in the lower (rather than upper) direction.
+
+Can you please investigate this?
+Well, I'm fully to blame on that one. During some unrelated work I've turned off --enable-debug in my mozconfig, therefore disabling JS_ASSERTs. As expected, with asserts turned on the previous version blows up.
+
+Anyway, here's tbpl: https://tbpl.mozilla.org/?tree=Try&rev=bdc6715c866d
+Comment on attachment 802723
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Review of attachment 802723:
+-----------------------------------------------------------------
+
+Nice job! Thanks for all the hard work here. r=bholley with comment addressed.
+
+::: js/xpconnect/tests/unit/test_sandbox_metadata.js
+@@ +30,5 @@
+> +  metadata = Components.utils.getSandboxMetadata(sandbox);
+> +  do_check_eq(metadata.foo, "bar");
+> +
+> +  let thrown = false;
+> +  let reflector = Components.utils.Sandbox('http:///foo.com');
+
+sandbox instances aren't actually reflectors (though their JSClass is custom enough that the structured clone will fail anyway). How about just doing:
+
+Cc["@mozilla.org/xmlextras/xmlhttprequest;1"].createInstance(Ci.nsIXMLHttpRequest)
+Created attachment 802831
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Thanks for the review!
+https://hg.mozilla.org/integration/fx-team/rev/947a298ea5bb
+https://hg.mozilla.org/mozilla-central/rev/947a298ea5bb
+This actually should not be closed until the Jetpack pull request is merged and then then introduced into m-c.
+Comment on attachment 802831
+0001-Bug-898559-Add-metadata-API-for-add-on-globals.patch
+
+Review of attachment 802831:
+-----------------------------------------------------------------
+
+::: js/xpconnect/src/Sandbox.cpp
+@@ +1347,5 @@
+>  
+>      rv = GetDOMConstructorsFromOptions(cx, optionsObject, options);
+> +
+> +    bool found;
+> +    rv = GetPropFromOptions(cx, optionsObject,
+
+This stopped propagating errors from GetDOMConstructorsFromOptions. Shouldn't be too hard to write a test that asserts with this change.
+Good point. mhordecki, can you fix that?
+(In reply to Bobby Holley (:bholley) from comment #37)
+> Good point. mhordecki, can you fix that?
+
+FYI, Mike's last day as an intern was last Friday, not sure how much involvement he will (or will not) have as a contributor.
+Commits pushed to master at https://github.com/mozilla/addon-sdk
+
+https://github.com/mozilla/addon-sdk/commit/63b15c0ae83e71d9150b551651bcab8462d5d547
+Bug 898559 - Add metadata API for add-on globals.
+
+https://github.com/mozilla/addon-sdk/commit/be9cbd64caf81b28e5678cbded8f8205d1fe4209
+Merge pull request #1164 from MHordecki/meta
+
+Bug 898559 - Add metadata API for add-on globals. r=@gozala
+Created attachment 812196
+Followup: Add back accidentally removed failure handling;
+Something like
+
+{
+  get wantGlobalProperties() { throw 7 },
+  get metadata() { throw 8 },
+}
+
+should probably assert; Bobby, could you please add something like that?
+Comment on attachment 812196
+Followup: Add back accidentally removed failure handling;
+
+Review of attachment 812196:
+-----------------------------------------------------------------
+
+(In reply to :Ms2ger from comment #41)
+> Something like
+> 
+> {
+>   get wantGlobalProperties() { throw 7 },
+>   get metadata() { throw 8 },
+> }
+> 
+> should probably assert; Bobby, could you please add something like that?
+
+Can you just add it to this patch? r=me either way.
+https://hg.mozilla.org/mozilla-central/rev/90f7b7680a85
+
+I don't know how to get into this code; if you don't want to do it, catch me at the summit to explain :)
+I don't think you ever explained how I should write that test :)
+function run_test() {
+  new Components.utils.Sandbox(null, { get wantGlobalProperties() { throw 7 } });
+}
+
+This should trigger the NS_ENSURE added in the patch.
+
+
+Add metadata API for add-on globals
+
+
+
+mhordecki needs this in bug 898559. 
+
+Bug 898559 - Add metadata API for add-on globals. r=bholley 
+
+Bug 898559 - Followup: Add back accidentally removed failure handling; r=bholley 

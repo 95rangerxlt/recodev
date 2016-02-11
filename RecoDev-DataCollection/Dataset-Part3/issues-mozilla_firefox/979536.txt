@@ -1,0 +1,192 @@
+We have recurring issues with tools in the toolbox failing because they don't expect the use case of being opened several times for the same connection.
+
+We should be able to add some simple tests against web content in m-c to manipulate each tool in this way and verify they still contain reasonable results.
+
+We have recurring issues with tools in the toolbox failing because they don't expect the use case of being opened several times for the same connection.
+
+We should be able to add some simple tests against web content in m-c to manipulate each tool in this way and verify they still contain reasonable results.
+Created attachment 8493734
+List WiFi device on WebIDE init
+
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=145c44511c9f
+Created attachment 8493993
+Part 1: Reopen each tool during remote connection
+
+I've added a new test to open the tools the same way that WebIDE does.  In particular, the target does not close the client when the toolbox closes, but instead it's left open and reused.
+
+In the process of writing this, I found that two (newer) tools actually fail in this mode, so I'll add fixes for those as well.
+
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=0901f7f73f5a
+Created attachment 8493995
+Part 2: Fix reopening timeline tool
+Created attachment 8493999
+Part 3: Fix reopening storage tool
+Comment on attachment 8493995
+Part 2: Fix reopening timeline tool
+
+Review of attachment 8493995:
+-----------------------------------------------------------------
+
+::: browser/devtools/timeline/timeline.js
+@@ +55,5 @@
+>  let shutdownTimeline = Task.async(function*() {
+>    yield TimelineView.destroy();
+>    yield TimelineController.destroy();
+>    yield gFront.stop();
+> +  gFront.destroy();
+
+Why do we need to do this manually? Comment please.
+Comment on attachment 8493999
+Part 3: Fix reopening storage tool
+
+Review of attachment 8493999:
+-----------------------------------------------------------------
+
+f+
+
+What happens when for the same connection, the tool is opened multiple times without closing ?
+
+(Not a peer so r?Mike)
+The fronts need to be destroyed manually to unbind their onPacket handlers.
+
+When you initialize a front and call |this.manage|, it adds a client actor pool that the DebuggerClient uses to route packet replies to that actor.
+
+Most (all?) tools create a new front when they are opened.  When the destroy step is skipped and the tool is reopened, a second front is created and also added to the client actor pool.  When a packet reply is received, is ends up being routed to the first (now unwanted) front that is still in the client actor pool.  Since this is not the same front that was used to make the request, an error occurs.
+
+This problem does not occur with the toolbox for a local tab because the toolbox target creates its own DebuggerClient for the local tab, and the client is destroyed when the toolbox is closed, which removes the client actor pools, and avoids this issue.
+
+In WebIDE, we do not destroy the DebuggerClient on toolbox close because it is still used for other purposes like managing apps, etc. that aren't part of a toolbox.  Thus, the same client gets reused across multiple toolboxes, which leads to the tools failing if they don't destroy their fronts.
+
+Now, Victor is probably wondering why there are still other tools I haven't changed... that's because my test was not good enough to find them! :) I'll attempt to strengthen it now, and also fix the tools.
+Created attachment 8494581
+Part 1: Look for leftover fronts after toolbox close
+
+Rewrote test to check for left over fronts in the client pool after toolbox close, which is much simpler.
+
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=a3c947f6a4f5
+Created attachment 8494584
+Part 2: Fix reopening timeline tool (v2)
+
+Added comment, but also moved where destroy call is made to parallel |new ...Front| in |panel.open|, so wanted to make sure it still looks good.
+Created attachment 8494585
+Part 3: Fix reopening storage tool (v2)
+
+Added comment, but also moved where destroy call is made to parallel |new ...Front| in |panel.open|, so wanted to make sure it still looks good.
+Created attachment 8494587
+Part 4: Fix reopening web audio tool
+Created attachment 8494589
+Part 5: Fix reopening graphics tools
+Comment on attachment 8494584
+Part 2: Fix reopening timeline tool (v2)
+
+Review of attachment 8494584:
+-----------------------------------------------------------------
+
+::: browser/devtools/timeline/panel.js
+@@ +57,5 @@
+>      }
+>  
+>      yield this.panelWin.shutdownTimeline();
+> +    // Destroy front to ensure packet handler is removed from client
+> +    this.panelWin.gFront.destroy();
+
+You're probably going to have to do this for all tools, don't you?
+(In reply to Victor Porof [:vporof][:vp] from comment #13)
+> Comment on attachment 8494584
+> Part 2: Fix reopening timeline tool (v2)
+> 
+> Review of attachment 8494584:
+> -----------------------------------------------------------------
+> 
+> ::: browser/devtools/timeline/panel.js
+> @@ +57,5 @@
+> >      }
+> >  
+> >      yield this.panelWin.shutdownTimeline();
+> > +    // Destroy front to ensure packet handler is removed from client
+> > +    this.panelWin.gFront.destroy();
+> 
+> You're probably going to have to do this for all tools, don't you?
+
+Yeah, there are probably even more fronts to fix than the ones this test finds...
+
+I'll likely need to add more specific per-tool tests to catch them.
+Comment on attachment 8494581
+Part 1: Look for leftover fronts after toolbox close
+
+Review of attachment 8494581:
+-----------------------------------------------------------------
+
+I'm wondering if we can take most of browser_toolbox_tool_remote_reopen.js and reuse it has helper in tool-specific tests as setup/teardown helpers...
+It would create target/client and open the toolbox, then let the specific test do stuff and assertion,
+then would always assert for empty pools and cleanup stuff.
+
+::: browser/devtools/framework/test/browser_toolbox_tool_remote_reopen.js
+@@ +4,5 @@
+> +const { DebuggerServer } =
+> +  Cu.import("resource://gre/modules/devtools/dbg-server.jsm", {});
+> +const { DebuggerClient } =
+> +  Cu.import("resource://gre/modules/devtools/dbg-client.jsm", {});
+> +
+
+It could be helpful to mention the bug # here to help understanding why we have such test.
+
+@@ +75,5 @@
+> +    // look for any that remain.
+> +    for (let pool of client.__pools) {
+> +      if (!pool.__poolMap) {
+> +        continue;
+> +      }
+
+I wish we could use less super-private fields... (__pools and __poolMap)
+I imagine we can't assert pool.isEmpty() because of the framerateActor issue?
+Created attachment 8494945
+Part 1: Look for leftover fronts after toolbox close (v2, ochameau: r+)
+
+(In reply to Alexandre Poirot [:ochameau] from comment #15)
+> I'm wondering if we can take most of browser_toolbox_tool_remote_reopen.js
+> and reuse it has helper in tool-specific tests as setup/teardown helpers...
+> It would create target/client and open the toolbox, then let the specific
+> test do stuff and assertion,
+> then would always assert for empty pools and cleanup stuff.
+
+Yes, that's a great idea!  I am sure it would find even more fronts to clean up.  I've filed bug 1072720 for this.
+
+> ::: browser/devtools/framework/test/browser_toolbox_tool_remote_reopen.js
+> @@ +4,5 @@
+> > +const { DebuggerServer } =
+> > +  Cu.import("resource://gre/modules/devtools/dbg-server.jsm", {});
+> > +const { DebuggerClient } =
+> > +  Cu.import("resource://gre/modules/devtools/dbg-client.jsm", {});
+> > +
+> 
+> It could be helpful to mention the bug # here to help understanding why we
+> have such test.
+
+Added bug number and the info from my rambling comment 7 into the test.
+
+> @@ +75,5 @@
+> > +    // look for any that remain.
+> > +    for (let pool of client.__pools) {
+> > +      if (!pool.__poolMap) {
+> > +        continue;
+> > +      }
+> 
+> I wish we could use less super-private fields... (__pools and __poolMap)
+> I imagine we can't assert pool.isEmpty() because of the framerateActor issue?
+
+Yeah, I agree it's not the best...  framerateActor is one reason, but it's also nice to be able to log the problem actor's name in the test failure.
+
+It seems okay for now I think.
+
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=76b69a641847
+https://hg.mozilla.org/integration/fx-team/rev/65cffee96ccb
+https://hg.mozilla.org/integration/fx-team/rev/bdf172ee41b5
+https://hg.mozilla.org/integration/fx-team/rev/de39c9dd1805
+https://hg.mozilla.org/integration/fx-team/rev/a7ec293d1f73
+https://hg.mozilla.org/integration/fx-team/rev/d90133c40a64
+https://hg.mozilla.org/mozilla-central/rev/65cffee96ccb
+https://hg.mozilla.org/mozilla-central/rev/bdf172ee41b5
+https://hg.mozilla.org/mozilla-central/rev/de39c9dd1805
+https://hg.mozilla.org/mozilla-central/rev/a7ec293d1f73
+https://hg.mozilla.org/mozilla-central/rev/d90133c40a64

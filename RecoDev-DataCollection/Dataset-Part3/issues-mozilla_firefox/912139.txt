@@ -1,0 +1,195 @@
+During the work on the new HTTP cache backend on the gum project branch I've discovered a new intermittent failure.
+
+Gum has a preference to run the old cache or the new cache.  With the new cache the browser_social_errorPage.js failure is pretty regular:
+
+https://tbpl.mozilla.org/?tree=Gum&rev=4d6933eb8d38
+See mainly Window boxes.
+
+However, I am able after some number of iterations reproduce this also on mozilla-central build.  So this is definitely not caused by the new cache, but just by how it changes scheduling of OnStart/OnStopRequest.  Hence, this hidden problem is just caught more often.
+
+I'll attach:
+
+- logs (console with NSPR logging inlined) for good and bad run of the gum tree and also bad run of mozilla-central
+
+- a small patch adding logs to the test and enabling only the one (first) sub-test that fails
+
+During the work on the new HTTP cache backend on the gum project branch I've discovered a new intermittent failure.
+
+Gum has a preference to run the old cache or the new cache.  With the new cache the browser_social_errorPage.js failure is pretty regular:
+
+https://tbpl.mozilla.org/?tree=Gum&rev=4d6933eb8d38
+See mainly Window boxes.
+
+However, I am able after some number of iterations reproduce this also on mozilla-central build.  So this is definitely not caused by the new cache, but just by how it changes scheduling of OnStart/OnStopRequest.  Hence, this hidden problem is just caught more often.
+
+I'll attach:
+
+- logs (console with NSPR logging inlined) for good and bad run of the gum tree and also bad run of mozilla-central
+
+- a small patch adding logs to the test and enabling only the one (first) sub-test that fails
+Created attachment 798991
+[LOG] mozilla-central, bad run
+Created attachment 798992
+[LOG] GUM, bad rum
+
+It is mostly identical to the mozilla-central bad run.
+Created attachment 798993
+[LOG] GUM, good run
+
+- it's identical to mozilla-central good run (not attached, but I can provide it)
+Created attachment 798996
+[NOT FOR CHECKIN] added logs to the test
+
+- it just adds few info() logs to the test, you can then find them in the logs.
+So, here's what I've so far discovered (it is identical for both mozilla-central and gum):
+
+In any 'good' run log I can see the following order of events:
+- go offline
+- then request for social_sidebar.html is made
+- also request for social_worker.js is made
+- both of them finish before 'onLoad 1' *) in the test with 804b0010 error which is expected NETWORK_OFFLINE error
+- then 'onLoad 1' is notified and we do 'clicking 1' (= clicking the [try again] button on the error page)
+- request for social_sidebar.html is made
+- it ends with 804b0010 or 804b0002 soon (804b0002 = NS_BINDING_ABORTED)
+- no other request during this loop is made
+- then 'onLoad 2' is notified
+- we switch back to online
+- we do 'clicking 2' (=reload, now should work)
+- request for social_sidebar.html is made
+- also request for social_worker.js is made
+- 'onLoad 3' is triggered since social_sidebar.html loads successfully
+- test ends with ALL OK
+
+
+In the 'bad' run I can see a following difference:
+- between 'clicking 1' and 'onLoad 2' also request for social_worker.js is made
+- it fails with 804b0010 (we are still offline, so that is expected)
+- then after going online and 'clicking 2' (=the last reload) request for social_sidebar.html is made
+- but it is very early canceled with 804b0002 because the FrameWorker now detects it cannot parse the social_worker.js ("Error evaluating worker script"), and cancels the whole load group (where now the social_sidebar.html request is contained) with NS_BINDING_ABORTED, this happens via a relatively complicated code path which I am not deeply familiar with, but callstack for the call to Cancel on the channel included bellow the comment [1]
+
+This is a rare race condition.  I don't understand fully what's happening, since I have no clue how the FrameWorker and Social API works, but something wrong is here, definitely.
+
+*) for 'onLoad' and 'clicking' log reference see the 'added logs to the test' patch.
+
+
+[1]
+>	xul.dll!mozilla::net::nsHttpChannel::Cancel(tag_nsresult status=NS_BINDING_ABORTED)  Line 4291	C++
+ 	xul.dll!nsLoadGroup::Cancel(tag_nsresult status=NS_BINDING_ABORTED)  Line 292 + 0x18 bytes	C++
+ 	xul.dll!nsDocLoader::Stop()  Line 268 + 0x21 bytes	C++
+ 	xul.dll!nsDocShell::Stop()  Line 192	C++
+ 	xul.dll!nsDocShell::Stop(unsigned int aStopFlags=0x00000003)  Line 4722	C++
+ 	xul.dll!nsDocShell::Destroy()  Line 4989	C++
+ 	xul.dll!nsFrameLoader::Finalize()  Line 590	C++
+ 	xul.dll!nsDocument::MaybeInitializeFinalizeFrameLoaders()  Line 6316	C++
+ 	xul.dll!nsDocument::EndUpdate(unsigned int aUpdateType=0x00000001)  Line 4489	C++
+ 	xul.dll!nsHTMLDocument::EndUpdate(unsigned int aUpdateType=0x00000001)  Line 2542	C++
+ 	xul.dll!mozAutoDocUpdate::~mozAutoDocUpdate()  Line 40	C++
+ 	xul.dll!nsINode::doRemoveChildAt(unsigned int aIndex=0x00000005, bool aNotify=true, nsIContent * aKid=0x10249558, nsAttrAndChildArray & aChildArray={...})  Line 1517 + 0x8 bytes	C++
+ 	xul.dll!mozilla::dom::FragmentOrElement::RemoveChildAt(unsigned int aIndex=0x00000005, bool aNotify=true)  Line 966	C++
+ 	xul.dll!nsINode::RemoveChild(nsINode & aOldChild={...}, mozilla::ErrorResult & aError={...})  Line 460	C++
+ 	xul.dll!mozilla::dom::NodeBinding::removeChild(JSContext * cx=0x008dda68, JS::Handle<JSObject *> obj={...}, nsINode * self=0x1017c550, const JSJitMethodCallArgs & args={...})  Line 626 + 0x19 bytes	C++
+ 	xul.dll!mozilla::dom::NodeBinding::genericMethod(JSContext * cx=0x008dda68, unsigned int argc=0x00000001, JS::Value * vp=0x0020c260)  Line 1182 + 0x26 bytes	C++
+ 	mozjs.dll!js::CallJSNative(JSContext * cx=0x008dda68, bool (JSContext *, unsigned int, JS::Value *)* native=0x535c3f00, const JS::CallArgs & args={...})  Line 219 + 0x19 bytes	C++
+
+0 anonymous(    <Failed to get 'arguments' while inspecting stack frame>
+) ["resource://gre/modules/FrameWorker.jsm":131]
+    this = [object Object]
+1 anonymous(    <Failed to get 'arguments' while inspecting stack frame>
+) ["resource://gre/modules/Promise.jsm":568]
+    this = [object Object]
+2 anonymous(    <Failed to get 'arguments' while inspecting stack frame>
+) ["resource://gre/modules/Promise.jsm":350]
+    this = [object Object]
+
+
+gum base @ 065727546e13
+m-c @ 065727546e13
+Created attachment 799244
+[EXPERIMENTAL] ensure worker is loaded before going offline.
+
+The test is assuming only sidebar errors - but what we are seeing is a "worker" error - clicking the "try again" on a worker error page reloads the worker, which is the stack in comment 5.
+
+I think the problem is simply that the worker hasn't fully loaded by the time we go offline, hence we see the worker error page and the reload causes the sidebar to stop loading.  The notification of a worker error is via postMessage, so it's likely being acted on *after* the sidebar error.  If this is the case, the solution is to wait for the worker to fully load before going offline - then no worker errors should be seen by the test.
+
+I can't repro this locally, but the this patch should achieve that - it would be great to see if it fixes the problem.
+(In reply to Mark Hammond (:markh) from comment #6)
+> Created attachment 799244
+> [EXPERIMENTAL] ensure worker is loaded before going offline.
+
+Are you sure that is the right patch?
+(In reply to Mark Hammond (:markh) from comment #6)
+> the solution is to wait for the worker to fully load
+> before going offline - then no worker errors should be seen by the test.
+
+Hmm... but we go offline and THEN we try to load the side bar.  Didn't you want to write 'before going online' ?
+Created attachment 799829
+Ensure worker is loaded before going offline.
+
+Oops - yeah, I uploaded the same patch.
+
+(In reply to Honza Bambas (:mayhemer) from comment #8)
+> (In reply to Mark Hammond (:markh) from comment #6)
+> > the solution is to wait for the worker to fully load
+> > before going offline - then no worker errors should be seen by the test.
+> 
+> Hmm... but we go offline and THEN we try to load the side bar.  Didn't you
+> want to write 'before going online' ?
+
+Nope.  A social provider has a number of different components, including a "worker" and a "sidebar".  The test is checking what happens if we try and load the *sidebar* when the network is down, but it implicitly assumes the *worker* has loaded OK.
+
+So this patch just ensures the *worker* is loaded, then goes offline, then attempts to load the sidebar.
+(In reply to Mark Hammond (:markh) from comment #9)
+> Created attachment 799829
+> [EXPERIMENTAL] ensure worker is loaded before going offline.
+> 
+> Oops - yeah, I uploaded the same patch.
+
+*sigh* - I uploaded the *wrong* patch.
+Comment on attachment 799829
+Ensure worker is loaded before going offline.
+
+https://tbpl.mozilla.org/?tree=Try&rev=176981692cb0
+
+I'll also try locally.
+
+Thanks for quick reply!
+Unreproducible locally.
+
+Should we do something about the FrameWorker and SocialAPI code it self or is this just and only about a badly written test?
+(In reply to Honza Bambas (:mayhemer) from comment #11)
+> https://tbpl.mozilla.org/?tree=Try&rev=176981692cb0
+
+
+Grrr... bad build... I forgot to turn the new backend on.
+
+The correct push: https://tbpl.mozilla.org/?tree=Try&rev=fbd648bd1a27
+Comment on attachment 799829
+Ensure worker is loaded before going offline.
+
+(In reply to Honza Bambas (:mayhemer) from comment #12)
+> Unreproducible locally.
+> 
+> Should we do something about the FrameWorker and SocialAPI code it self or
+> is this just and only about a badly written test?
+
+It's just the test making poor assumptions.  I guess there *might* be a real issue if the user manages to click "try again" in between the worker and the sidebar reporting an error state, but this would be exceedingly unlikely and fixed simply by clicking "try again" one more time.
+
+That try looks green and I think my patch is fine to go with - I'll ask Shane to review it.
+Comment on attachment 799829
+Ensure worker is loaded before going offline.
+
+Already looked through this earlier, r+.  One improvement, if you want to consider it, maybe we should be doing this wait in runSocialTestWithProvider.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #15)
+> Already looked through this earlier, r+.  One improvement, if you want to
+> consider it, maybe we should be doing this wait in runSocialTestWithProvider.
+
+I think that's something we could consider for later, but most tests aren't going to hit this as most tests that rely on workers use a worker port, and this will already do the right thing.
+
+To put it another way, if my week wasn't already over, I'd probably knock up a patch that does this :)  But my week is over, so if someone wants to land this in the meantime, please go ahead and we can consider Shane's suggestion in a followup.
+Comment on attachment 799829
+Ensure worker is loaded before going offline.
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/0d651ed131b3
+https://hg.mozilla.org/mozilla-central/rev/0d651ed131b3
+https://hg.mozilla.org/releases/mozilla-aurora/rev/4f2dd6784169
+https://hg.mozilla.org/releases/mozilla-beta/rev/f6273640c6e3

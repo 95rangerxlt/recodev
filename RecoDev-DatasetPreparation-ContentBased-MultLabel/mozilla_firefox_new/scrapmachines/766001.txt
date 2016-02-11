@@ -1,0 +1,1718 @@
+Right now, it opens to view source with the line highlighted, instead it should open the script in the debugger's view.
+
+Right now, it opens to view source with the line highlighted, instead it should open the script in the debugger's view.
+Sounds like a good idea to me. Do others agree?
+In principle it seems like a good idea, but I wonder in how many corner cases it will misbehave. The problem is that until the debugger is opened, the page isn't set up for debugging. By that time, the script that caused the error or message may be long gone (GC'd), in which case the debugger won't be able to find it (cf. bug 758663).
+
+I do think that some experimentation is warranted, however.
+I think it's definitely worth trying. I also think the cases where the script has been evicted are going to be pretty infrequent and not sure what the current link scheme would give you anyway.
+
++1!
+(In reply to Nick Fitzgerald :fitzgen from comment #0)
+> Right now, it opens to view source with the line highlighted, instead it
+> should open the script in the debugger's view.
+
+We should do this for the error console as well, that's the first place I go to for JS error.
+We could, although without Chrome Debugging, that's not going to make a lot of sense in the case of a browser error.
+My use case is when I'm developing my own sites (mostly the profiler frontend website) I'd like to be able to open source line in the debugger from where I could set a break point. I think this would improve the workflow for web developers.
+Right now this bug cannot be fixed as there just after loading the Debugger, it starts loading the first script in the list (alphabetically sorted), then I change the script to the desired script, it gets changed, but as soon as the previously started loading of the first script finishes, the source-editor is filled with text of that script, without even changing the name of the script in the menu list. And after that the Debugger behaves as the content loaded in the source editor belongs to the second script that I switched to.
+
+Here is the code that use to do the same:
+
+function openScript(aSourceURL) {
+  let scriptsView = dbg.DebuggerView.Scripts;
+  let scriptLocations = scriptsView.scriptLocations;
+  if (scriptLocations.indexOf(aSourceURL) === -1) {
+    return;
+  }
+  scriptsView.selectScript(aSourceURL);
+}
+
+let dbg = null, debuggerOpenedByThis = false;
+if (this.chromeWindow.DebuggerUI.getDebugger() == null) {
+  this.chromeWindow.DebuggerUI.toggleDebugger();
+  dbg = this.chromeWindow.DebuggerUI.getDebugger().contentWindow;
+  let self = this;
+  dbg.addEventListener("Debugger:Connecting", function onConnecting() {
+    dbg.removeEventListener("Debugger:Connecting", onConnecting);
+    dbg.addEventListener("Debugger:AfterScriptsAdded", function onScriptsAdded() {
+      dbg.removeEventListener("Debugger:AfterScriptsAdded", onScriptsAdded);
+      openScript.call(self, <url of script that is not the first script in the menu list>);
+    });
+  });
+}
+Created attachment 661528
+patch without test
+
+This patch also fixes bug 791323, thus asking feedback from Panos too.
+
+Also, can you please apply this patch (which requires patch from bug 782653 applied first) and then follow these simple STRs:
+
+1. open a new tab
+2. Open web console and have only the JS filer on.
+3. Load http://grssam.com on that page.
+4. 2 kind of errors appear, one is from jquery.js:2, and other is from isolate.html
+5. Clicking the jquery.js link opens the jqyery file in the debugger and focuses line 2, as expected.
+6. Clicking on isolate.html link opens the source view.
+7. Now close the debugger, reopen it, reload the page, wait for load complete, all the time keeping the web console open.
+8. Now click the isolate.html error link (one of the new ones).
+9 The file is opened in debugger properly.
+
+I am confused.
+There are two different isolate.html's the STR are reproducible for only 1 of them, ending with 'match'. For the other one, it always open in view source.
+Comment on attachment 661528
+patch without test
+
+Switching to Rob as Mihai is really busy :)
+Comment on attachment 661528
+patch without test
+
+Review of attachment 661528:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +1325,5 @@
+>    function SS__onLoadSourceFinished(aScriptUrl, aSourceText, aContentType, aOptions) {
+> +    if (!DebuggerView.Scripts.isSelected(aScriptUrl)) {
+> +      // The script is no longer visible, returning.
+> +      return;
+> +    }
+
+This needs a test in bug 791323.
+
+Also, note that source loading scenarios will soon be changed by work done in bug 755661 (which by the looks of it, it's pretty close to landing). I'm not sure about the implications of making such changes beforehand (maybe none). It may even be possible to prevent the source from loading in such cases, which would be a pretty good thing to do imho. Past has been monitoring work in 755661 closer, so he knows best.
+(In reply to Victor Porof [:vp] from comment #11)
+> 
+> Also, note that source loading scenarios will soon be changed by work done
+> in bug 755661 (which by the looks of it, it's pretty close to landing). I'm
+> not sure about the implications of making such changes beforehand (maybe
+> none). It may even be possible to prevent the source from loading in such
+> cases, which would be a pretty good thing to do imho. Past has been
+> monitoring work in 755661 closer, so he knows best.
+
+Will bug 755661 fix 791323 too ?
+Comment on attachment 661528
+patch without test
+
+Review of attachment 661528:
+-----------------------------------------------------------------
+
+The problem you are having with the isolate.html in your site is that it's executed during page load and then scavenged before the debugger gets a chance to observe its existence. This is a common behavior in debuggers, and you need to reload the page with the debugger open to see the script. It is what I described in comment 2.
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +1325,5 @@
+>    function SS__onLoadSourceFinished(aScriptUrl, aSourceText, aContentType, aOptions) {
+> +    if (!DebuggerView.Scripts.isSelected(aScriptUrl)) {
+> +      // The script is no longer visible, returning.
+> +      return;
+> +    }
+
+As Victor said, this is going to change significantly in bug 755661. In any case, if we need to bail out before updating the editor with the script contents, we should at the very least not throw it away, but rather store it in the element, before returning early.
+
+Also, when you close the debugger UI in viewSourceInDebugger this handler is still running, so you need to return early if DebuggerView.Scripts is undefined.
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +1113,5 @@
+> +      if (scriptsView.scriptLocations.indexOf(aSourceURL) == -1) {
+> +        if (debuggerOpenedByThis) {
+> +          this.chromeWindow.DebuggerUI.toggleDebugger();
+> +        }
+> +        // Open view source if style editor fails.
+
+You probably mean "debugger fails" here.
+
+@@ +1148,5 @@
+> +    debuggerOpenedByThis = true;
+> +    dbg = this.chromeWindow.DebuggerUI.getDebugger().contentWindow;
+> +    let self = this;
+> +
+> +    dbg.addEventListener("Debugger:Connecting", function onConnecting() {
+
+You don't need to wait for this event, since it's AfterScriptsAdded you are interested in.
+
+::: browser/devtools/webconsole/webconsole.js
+@@ +2169,4 @@
+>            win.focus();
+>          }
+>        }
+> +      else if (locationNode.parentNode.category == CATEGORY_JS) {
+
+I think we would want to open the debugger in the case of console API calls, too.
+(In reply to Panos Astithas [:past] from comment #13)
+> The problem you are having with the isolate.html in your site is that it's
+> executed during page load and then scavenged before the debugger gets a
+> chance to observe its existence. This is a common behavior in debuggers, and
+> you need to reload the page with the debugger open to see the script. It is
+> what I described in comment 2.
+
+Oh, so there is no way to have it in the first run. But this brings about a bad UI that first the debugger opens up, and then suddenly closes and then view source opens up. Is there no way to get the script list without opening the debugger (atleast not visibly opening it) ?
+
+> ::: browser/devtools/debugger/debugger-controller.js
+> @@ +1325,5 @@
+> >    function SS__onLoadSourceFinished(aScriptUrl, aSourceText, aContentType, aOptions) {
+> > +    if (!DebuggerView.Scripts.isSelected(aScriptUrl)) {
+> > +      // The script is no longer visible, returning.
+> > +      return;
+> > +    }
+> 
+> As Victor said, this is going to change significantly in bug 755661. In any
+> case, if we need to bail out before updating the editor with the script
+> contents, we should at the very least not throw it away, but rather store it
+> in the element, before returning early.
+> 
+> Also, when you close the debugger UI in viewSourceInDebugger this handler is
+> still running, so you need to return early if DebuggerView.Scripts is
+> undefined.
+
+Ok, got you about checking if Scripts is undefined or not.
+On the saving the source somewhere, how should it be stored and how can it me made use of later on, does some logic already exist like that, I guess it is, as when you load one script, go to another, and come back, then Loading sign does not show up. Will follow up this in its original bug then.
+
+> ::: browser/devtools/webconsole/HUDService.jsm
+> @@ +1113,5 @@
+> > +      if (scriptsView.scriptLocations.indexOf(aSourceURL) == -1) {
+> > +        if (debuggerOpenedByThis) {
+> > +          this.chromeWindow.DebuggerUI.toggleDebugger();
+> > +        }
+> > +        // Open view source if style editor fails.
+> 
+> You probably mean "debugger fails" here.
+
+Yes, copy paste error :P
+
+> @@ +1148,5 @@
+> > +    debuggerOpenedByThis = true;
+> > +    dbg = this.chromeWindow.DebuggerUI.getDebugger().contentWindow;
+> > +    let self = this;
+> > +
+> > +    dbg.addEventListener("Debugger:Connecting", function onConnecting() {
+> 
+> You don't need to wait for this event, since it's AfterScriptsAdded you are
+> interested in.
+
+Yes, at first, I was having some issues due to the bug 791323, so I added this, will remove it in next iteration.
+
+> ::: browser/devtools/webconsole/webconsole.js
+> @@ +2169,4 @@
+> >            win.focus();
+> >          }
+> >        }
+> > +      else if (locationNode.parentNode.category == CATEGORY_JS) {
+> 
+> I think we would want to open the debugger in the case of console API calls,
+> too.
+
+Like console.log etc ?
+(In reply to Girish Sharma [:Optimizer] from comment #14)
+> (In reply to Panos Astithas [:past] from comment #13)
+> > The problem you are having with the isolate.html in your site is that it's
+> > executed during page load and then scavenged before the debugger gets a
+> > chance to observe its existence. This is a common behavior in debuggers, and
+> > you need to reload the page with the debugger open to see the script. It is
+> > what I described in comment 2.
+> 
+> Oh, so there is no way to have it in the first run. But this brings about a
+> bad UI that first the debugger opens up, and then suddenly closes and then
+> view source opens up. Is there no way to get the script list without opening
+> the debugger (atleast not visibly opening it) ?
+
+There is no such way right now, but it is something we could perhaps tweak our UI setup phase to provide. However, I'm not convinced it would be worth the effort and the ugliness. Also, in the cases where view source would be the ultimate destination, the delay from starting the debugger backend first, may still be noticeable.
+
+Perhaps a scratchpad/view-source mode for the debugger would make better sense, I don't know. Just opening the UI and loading the specified URL in the editor. It would appear consistent to the user, but perhaps not that useful.
+
+> > ::: browser/devtools/debugger/debugger-controller.js
+> > @@ +1325,5 @@
+> > >    function SS__onLoadSourceFinished(aScriptUrl, aSourceText, aContentType, aOptions) {
+> > > +    if (!DebuggerView.Scripts.isSelected(aScriptUrl)) {
+> > > +      // The script is no longer visible, returning.
+> > > +      return;
+> > > +    }
+> > 
+> > As Victor said, this is going to change significantly in bug 755661. In any
+> > case, if we need to bail out before updating the editor with the script
+> > contents, we should at the very least not throw it away, but rather store it
+> > in the element, before returning early.
+> > 
+> > Also, when you close the debugger UI in viewSourceInDebugger this handler is
+> > still running, so you need to return early if DebuggerView.Scripts is
+> > undefined.
+> 
+> Ok, got you about checking if Scripts is undefined or not.
+> On the saving the source somewhere, how should it be stored and how can it
+> me made use of later on, does some logic already exist like that, I guess it
+> is, as when you load one script, go to another, and come back, then Loading
+> sign does not show up. Will follow up this in its original bug then.
+
+Just move your conditional before the other conditional in that method.
+
+> > ::: browser/devtools/webconsole/webconsole.js
+> > @@ +2169,4 @@
+> > >            win.focus();
+> > >          }
+> > >        }
+> > > +      else if (locationNode.parentNode.category == CATEGORY_JS) {
+> > 
+> > I think we would want to open the debugger in the case of console API calls,
+> > too.
+> 
+> Like console.log etc ?
+
+Exactly.
+unassigning myself as nothing is decided here.
+Comment on attachment 661528
+patch without test
+
+I think the approach is fine here.
+(In reply to Rob Campbell [:rc] (:robcee) from comment #17)
+> Comment on attachment 661528
+> patch without test
+> 
+> I think the approach is fine here.
+
+I would like to highlight that this approach is no longer valid, as the code to open the script and select the line will drastically change (or atleast should change) after bug 791323 gets solved, which in turn is on hold due to some other bug that Victor mentioned on IRC.
+(In reply to Rob Campbell [:rc] (:robcee) from comment #17)
+> Comment on attachment 661528
+> patch without test
+> 
+> I think the approach is fine here.
+
+Are you OK with the experience mentioned in comment 14 (flashing the debugger before opening view source)?
+(In reply to Panos Astithas [:past] from comment #19)
+> (In reply to Rob Campbell [:rc] (:robcee) from comment #17)
+> > Comment on attachment 661528
+> > patch without test
+> > 
+> > I think the approach is fine here.
+> 
+> Are you OK with the experience mentioned in comment 14 (flashing the
+> debugger before opening view source)?
+
+I personally don't fancy it. There are ways to get around the flashing, but they're all ugly (ux-wise and code-wise). We should just make sure that the debugger stays open.
+
+This is a pretty awkward problem, since the debugger has no way of knowing for sure if a script would eventually show up.
+
+We could just "trust" the webconsole to provide a correct source url when starting the debugger. We could even pass the entire source text contents when doing so (if available?). That's probably a bad idea.
+
+Another thing that's possible is faking/forcing a newscript event to be fired with the required source. That's also probably a bad idea.
+But let's just choose an idea :)
+(In reply to Victor Porof [:vp] from comment #20)
+> (In reply to Panos Astithas [:past] from comment #19)
+> > (In reply to Rob Campbell [:rc] (:robcee) from comment #17)
+> > > Comment on attachment 661528
+> > > patch without test
+> > > 
+> > > I think the approach is fine here.
+> > 
+> > Are you OK with the experience mentioned in comment 14 (flashing the
+> > debugger before opening view source)?
+> 
+> I personally don't fancy it. There are ways to get around the flashing, but
+> they're all ugly (ux-wise and code-wise). We should just make sure that the
+> debugger stays open.
+> 
+> This is a pretty awkward problem, since the debugger has no way of knowing
+> for sure if a script would eventually show up.
+> 
+> We could just "trust" the webconsole to provide a correct source url when
+> starting the debugger. We could even pass the entire source text contents
+> when doing so (if available?). That's probably a bad idea.
+> 
+> Another thing that's possible is faking/forcing a newscript event to be
+> fired with the required source. That's also probably a bad idea.
+> But let's just choose an idea :)
+
+I think I'd like a combination of your bad ideas :-) If we don't get the server to fetch the source we will have the well-known problems with remote debugging. If we added a protocol operation like { to: "conn0.context2", type: "loadSource", url: "..." }, then this should work. Even breakpoints would work after a reload.
+
+Jim, how does that sound? It seems weird that the client would know more about the server about what sources exist in the page, but that's exactly what happens when the debugger is opened after a page was loaded.
+Note that this is needed for getting links in the web console to work when clicked for b2g, unless we want to teach view-source about the remote protocol of course.
+@Panos, Victor and Rob
+
+Correct me if I am wrong:
+
+1. Even though this is needed for b2g, the code will still reside in webconsole and is not required from the Debugger side.
+2. If the script is not found in the Debugger, I leave it open and then show Source View.
+3. If the script is not found in Debugger, I try to load it by following the same steps as in _onNewScript with a hardcoded url of the script. (btw, what is aPacket.source in that function)
+
+If this is final, I can start working on this one. Although bug 791323 might still be needed to get fixed, but not as per what its current summary is, but as per what actually it was supposed to do.
+(In reply to Girish Sharma [:Optimizer] from comment #23)
+> @Panos, Victor and Rob
+> 
+> Correct me if I am wrong:
+> 
+> 1. Even though this is needed for b2g, the code will still reside in
+> webconsole and is not required from the Debugger side.
+> 2. If the script is not found in the Debugger, I leave it open and then show
+> Source View.
+> 3. If the script is not found in Debugger, I try to load it by following the
+> same steps as in _onNewScript with a hardcoded url of the script. (btw, what
+> is aPacket.source in that function)
+> 
+> If this is final, I can start working on this one. Although bug 791323 might
+> still be needed to get fixed, but not as per what its current summary is,
+> but as per what actually it was supposed to do.
+
+No, I don't think this is good UX. Opening the debugger for no apparent reason (since the file is eventually displayed in view source) is bad, and simulating the file load on the client will lead to even more confusion, since for example breakpoints won't work.
+(In reply to Panos Astithas [:past] from comment #24)
+> > 2. If the script is not found in the Debugger, I leave it open and then show
+> > Source View.
+
+Okay, then close the debugger. though even that is a bad UX . Opening and closing without any apparent result.
+
+> simulating the file load on the client will lead to even more confusion,
+> since for example breakpoints won't work.
+
+What do you mean by simulating the file load on client. What I meant by my comment was simply follow the same step what debugger follows to request for the source of the file when the file url could not be found in the list of scripts.
+So basically I will be tricking Debugger to load the file url that is not in the scripts list yet. Its like doing the same thing which is done when the file is present in the scripts list and user selected that script from the menulist.
+(In reply to Girish Sharma [:Optimizer] from comment #25)
+> (In reply to Panos Astithas [:past] from comment #24)
+> > simulating the file load on the client will lead to even more confusion,
+> > since for example breakpoints won't work.
+> 
+> What do you mean by simulating the file load on client. What I meant by my
+> comment was simply follow the same step what debugger follows to request for
+> the source of the file when the file url could not be found in the list of
+> scripts.
+> So basically I will be tricking Debugger to load the file url that is not in
+> the scripts list yet. Its like doing the same thing which is done when the
+> file is present in the scripts list and user selected that script from the
+> menulist.
+
+Script loading takes place in the server side, based on information the server collects from the page. There is no way for the client to request a new script to appear, hence the new protocol request suggested in comment 21.
+So then we call the server with this "loadSource" and the url that we want the server to load, the server looks for it, and if it is possible to load it, fires the "newScript" notification, or it directly returns the source of the url requested ?
+Created attachment 692717
+patch v0.1 wihtout tests
+
+This patch is much better, many thanks to Victor.
+
+It solves the Debugger flashing problem when the source is not present in the debugger, as there is only one toolbox now, so I just switch back to Web Console. No flashing.
+
+Working on tests now.
+Created attachment 692724
+patch v1.0
+
+Ready for review. Handles all the possible combinations. Test coming in a separate patch.
+Created attachment 692725
+patch v1.1
+
+Accidentally changed an existing test.
+
+Why god why ... :(
+Created attachment 692739
+test for patch v1.1
+
+Added tests. Tests for 3 cases:
+
+1. Debugger loaded for first time.
+2. Debugger already loaded and a new file selected.
+3. Debugger already loaded and an already loaded file selected.
+Comment on attachment 692725
+patch v1.1
+
+Review of attachment 692725:
+-----------------------------------------------------------------
+
+asking for some additional review on this.
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +557,5 @@
+> +   */
+> +  viewSourceInDebugger:
+> +  function WC_viewSourceInDebugger(aSourceURL, aSourceLine)
+> +  {
+> +
+
+nit: blank line.
+
+@@ +559,5 @@
+> +  function WC_viewSourceInDebugger(aSourceURL, aSourceLine)
+> +  {
+> +
+> +    function openScript() {
+> +      gView = dbg.panelWin.DebuggerView;
+
+Does this to be a global? Why?
+
+@@ +566,5 @@
+> +            gView.Sources.getItemByValue(aSourceURL).attachment.loaded) {
+> +          gView.editor.setCaretPosition(aSourceLine - 1);
+> +          return;
+> +        }
+> +        dbg.panelWin.addEventListener("Debugger:SourceShown", 
+
+nit: trailing whitespace.
+
+@@ +578,5 @@
+> +        gView.Sources.preferredSource = aSourceURL;
+> +      }
+> +      else {
+> +        // Switch back to web console and open view source if script not found.
+> +        gDevTools.showToolbox(target,"webconsole");
+
+nit: space between , and "webconsole".
+
+@@ +585,5 @@
+> +    }
+> +
+> +    let target = TargetFactory.forTab(this.tab);
+> +    let gDevTools = this.chromeWindow.gDevTools;
+> +    let self = this, dbg = null, gView;
+
+why declare dbg here? Why on a comma?
+
+I'd prefer to see this block of declarations at the top of your viewSourceInDebugger function. It makes this easier to follow.
+
+I'd also place the declaration for openScript underneath the following showToolbox code. That's a personal preference though.
+(In reply to Rob Campbell [:rc] (:robcee) from comment #32)
+> nit: blank line.
+
+noted.
+
+> @@ +559,5 @@
+> > +  function WC_viewSourceInDebugger(aSourceURL, aSourceLine)
+> > +  {
+> > +
+> > +    function openScript() {
+> > +      gView = dbg.panelWin.DebuggerView;
+> 
+> Does this to be a global? Why?
+
+You are right, no need.
+
+> @@ +566,5 @@
+> > +            gView.Sources.getItemByValue(aSourceURL).attachment.loaded) {
+> > +          gView.editor.setCaretPosition(aSourceLine - 1);
+> > +          return;
+> > +        }
+> > +        dbg.panelWin.addEventListener("Debugger:SourceShown", 
+> 
+> nit: trailing whitespace.
+
+noted.
+
+> @@ +578,5 @@
+> > +        gView.Sources.preferredSource = aSourceURL;
+> > +      }
+> > +      else {
+> > +        // Switch back to web console and open view source if script not found.
+> > +        gDevTools.showToolbox(target,"webconsole");
+> 
+> nit: space between , and "webconsole".
+
+noted.
+
+> @@ +585,5 @@
+> > +    }
+> > +
+> > +    let target = TargetFactory.forTab(this.tab);
+> > +    let gDevTools = this.chromeWindow.gDevTools;
+> > +    let self = this, dbg = null, gView;
+> 
+> why declare dbg here? Why on a comma?
+
+It can be moved to separate line.
+
+> I'd prefer to see this block of declarations at the top of your
+> viewSourceInDebugger function. It makes this easier to follow.
+
+Due to "use strict" , I cannot declare variables before functions. Although I can make the openScript method a variable.
+
+> I'd also place the declaration for openScript underneath the following
+> showToolbox code. That's a personal preference though.
+
+Same as above.
+(In reply to Girish Sharma [:Optimizer] from comment #33)
+> (In reply to Rob Campbell [:rc] (:robcee) from comment #32)
+> > nit: blank line.
+> 
+> It can be moved to separate line.
+> 
+> > I'd prefer to see this block of declarations at the top of your
+> > viewSourceInDebugger function. It makes this easier to follow.
+> 
+> Due to "use strict" , I cannot declare variables before functions. Although
+> I can make the openScript method a variable.
+> 
+> > I'd also place the declaration for openScript underneath the following
+> > showToolbox code. That's a personal preference though.
+> 
+> Same as above.
+
+Nope. Function declarations may appear at the top level or directly (anywhere) inside a function body, but not inside a descendant block scope. Function hoisting is permitted in strict mode AFAIK.
+Comment on attachment 692725
+patch v1.1
+
+Review of attachment 692725:
+-----------------------------------------------------------------
+
+There many redundancies in this implementation.
+
+The "preferredSource" setter isn't used correctly; it's supposed to mean "This is the source I'd like to show in the debugger. If it's already displayed, then it's all good. If not, then if at some point I know of its existence, I'll select and show it automatically". There's also no way of avoiding the debugger flashing if we want the implementation to be correct.
+
+Here's something I just baked in Scratchpad for the purpose of this bug: https://gist.github.com/d06c98cf47dc1fe43f53
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +562,5 @@
+> +    function openScript() {
+> +      gView = dbg.panelWin.DebuggerView;
+> +      if (gView.Sources.containsValue(aSourceURL)) {
+> +        if (gView.Sources.selectedValue == aSourceURL &&
+> +            gView.Sources.getItemByValue(aSourceURL).attachment.loaded) {
+
+Checking for the load state is redundant. If the source is selected, then it's surely also loaded and displayed.
+
+@@ +567,5 @@
+> +          gView.editor.setCaretPosition(aSourceLine - 1);
+> +          return;
+> +        }
+> +        dbg.panelWin.addEventListener("Debugger:SourceShown", 
+> +                                      function sourceShown() {
+
+nit: function expression on the same line.
+
+@@ +568,5 @@
+> +          return;
+> +        }
+> +        dbg.panelWin.addEventListener("Debugger:SourceShown", 
+> +                                      function sourceShown() {
+> +          if (gView.Sources.selectedValue != aSourceURL) {
+
+You should use aEvent.detail.url here.
+
+@@ +571,5 @@
+> +                                      function sourceShown() {
+> +          if (gView.Sources.selectedValue != aSourceURL) {
+> +            return;
+> +          }
+> +          dbg.panelWin.removeEventListener("Debugger:SourceShown", sourceShown);
+
+It seems to me that there are a few cases in which this listener is never removed.
+
+@@ +574,5 @@
+> +          }
+> +          dbg.panelWin.removeEventListener("Debugger:SourceShown", sourceShown);
+> +          gView.editor.setCaretPosition(aSourceLine - 1);
+> +        });
+> +        gView.Sources.preferredSource = aSourceURL;
+
+Setting the preferredSource here is pretty much identical to setting the selectedValue. It has a different use.
+
+@@ +588,5 @@
+> +    let gDevTools = this.chromeWindow.gDevTools;
+> +    let self = this, dbg = null, gView;
+> +    gDevTools.showToolbox(target, "jsdebugger").then(function(toolbox) {
+> +      dbg = toolbox.getCurrentPanel();
+> +      if (dbg.panelWin.gClient) {
+
+No need to check if the debugger is connected.
+
+@@ +592,5 @@
+> +      if (dbg.panelWin.gClient) {
+> +        openScript();
+> +        return;
+> +      }
+> +      dbg.once("connected", function() {
+
+No need to wait for the debugger to connect.
+
+@@ +593,5 @@
+> +        openScript();
+> +        return;
+> +      }
+> +      dbg.once("connected", function() {
+> +        dbg.panelWin.gClient.addOneTimeListener("resumed", function() {
+
+No need to wait for the initial resume.
+(In reply to Victor Porof [:vp] from comment #35)
+> Comment on attachment 692725
+> patch v1.1
+> 
+> Review of attachment 692725:
+> -----------------------------------------------------------------
+> 
+> There many redundancies in this implementation.
+> 
+> The "preferredSource" setter isn't used correctly; it's supposed to mean
+> "This is the source I'd like to show in the debugger. If it's already
+> displayed, then it's all good. If not, then if at some point I know of its
+> existence, I'll select and show it automatically". There's also no way of
+> avoiding the debugger flashing if we want the implementation to be correct.
+> 
+> Here's something I just baked in Scratchpad for the purpose of this bug:
+> https://gist.github.com/d06c98cf47dc1fe43f53
+
+I was not exactly sure of the exact meaning of "preferredSource", but I guessed that only. For this patch, the use case is that user is clicking on some log/exception from Web Console, so I assumed that the source is already available to the debugger server and it will not be present in future, but is present in present. That sounds weird..
+
+> > +            gView.Sources.getItemByValue(aSourceURL).attachment.loaded) {
+> 
+> Checking for the load state is redundant. If the source is selected, then
+> it's surely also loaded and displayed.
+
+This happened for me when the debugger is loaded the first time, the selected value was the url, but it was not loaded, so always the first line for selected in the editor. May be due to some race conditions ?
+
+> > +        dbg.panelWin.addEventListener("Debugger:SourceShown", 
+> > +                                      function sourceShown() {
+> 
+> nit: function expression on the same line.
+
+You mean like :
+
+dbg.panelWin.addEventListener("Debugger:SourceShown", function
+                              sourceShown() {
+
+?
+
+> > +                                      function sourceShown() {
+> > +          if (gView.Sources.selectedValue != aSourceURL) {
+> 
+> You should use aEvent.detail.url here.
+
+noted.
+
+> @@ +571,5 @@
+> > +                                      function sourceShown() {
+> > +          if (gView.Sources.selectedValue != aSourceURL) {
+> > +            return;
+> > +          }
+> > +          dbg.panelWin.removeEventListener("Debugger:SourceShown", sourceShown);
+> 
+> It seems to me that there are a few cases in which this listener is never
+> removed.
+
+As I have already checked whether the source is in the list of known sources and is not already selected, it is bound to be loaded at some time.
+
+
+> > +        gView.Sources.preferredSource = aSourceURL;
+> 
+> Setting the preferredSource here is pretty much identical to setting the
+> selectedValue. It has a different use.
+
+Might be.
+
+> @@ +588,5 @@
+> > +    let gDevTools = this.chromeWindow.gDevTools;
+> > +    let self = this, dbg = null, gView;
+> > +    gDevTools.showToolbox(target, "jsdebugger").then(function(toolbox) {
+> > +      dbg = toolbox.getCurrentPanel();
+> > +      if (dbg.panelWin.gClient) {
+> 
+> No need to check if the debugger is connected.
+
+This is done for the case when the debugger is already loaded once. the showToolbox method has no way of telling user whether the tool was just selected or opened, so I have to check like this. But ...
+
+> > +      dbg.once("connected", function() {
+> 
+> No need to wait for the debugger to connect.
+
+.. if this ...
+
+> > +      dbg.once("connected", function() {
+> > +        dbg.panelWin.gClient.addOneTimeListener("resumed", function() {
+> 
+> No need to wait for the initial resume.
+
+.. and this are not required, I can do away with the check.
+
+So my question is: Is it wrong to assume that the source is already present to the server, and will be fetched as soon as the debugger is opened for the first time ? As the source already showed up on Web Console, the only way that it is not with the debugger is that it is now deleted. Is this assumption incorrect ?
+(In reply to Victor Porof [:vp] from comment #35)
+> Here's something I just baked in Scratchpad for the purpose of this bug:
+> https://gist.github.com/d06c98cf47dc1fe43f53
+
+So, this approach will flash debugger for more time, but I think that it is much better than my approach to only consider the then loaded list of scripts. It might be true that the server *has* the script which is responsible for exception/console message in web console, but due to ordering it might not reach the client at the point when I was checking. And this is also why my try was failing for certain debug builds.
+
+I will resubmit with Victor's implementation, and we can then decide on the time to wait for the script.
+(In reply to Girish Sharma [:Optimizer] from comment #36)
+> (In reply to Victor Porof [:vp] from comment #35)
+> 
+> This happened for me when the debugger is loaded the first time, the
+> selected value was the url, but it was not loaded, so always the first line
+> for selected in the editor. May be due to some race conditions ? 
+
+If Panos thinks the timeout is unnecessary, then you can remove it, or use a smaller delay.
+ 
+> This is done for the case when the debugger is already loaded once. the
+> showToolbox method has no way of telling user whether the tool was just
+> selected or opened, so I have to check like this.
+
+No, you don't :) It doesn't matter.
+(In reply to Victor Porof [:vp] from comment #38)
+> (In reply to Girish Sharma [:Optimizer] from comment #36)
+> > (In reply to Victor Porof [:vp] from comment #35)
+> > 
+> > This happened for me when the debugger is loaded the first time, the
+> > selected value was the url, but it was not loaded, so always the first line
+> > for selected in the editor. May be due to some race conditions ? 
+> 
+> If Panos thinks the timeout is unnecessary, then you can remove it, or use a
+> smaller delay.
+>  
+
+What timeout ? what delay ?
+
+> > This is done for the case when the debugger is already loaded once. the
+> > showToolbox method has no way of telling user whether the tool was just
+> > selected or opened, so I have to check like this.
+> 
+> No, you don't :) It doesn't matter.
+
+I was :| . But anyways, not required now.
+Created attachment 692847
+patch v2.0
+
+Updated according to Victor's approach.
+
+Note that using this approach, even 5 seconds is not enough time for the source to appear in debug builds.
+
+Refer : https://tbpl.mozilla.org/?tree=Try&rev=489c8f46fe60
+Comment on attachment 692847
+patch v2.0
+
+Review of attachment 692847:
+-----------------------------------------------------------------
+
+I found 3 issues with this patch, 2 of them fixable, not so sure about the third.
+
+1. The main use for this patch is when debugging remote targets, since there is no other way currently to get to the sources. However, what happens with this patch is that the (remote) web console tries to open the debugger in the active tab of the desktop browser (because that's what gDevTools returns), which is of course unrelated to the tab in the remote instance. The code should instead get a reference to the toolbox the console is residing in, and open the debugger from that.
+
+2. If the debugger is paused while the user clicks on a link in the web console, the displayed script will not change (unless it's the same script, in which case the correct line will be focused). Since this is something that can be observed before the console opens the debugger tab (DebuggerController.activeThread.state), it should just go straight to view-source in those cases.
+
+3. As I've mentioned in comment 2, the debugger can't display the scripts in this page, unless it's open and the page is reloaded: https://bug758663.bugzilla.mozilla.org/attachment.cgi?id=634313
+I can't think of anything we can do about this case, short of something like comment 21, but I think it's a little better now with the toolbox. The debugger opens, but since it's just a tab change and not a completely separate pane opening, it feels slightly less bad than before.
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +556,5 @@
+> +   *
+> +   * @param string aSourceURL
+> +   *        The URL of the file.
+> +   * @param integer aSourceLine
+> +   *        The line number which you want to place the caret.
+
+Better: "The line number that will be focused."
+(In reply to Panos Astithas [:past] from comment #41)
+> 1. The main use for this patch is when debugging remote targets, since there
+> is no other way currently to get to the sources. However, what happens with
+> this patch is that the (remote) web console tries to open the debugger in
+> the active tab of the desktop browser (because that's what gDevTools
+> returns), which is of course unrelated to the tab in the remote instance.
+> The code should instead get a reference to the toolbox the console is
+> residing in, and open the debugger from that.
+
+Noted. Will do.
+
+> 2. If the debugger is paused while the user clicks on a link in the web
+> console, the displayed script will not change (unless it's the same script,
+> in which case the correct line will be focused). Since this is something
+> that can be observed before the console opens the debugger tab
+> (DebuggerController.activeThread.state), it should just go straight to
+> view-source in those cases.
+
+Why is changing the script not allowed when debugger is paused on a line in some script ?
+
+Anyways, I will add this check.
+
+> 3. As I've mentioned in comment 2, the debugger can't display the scripts in
+> this page, unless it's open and the page is reloaded:
+> https://bug758663.bugzilla.mozilla.org/attachment.cgi?id=634313
+> I can't think of anything we can do about this case, short of something like
+> comment 21, but I think it's a little better now with the toolbox. The
+> debugger opens, but since it's just a tab change and not a completely
+> separate pane opening, it feels slightly less bad than before.
+
+True, this is unavoidable in case of scripts that are no longer present now.
+The two approaches (one mine in the earlier patch, and one this one as recommended by Victor) have different behaviors. In my aproach, such cases would immedietly lead to opening of view source. While in this patch, the user will be stuck on the Debugger Tab for 5 seconds after which he will be taken to web console and then view source would appear.
+
+
+> ::: browser/devtools/webconsole/HUDService.jsm
+> @@ +556,5 @@
+> > +   *
+> > +   * @param string aSourceURL
+> > +   *        The URL of the file.
+> > +   * @param integer aSourceLine
+> > +   *        The line number which you want to place the caret.
+> 
+> Better: "The line number that will be focused."
+
+noted.
+(In reply to Girish Sharma [:Optimizer] from comment #42)
+> (In reply to Panos Astithas [:past] from comment #41)
+> > 2. If the debugger is paused while the user clicks on a link in the web
+> > console, the displayed script will not change (unless it's the same script,
+> > in which case the correct line will be focused). Since this is something
+> > that can be observed before the console opens the debugger tab
+> > (DebuggerController.activeThread.state), it should just go straight to
+> > view-source in those cases.
+> 
+> Why is changing the script not allowed when debugger is paused on a line in
+> some script ?
+
+I'm not really sure. Victor, do you remember if there was a reason for that or is it just a bug?
+
+> > 3. As I've mentioned in comment 2, the debugger can't display the scripts in
+> > this page, unless it's open and the page is reloaded:
+> > https://bug758663.bugzilla.mozilla.org/attachment.cgi?id=634313
+> > I can't think of anything we can do about this case, short of something like
+> > comment 21, but I think it's a little better now with the toolbox. The
+> > debugger opens, but since it's just a tab change and not a completely
+> > separate pane opening, it feels slightly less bad than before.
+> 
+> True, this is unavoidable in case of scripts that are no longer present now.
+> The two approaches (one mine in the earlier patch, and one this one as
+> recommended by Victor) have different behaviors. In my aproach, such cases
+> would immedietly lead to opening of view source. While in this patch, the
+> user will be stuck on the Debugger Tab for 5 seconds after which he will be
+> taken to web console and then view source would appear.
+
+Well, the 5 seconds is just an arbitrary timeout and I even think we should make that shorter. I haven't tested the previous version, but I believe your previous approach of manually checking the script list would race with the debugger frontend and miss scripts that are still live as a result.
+About keeping this 5 second delay even shorter :
+
+Even now only the debug builds are failing in the try link that I posted, because 5 seconds was not enough to load the script list and thus the view source loads up .
+(In reply to Panos Astithas [:past] from comment #43)
+> (In reply to Girish Sharma [:Optimizer] from comment #42)
+> > (In reply to Panos Astithas [:past] from comment #41)
+> > > 2. If the debugger is paused while the user clicks on a link in the web
+> > > console, the displayed script will not change (unless it's the same script,
+> > > in which case the correct line will be focused). Since this is something
+> > > that can be observed before the console opens the debugger tab
+> > > (DebuggerController.activeThread.state), it should just go straight to
+> > > view-source in those cases.
+> > 
+> > Why is changing the script not allowed when debugger is paused on a line in
+> > some script ?
+> 
+> I'm not really sure. Victor, do you remember if there was a reason for that
+> or is it just a bug?
+> 
+
+I can't remember the specific bug, but I don't see any reason we couldn't do this with the current debugger frontend code.
+
+> > > 3. As I've mentioned in comment 2, the debugger can't display the scripts in
+> > > this page, unless it's open and the page is reloaded:
+> > > https://bug758663.bugzilla.mozilla.org/attachment.cgi?id=634313
+> > > I can't think of anything we can do about this case, short of something like
+> > > comment 21, but I think it's a little better now with the toolbox. The
+> > > debugger opens, but since it's just a tab change and not a completely
+> > > separate pane opening, it feels slightly less bad than before.
+> > 
+> > True, this is unavoidable in case of scripts that are no longer present now.
+> > The two approaches (one mine in the earlier patch, and one this one as
+> > recommended by Victor) have different behaviors. In my aproach, such cases
+> > would immedietly lead to opening of view source. While in this patch, the
+> > user will be stuck on the Debugger Tab for 5 seconds after which he will be
+> > taken to web console and then view source would appear.
+> 
+> Well, the 5 seconds is just an arbitrary timeout and I even think we should
+> make that shorter. I haven't tested the previous version, but I believe your
+> previous approach of manually checking the script list would race with the
+> debugger frontend and miss scripts that are still live as a result.
+
+Yes, please don't check the scripts list like in the previous approach, that's why we have the preferredSource setter. I'm even considering adding a preferredUrlAndLine companion setter, but it's a bit premature right now.
+
+I think 100 or 150 ms is more than enough for the timeout; if we don't get our source by that time, chances are we never will.
+(In reply to Girish Sharma [:Optimizer] from comment #44)
+> About keeping this 5 second delay even shorter :
+> 
+> Even now only the debug builds are failing in the try link that I posted,
+> because 5 seconds was not enough to load the script list and thus the view
+> source loads up .
+
+Sounds like the test needs to be fixed. It shouldn't always expect the source to end up being present in the debugger.
+(In reply to Victor Porof [:vp] from comment #46)
+> (In reply to Girish Sharma [:Optimizer] from comment #44)
+> > About keeping this 5 second delay even shorter :
+> > 
+> > Even now only the debug builds are failing in the try link that I posted,
+> > because 5 seconds was not enough to load the script list and thus the view
+> > source loads up .
+> 
+> Sounds like the test needs to be fixed. It shouldn't always expect the
+> source to end up being present in the debugger.
+
+No, as the test is created by me, so does the html file and both the (very small) scripts. If they do not end up in debugger (even in 5 seconds) then that is a debugger bug, not the test's .
+In the next try run you should add the patch from bug 758172 in your patch queue, so we can get a better idea of what happens during these test failures.
+Comment on attachment 692847
+patch v2.0
+
+Review of attachment 692847:
+-----------------------------------------------------------------
+
+Thank you for the patch!
+
+Others have already provided valid comments about the patch. Clearing review request for now.
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +591,5 @@
+> +        return;
+> +      }
+> +      window.clearTimeout(timeout);
+> +      panelWin.removeEventListener("Debugger:SourceShown", onSource, false);
+> +      panelWin.editor.setCaretPosition(aSourceLine - 1);
+
+Shouldn't this be the same as above? panelWin.DebuggerView.editor.set...
+(In reply to Mihai Sucan [:msucan] from comment #49)
+> 
+> Shouldn't this be the same as above? panelWin.DebuggerView.editor.set...
+
+There's a shortcut getter on the window for accessing the editor. It's very old legacy, and it's still there mostly because I'm too lazy to change all the tests :)
+(In reply to Panos Astithas [:past] from comment #41)
+> 1. The main use for this patch is when debugging remote targets, since there
+> is no other way currently to get to the sources. However, what happens with
+> this patch is that the (remote) web console tries to open the debugger in
+> the active tab of the desktop browser (because that's what gDevTools
+> returns), which is of course unrelated to the tab in the remote instance.
+> The code should instead get a reference to the toolbox the console is
+> residing in, and open the debugger from that.
+
+I looked into the code, right now even Webconsole assumes that the selected tab is the tab in concern and thus there is no other reliable source to get reference to the target other that |this.tab| as there is no toolbox reference. This is also the cause of bug 821345
+
+> 2. If the debugger is paused while the user clicks on a link in the web
+> console, the displayed script will not change (unless it's the same script,
+> in which case the correct line will be focused). Since this is something
+> that can be observed before the console opens the debugger tab
+> (DebuggerController.activeThread.state), it should just go straight to
+> view-source in those cases.
+
+I tried and scripts get switched just fine. Now the question is, should I myself stop this behavior when debugger is paused ?
+
+> ::: browser/devtools/webconsole/HUDService.jsm
+> @@ +556,5 @@
+> > +   *
+> > +   * @param string aSourceURL
+> > +   *        The URL of the file.
+> > +   * @param integer aSourceLine
+> > +   *        The line number which you want to place the caret.
+> 
+> Better: "The line number that will be focused."
+
+Done.
+Pushed to try using the patch from bug 758172 in the queue too.
+
+https://tbpl.mozilla.org/?tree=Try&rev=b94802f39a94
+Try is orange for 4 build, while on the green builds, the source loaded and the correct line was selected instantaneously , on the failing builds, the correct line was not selected. Instead view-source opened before the source was loaded. Not sure where the fault lies.
+Comment on attachment 692847
+patch v2.0
+
+Review of attachment 692847:
+-----------------------------------------------------------------
+
+Test needs to be fixed. Clearing review request.
+(In reply to Victor Porof [:vp] from comment #54)
+> Comment on attachment 692847
+> patch v2.0
+> 
+> Review of attachment 692847:
+> -----------------------------------------------------------------
+> 
+> Test needs to be fixed. Clearing review request.
+
+Can you please give some pointers or hint on what do you think is needed to be fixed in the test ?
+
+Moreover, I am able to reproduce the same behavior in the tests sometimes in my usual browsing too.
+Created attachment 703377
+patch v3.0 with tests
+
+Rebased the patch.
+Added a fallback check in the tests to consider that view source window can also open. Passing through try to see the result as locally I never get that scenario.
+
+https://tbpl.mozilla.org/?tree=Try&rev=5cdfeb502a85
+
+Will ask for review if everything is good.
+Created attachment 703439
+patch v3.1 with tests
+
+Saw a failure, stopped. Fixed the possible cause and pushed again.
+
+https://tbpl.mozilla.org/?tree=Try&rev=8eb35ba7df0d
+Created attachment 703444
+patch v3.2 with tests
+
+Sorry for the spam. This is the correct patch and push.
+
+https://tbpl.mozilla.org/?tree=Try&rev=f69c3be649ab
+Created attachment 714784
+patch v3.3 with tests
+
+Rebased. Added 
+
+requestLongerTimeout(4);
+
+in the tests and pushed again : https://tbpl.mozilla.org/?tree=Try&rev=ab676d691b1
+Comment on attachment 714784
+patch v3.3 with tests
+
+Adding Mihai for the web console changes.
+holy sh** tests passed. try is green. land this !@#!@.
+Comment on attachment 714784
+patch v3.3 with tests
+
+Review of attachment 714784:
+-----------------------------------------------------------------
+
+Thanks for your updates and persistence in fixing this bug, I feel it's very close.
+
+I can't quite yet r+ this patch. The timeouts worry me, both in HUDService and in the test.
+
+Panos: what do you think? do we have better ideas here?
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +374,5 @@
+> +    let self = this;
+> +    let panelWin = null;
+> +    let timeout = null;
+> +
+> +    gDevTools.showToolbox(this.target, "jsdebugger").then(function(toolbox) {
+
+nit: name the function
+
+@@ +385,5 @@
+> +        return;
+> +      }
+> +      // Hope for the requested script to be present in the debugger after a
+> +      // certain amount of time, otherwise fallback and open view source.
+> +      timeout = window.setTimeout(onTimeout, SCRIPT_LOAD_WAITING_TIME);
+
+I'm worried to see this here. Aren't there better solutions? Like wait for ScriptsAdded / AfterScriptsAdded, then check if the source URL is in the list of scripts.
+
+@@ +389,5 @@
+> +      timeout = window.setTimeout(onTimeout, SCRIPT_LOAD_WAITING_TIME);
+> +
+> +      panelWin.addEventListener("Debugger:SourceShown", onSource, false);
+> +      panelWin.DebuggerView.Sources.preferredSource = aSourceURL;
+> +    });
+
+.bind(this) here
+
+::: browser/devtools/webconsole/test/browser_webconsole_bug_766001_JS_Console_in_Debugger.js
+@@ +11,5 @@
+> +
+> +function test()
+> +{
+> +  expectUncaughtException();
+> +  requestLongerTimeout(4);
+
+Do you really need this? The HUDService will timeout, and your observer will find the new view source window, so, in theory, this test should never timeout.
+
+@@ +130,5 @@
+> +};
+> +
+> +function checkDebuggerForSourceAndLine(aSourceURL, aSourceLine, aCallback)
+> +{
+> +  let foundEditor = null;
+
+Is this used?
+
+::: browser/devtools/webconsole/test/test-bug-766001-js-console-links.html
+@@ +8,5 @@
+> +    <script type="text/javascript" src="test-bug-766001-js-errors.js"></script>
+> +    <script type="text/javascript" src="test-bug-766001-console-log.js"></script>
+> +  </head>
+> +  <body>
+> +    <p>Web Console test for bug 766001 : Open JS/Consoel call Links in Debugger.</p>
+
+typo: s/Consoel/Console/
+(In reply to Mihai Sucan [:msucan] from comment #62)
+> Comment on attachment 714784
+> patch v3.3 with tests
+> 
+> Review of attachment 714784:
+> -----------------------------------------------------------------
+> 
+> Thanks for your updates and persistence in fixing this bug, I feel it's very
+> close.
+> 
+> I can't quite yet r+ this patch. The timeouts worry me, both in HUDService
+> and in the test.
+> 
+> Panos: what do you think? do we have better ideas here?
+
+I came up with all the numbers after a long discussion, both in the bug and on IRC :)
+
+> @@ +385,5 @@
+> > +        return;
+> > +      }
+> > +      // Hope for the requested script to be present in the debugger after a
+> > +      // certain amount of time, otherwise fallback and open view source.
+> > +      timeout = window.setTimeout(onTimeout, SCRIPT_LOAD_WAITING_TIME);
+> 
+> I'm worried to see this here. Aren't there better solutions? Like wait for
+> ScriptsAdded / AfterScriptsAdded, then check if the source URL is in the
+> list of scripts.
+
+The point here was that what if the script is not present at all. The user will just keep on waiting on the debugger's tab for the script while some random other script will be shown to him. Thus we need to see if the script is not found in some time, open view source instead.
+
+> > +{
+> > +  expectUncaughtException();
+> > +  requestLongerTimeout(4);
+> 
+> Do you really need this? The HUDService will timeout, and your observer will
+> find the new view source window, so, in theory, this test should never
+> timeout.
+
+So the issue that was happening was that each time the waitForSuccess function was needing around 8 to 9 seconds to return true. This delay in opening up of the script was happening on debug machines only. So the third time or so, the test on the whole was timing out. The bottle neck was the duration of test on the whole.
+
+> @@ +130,5 @@
+> > +};
+> > +
+> > +function checkDebuggerForSourceAndLine(aSourceURL, aSourceLine, aCallback)
+> > +{
+> > +  let foundEditor = null;
+> 
+> Is this used?
+
+Nope, will remove.
+
+
+rest all, agreed.
+(In reply to Girish Sharma [:Optimizer] from comment #63)
+> (In reply to Mihai Sucan [:msucan] from comment #62)
+> > Comment on attachment 714784
+> > patch v3.3 with tests
+> > 
+> > Review of attachment 714784:
+> > -----------------------------------------------------------------
+> > 
+> > Thanks for your updates and persistence in fixing this bug, I feel it's very
+> > close.
+> > 
+> > I can't quite yet r+ this patch. The timeouts worry me, both in HUDService
+> > and in the test.
+> > 
+> > Panos: what do you think? do we have better ideas here?
+> 
+> I came up with all the numbers after a long discussion, both in the bug and
+> on IRC :)
+
+If Panos agrees with this approach, I'm ok with it, but it's not something I'm very happy with.
+
+> > @@ +385,5 @@
+> > > +        return;
+> > > +      }
+> > > +      // Hope for the requested script to be present in the debugger after a
+> > > +      // certain amount of time, otherwise fallback and open view source.
+> > > +      timeout = window.setTimeout(onTimeout, SCRIPT_LOAD_WAITING_TIME);
+> > 
+> > I'm worried to see this here. Aren't there better solutions? Like wait for
+> > ScriptsAdded / AfterScriptsAdded, then check if the source URL is in the
+> > list of scripts.
+> 
+> The point here was that what if the script is not present at all. The user
+> will just keep on waiting on the debugger's tab for the script while some
+> random other script will be shown to him. Thus we need to see if the script
+> is not found in some time, open view source instead.
+
+I understand the point, but isn't there an event you can wait for that tells you all scripts have been added? So you can avoid the use of a timeout. If there's no such event, why can't we add one?
+
+
+> > > +{
+> > > +  expectUncaughtException();
+> > > +  requestLongerTimeout(4);
+> > 
+> > Do you really need this? The HUDService will timeout, and your observer will
+> > find the new view source window, so, in theory, this test should never
+> > timeout.
+> 
+> So the issue that was happening was that each time the waitForSuccess
+> function was needing around 8 to 9 seconds to return true. This delay in
+> opening up of the script was happening on debug machines only. So the third
+> time or so, the test on the whole was timing out. The bottle neck was the
+> duration of test on the whole.
+
+I see.
+(In reply to Mihai Sucan [:msucan] from comment #64)
+> > > @@ +385,5 @@
+> > > > +        return;
+> > > > +      }
+> > > > +      // Hope for the requested script to be present in the debugger after a
+> > > > +      // certain amount of time, otherwise fallback and open view source.
+> > > > +      timeout = window.setTimeout(onTimeout, SCRIPT_LOAD_WAITING_TIME);
+> > > 
+> > > I'm worried to see this here. Aren't there better solutions? Like wait for
+> > > ScriptsAdded / AfterScriptsAdded, then check if the source URL is in the
+> > > list of scripts.
+> > 
+> > The point here was that what if the script is not present at all. The user
+> > will just keep on waiting on the debugger's tab for the script while some
+> > random other script will be shown to him. Thus we need to see if the script
+> > is not found in some time, open view source instead.
+> 
+> I understand the point, but isn't there an event you can wait for that tells
+> you all scripts have been added? So you can avoid the use of a timeout. If
+> there's no such event, why can't we add one?
+
+Maybe because web pages can behave very weirdly, and it might be a case that a page just keeps on loading new JS files. Thus the debugger server can never be sure of when all the scripts have been loaded.
+Comment on attachment 714784
+patch v3.3 with tests
+
+Review of attachment 714784:
+-----------------------------------------------------------------
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +32,5 @@
+>  const STRINGS_URI = "chrome://browser/locale/devtools/webconsole.properties";
+>  let l10n = new WebConsoleUtils.l10n(STRINGS_URI);
+>  
+> +// The time in ms for which debugger should wait for the specified script to get
+> +// loaded. After which, the script will be shown in view source.
+
+I think it would read better if it were reworded like this:
+
+"The time interval (in msec) that the web console will wait for the debugger to display the specified script. After that, the script will be displayed in View Source."
+
+@@ +374,5 @@
+> +    let self = this;
+> +    let panelWin = null;
+> +    let timeout = null;
+> +
+> +    gDevTools.showToolbox(this.target, "jsdebugger").then(function(toolbox) {
+
+I'll call it onDebuggerOpen for the purposes of this review.
+
+@@ +385,5 @@
+> +        return;
+> +      }
+> +      // Hope for the requested script to be present in the debugger after a
+> +      // certain amount of time, otherwise fallback and open view source.
+> +      timeout = window.setTimeout(onTimeout, SCRIPT_LOAD_WAITING_TIME);
+
+Mihai is right, this timeout is only working when the debugger panel is already initialized and only for local tabs. When connected to a remote device, this code always pops up view source for me.
+
+You should add a listener for Debugger:AfterScriptsAdded on the chrome window before opening the debugger panel. In case the debugger panel is already there, the existing code should work as it is now. In case it is not open, add an additional callback to Debugger:AfterScriptsAdded that will call onDebuggerOpen which should do the right thing.
+
+I believe that you can check whether the debugger is already open with something like the following (untested):
+
+if (!gDevTools.getToolbox(this.target).getPanel("jsdebugger")) {
+  window.addEventListener("Debugger:AfterScriptsAdded", onDebuggerOpen);
+}
+
+Don't forget to factor out onDebuggerOpen and have it remove the new listener in the beginning.
+
+@@ +389,5 @@
+> +      timeout = window.setTimeout(onTimeout, SCRIPT_LOAD_WAITING_TIME);
+> +
+> +      panelWin.addEventListener("Debugger:SourceShown", onSource, false);
+> +      panelWin.DebuggerView.Sources.preferredSource = aSourceURL;
+> +    });
+
+That's not really necessary, since there is no use of |this| in this function.
+
+::: browser/devtools/webconsole/test/browser_webconsole_bug_766001_JS_Console_in_Debugger.js
+@@ +11,5 @@
+> +
+> +function test()
+> +{
+> +  expectUncaughtException();
+> +  requestLongerTimeout(4);
+
+A factor of 4 seems rather too much. Did you try with 2 first?
+(In reply to Panos Astithas [:past] from comment #66)
+> That's not really necessary, since there is no use of |this| in this
+> function.
+
+Splinter apparently didn't understand it, but that comment was meant to address Mihai's suggestion to bind onDebuggerOpen to |this|.
+Since view source is only necessary for files that the debugger can't see (scripts that were scavenged, or scripts from previous pages in the same tab), and considering the fact that in the remote debugging case view source won't be able to have access to the right source anyway, I believe we could even do what Chrome seems to be doing. That would be to treat these scripts as ephemeral "files" and open them in the debugger (in a separate tab in Chrome's case), the same way Sublime Text uses a "scratchpad-like" tab when you open a file with a single click on the folder view.
+
+In Sublime's case it is a reusable container that hosts the last single-clicked file. In our case it would be a script that doesn't have an entry in the script list, or maybe we could even add it to the list (especially Victor's new pretty thing), but mark it somehow differently (italics, special group, etc.). The implementation would copy SA__loadSource back to the frontend and add a new openScript method in DebuggerController (pseudo-code):
+
+DebuggerController.openScript = function (aUrl, aLine) {
+  if (DebuggerView.Sources.containsValue(aUrl) {
+    DebuggerView.Sources.selectedValue = aUrl;
+    DebuggerView.Sources.updateLine(aLine);
+  } else {
+    this._loadSource(aUrl).then(function() {
+      DebuggerView.Sources.updateLine(aLine);
+    });
+  }
+}
+
+I'm thinking of filing a followup bug for this, because getting rid of both the timeout and view source would make for a better UX, but I wonder how people feel about it.
+(In reply to Panos Astithas [:past] from comment #68)
+> Since view source is only necessary for files that the debugger can't see
+> (scripts that were scavenged, or scripts from previous pages in the same
+> tab), and considering the fact that in the remote debugging case view source
+> won't be able to have access to the right source anyway, I believe we could
+> even do what Chrome seems to be doing. That would be to treat these scripts
+> as ephemeral "files" and open them in the debugger (in a separate tab in
+> Chrome's case), the same way Sublime Text uses a "scratchpad-like" tab when
+> you open a file with a single click on the folder view.
+> 
+> ...
+
+Sounds like a good idea to me. We could do something similar with the style editor: we could load the stylesheet the user clicks on in a temporary buffer of some kind, inside the style editor -- if the styleshet URL is not in the list already.
+
+Thus we would avoid the need of a separate view source that would be capable of displaying source files from the remote server.
+
+In the approach you are suggesting where does the source code load happen? Server or client?
+(In reply to Mihai Sucan [:msucan] from comment #69)
+> In the approach you are suggesting where does the source code load happen?
+> Server or client?
+
+Client, because that would maintain the existing behavior users are accustomed to, and doing it in the server requires a new protocol operation, like the one I suggested in comment 21. If, however, we decide that's a good thing to have, we could support scavenged scripts in the remote case, too.
+(In reply to Panos Astithas [:past] from comment #70)
+> (In reply to Mihai Sucan [:msucan] from comment #69)
+> > In the approach you are suggesting where does the source code load happen?
+> > Server or client?
+> 
+> Client, because that would maintain the existing behavior users are
+> accustomed to, and doing it in the server requires a new protocol operation,
+> like the one I suggested in comment 21. If, however, we decide that's a good
+> thing to have, we could support scavenged scripts in the remote case, too.
+
+So you mean to say that while opening the dead script as just files in debugger, we do not involve the server and just load the file directly in client ?
+Yes.
+Created attachment 715179
+patch v3.4
+
+Addressed all of the above comments.
+
+The try push with requestLongerTimeout(2); has been pushed at https://tbpl.mozilla.org/?tree=Try&rev=72e551b62beb
+
+If that is green, we are good with factor 2.
+Created attachment 715219
+patch v3.5
+
+Adding the AfterScriptsAdded event listener before opening the debugger.
+
+Patch with 
+  requestLongerTimeout(2);
+
+is green, so going with that only.
+
+Pushed again at : https://tbpl.mozilla.org/?tree=Try&rev=785a3ab20537
+
+(sadly some other changes are also getting pushed, what so ever I do)
+Comment on attachment 715219
+patch v3.5
+
+Review of attachment 715219:
+-----------------------------------------------------------------
+
+Thanks for your update.
+
+My concern wrt. the timeout in the web console is still valid. I believe we can do better - avoid the timeout. I discussed an idea with Panos and we can discuss it further on IRC with you as well.
+
+More comments below.
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +396,5 @@
+> +      }
+> +    });
+> +
+> +    function loadScript() {
+> +      let gView = panelWin.DebuggerView;
+
+nit: gView here? "g" prefix is used for globals.
+
+::: browser/devtools/webconsole/test/test-bug-766001-js-console-links.html
+@@ +8,5 @@
+> +    <script type="text/javascript" src="test-bug-766001-js-errors.js"></script>
+> +    <script type="text/javascript" src="test-bug-766001-console-log.js"></script>
+> +  </head>
+> +  <body>
+> +    <p>Web Console test for bug 766001 : Open JS/Consoel call Links in Debugger.</p>
+
+you still have the typo... mentioned in my previous review comment.
+As discussed in IRC, we can probably get rid of the timeout, by querying the debugger for the script list. A slight variation of the code I mentioned in comment 68 should do it:
+
+if (DebuggerView.Sources.containsValue(aUrl) {
+  DebuggerView.Sources.selectedValue = aUrl;
+  DebuggerView.Sources.updateLine(aLine);
+} else {
+  this.viewSource(aURL, aLine);
+}
+
+This will minimize the flickering to a single case (debugger not open and script not present) and fallback to view source in the minimum amount of time. It will also provide a straightforward upgrade path to eventually avoiding view source altogether, as I described in comment 68.
+
+Victor do you see any problems with that approach for replacing the timeout?
+Created attachment 715581
+patch v4.0
+
+Unless Victor comes back with some major issue, this should be the patch.
+
+try at : https://tbpl.mozilla.org/?tree=Try&rev=9dd86f1d334b
+Comment on attachment 715581
+patch v4.0
+
+Review of attachment 715581:
+-----------------------------------------------------------------
+
+I think Victor would suggest to use DebuggerView.updateEditor() instead of mucking with the private editor instance. I'm passing this over to him to make sure I'm not missing anything. Otherwise it looks fine to me, provided you fix the test failures.
+
+::: browser/devtools/webconsole/test/browser_webconsole_bug_766001_JS_Console_in_Debugger.js
+@@ +154,5 @@
+> +    {
+> +      aCallback && executeSoon(aCallback);
+> +    },
+> +    failureFn: finishTest,
+> +    timeout: 10000,
+
+Try runs hit this timeout. Try increasing it.
+(In reply to Panos Astithas [:past] from comment #78)
+> Comment on attachment 715581
+> patch v4.0
+> 
+> Review of attachment 715581:
+> -----------------------------------------------------------------
+> 
+> I think Victor would suggest to use DebuggerView.updateEditor() instead of
+> mucking with the private editor instance. I'm passing this over to him to
+> make sure I'm not missing anything. Otherwise it looks fine to me, provided
+> you fix the test failures.
+
+I also thought of using that, but that function in itself was doing a lot of checks (extra checks that were not needed in this case), so to keep the computation simple, I went for this method only.
+
+> :::
+> browser/devtools/webconsole/test/
+> browser_webconsole_bug_766001_JS_Console_in_Debugger.js
+> @@ +154,5 @@
+> > +    {
+> > +      aCallback && executeSoon(aCallback);
+> > +    },
+> > +    failureFn: finishTest,
+> > +    timeout: 10000,
+> 
+> Try runs hit this timeout. Try increasing it.
+
+If even 10 seconds is not enough here, I should probably use some other way to test.
+(In reply to Panos Astithas [:past] from comment #76)
+> As discussed in IRC, we can probably get rid of the timeout, by querying the
+> debugger for the script list. A slight variation of the code I mentioned in
+> comment 68 should do it:
+> 
+> if (DebuggerView.Sources.containsValue(aUrl) {
+>   DebuggerView.Sources.selectedValue = aUrl;
+>   DebuggerView.Sources.updateLine(aLine);
+> } else {
+>   this.viewSource(aURL, aLine);
+> }
+> 
+> This will minimize the flickering to a single case (debugger not open and
+> script not present) and fallback to view source in the minimum amount of
+> time. It will also provide a straightforward upgrade path to eventually
+> avoiding view source altogether, as I described in comment 68.
+> 
+> Victor do you see any problems with that approach for replacing the timeout?
+
+No, I think this is a splendid idea. It's similar to what we're doing in some of the debugger tests to query if the prototype and properties are fetched, for example. I'll take a look at the patch soon.
+Comment on attachment 715581
+patch v4.0
+
+Review of attachment 715581:
+-----------------------------------------------------------------
+
+Patch looks good to me now. The timeout is gone and you have addressed my review comments.
+
+A couple of nits below - not requirements for r+/landing this.
+
+If Victor likes the patch, let's land this!
+
+::: browser/devtools/webconsole/test/browser_webconsole_bug_766001_JS_Console_in_Debugger.js
+@@ +54,5 @@
+> +    failureFn: finishTest,
+> +  });
+> +}
+> +
+> +function onDebuggerReady(aEvent, aPanel)
+
+nit: i'm worried by the amount of nesting in this function. maybe you can organize the whole test to be easier to follow? You can use promises if you think that might help with async stuff.
+
+@@ +138,5 @@
+> +      if (sourceViewOpened) {
+> +        sourceViewOpened = false;
+> +        return true;
+> +      }
+> +      let gView = dbg.panelWin.DebuggerView;
+
+nit: gView is not a global.
+Created attachment 718252
+patch v4.5
+
+Refactored the tests to have less nesting and now I am using the waitForSuccess method after the source is shown. That should take care of the timeouts on slow debug machines.
+
+Pushed to try at : https://tbpl.mozilla.org/?tree=Try&rev=67eb0bd9f0a4
+Comment on attachment 718252
+patch v4.5
+
+Review of attachment 718252:
+-----------------------------------------------------------------
+
+Thanks for the test update - it's better now.
+Comment on attachment 718252
+patch v4.5
+
+Review of attachment 718252:
+-----------------------------------------------------------------
+
+Looks ok, just a few comments below. r+ with those out of the way.
+
+::: browser/devtools/webconsole/HUDService.jsm
+@@ +358,5 @@
+> +  function WC_viewSourceInDebugger(aSourceURL, aSourceLine)
+> +  {
+> +    let self = this;
+> +    let panelWin = null;
+> +    let alreadyLoaded = true;
+
+s/alreadyLoaded/debuggerWasOpen/ because it sounds a bit too generic (I initially thought it was referring to sources and not the debugger). Set the initial value to false.
+
+@@ +362,5 @@
+> +    let alreadyLoaded = true;
+> +    let toolbox = gDevTools.getToolbox(this.target);
+> +
+> +    if (!toolbox.getPanel("jsdebugger")) {
+> +      alreadyLoaded = false;
+
+Since debuggerWasOpen starts out false, this assignment would be redundant.
+
+@@ +367,5 @@
+> +      let toolboxWin = toolbox.doc.defaultView;
+> +      toolboxWin.addEventListener("Debugger:AfterScriptsAdded",
+> +                                  function afterScriptsAdded() {
+> +        toolboxWin.removeEventListener("Debugger:AfterScriptsAdded",
+> +                                       afterScriptsAdded);
+
+This event becomes "Debugger:AfterSourcesAdded" with bug 795368. Make sure they're synchronized after either of the bugs land.
+
+@@ +372,5 @@
+> +        loadScript();
+> +      });
+> +    }
+> +
+> +    toolbox.selectTool("jsdebugger").then(function onDebuggerOpen(dbg) {
+
+You should simply do
+> ...
+> } else {
+>   toolbox.selectTool("jsdebugger").then(function onDebuggerOpen(dbg) {
+>   ...
+> }
+and avoid if (alreadyLoaded) conditional below.
+
+@@ +375,5 @@
+> +
+> +    toolbox.selectTool("jsdebugger").then(function onDebuggerOpen(dbg) {
+> +      panelWin = dbg.panelWin;
+> +      if (alreadyLoaded) {
+> +        loadScript();
+
+Make sure you set debuggerWasOpen to true here, before attempting to load the script.
+
+@@ +381,5 @@
+> +    });
+> +
+> +    function loadScript() {
+> +      let debuggerView = panelWin.DebuggerView;
+> +      if (!debuggerView.Sources.containsValue(aSourceURL)) {
+
+This needs to be
+> debuggerWasOpen && !debuggerView.Sources.containsValue(aSourceURL)
+
+"If the debugger was open until now and it still doesn't contain my source, then it's safe to bet it will never do so soon, so just open view-source"
+(In reply to Victor Porof [:vp] from comment #84)
+> Comment on attachment 718252
+> patch v4.5
+> 
+> Review of attachment 718252:
+> -----------------------------------------------------------------
+> 
+> Looks ok, just a few comments below. r+ with those out of the way.
+> 
+> ::: browser/devtools/webconsole/HUDService.jsm
+> @@ +358,5 @@
+> > +  function WC_viewSourceInDebugger(aSourceURL, aSourceLine)
+> > +  {
+> > +    let self = this;
+> > +    let panelWin = null;
+> > +    let alreadyLoaded = true;
+> 
+> s/alreadyLoaded/debuggerWasOpen/ because it sounds a bit too generic (I
+> initially thought it was referring to sources and not the debugger). Set the
+> initial value to false.
+
+ok.
+
+> @@ +362,5 @@
+> > +    let alreadyLoaded = true;
+> > +    let toolbox = gDevTools.getToolbox(this.target);
+> > +
+> > +    if (!toolbox.getPanel("jsdebugger")) {
+> > +      alreadyLoaded = false;
+> 
+> Since debuggerWasOpen starts out false, this assignment would be redundant.
+
+hmm.
+
+> @@ +367,5 @@
+> > +      let toolboxWin = toolbox.doc.defaultView;
+> > +      toolboxWin.addEventListener("Debugger:AfterScriptsAdded",
+> > +                                  function afterScriptsAdded() {
+> > +        toolboxWin.removeEventListener("Debugger:AfterScriptsAdded",
+> > +                                       afterScriptsAdded);
+> 
+> This event becomes "Debugger:AfterSourcesAdded" with bug 795368. Make sure
+> they're synchronized after either of the bugs land.
+
+That one has r+, so I will wait for it to land first, but not for long ;)
+
+> @@ +372,5 @@
+> > +        loadScript();
+> > +      });
+> > +    }
+> > +
+> > +    toolbox.selectTool("jsdebugger").then(function onDebuggerOpen(dbg) {
+> 
+> You should simply do
+> > ...
+> > } else {
+> >   toolbox.selectTool("jsdebugger").then(function onDebuggerOpen(dbg) {
+> >   ...
+> > }
+> and avoid if (alreadyLoaded) conditional below.
+
+No, in that case, if the debugger is not already open, it will not be opened :|
+
+
+> @@ +375,5 @@
+> > +
+> > +    toolbox.selectTool("jsdebugger").then(function onDebuggerOpen(dbg) {
+> > +      panelWin = dbg.panelWin;
+> > +      if (alreadyLoaded) {
+> > +        loadScript();
+> 
+> Make sure you set debuggerWasOpen to true here, before attempting to load
+> the script.
+
+No need, see the comment below:
+
+> @@ +381,5 @@
+> > +    });
+> > +
+> > +    function loadScript() {
+> > +      let debuggerView = panelWin.DebuggerView;
+> > +      if (!debuggerView.Sources.containsValue(aSourceURL)) {
+> 
+> This needs to be
+> > debuggerWasOpen && !debuggerView.Sources.containsValue(aSourceURL)
+> 
+> "If the debugger was open until now and it still doesn't contain my source,
+> then it's safe to bet it will never do so soon, so just open view-source"
+
+loadScript can be called via two flows:
+
+1) Debugger is not open, so we wait for AfterScriptsAdded event and then call loadScript, in which case list of all the available script will be there with the deugger.
+
+2) Debugger is already open, so we call loadScript directly and the script that generated the console (error|log|anything else) will already be present with the debugger.
+
+So in both the cases, there is no need of knowing and checking whether the debugger was already open, because if debugger was not already open and the script is not present in the list even after the AfterScriptsAdded event, then it will not come and there is no timeout, so we keep waiting for it forever, keeping the debugger open with some other random script selected. We don't want that.
+Created attachment 721804
+patch v4.6
+
+Renamed the variable. Changed the event name to "Debugger:AfterSourcesAdded"
+finally :)
+https://hg.mozilla.org/integration/fx-team/rev/84d33290244a
+https://hg.mozilla.org/mozilla-central/rev/84d33290244a
+
+
+In the webconsole, when you click on the filename/line-number of a js-error or message, the debugger should open instead of view source
+
+
+
+Bug 766001 - In the webconsole, when you click on the filename/line-number of a js-error or message, the debugger should open instead of view source. r=past,msucan,vporof f=rcampbell 
+
+Bug 961621 - Fix for intermittent browser_webconsole_bug_766001_JS_Console_in_Debugger.js | Timed out while waiting for: correct source and line test for debugger for index 2; r=me 

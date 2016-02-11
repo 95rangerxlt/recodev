@@ -1,0 +1,123 @@
+When the preference browser.tabs.insertRelatedAfterCurrent is set to true (which it is by default) then links opened via middle-click/ctrl+click/rightclick + open link in new tab or target="_blank" should open next to the current tab.
+
+This still is the case on regular links. But links with the rel="noreferrer" instead open the new tab as last item in the tab list.
+
+When the preference browser.tabs.insertRelatedAfterCurrent is set to true (which it is by default) then links opened via middle-click/ctrl+click/rightclick + open link in new tab or target="_blank" should open next to the current tab.
+
+This still is the case on regular links. But links with the rel="noreferrer" instead open the new tab as last item in the tab list.
+I guess the core issue is that the referrerURI argument, as passed to openLinkIn and forwarded to gBrowser.addTab (via gBrowser.loadOneTab), controls more than just whether we send the referrer URI in the ensuing load. In particular the logic here:
+
+https://hg.mozilla.org/mozilla-central/annotate/b42615e51c81/browser/base/content/tabbrowser.xml#l1812
+Thanks for filing this!
+So it sounds like we just need to modify addTab to take rel="noreferrer" links into account. This comment, for example, is no longer accurate:
+
+// aReferrerURI is null or undefined if the tab is opened from
+// an external application or bookmark, i.e. somewhere other
+// than the current tab.
+
+I hesitate to add yet another argument to loadOneTab / addTab for "noreferrer", but that might be our best bet here, unless anybody has a better idea.
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #3)
+> I hesitate to add yet another argument to loadOneTab / addTab for
+> "noreferrer", but that might be our best bet here, unless anybody has a
+> better idea.
+
+I think that's the right call. Adding a parameter is not that bad, you can just add it as a pseudo-argument as with aFromExternal/aRelatedToCurrent/etc.
+Nathan, can you fix this regression from your bug, or back out the offending change?
+(In reply to :Gavin Sharp [email: gavin@gavinsharp.com] from comment #5)
+> Nathan, can you fix this regression from your bug, or back out the offending
+> change?
+
+I think so.  But I don't really understand...
+
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #3)
+> So it sounds like we just need to modify addTab to take rel="noreferrer"
+> links into account. This comment, for example, is no longer accurate:
+> 
+> // aReferrerURI is null or undefined if the tab is opened from
+> // an external application or bookmark, i.e. somewhere other
+> // than the current tab.
+
+So right now we have:
+
+(aRelatedToCurrent == null ? aReferrerURI : aRelatedToCurrent) && ...
+
+and I suppose aRelatedToCurrent is null in the scenario described in comment 0?  How does knowing we have rel=noreferrer help us in this case?  Because we still think that the new tab isn't related to the old one in any way...right?  Your comment above makes me think we should do:
+
+(aRelatedToCurrent == null ? (aHaveNoreferrer ? aHaveNoreferrer : aReferrerURI) : aRelatedToCurrent) && ...
+
+?  That seems like sort of weird logic...unless aRelatedToCurrent is getting set somewhere higher up the call chain based on aReferrerURI being null?  But that doesn't make sense to me either...
+By the time we get to addTab, aReferrerURI is used in two ways:
+- to actually pass the referring URI to the load calls
+- to determine whether the load is "related" to the previous load, if that is not specified explicitly by the caller via aRelatedToCurrent
+
+The patch for bug 1031264 broke that second case. For the purposes of this check, you want to ignore rel=noreferrer. This was broken by your patch because aReferrerURI was set to null earlier in the call chain. So two possible solutions:
+
+- avoid nulling out aReferrerURI so early, and only do so much later (in addTab, after we've determined fallback for aRelatedToCurrent), based on a new additional parameter passed all the way to addTab that indicates whether rel=noreferer is set (solution proposed in comment 3/comment 4)
+
+- have all addTab callers specify aRelatedToCurrent explicitly, and stop falling back on aReferrerURI. I'm not sure whether this solution is feasible since the call chains here are complicated, but it would likely be cleaner.
+Created attachment 8560608
+part 1 - fixup grabbing of documentURIObject
+
+The patch for bug 1031264 factored out an _openLinkInParameters
+function.  But this new function grabbed the referrerURI from
+|document|, rather from the passed in |doc|, whereas all the callers had
+obtained |referrerURI| from the (to-be-passed-in) |doc| object.  Let's
+fix this mix-up before going any further.
+
+(I'm have zero frontend expertise to know whether |document| and |doc| are
+synonymous at this point, but better safe than sorry seems like a good idea
+here.)
+Created attachment 8560610
+part 2 - ensure addOneTab sees a referrer URI if it was available
+
+addOneTab uses the existence of a referrer URI to determine where to
+position the newly opened tab.  Bug 1031264 changed callsites so that a
+referrer URI was no longer passed in if the opening link had
+rel=noreferrer set on it.  This change, then, broke placement of newly
+opened tabs if their opening link had rel=noreferrer on it.
+
+Instead of not passing in the referrer URI if rel=noreferrer, let's
+instead explicitly tell addOneTab whether rel=noreferrer was present on
+the opening link.  Then addOneTab can hide the referrer URI from the
+actual network request, while still using the referrer URI to determine
+tab placement.
+
+(Gavin's suggestion of fixing up addTab's callers (and loadOneTab's...) in
+comment 7 does sound cleaner, but this patch is much easier to write and
+verify.  This patch also removes the hideous !noReferrer constructs, which I
+think is a good thing.)
+Comment on attachment 8560608
+part 1 - fixup grabbing of documentURIObject
+
+Yikes, good catch - "document" here is a chrome document, while "doc" is the content document, so this likely means we broke sending referrer URIs for these loads entirely.
+Ouch. My bad for missing that in review. :(
+Comment on attachment 8560608
+part 1 - fixup grabbing of documentURIObject
+
+A glance through the original patch for bug 1031264 shows that this was the only such violation. Sorry for missing that the first time around.
+Nathan, will you ask for review on attachment 8560610?
+Comment on attachment 8560610
+part 2 - ensure addOneTab sees a referrer URI if it was available
+
+Review of attachment 8560610:
+-----------------------------------------------------------------
+
+This works for me. I applied the patches and opened some links (with and without rel="noreferrer"), and it seemed to do the job.
+
+I think we might want to get some automated tests written for this if we can. I don't want to block on that, but I think it's worth the investment at some point - either here, or in a follow-up.
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/ff11fe561fa5
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/f6d678e3120b
+https://hg.mozilla.org/mozilla-central/rev/ff11fe561fa5
+https://hg.mozilla.org/mozilla-central/rev/f6d678e3120b
+https://hg.mozilla.org/releases/mozilla-aurora/rev/55e36fd42ae6
+https://hg.mozilla.org/releases/mozilla-aurora/rev/8b352186edd8
+This "fix" caused this bug 1133201
+
+
+New rel=noreferrer logic breaks insert related tab after current
+
+
+
+Bug 1118502 - part 1 - fixup grabbing of documentURIObject; r=mconley
+
+Bug 1118502 - part 2 - ensure addOneTab sees a referrer URI if it was available; r=mconley

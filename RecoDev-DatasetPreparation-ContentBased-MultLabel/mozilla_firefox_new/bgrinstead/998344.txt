@@ -1,0 +1,383 @@
+If you create a large Uint8Array object like this:
+
+    var myArray = new ArrayBuffer(2354207);
+    window.longInt8View = new Uint8Array(myArray);
+
+    for (var i=0; i< longInt8View.length; i++) {
+      longInt8View[i] = i % 255;
+    }
+
+Then typing `longInt8View.` in the console is very slow, causing beach ball on OSX.
+
+Test case: http://fiddle.jshell.net/bgrins/W5Wsp/show/.
+
+If you create a large Uint8Array object like this:
+
+    var myArray = new ArrayBuffer(2354207);
+    window.longInt8View = new Uint8Array(myArray);
+
+    for (var i=0; i< longInt8View.length; i++) {
+      longInt8View[i] = i % 255;
+    }
+
+Then typing `longInt8View.` in the console is very slow, causing beach ball on OSX.
+
+Test case: http://fiddle.jshell.net/bgrins/W5Wsp/show/.
+Created attachment 8416868
+webconsole-speed-up-autocompletion-for-large-arrays.patch
+
+Here's a patch that speeds up the process of listing properties of arrays and array like objects. It takes a list of properties, sorts them, finds the first and last numeric property names and ignores everything between them in one go. The current version loops trough them all causing a bit of a lag.
+
+Here's some benchmarks for the attached test case on my machine (using console.time):
+- Current trunk:
+    - getMatchedProps_impl takes about 9500 ms from which
+      - getProperties takes about 300 ms
+      - looping takes the rest (9200 ms)
+- This patch
+    - getMatchedProps_impl takes about 580 ms from which
+      - getProperties takes about 300 ms
+      - filterIndices takes about 270ms from which about 99.6% is spent sorting the names.
+      
+Without sorting the only thing that really takes time is the call to getProperties. However the Object.getOwnPropertyNames used by getProperties doesn't guarantee the order of the properties (though I have noticed that in most cases all numeric indices are at the beginning) which might lead to some properties getting caught between indices and get removed from the final listing if the property names are not sorted.
+
+About the test case I wasn't really sure about the best way to expose the filterIndices function to the test. Thus I created and exported a new Testing object in toolkit/devtools/webconsole/utils.js and added filterIndices to it. If there's a better way to do this I'd be happy to implement it.
+Tested this out. This does indeed speed things up considerably. Thanks for writing this patch.
+
+Review to follow.
+Comment on attachment 8416868
+webconsole-speed-up-autocompletion-for-large-arrays.patch
+
+Review of attachment 8416868:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/webconsole/test/unit/test_numeric_property_filtering.js
+@@ +5,5 @@
+> +
+> +"use strict";
+> +const Cu = Components.utils;
+> +const { devtools } = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+> +const utils = devtools.require("devtools/toolkit/webconsole/utils")
+
+missing ;
+
+::: toolkit/devtools/webconsole/utils.js
+@@ +31,5 @@
+>  // Match the function arguments from the result of toString() or toSource().
+>  const REGEX_MATCH_FUNCTION_ARGS = /^\(?function\s*[^\s(]*\s*\((.+?)\)/;
+>  
+> +let Testing = {};
+> +exports.Testing = Testing;
+
+what's this for? We don't usually expose new interfaces for the sole purpose of testing.
+
+Also, see how we add exported objects at the end of this file. No need to create a variable with an empty object when you could just do:
+
+exports.Testing = {};
+
+@@ +981,5 @@
+> +    // Properties contain some array indices; filter them out. The condition is
+> +    // a bit dull but we only really care about arrays with a lot of elements
+> +    // (bug 998344) and they are guaranteed to have a property called '0'. If an
+> +    // object has a property called '1' but not '0', the numeric properties are
+> +    // filtered in the loop below anyways...
+
+This comment is confusing.
+
+I'm going to try an edit. Please let me know if this is accurate:
+
+// Filter out array indices to speed up auto-completion searches.
+// See bug 998344.
+
+@@ +982,5 @@
+> +    // a bit dull but we only really care about arrays with a lot of elements
+> +    // (bug 998344) and they are guaranteed to have a property called '0'. If an
+> +    // object has a property called '1' but not '0', the numeric properties are
+> +    // filtered in the loop below anyways...
+> +    if (props.indexOf("0") != -1) {
+
+What I'd really like is a TypedArray.isTypedArray() method but I guess this'll have to do.
+
+There are going to be cases where someone defines a 0 property on an object and this is going to cause filterIndices to get called.
+
+@@ +1015,5 @@
+>    };
+>  }
+>  
+>  /**
+> + * Filters numeric indices form given property list. Sorts the property list,
+
+Filters numeric indices *from* given property list...
+
+@@ +1025,5 @@
+> + * @return array Array of given properties without any purely numeric ones.
+> + */
+> +function filterIndices(aProps)
+> +{
+> +  let isIndice = (value) => +value == +value;
+
+nit: isIndex.
+
+this isn't really obvious what's going on here.
+
+You could alternatively do something like:
+
+let isIndex = (value) => isNaN(+value);
+
+Not sure if that's clearer or not.
+
+In any case, you don't really need to declare a variable for this function since you can just pass the arrow function into findIndex directly.
+
+@@ +1028,5 @@
+> +{
+> +  let isIndice = (value) => +value == +value;
+> +
+> +  // A helper method similar to Array.findIndex. While Array.findIndex starts
+> +  // the search form the beginning of the array findLastIndex starts in from the
+
+form -> from.
+
+@@ +1033,5 @@
+> +  // end.
+> +  //
+> +  // For large arrays aProps looks a lot like ["0", "1",...,"999999999",
+> +  // "length", "x", "y", "z"]. It's a lot faster to start the filtering from the
+> +  // end instead of going trough all indices before finding the last one.
+
+in theory. If you had a sparsely populated (typed) array, you'd still traverse the whole thing.
+
+E.g., new Uint8Array(2000000);
+
+@@ +1046,5 @@
+> +
+> +  // Sort the properties to make sure no non-numeric properties get removed if
+> +  // one exists among numeric properties. This shouldn't be problem for arrays
+> +  // but might come up with other objects that have numeric properties.
+> +  aProps.sort();
+
+not sure I understand this. Couldn't you just check if a property is non-numeric before you delete it?
+
+I'd expect sorting an entire array of many entries to be slower than this check but maybe not...
+
+@@ +1049,5 @@
+> +  // but might come up with other objects that have numeric properties.
+> +  aProps.sort();
+> +
+> +  let firstIndice = aProps.findIndex(isIndice);
+> +  let lastIndice = findLastIndex(aProps, isIndice);
+
+Indice -> Index in these names, please.
+
+@@ +1054,5 @@
+> +  if (firstIndice == -1 || lastIndice == -1) {
+> +    return aProps;
+> +  }
+> +
+> +  let firstNonIndiceIndex = lastIndice + 1;
+
+can you call this "pivot" or something? Too much indice. :)
+
+@@ +1058,5 @@
+> +  let firstNonIndiceIndex = lastIndice + 1;
+> +  let firstPart = aProps.slice(0, firstIndice); // props before indices
+> +  let secondPart = aProps.slice(firstNonIndiceIndex); // props after indices
+> +
+> +  return firstPart.concat(secondPart);
+
+ok, I like these three lines. :)
+
+@@ +1157,5 @@
+>    },
+>  };
+>  
+>  
+> +Testing.filterIndices = filterIndices;
+
+If you want to export this, I'd suggest something like:
+
+exports.FilterIndices = filterIndices;
+
+rather than the exports.Testing property.
+Comment on attachment 8416868
+webconsole-speed-up-autocompletion-for-large-arrays.patch
+
+Review of attachment 8416868:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/webconsole/utils.js
+@@ +982,5 @@
+> +    // a bit dull but we only really care about arrays with a lot of elements
+> +    // (bug 998344) and they are guaranteed to have a property called '0'. If an
+> +    // object has a property called '1' but not '0', the numeric properties are
+> +    // filtered in the loop below anyways...
+> +    if (props.indexOf("0") != -1) {
+
+I'm also worried about this - it looks like this will slice out "0a" on `let foo = { 0: true, "0a": true, 1: true }`.  Could we check the type of the aObj param instead of this indexOf("0") check?
+(In reply to Brian Grinstead [:bgrins] from comment #4)
+> Comment on attachment 8416868
+> webconsole-speed-up-autocompletion-for-large-arrays.patch
+> 
+> Review of attachment 8416868:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/devtools/webconsole/utils.js
+> @@ +982,5 @@
+> > +    // a bit dull but we only really care about arrays with a lot of elements
+> > +    // (bug 998344) and they are guaranteed to have a property called '0'. If an
+> > +    // object has a property called '1' but not '0', the numeric properties are
+> > +    // filtered in the loop below anyways...
+> > +    if (props.indexOf("0") != -1) {
+> 
+> I'm also worried about this - it looks like this will slice out "0a" on `let
+> foo = { 0: true, "0a": true, 1: true }`.  Could we check the type of the
+> aObj param instead of this indexOf("0") check?
+
+What I really wanted was an | Array.isArray(aObj) && isTypedArray(aObj) | type check. You'd have to implement isTypedArray function.
+(In reply to Rob Campbell [:rc] (:robcee) from comment #5)
+> (In reply to Brian Grinstead [:bgrins] from comment #4)
+> > Comment on attachment 8416868
+> > webconsole-speed-up-autocompletion-for-large-arrays.patch
+> > 
+> > Review of attachment 8416868:
+> > -----------------------------------------------------------------
+> > 
+> > ::: toolkit/devtools/webconsole/utils.js
+> > @@ +982,5 @@
+> > > +    // a bit dull but we only really care about arrays with a lot of elements
+> > > +    // (bug 998344) and they are guaranteed to have a property called '0'. If an
+> > > +    // object has a property called '1' but not '0', the numeric properties are
+> > > +    // filtered in the loop below anyways...
+> > > +    if (props.indexOf("0") != -1) {
+> > 
+> > I'm also worried about this - it looks like this will slice out "0a" on `let
+> > foo = { 0: true, "0a": true, 1: true }`.  Could we check the type of the
+> > aObj param instead of this indexOf("0") check?
+> 
+> What I really wanted was an | Array.isArray(aObj) && isTypedArray(aObj) |
+> type check. You'd have to implement isTypedArray function.
+
+Not sure if this is the best way to do it, but could we do something like this for isTypedArray: http://jsfiddle.net/bgrins/RLQNt/.
+I've thought about this some more, and realized that in the context of autocomplete, numeric values don't make any sense regardless of type.  It seems like any value that cannot be accessed directly through obj.* and instead needs to be accessed with obj["*"] could be filtered out of the `props` list immediately with a simple filter function.
+Created attachment 8418818
+webconsole-autocomplete-speedup.patch
+
+Idea mentioned in Comment 7.  Not sure why calling filter on the props before iterating is faster, but it seems significantly faster than adding an additional check inside of the loop.  Sami, how does the performance of this compare with the original patch in your measurements?
+With the patch in comment 8 a call to getMatchedProps_impl takes about 1100ms which is a significant increase in performance with a simple change. I think it's better to take that approach instead of my complicated one with only small performance advantage over the simpler one.
+Created attachment 8423324
+autocomplete-speedup.patch
+
+Switching to a traditional for loop speeds this lag up from 26224ms to 5952ms.  I have some ideas about how to shrink the remaining 6 seconds of lag, but I don't see why we couldn't land this first.
+One thing that is pretty slow is Object.getOwnPropertyNames(longInt8View).
+
+When I run the following command in the console on http://fiddle.jshell.net/bgrins/W5Wsp/show/ I see pretty wildly different results (granted, it is much worse on my local build than nightly but it is still slow either way):
+
+console.time("s");Object.getOwnPropertyNames(longInt8View);console.timeEnd("s")
+
+When timing this as part of getMatchedProps_impl, getOwnPropertyNames seems to take anywhere from 20-40% of the time.  I was hoping to shim this to only return non-numeric properties, but I guess there isn't a way to do that since it includes non-enumerable property names.
+Comment on attachment 8423324
+autocomplete-speedup.patch
+
+Review of attachment 8423324:
+-----------------------------------------------------------------
+
+r+ but we should leave this open to get a proper fix that gets us under an acceptable response time.
+Hi Brian,
+could you provide a Try link. Suggestions for what to run if you haven't
+yet can be found here:
+https://wiki.mozilla.org/Sheriffing/How:To:Recommended_Try_Practices
+Pushed to try: https://tbpl.mozilla.org/?tree=Try&rev=29832df4ff02
+https://hg.mozilla.org/integration/fx-team/rev/03aa92ba77e3
+https://hg.mozilla.org/mozilla-central/rev/03aa92ba77e3
+Worth noting that generally arrays are much slower than objects because objects hit MAX_COMPLETIONS soon, while arrays don't since the numeric keys are skipped.
+
+Compare:
+
+// Fast autocompletion on foo
+let foo = {}; for (let i = 0; i < 2354207; i++) { foo['a' + i] = true; }
+
+// Slow autocompletion on bar and baz because MAX_COMPLETIONS is never hit
+let bar = []; for (let i = 0; i < 2354207; i++) { bar.push(i) }
+let baz = {}; for (let i = 0; i < 2354207; i++) { baz[i] = true; }
+Created attachment 8425609
+webconsole-autocomplete-bail.patch
+
+Rob, I'd like some advice on the direction to go here.  What this patch is doing is counting the number of properties that need to be processed and returning with no results if this happens.
+
+There is a second concept for limiting the return values already in this function, called MAX_COMPLETIONS (in my patch I've renamed to MAX_AUTOCOMPLETIONS).  Where this is failing is on values with mostly numeric keys, because matches.size only gets incremented on a valid autocomplete value (and a number isn't).  Another case where autocomplete values would be invalid is if you said 'foo.b' - then all foo.a* values will be processed but not included in the match set.
+
+My question is: is it valuable to keep track of the number of total properties differently than the number of valid properties.  I'm keeping them separate in this patch - one downside to keeping them tallied together is that an array of length, say 1505, would return with no (or partial) results.
+Comment on attachment 8425609
+webconsole-autocomplete-bail.patch
+
+Review of attachment 8425609:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/webconsole/utils.js
+@@ +979,4 @@
+>  
+>    // We need to go up the prototype chain.
+>    let iter = chainIterator(aObj);
+> +  let props = [];
+
+this line shouldn't be here - it is a typo
+Comment on attachment 8423324
+autocomplete-speedup.patch
+
+Review of attachment 8423324:
+-----------------------------------------------------------------
+
+This will not be needed any more after Bug 874580 (IonMonkey: Optimize for .. of)
+*** Bug 1049495 has been marked as a duplicate of this bug. ***
+Created attachment 8468480
+webconsole-autocomplete-bail.patch
+
+As mentioned in Comment 18, this patch adds a new constant MAX_AUTOCOMPLETE_ATTEMPTS that protects against large objects with numeric properties (like arrays).  Also adds a test for this and for the 1500 limit on MAX_AUTOCOMPLETIONS
+Comment on attachment 8468480
+webconsole-autocomplete-bail.patch
+
+Review of attachment 8468480:
+-----------------------------------------------------------------
+
+Thanks for your patch!
+
+::: toolkit/devtools/webconsole/utils.js
+@@ +36,5 @@
+> +
+> +// Provide an easy way to bail out of even attempting an autocompletion
+> +// if an object has way too many properties. Protects against large objects
+> +// with numeric values that wouldn't be tallied towards MAX_AUTOCOMPLETIONS.
+> +const MAX_AUTOCOMPLETE_ATTEMPTS = exports.MAX_AUTOCOMPLETE_ATTEMPTS = 100000;
+
+Exporting these values may suggest to external users that they can change them. Is this ok?
+(In reply to Mihai Sucan [:msucan] from comment #23)
+> Comment on attachment 8468480
+> webconsole-autocomplete-bail.patch
+> 
+> Review of attachment 8468480:
+> -----------------------------------------------------------------
+> 
+> Thanks for your patch!
+> 
+> ::: toolkit/devtools/webconsole/utils.js
+> @@ +36,5 @@
+> > +
+> > +// Provide an easy way to bail out of even attempting an autocompletion
+> > +// if an object has way too many properties. Protects against large objects
+> > +// with numeric values that wouldn't be tallied towards MAX_AUTOCOMPLETIONS.
+> > +const MAX_AUTOCOMPLETE_ATTEMPTS = exports.MAX_AUTOCOMPLETE_ATTEMPTS = 100000;
+> 
+> Exporting these values may suggest to external users that they can change
+> them. Is this ok?
+
+The only reason I'm exporting here is to prevent magic number duplication in the test.  We could make them as properties on WebConsoleUtils if we wanted them to be mutable, but I don't see any need for it.  Though it would be interesting to run some tests where we measure the performance of various numbers in these places and figure out the ideal numbers as a trade off for perf and accuracy..
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=af056c742bbb
+https://hg.mozilla.org/integration/fx-team/rev/6da5056ae14a
+https://hg.mozilla.org/mozilla-central/rev/6da5056ae14a
+
+
+Console input is slow when accessing large Uint8Array object properties
+
+
+
+Bug 998344 - Console input is slow when accessing large Uint8Array object properties. r=robcee 
+
+Bug 998344 - Prevent console autocompletion on objects with a large number of properties. r=msucan 

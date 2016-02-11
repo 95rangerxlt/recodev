@@ -1,0 +1,167 @@
+look like a typo in _prepWindowToRestoreInto
+
+we get tabview-group data change group id to zero and set the modified data into tabview-groups !!!
+
+> let data = this.getWindowValue(aWindow, "tabview-group");
+...
+...
+> this.setWindowValue(aWindow, "tabview-groups", JSON.stringify(data));
+
+look like a typo in _prepWindowToRestoreInto
+
+we get tabview-group data change group id to zero and set the modified data into tabview-groups !!!
+
+> let data = this.getWindowValue(aWindow, "tabview-group");
+...
+...
+> this.setWindowValue(aWindow, "tabview-groups", JSON.stringify(data));
+Even worse, just correcting the typo doesn't do what it's supposed to. Patch coming soon.
+Created attachment 566054
+Patch v0.1
+
+I changed what we look at entirely - we're now looking at tabview-groups instead of tabview-group. This seems like it should be a bit quicker & less tricky (no using Object.keys anymore). It seems to work just fine as well.
+Comment on attachment 566054
+Patch v0.1
+
+Tim, can you take a look at this too. I'm tricking Panorama in a way it wasn't before.
+Comment on attachment 566054
+Patch v0.1
+
+Review of attachment 566054:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/nsSessionStore.js
+@@ +1630,4 @@
+>          //XXXzpao This is a hack and the proper fix really belongs in Panorama.
+> +        if (groupsData.activeGroupId != 0) {
+> +          groupsData.activeGroupId = 0;
+> +          this.setWindowValue(aWindow, "tabview-groups", JSON.stringify(groupsData));
+
+That's unfortunately not working - we only use the activeGroupId to activate the right group after all groups were restored. Merging works only if both groupIds are the same. So you have to create two groups and use the second to store your tabs in (for the restored session) to make it fail. This behavior is now even worse than before because now we get an "orphan" tab instead of a second group.
+
+We have an orphan tab because that has a non-existant groupID which we can't find a group for. So it's just not assigned to any group. I think that case should be handled by Panorama. I'll attach a patch with those changes (I needed to try that so I figured I could give you that patch right away ;).
+Created attachment 566157
+Patch v0.2
+
+We should maybe write a test for this scenario, too? Shouldn't be that hard I think.
+Created attachment 566185
+proposed patch
+
+There are 2 main problem with the function GroupItems_reconstitute, i'v attached a file with a patch to the function that i believe solves the problems
+
+1st: we have to set tabItem._reconnected = false to All item that were exist before the restore, if not we can lose our data if the other action on groups trigger item save.
+
+2nd. Removing items inside foreach groupItem.getChildren() is wrong, and lead to orphaned tabItems if the loop skip over some.
+its have to be groupItem.getChildren().concat() or just remove the call to _reconnect() from this function
+
+You have to take into consideration that any extension can also call setBrowserState setWindowState with or with out overwrite existing tabs.
+
+my proposed patch is very simple:
+1. mark tabs, that were overwrite by restore, that are about to move from one existing group to another as _reconnected = false.
+2. mark tabs, that were overwrite by restore, taht are in group that is going to be close as _reconnected = false.
+3. the rest of the work is done any how later by later by UI.reset if there are no groups at all or by TabItems.resumeReconnecting if there is groups. 
+
+i don't see any reason to change any of the tabview-tab data that come from the sessionRestore.
+Comment on attachment 566157
+Patch v0.2
+
+Canceling review. Tim's going to evaluate the approach in the new patch.
+Comment on attachment 566185
+proposed patch
+
+Tim, I'm marking you for feedback? here so it doesn't fall off your radar. If this is on a better path than your patch, feel free to take the review.
+Comment on attachment 566185
+proposed patch
+
+This approach works for tabs that get moved to a new group but only if the originating group will not be closed. Setting '_reconnected = false' does not prevent the tab from being closed when its parent group is. In a case like this we'd first need to find the new group's id, modify the tab data and then call reconnect() before the group is closed (see [1]).
+
+Additionally I'd really like to get rid of the session store hack (see [1]) that solely exists to work around Panorama's strange (former) behavior.
+
+[1] https://bug688695.bugzilla.mozilla.org/attachment.cgi?id=566157
+
+
+> 1st: we have to set tabItem._reconnected = false to All item that were exist
+> before the restore, if not we can lose our data if the other action on groups
+> trigger item save.
+
+True, thanks for finding that! At the moment even that can't occur because we didn't notice that tabs that changed groups weren't moved to their right groups on session restore... Filed bug 705964.
+
+> 2nd. Removing items inside foreach groupItem.getChildren() is wrong, and lead to
+> orphaned tabItems if the loop skip over some.
+
+The usage here is correct. Please read the MDN documentation regarding Array.forEach().
+Created attachment 577456
+patch v3
+
+This patch removes the session store workaround for the old Panorama behavior wrt to group merging. It makes sure that tabs not assigned to a valid group are merged into the currently active group.
+
+I'm not sure how to write a test for ss.restoreLastSession()... I think that's something for MozMill, right?
+Please apply the patch from bug 705964 before this one (you might get conflicts when applying).
+(In reply to Tim Taubert [:ttaubert] from comment #9)
+> The usage here is correct. Please read the MDN documentation regarding
+> Array.forEach().
+
+try this test code. it only show 1, 3 as an output.
+let a = ["1", "2", "3", "4"];
+a.forEach(function(item) {
+  Services.console.logStringMessage(item);
+  a.shift(item);
+});
+Comment on attachment 577456
+patch v3
+
+Review of attachment 577456:
+-----------------------------------------------------------------
+
+Looks good to me. Thanks Tim! Testing ss.restoreLastSession() doesn't really happen, but a mozmill test would be the right way to go. I think there are litmus tests for this for whenever they get run.
+(In reply to onemen.one from comment #12)
+> (In reply to Tim Taubert [:ttaubert] from comment #9)
+> > The usage here is correct. Please read the MDN documentation regarding
+> > Array.forEach().
+> 
+> try this test code. it only show 1, 3 as an output.
+> let a = ["1", "2", "3", "4"];
+> a.forEach(function(item) {
+>   Services.console.logStringMessage(item);
+>   a.shift(item);
+> });
+
+I don't think there's anything actually being removed from the array in Tim's code. So while your example shows gotchas with forEach, it's not applicable here.
+(In reply to onemen.one from comment #12)
+> try this test code. it only show 1, 3 as an output.
+
+Mhh. I'm sure I tried the same with Array.splice() but got a different output. It's maybe safer to not rely on a special behavior and just clone the array...
+
+(In reply to Paul O'Shannessy [:zpao] from comment #14)
+> I don't think there's anything actually being removed from the array in
+> Tim's code.
+
+In fact, TabItem._reconnect() can remove items from the current children array when they change the group.
+https://hg.mozilla.org/integration/fx-team/rev/7923eebf6c13
+> +            // correct the tab's groupID if necessary
+> +            if (!parentGroup || -1 < toClose.indexOf(parentGroup)) {
+> +              tabData.groupID = activeGroupId || Object.keys(groupItemData)[0];
+> +              Storage.saveTab(tabItem.tab, tabData);
+> +            }
+
+
+this line
+tabData.groupID = activeGroupId || Object.keys(groupItemData)[0];
+
+not look good to me,
+if we restore group-less session over existing session with group
+in reconstitute both groupItemData and groupItemsData are empty objects ( {} }
+
+activeGroupId is undefined
+Object.keys(groupItemData)[0] is undefined when groupItemData = {}
+
+setting undefined to tabData.groupID is not a good idea.
+
+in TabItem__reconnect, for example, every tab with tabData.groupID = undefined
+reconnect to new group !
+(In reply to onemen.one from comment #17)
+> if we restore group-less session over existing session with group
+> in reconstitute both groupItemData and groupItemsData are empty objects ( {}
+
+Uh, yeah. We should not try to sanitize the tab's groupID if its tabData is invalid. I filed a follow-up for this (bug 706430). Thanks again, you've been very helpful with this bug!
+https://hg.mozilla.org/mozilla-central/rev/7923eebf6c13

@@ -1,0 +1,370 @@
+Created attachment 8559670
+patch
+
+Now that we store the original location in the BreakpointActor, we can store BreakpointActors in the BreakpointActorMap by original location instead of generated location.
+
+This patch is based on top of the patch in 1128921. To avoid confusion, you might want to wait with reviewing this until that patch lands.
+
+Created attachment 8559670
+patch
+
+Now that we store the original location in the BreakpointActor, we can store BreakpointActors in the BreakpointActorMap by original location instead of generated location.
+
+This patch is based on top of the patch in 1128921. To avoid confusion, you might want to wait with reviewing this until that patch lands.
+Comment on attachment 8559670
+patch
+
+Review of attachment 8559670:
+-----------------------------------------------------------------
+
+See my comment; I want to see some numbers before we change that behavior in `_addScript`.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +2047,5 @@
+>      let endLine = aScript.startLine + aScript.lineCount - 1;
+> +    let sourceActor = this.sources.createNonSourceMappedActor(aScript.source);
+> +    for (let actor of this.breakpointActorMap.findActors()) {
+> +      let generatedLocation = this.synchronize(this.sources.getGeneratedLocation(actor.originalLocation));
+> +
+
+I don't know about this. This will now block the debugger on downloading a source map and parsing it if it has a breakpoint, which potentially could be a large map (think of one large source map for the one large bundle.js file). I'd like to see what the performance of that is with this.
+
+This does fix a theoretical problem though: if you recompile bundle.js and reload the page, if we just blindly set the previous generatedLocation it could be wrong (since the generated source is different now).
+
+Can you provide basic numbers comparing the time it takes for `_addScript` to run before this patch and after? Make a test case with a large amount of sourcemaps files (use a bundler like browserify/webpack), set a bunch of breakpoints in a couple of the sourcemapped files and time it. If you need a test case I can make one for you.
+
+I just want to make sure that forcing the source map parsing isn't going to slow it down too much.
+Created attachment 8562072
+patch
+
+Actually, I was being conservative in using synchronize, because I didn't know if whether there were parts of the code that had timing assumptions about new script notifications (such as all breakpoints being set before on new script notifications are fired, for instance).
+
+However, I tried rewriting the patch without synchronize, and it *seems* to just work. I'm just not 100% confident that this is race condition free. What happens for instance when you refresh the page, and a script that previously was garbage collected is reintroduced? If the script's source is source mapped, then fetching the source map could take some time, so if we need to set a breakpoint at some point in the script, execution could theoretically already have passed that point long before we get to it.
+
+Is that a scenario we care about? If not, then this new patch should be perfectly adequate, and addresses your problem with the previous version. If not, I really can't think of any other way to do this but synchronously. Doing measurements is only useful if an alternative implementation is feasible, imho. So, do you have any thoughts on how we could implement this differently?
+Comment on attachment 8562072
+patch
+
+Argh, this is the wrong patch. Damnit brain. Get it through your damn nerve endings!
+Created attachment 8562083
+patch
+
+Let's try that one again, shall we?
+Speaking of try:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=77a4bc358868
+(In reply to Eddy Bruel [:ejpbruel] from comment #2)
+
+> Is that a scenario we care about? If not, then this new patch should be
+> perfectly adequate, and addresses your problem with the previous version. If
+> not, I really can't think of any other way to do this but synchronously.
+> Doing measurements is only useful if an alternative implementation is
+> feasible, imho. So, do you have any thoughts on how we could implement this
+> differently?
+
+Well, it doesn't quite address what I was saying, so before we figure out if this is feasible, I'd still like to talk about that.
+
+Avoiding `synchronize` is better, but this will still force *all* sourcemaps to be parsed before the debugger completes initializing. The performance hit of that can't be trivial. All sourcemaps are fetched, yes, because we need to get the list of original sources, but we delay parsing them until a source is clicked (or maybe even until something like a breakpoint is set on it).
+
+If a page has a lot of sources, and each have a sourcemap, I would expect this to significantly slow down the startup time of the debugger.
+
+And I'm saying it's worth doing a rough profile of that to even see how bad it is. We may find that it's horrible, so we have to find another way to do it, or that it's within an acceptable margin. But we delay sourcemap parsing for a reason.
+
+I'm going to suggest something controversial: that it's not worth it. Store the generatedLocation as well and keep just setting that like before. The *primary* use case here is the user sets a breakpoint and refreshes the page to test something at startup. For the other workflow, if the user makes changes to the source, they most likely wanted to set different breakpoints on the new source anyway.
+
+If you disagree, may be worth asking fitzgen to chime in here?
+(a) Avoid `synchronize` like the plague. It is the most horrible thing in the universe.
+
+(b) Getting a list of sources from a source map doesn't require parsing the mappings (which is the expensive process that is done lazily). This was done because it was a significant bottleneck to performance. Like multiple seconds beach ball for huge source maps.
+Comment on attachment 8562083
+patch
+
+Review of attachment 8562083:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/script.js
+@@ +2047,5 @@
+>      let endLine = aScript.startLine + aScript.lineCount - 1;
+> +    let sourceActor = this.sources.createNonSourceMappedActor(aScript.source);
+> +    let promises = [];
+> +    for (let actor of this.breakpointActorMap.findActors()) {
+> +      promises.push(this.sources.getGeneratedLocation(actor.originalLocation)
+
+Yeah, this is going to trigger a parse of the mappings, which is no bueno :(
+
+Ideally we would move all SourceMapConsumers (and therefore mappings parsing) off into a worker and interact with it via message passing (ideally, the same worker used for pretty printing so that we aren't spinning up tons of workers and wasting memory), and at least that way we wouldn't beach ball even if it would still take a long time to get the data.
+
+Not sure if the startup slow down is worth it, even if we aren't blocking the main thread.
+That was my intuition as well... we sacrifice perfection for usability in common use case. Loading the debugger is done by every developer a million times. The amount of times someone sets a breakpoint on a sourcemapped source, changes the contents, and refreshes is far less. And we could somehow help them re-set the breakpoint, if we can detect it stopped on a line without a breakpoint?
+In fact, we have this problem with non-sourcemapped sources anyway. If you set a breakpoint and change the source, we still set the breakpoint on whatever line it was on, even though that line of code is totally different now. I think that's just kind of expected to happen if you change the source from underneath it.
+Comment on attachment 8562083
+patch
+
+Review of attachment 8562083:
+-----------------------------------------------------------------
+
+Gonna go ahead and r- because I think it's pretty decided that this would just be way too expensive. I recommend keeping the generated location on the SourceActor and just re-setting that.
+(In reply to James Long (:jlongster) from comment #11)
+> Comment on attachment 8562083
+> patch
+> 
+> Review of attachment 8562083:
+> -----------------------------------------------------------------
+> 
+> Gonna go ahead and r- because I think it's pretty decided that this would
+> just be way too expensive. I recommend keeping the generated location on the
+> SourceActor and just re-setting that.
+
+I understand your point on how triggering a source map parse on addScript would be way too expensive. I just have one question:
+
+If we keep the generatedLocation on the BreakpointActor, as you suggest, doesn't that imply that we already parsed the source map when the breakpoint was set? Otherwise, how could we have obtained that generatedLocation?
+
+In other words: since setBreakpointForActor calls getGeneratedLocation for the actor's originalLocation, the fact that this BreakpointActor exists when addScript is called implies that we already parsed its source map at least once. Since we cache the mappings after the first parse, subsequent calls to getGeneratedLocation shouldn't be that expensive at all.
+
+Am I missing something here?
+After thinking about it some more, here are some additional observations:
+
+The onNewScript handler is called synchronously by the Debugger API before the script starts executing. If we haven’t completely finished setting breakpoints before the onNewScript handler returns, the script could theoretically start executing and pass through one or more previously pending breakpoints before they are set.
+
+This could be very confusing, for example, when the user sets a few breakpoints in the global scope in a source mapped source, and then tries to refresh. If the top level script was garbage collected when the breakpoints were set, it is now reintroduced, but since the call to getGeneratedLocation is asynchronous, the top level script can start running before the pending breakpoints become active.
+
+Because of this, I think we should seriously consider using synchronise in onNewScript whenever we need to call asynchronous functions like getGeneratedLocation. However, I also understand the performance implications of having to load huge source maps whenever a new script is introduced. More on that below.
+
+Currently, setBreakpoint gets or creates a BreakpointActor, stores it in the BreakpointActorMap, and then calls getGeneratedLocation to obtain the generated location of the actor. If we then store the generated location in the BreakpointActor, as James is suggesting, the onNewScript handler can fire before the getGeneratedLocation promise resolves. If that happens, addScript will find the BreakpointActor in the BreakpointActorMap, but won’t have its generatedLocation.
+
+Previously, setBreakpoint called getGeneratedLocation first and *then* gets or creates the BreakpointActor and stores it in the BreakpointActorMap (using its generated location). In this case, the onNewScript handler will never find any BreakpointActors for which it doesn’t have a generatedLocation, but can still fire before the BreakpointActor is put into the BreakpointActorMap. However, after the BreakpointActor is put into the BreakpointActorMap, we call setBreakpointForActor, and the newly introduced script will be found there, so we won’t have any problems.
+
+What this tells you is that I’ve been ‘doing it wrong’ (tm) and I messed up the order in which we do things. Instead of:
+
+1. Getting or creating the BreakpointActor
+2. Putting it in the BreakpointActorMap
+3. Calling getGeneratedLocation to obtain its generatedLocation
+4. Calling setBreakpointForActor
+
+We should be:
+
+1. Getting or creating the BreakpointActor
+2. Calling getGeneratedLocation to obtain its generatedLocation
+3. Calling setBreakpointForActor
+4. Putting it in the BreakpointActorMap
+
+This way, the generatedLocation is guaranteed to be stored on the BreakpointActor if and only if it is stored in the BreakpointActorMap, so the onNewScript handler will never find any BreakpointActors for which it doesn’t have a generatedLocation.
+
+However, regarding storing the generated location on the actor, consider the following. If the onNewScript handler finds a BreakpointActor, then it is stored in the BreakpointActorMap. If the BreakpointActor is stored in the BreakpointActorMap, the getGeneratedLocation promise has been resolved. If the getGeneratedLocation promise has been resolved, the source map for the BreakpointActor’s originalLocation has been loaded and parsed. Therefore, if onNewScript finds a BreakpointActor, then the source map for it’s original location has been loaded and parsed.
+
+I’ve written some code to check if the above assertion holds, and that seems to be the case. If I’m right, that means there is no added benefit to storing the generated location in the actor directly: we can always obtain it from the original source, and as long as the the source map doesn’t change out from under us (which is the common case), it is guaranteed to already be loaded and parsed, so obtaining the generated location is cheap.
+
+An additional advantage of not storing the generated location in the actor directly, is that it will make things behave correctly even if the source map changes out from under us, as you pointed out. Of course, in that case, startup time of the debugger would be negatively affected, but as you also pointed out, this isn’t something people commonly do, in which case being correct is to be preferred over being fast, when possible, imo.
+
+Now, I’m wondering if I’m not completely wrong about all of this, so feel free to point out if anything I said makes no sense. One thing I’m unsure of for example, is what happens if a source map foo.map is replaced with another map with the same name, since the fetch mechanism caches source maps by url. Also, I can imagine that the above is not enough to convince you, so we should probably still do some measurement even if the above makes sense.
+Also chiming in Nick to give his thoughts on the above.
+xpcshell debugging is broken due to this - it sets a breakpoint before loading a regular module, but often onNewScript returns before the breakpoint is *really* set so is skipped.
+
+I'm sure some of the subtleties escape me, but it sounds like it might be possible to only block on the "expensive" promises when there's a breakpoint already set anywhere in that script - which sounds like the unusual case for when onNewScript is called?
+(In reply to Mark Hammond [:markh] from comment #15)
+> xpcshell debugging is broken due to this - it sets a breakpoint before
+> loading a regular module, but often onNewScript returns before the
+> breakpoint is *really* set so is skipped.
+> 
+> I'm sure some of the subtleties escape me, but it sounds like it might be
+> possible to only block on the "expensive" promises when there's a breakpoint
+> already set anywhere in that script - which sounds like the unusual case for
+> when onNewScript is called?
+
+I'll just reply directly to this before replying to Eddy: that's not directly related to this. Setting the breakpoints can, and should, be entirely synchronous by default, which actually is another reason why we can't lookup the sourcemaps. Unfortunately the breakpoint functions in `SourceActor` does still run the location through the sourcemaps, but we shouldn't do that. Eddy's already working on separating methods into ones that set breakpoints specifically for generated locations or not, and when that happens, we could just call the one that directly sets the generated location and never touches sourcemaps.
+(In reply to Eddy Bruel [:ejpbruel] from comment #12)
+> 
+> I understand your point on how triggering a source map parse on addScript
+> would be way too expensive. I just have one question:
+> 
+> If we keep the generatedLocation on the BreakpointActor, as you suggest,
+> doesn't that imply that we already parsed the source map when the breakpoint
+> was set? Otherwise, how could we have obtained that generatedLocation?
+> 
+> In other words: since setBreakpointForActor calls getGeneratedLocation for
+> the actor's originalLocation, the fact that this BreakpointActor exists when
+> addScript is called implies that we already parsed its source map at least
+> once. Since we cache the mappings after the first parse, subsequent calls to
+> getGeneratedLocation shouldn't be that expensive at all.
+> 
+> Am I missing something here?
+
+The only way to set a breakpoint is to click on the source and click on the line number. When you set that breakpoint, the sourcemaps are finally parsed because we need it. The breakpoint is created and the stored with a generatedLocation.
+
+Sourcemaps do not survive across reloads, obviously. When the page is refreshed, all the sources and sourcemaps are cleared but we still have a breakpoint with a generatedLocation. When `_addScript` is fired all we need to do is re-set those breakpoints with their generatedLocation.
+
+At that point we don't have any sourcemaps, since they don't survive reloads.
+(In reply to James Long (:jlongster) from comment #16)
+> (In reply to Mark Hammond [:markh] from comment #15)
+> > xpcshell debugging is broken due to this - it sets a breakpoint before
+> > loading a regular module, but often onNewScript returns before the
+> > breakpoint is *really* set so is skipped.
+> > 
+> > I'm sure some of the subtleties escape me, but it sounds like it might be
+> > possible to only block on the "expensive" promises when there's a breakpoint
+> > already set anywhere in that script - which sounds like the unusual case for
+> > when onNewScript is called?
+> 
+> I'll just reply directly to this before replying to Eddy: that's not
+> directly related to this. Setting the breakpoints can, and should, be
+> entirely synchronous by default, which actually is another reason why we
+> can't lookup the sourcemaps. Unfortunately the breakpoint functions in
+> `SourceActor` does still run the location through the sourcemaps, but we
+> shouldn't do that. Eddy's already working on separating methods into ones
+> that set breakpoints specifically for generated locations or not, and when
+> that happens, we could just call the one that directly sets the generated
+> location and never touches sourcemaps.
+
+It's not directly related to this, but I bet you it's due to one of the earlier refactors we did (making setBreakpoint return a promise, combined with the fact that then handlers are now asynchronous). In any case, it does illustrate my point that its important to keep addScript fully synchronous.
+I just talked to jlongster on irc. The part I overlooked is that the source map cache doesn't survive across refresh, so getting the generated location in _addScript could still trigger an expensive source map parse on reload.
+
+We agreed that because of this, were going to have to keep storing the generated location on the BreakpointActor. This means that we still won't be able to handle source maps changes between reloads, but thats no worse than the current situation, and isn't something users regularly do anyway.
+
+Another implication of this compromise is that we can't do breakpoint sliding the way I had in mind for pending breakpoints: since breakpoint sliding is going to operate on original locations, I'm going to have to recompute the generated locations each time we slide to the next line. Since that would trigger a source map reparse, we can never do this from within addScript.
+
+However, since we have the ScriptStore now, pending breakpoints are actually going to be quite rare. They should only appear when the Debugger is first enabled. Since they are so rare, it should be safe not to perform breakpoint sliding for pending breakpoints at all. If the pending breakpoint cannot be set on the requested line, we should just delete it.
+(0) Yes, we need to set any stored BPs synchronously within addScript/onNewScript. This is the only way we can guarantee that BPs are (re)set before running debuggee code.
+
+(1) Yes, the non source mapped case should be synchronous now. If recent changes made it so that it isn't synchronous, then we need to fix that ASAP because all reload+BP stuff will be broken and racy.
+
+(2) On refresh we get new scripts with new source maps. Fetching these new source maps is asynchronous. Fail. We could use synchronize, but it is virtually the worst thing in the world. It makes control flow very ambiguous and murky, especially because we are "pausing" the thread but then continue to do work in that same thread. The possibilities for messing this up are endless. Instead, I think we should do something somewhat equivalent, but do our best to preserve some sanity: move all source map stuff into the helper worker so we aren't messing around with the "paused" thread willy nilly and can keep some form of separation and sanitation. Here is a sketch of what we would do in onNewScript/addScript:
+
+
+  let p = new Promise(resolve => {
+    sendRequestToHelperWorker({
+      type: "fetchSourceMap",
+      sourceMapUrl: normalizeRelativePath(script.sourceMapURL)
+    }, sourceMapHandle => {
+      resolve(sourceMapInWorkerHandle);
+    })
+  });
+
+  p = p.then(sourceMapInWorkerHandle => {
+    let generatedPositionsToSetBPsOn = [];
+
+    for (let bpActor of bpStore) {
+      // Note that this lets us keep the bp store full of original locations,
+      // like how we really want.
+      generatedPositionsToSetBPsOn.push(new Promise(resolve => {
+        // Triggers a mappings parse on startup/refresh but at least it's
+        // off main thread.
+        sourceMapInWorkerHandle.getGeneratedLocation(bpActor.originalLocation, genLoc => {
+          resolve({
+            actor: bpActor,
+            location: genLoc
+          });
+        });
+      }));
+    }
+
+    return Promise.all(generatedPositionsToSetBPsOn);
+  });
+
+  // Make sure that for _ALL_ the async stuff we have to do, we
+  // only call synchronize ONCE!
+  let bpLocations = this.synchronize(p);
+
+  for (let { actor, location } of bpLocations) {
+    actuallySetTheBreakpoint(actor, location);
+  }
+
+I think this would be cleaner (and non-beach-ball-y) than doing all the same work on the main thread, and the boundaries are more clear than just using synchronize all over the place.
+
+Anyways, when implementing this stuff, here is a good test case: http://lampwww.epfl.ch/~doeraene/presentations/scala-js-scaladays2013/
+
+Huge amount of scripts, big source map files. If start up is still "fast" on that test case, then we are probably alright. Make sure to measure, though!
+Created attachment 8564246
+patch
+
+Here's a new patch that refactors addScript as we discussed. Note that this patch is based on top of the one in bug 1131643, so it contains a few more changes compared to the previous version.
+
+If this patch makes it to r+, we still need to gather performance measurements for this change before we land it.
+Comment on attachment 8564246
+patch
+
+Review of attachment 8564246:
+-----------------------------------------------------------------
+
+Looks fine to me now. Interested to see the benchmark numbers, with & without sourcemaps. r+ if you add that if check
+
+::: toolkit/devtools/server/actors/script.js
+@@ +2052,4 @@
+>      }
+>  
+> +    this.synchronize(Promise.all(promises));
+> +
+
+I thought you were going to do a `if(promises.length) {}` check because the `synchronize` function doesn't properly do that optimization. (it assumes sync promises which I'd rather not rely on)
+(In reply to James Long (:jlongster) from comment #22)
+> Comment on attachment 8564246
+> patch
+> 
+> Review of attachment 8564246:
+> -----------------------------------------------------------------
+> 
+> Looks fine to me now. Interested to see the benchmark numbers, with &
+> without sourcemaps. r+ if you add that if check
+> 
+> ::: toolkit/devtools/server/actors/script.js
+> @@ +2052,4 @@
+> >      }
+> >  
+> > +    this.synchronize(Promise.all(promises));
+> > +
+> 
+> I thought you were going to do a `if(promises.length) {}` check because the
+> `synchronize` function doesn't properly do that optimization. (it assumes
+> sync promises which I'd rather not rely on)
+
+Ah yes, thanks for catching that. I forgot to add it :-)
+I've performed some measurements on my machine, using the following site as test case:
+http://lampwww.epfl.ch/~doeraene/presentations/scala-js-scaladays2013/
+
+At first, I tried to compute a running average of how long each call to addScript took. However, this lead to skewed results, as most calls would finish in less than 1ms (which then gets rounded to 0). A better approach is to measure the total time spend in addScript instead. When using this metric, I consistently seeing numbers around 1500ms with my patch applied, and around 450ms without it.
+
+Of course, these numbers should only be taken as relative values, since the absolute values are dependent on the speed of your machine, and the speed at which the source maps can be downloaded. Another thing to keep in mind is that logging the total time so far in each call to addScript is likely to cause some slowdown as well.
+
+Bearing that in mind, it's probably still safe to say that this patch causes a 3x slowdown in debugger startup when there are huge source maps present. Although that is obviously very significant, the slowdown isn't so bad as to make the debugger unusable, in my opinion.
+
+Also, keep in mind that this slowdown is due to the fact that we really need access to the up to date source map in addScript if we are to do the correct thing. The only way that we can improve performance here is by sacrificing correctness (which is what we did before), either by not properly dealing with source maps that changed after a reload, or by not guaranteeing that top-level breakpoints are set before execution passes through them.
+
+Generally speaking, I am of the opinion that correctness should virtually always trump performance in a debugger, unless perhaps performance becomes so abysmal as to render the debugger unusable. I don't think that is the case here, but obviously that is rather subjective.
+
+Let's talk this out and make sure we all agree before I land this patch.
+I tried some more measurements. When I load jlongster's blog at http://jlongster.com:9000/ without my patch applied, set a breakpoint on line 1 of webpack:///static/js/main.js, and then refresh, the total amount of time spent in _addScript is +/- 35ms. If I do the same with my patch applied, this goes up to +/- 3700ms. That 3665ms most likely comes from reloading and reparsing the source map.
+
+That's a huge increase, much more than what we saw with my previous difference. Apparently, the amount of extra time spent in addScript is purely a function of the size of the source map, which means that we shouldn't be looking at this in terms of relative performance loss (I can make addScript as slow as you like, by making the source map large enough).
+
+Perhaps we've been looking at this from the wrong perspective. Without my patch applied, we only spend 35ms in _addScript yes, but it still takes about 3500ms before the source on which I set the breakpoint is reloaded. I can't meaningfully start debugging that breakpoint before the source is reloaded, so the source map needs to be reloaded anyway.
+
+This patch doesn't increase the amount of time we spend loading/parsing the source map, it changes *when* we do it. More importantly, it blocks the debugger while the source map is being loaded, so we can set breakpoints before the scripts start. Previously, we avoided blocking the debugger by not recomputing the generated locations for the breakpoint actors, but this can lead to breakpoints being set in the wrong place if the source map changed.
+
+The question I think we should ask is whether its such a big problem if we block the debugger. After all, we only do this if you actually have a breakpoint set in a source mapped source (if there are no BreakpointActors, we don't need to recompute their generated locations, so we don't need to block on loading the source map. If there is no source map, we don't need to load anything at all).
+
+If you set a breakpoint in a source mapped source, I think it's reasonable to assume that you want to do something with that breakpoint. However, you can't actually do that until the source is reloaded, which doesn't happen until *after* the source map is reloaded. Its unlikely that you'll want to do something else with the debugger while you're waiting for that to happen (which is usually a matter of seconds).
+
+In short, yes, blocking is bad, but we have a good reason for it here, and in the cases where we do, I doubt it actually matters much to the user whether the debugger stays responsive while they are waiting for their sources to be reloaded.
+Try run for this patch:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=87b16c033cd0
+
+Nick and/or James, in light of comment 25, if you have any objections to me landing this patch, let me know. Otherwise, I'm going to go ahead and land it.
+> Without my patch applied, we only spend 35ms in _addScript yes, but it still takes about 3500ms before the source on which I set the breakpoint is reloaded. 
+
+Are you saying that the debugger fired up in 35ms, but there was a "loading source..." message for 3500ms? That's a very good point.
+
+I think I'm ok with this now, but socially speaking, I'm just worried that people are going to complain that it "feels" worse (even though, like you said, you do have to wait anyway...), while we still don't have support for basic stuff like sourcemapping in the web console. I'm not saying they are right.
+
+I think it would help a lot to not beachball the UI. But I'm ok fixing that in a follow-up. I liked Nick's idea of showing an overlay that says "loading debug symbols" or "loading sourcemap" or something like that.
+Agree with both of you.
+
+I think the key is making sure that we "educate" users about what's going on via the "loading source map" overlay. High priority follow up, please.
+Huh. Try run for this patch is yellow, but I can't reproduce any of the failures locally. I suspect that most of the failures are due to the failure in the first test, browser_dbg_source-maps-04.js.
+
+We've seen this test fail before. Whenever we change something that should be unrelated, the number of frames we get changes from 1 to 2, or vice versa. I strongly suspect there is a race condition in this test somewhere, but so far I've been unable to figure out where.
+
+I really don't want to go hunting for race conditions before I can land this patch, so I'd like to propose to disable this test for now and file a follow up bug to fix it. James, you've seen this test fail before, so what do you think?
+
+Here's another try push for the same patch, just to make sure:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=8083bdf7f06a
+Huh. I don't know if I looked at the wrong try push earlier, but apparently the previous try push was green after all. So is the second one. We should be able to land this.
+https://hg.mozilla.org/integration/fx-team/rev/9aa1baf04e80
+https://hg.mozilla.org/mozilla-central/rev/9aa1baf04e80

@@ -1,0 +1,147 @@
+This is one of the last two test failures blocking compartment-per-global. The test fails when run standalone with both trunk and c-p-g. However, the entire suite collectively passes on trunk (but not with c-p-g). 
+
+STR: TEST_PATH=browser/components/sessionstore/test/browser_705597.js make -C $OBJDIR mochitest-browser-chrome
+
+about:home is throwing here, because localStorage['search-engine'] hasn't been set up, and JSON.parse doesn't expect that: http://mxr.mozilla.org/mozilla-central/source/browser/base/content/abouthome/aboutHome.js#181
+
+This seems to be set up in loadDefaultSearchEngine, which is only called by the defaultArgs getter:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/components/nsBrowserContentHandler.js#865
+
+When Jared ran the whole subdirectory, the failures went away. So one of the previous tests is probably triggering the necessary setup here.
+
+Presumably the failure on trunk and the failure with c-p-g are linked: we're relying on some sort of lazy setup of localStorage['search-engine'] that isn't guaranteed to happen. But either way, this bug is about making things worth with c-p-g.
+
+Dolske, can you make sure this bug gets traction?
+
+This is one of the last two test failures blocking compartment-per-global. The test fails when run standalone with both trunk and c-p-g. However, the entire suite collectively passes on trunk (but not with c-p-g). 
+
+STR: TEST_PATH=browser/components/sessionstore/test/browser_705597.js make -C $OBJDIR mochitest-browser-chrome
+
+about:home is throwing here, because localStorage['search-engine'] hasn't been set up, and JSON.parse doesn't expect that: http://mxr.mozilla.org/mozilla-central/source/browser/base/content/abouthome/aboutHome.js#181
+
+This seems to be set up in loadDefaultSearchEngine, which is only called by the defaultArgs getter:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/components/nsBrowserContentHandler.js#865
+
+When Jared ran the whole subdirectory, the failures went away. So one of the previous tests is probably triggering the necessary setup here.
+
+Presumably the failure on trunk and the failure with c-p-g are linked: we're relying on some sort of lazy setup of localStorage['search-engine'] that isn't guaranteed to happen. But either way, this bug is about making things worth with c-p-g.
+
+Dolske, can you make sure this bug gets traction?
+Created attachment 613454
+compartment-per-global
+
+Attaching the compartment-per-global patch. All of the dependent bugs have landed, so this should apply directly to trunk, and can be used for testing.
+This test probably relies on browser/components/test/browser_bug538331.js running before it (it calls the defaultArgs getter explicitly - AFAIK that getter isn't otherwise called ever in our test environment).
+
+I think we need to understand why c-p-g is causing this to fail in an whole-testsuite run. Does it cause browser_bug538331.js to not run, somehow? Change the ordering of tests?
+Hm, I'd guess it's related to this stuff:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/components/nsBrowserContentHandler.js#853
+
+I'll dig in a bit more.
+Ah, so I think that the failures on tinderbox were actually a different problem in the test. When I hack in:
+
+Cc["@mozilla.org/browser/clh;1"].getService(Ci.nsIBrowserHandler).defaultArgs;
+
+to the test, it no longer throws, but still hangs.
+For the record that test doesn't need to load about:home, any page would do. But it sounds like we should figure this out anyway.
+It's (at least partially) a QI issue. sessionHistory.getEntryAtIndex returns an  nsIHistoryEntry, but the test tries to get |childCount|, an nsISHContainer attribute. This happened to work before, but isn't guaranteed to, and breaks with cpg.
+
+There's still a subsequent hang after that though. Looking into it now.
+So I made the following two changes: http://pastebin.mozilla.org/1562581
+
+I'm now getting a failure in tabbrowser.xml. In the DOMTitleChanged event handler, the contentWin pulled off of the event doesn't match any of the browsers, so this._getTabForContentWindow(contentWin) returns undefined.
+
+contentWin location is about:mozilla. There are 2 browsers. The first one has contentWindow.location==about:blank, the second has about:home.
+
+The about:mozilla thing appears with the following code, which seems to be making an iframe in the browser document: http://mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/test/browser_705597.js#43
+
+Thoughts?
+Tim wrote that patch and Dietrich reviewed it, so +them.
+
+So I thought the contentWin == contentWin.top check stopped changed titles in frames from doing anything. contentWin should be the frame and top should be the enclosing page right? Or is CPG messing that up?
+(In reply to Paul O'Shannessy [:zpao] from comment #8)
+> Tim wrote that patch and Dietrich reviewed it, so +them.
+> 
+> So I thought the contentWin == contentWin.top check stopped changed titles
+> in frames from doing anything. contentWin should be the frame and top should
+> be the enclosing page right? Or is CPG messing that up?
+
+Well, I don't quite understand how this hierarchy is supposed to work. My impression is that we've got a tab containing a chrome window/document, and this chrome window/document has an iframe with a content window/document. In that case, it's unclear to me why this is supposed to work. The about:mozilla frame is top-level content, but it's still not the content window of the tab. Or am I missing something?
+(In reply to Bobby Holley (:bholley) from comment #7)
+> I'm now getting a failure in tabbrowser.xml. In the DOMTitleChanged event
+> handler, the contentWin pulled off of the event doesn't match any of the
+> browsers, so this._getTabForContentWindow(contentWin) returns undefined.
+> 
+> contentWin location is about:mozilla. There are 2 browsers. The first one
+> has contentWindow.location==about:blank, the second has about:home.
+
+Why is the contentWin.top != contentWin check failing? Given that contentWin is an iframe, it's .top should return its parent (regardless of what privileges either of them have). That seems like the problem that you need to debug.
+(In reply to Gavin Sharp (use gavin@gavinsharp.com for email) from comment #10)
+
+> Why is the contentWin.top != contentWin check failing? Given that contentWin
+> is an iframe, it's .top should return its parent (regardless of what
+> privileges either of them have). That seems like the problem that you need
+> to debug.
+
+Oh, I see. I'd figured that since it was an html document, it would be type="content", so window.top would stop at the content->chrome boundary. But indeed, it's a chrome iframe.
+
+Some quick gdb-ing indicates that the about:mozilla docshell has a null parent. I'll see if I can figure out why.
+All of the docshells in (and under) a tab are type=content, FWIW.
+Ok, getting back to this. As before, I'm running with the following patch applied: http://pastebin.mozilla.org/1562581
+
+The issue arrises with the setTabState call here: http://mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/test/browser_705597.js#22
+
+That code kicks off an asynchronous InternalLoad on the tab docshell. Presumably, the intention is for this to happen first, which would make the childCount 1, and then cause us to insert the dynamic subframe, which would make the childCount 2, and finish the test. But somehow, the InternalLoad from setTabState ends up coming in after we've already set up the dynamic subframe. Since the docshell doing the load is the tab, the children are destroyed and the subframe docshell goes away. But the DOMTitleChanged event still has the subframe window as its defaultView. So when that hits tabbrowser, we get the wrong answer when calling .top, because the docshell has already been torn down.
+
+So my best guess is that something in the sessionstore JS code is doing something that breaks with CPG. Somewhere around here: mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/nsSessionStore.js#2946
+
+Anyway, this has all been educational, but I think it's probably most efficient for someone who knows the sessionstore code to figure out what's going on here. zpao offered to take a look.
+
+Also, the attached CPG patch probably won't apply perfectly on trunk, because I recently added an assertion at the top of xpc_CreateGlobalObject. Resolving the conflicts should be trival, though.
+Ok, so the test is bad here. It tries to add a frame to a document that is going away. setTabState starts a load of about:home from about:blank, then returns out to the test. entry is correctly set to the new entry which session restore set up, which has 1 child and so we go into the whenChildCount(1) callback. about:blank is still loaded and so we add a frame to that, which we still load and apparently that still gets to the point where it's firing domtitlechanged and as Bobby noted that docshell is now gone and boom. We should wait for the load before checking child entries (we shouldn't need to check for 1 child entry if we wait for SSTabRestored I think).
+
+Bobby also pointed out that browser_707862.js has the same failure and that makes sense - it has the same test structure.
+
+I have no idea why CPG makes this suddenly break now but it does :/
+Created attachment 615570
+Patch v0.1
+
+Strictly speaking, the whenChildCount(1) calls shouldn't be necessary, but I didn't want to completely rewrite the test (and it would provide some usefulness if there's another strange breakage)
+Comment on attachment 615570
+Patch v0.1
+
+Tim, you wrote both of these tests so I wanted to run this by you as well to make sure I haven't changed what the test is supposed to be checking
+Don't you need the QI fix as well? Or does the need for that go away?
+
+Also, it might be nice to add the defaultArgs hack as well, so that this test can be run standalone.
+(In reply to Bobby Holley (:bholley) from comment #17)
+> Don't you need the QI fix as well? Or does the need for that go away?
+
+I left that in. We still need it because as you said on IRC, we lose the QIs across boundaries. It was working before because session restore would QI it but that's a different scope than here.
+
+> Also, it might be nice to add the defaultArgs hack as well, so that this
+> test can be run standalone.
+
+Yea, true. I can add that back in with a comment mentioning that (or we could just not use about:home for the test page)
+Comment on attachment 615570
+Patch v0.1
+
+Review of attachment 615570:
+-----------------------------------------------------------------
+
+looks good to me. is there a common header file to put those helper functions in?
+Comment on attachment 615570
+Patch v0.1
+
+Review of attachment 615570:
+-----------------------------------------------------------------
+
+Looks good to me as well.
+Can we land this?
+Landed with some changes (pulled some shared stuff into head.js)
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f7f0bcab1995
+https://hg.mozilla.org/mozilla-central/rev/f7f0bcab1995

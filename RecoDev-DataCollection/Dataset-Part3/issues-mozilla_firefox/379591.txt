@@ -1,0 +1,342 @@
+ 
+
+ 
+in addition to the optimization described in the bug summary, there are cases where we don't need to anything in itemChanged().
+
+for example, itemChanged() will get called after you merely click on a bookmark in the personal toolbar folder.
+
+what's going on here is by clicking on the bookmark, we will be visiting the bookmarked item.  when we lazily process the visit, we will call the itemChanged() in toolbar.xml (as _viewer implements nsINavHistoryResultViewer).
+
+currently, itemChanged() will call itemReplaced() which will all and remove the node.
+
+perhaps in toolbar.xml's itemChanged(), we should check if the title, uri and favicon have changed.  otherwise, we can ignore the notification.
+
+>	places.dll!nsNavHistoryFolderResultNode::OnItemVisited(__int64 aBookmarkId=46, nsIURI * aBookmark=0x02717bc0, __int64 aVisitId=136, __int64 aTime=1178736787875000)  Line 3106	C++
+ 	places.dll!nsNavHistoryResult::OnItemVisited(__int64 aBookmarkId=46, nsIURI * aBookmark=0x02717bc0, __int64 aVisitId=136, __int64 aVisitTime=1178736787875000)  Line 3785 + 0x9a bytes	C++
+ 	places.dll!nsNavBookmarks::OnVisit(nsIURI * aURI=0x02717bc0, __int64 aVisitID=136, __int64 aTime=1178736787875000, __int64 aSessionID=70, __int64 aReferringID=0, unsigned int aTransitionType=0)  Line 2333 + 0x8f bytes	C++
+ 	places.dll!nsNavHistory::AddVisit(nsIURI * aURI=0x02717bc0, __int64 aTime=1178736787875000, __int64 aReferringVisit=0, int aTransitionType=0, int aIsRedirect=0, __int64 aSessionID=70, __int64 * aVisitID=0x0012f9ec)  Line 1869 + 0xa5 bytes	C++
+ 	places.dll!nsNavHistory::AddVisitChain(nsIURI * aURI=0x02717bc0, __int64 aTime=1178736784656250, int aToplevel=1, int aIsRedirect=0, nsIURI * aReferrer=0x00000000, __int64 * aVisitID=0x0012f9ec, __int64 * aSessionID=0x0012fa14, __int64 * aRedirectBookmark=0x0012fa0c)  Line 2887 + 0x48 bytes	C++
+ 	places.dll!nsNavHistory::AddURIInternal(nsIURI * aURI=0x02717bc0, __int64 aTime=1178736784656250, int aRedirect=0, int aToplevel=1, nsIURI * aReferrer=0x00000000)  Line 2757 + 0x2c bytes	C++
+ 	places.dll!nsNavHistory::CommitLazyMessages()  Line 3193	C++
+ 	places.dll!nsNavHistory::LazyTimerCallback(nsITimer * aTimer=0x04876888, void * aClosure=0x021520e0)  Line 3178	C++
+ 	xpcom_core.dll!nsTimerImpl::Fire()  Line 383 + 0x13 bytes	C++
+ 	xpcom_core.dll!nsTimerEvent::Run()  Line 458	C++
+ 	xpcom_core.dll!nsThread::ProcessNextEvent(int mayWait=1, int * result=0x0012fb30)  Line 483	C++
+ 	xpcom_core.dll!NS_ProcessNextEvent_P(nsIThread * thread=0x00b9cde8, int mayWait=1)  Line 227 + 0x16 bytes	C++
+ 	gkwidget.dll!nsBaseAppShell::Run()  Line 154 + 0xc bytes	C++
+ 	tkitcmps.dll!nsAppStartup::Run()  Line 171 + 0x1c bytes	C++
+ 	xul.dll!XRE_main(int argc=1, char * * argv=0x00b99d60, const nsXREAppData * aAppData=0x004036b4)  Line 2806 + 0x25 bytes	C++
+ 	firefox.exe!main(int argc=1, char * * argv=0x00b99d60)  Line 61 + 0x13 bytes	C++
+ 	firefox.exe!__tmainCRTStartup()  Line 586 + 0x19 bytes	C
+ 	firefox.exe!mainCRTStartup()  Line 403	C
+ 	kernel32.dll!7c816fd7() 	
+ 	[Frames below may be incorrect and/or missing, no symbols loaded for kernel32.dll]	
+
+Is the title, url and icon the only things that could change that would relevant? Is so, then itemChanged could just set those attributes instead of recreating the item.
+> Is the title, url and icon the only things that could change that would
+relevant? Is so, then itemChanged could just set those attributes instead of
+recreating the item.
+
+that sounds good to me.  
+
+see the patch in bug #337855 for how I propose in menu.xml to find the element that corresponds to the node.  we could do something similar in toolbar.xml.
+
+for bookmarks, if none of those change, we can just bail out early.  if we do what you propose, only if title changes we should call updateChevron() [see bug #380230]
+
+taking, as this is having an impact when reloading live bookmark on the personal toolbar.
+Created attachment 266286
+patch
+having itemChanged() call itemReplaced() is expensive, as we find the item, remove the item, create, and insert the item, and then update the chevron.
+
+with this patch, opening a livebookmark folder on the personal toolbar and then doing reload livebookmark should be much less expensive.
+
+I'll go get some perf numbers.
+Created attachment 266305
+updated patch
+some numbers from my debug trunk build:
+
+handleResult() in the livemark service drives the updating of the toolbar when reloading a feed.  (http://lxr.mozilla.org/seamonkey/source/toolkit/components/places/src/nsLivemarkService.js#433)
+
+before this patch, reloading http://planet.mozilla.org/rss20.xml on my personal toolbar (after having opened it) handleResult() went from taking 2.3 seconds to 1 second.
+
+keep in mind this was with a new profile with a relatively sparse personal toolbar.  the more items on your personal toolbar, the more expensive it is to rebuild it.  (numbers coming with jay patel's real world" personal toolbar)
+
+real world numbers from jay's bookmarks.html:  8 seconds vs. 1.2 seconds.
+Comment on attachment 266305
+updated patch
+
+Would also take a review from Asaf for this perf related fix.
+Comment on attachment 266305
+updated patch
+
+>Index: content/toolbar.xml
+>===================================================================
+>         itemChanged: function MV_V_itemChanged(aNode) {
+>-          // XXX NOTE
+>-          // for bug #379591, if you rewrite itemChanged()
+>-          // to not call itemReplaced() don't forget to call:
+>-          // this._self.updateChevron();
+>-          this.itemReplaced(aNode.parent, aNode, aNode, -1);
+>+          // for the toolbar,
+>+          // we only care if children of the root are changing
+>+          if (!aNode.parent ||
+
+I don't think this can ever happen.
+
+>+              (PlacesUtils.nodeIsFolder(aNode.parent) &&
+
+this didn't parse here either.
+
+>+               aNode.parent != this._self.getResult().root)) {
+
+Any case in which this is not sufficient?
+
+>+            return;
+>+          }
+>+          
+>+          var button;
+>+          
+>+          var children = this._self.childNodes;
+>+          for (var i = 0; i < children.length; i++) {
+>+            if (children[i].node == aNode) {
+>+              button = children[i];
+>+              break;
+
+Please file a RFE on using node's viewIndex instead, like we do in PlacesTreeView.
+
+>+            }
+>+          }
+>+
+>+          NS_ASSERT(button, "unable to find a toolbar element");
+>+
+
+nit: trailing spaces (and in few other places).
+
+>+          var title = aNode.title;
+>+          var url = aNode.uri;
+>+          if (PlacesUtils.nodeIsURI(aNode)) {
+>+            if (button.getAttribute("url") != url) {
+>+              button.setAttribute("url", url);
+>+            }
+
+Hrm, I think we should make http://lxr.mozilla.org/seamonkey/source/browser/base/content/browser-places.js#342 use node's uri directly and don't set this attribute at all.
+
+>+            if (PlacesUtils.nodeIsBookmark(aNode)) {
+>+              // If the item has a generated title, use that instead.
+>+              if (this._self._generatedTitles[aNode.itemId]) {
+>+                title = this._self._generatedTitles[aNode.itemId];
+>+              }
+>+            }
+>+          } 
+>+          else if (PlacesUtils.nodeIsSeparator(aNode)) {
+>+            // nothing to do when a separator changes
+>+            return;
+>+          } 
+>+          else if (PlacesUtils.nodeIsContainer(aNode)) {
+>+            if (PlacesUtils.nodeIsLivemarkContainer(aNode)) {
+>+              var folder = aNode.itemId;
+>+              // duplicate nsLivemarkService.getSiteURI to avoid instantiating
+>+              // the service on startup.
+>+              var siteURIString;
+>+              try {
+>+                siteURIString =
+>+                  PlacesUtils.annotations.getItemAnnotationString(folder, "livemark/siteURI");
+>+              }
+>+              catch (ex) {}
+>+              // end duplication
+
+Here the livemark-service must have been already initialized.
+
+>+              if (siteURIString) {
+>+                if (button.getAttribute("siteURI") != siteURIString) {
+>+                  button.setAttribute("siteURI", siteURIString);
+>+                }
+>+              }
+>+              else {
+>+                if (button.hasAttribute("setURI")) {
+>+                  button.removeAttribute("siteURI");
+>+                }
+>+              }
+>+            }
+>+          }
+>+          
+>+          if (aNode.icon) {
+>+            if (button.getAttribute("image") != aNode.icon.spec) {
+>+              button.setAttribute("image", aNode.icon.spec);
+>+            }
+>+          }
+>+          else {
+>+            if (button.hasAttribute("image")) {
+>+              button.removeAttribute("image");
+>+            }
+
+the hasAttribute check is not necessary.
+
+>+          }
+>+        
+>+          // the only change that might require a chevron update
+>+          // is when the title changes
+>+          if (button.getAttribute("label") != title)
+>+          {
+>+            button.setAttribute("label", title);
+>+            this._self.updateChevron();
+
+Hrm, it might worth checking whether boxObject.width of the DOM node has changed (on a timeout) and only call updateChevron if so.
+Created attachment 266570
+revised patch
+responses for mano:
+
+1)
+
+>>+          if (!aNode.parent ||
+> I don't think this can ever happen.
+
+Here's how it happens when updating livemarks:
+ 
+     places.dll!nsNavHistoryContainerResultNode::ReverseUpdateStats(int aAccessCountChange=-1)  Line 530    C++
+     places.dll!nsNavHistoryContainerResultNode::RemoveChildAt(int aIndex=0, int aIsTemporary=0)  Line 1375    C++
+     places.dll!nsNavHistoryFolderResultNode::OnItemRemoved(__int64 aItemId=53, __int64 aParentFolder=11, int aIndex=0)  Line 3130    C++
+     places.dll!nsNavHistoryResult::OnItemRemoved(__int64 aItemId=53, __int64 aFolder=11, int aIndex=0)  Line 3718 + 0x8e bytes    C++
+     places.dll!nsNavBookmarks::RemoveItem(__int64 aItemId=53)  Line 968 + 0xa7 bytes    C++
+     places.dll!nsNavBookmarks::RemoveFolderChildren(__int64 aFolder=11)  Line 1356 + 0x21 bytes    C++
+
+The livemark container (on the personal toolbar folder) has a mParent, and it is the toolbar folder (itemId  = 4)
+
+The personal toolbar folder's parent is null.
+
+nsNavHistoryContainerResultNode::ReverseUpdateStats() calls ItemChanged() with the mParent (so the personal toolbar folder),
+so aNode.parent in toolbar.xml's itemChanged() is is null.
+
+A couple of questions / comments:
+
+a)  should the toolbar folder's parent be null, or should it be the root?
+
+b)  for the toolbar.xml view, we are not not sorted.  so we don't need the back end to notify the view in nsNavHistoryContainerResultNode::ReverseUpdateStats(). 
+perhaps part of the fix here is to fix is to not call ItemChanged() on the view if our sort type is SORT_BY_NONE.
+
+For this performance patch, I'd like to keep it simple and keep the check for a null aNode.parent.  I've logged bug #382397 to track a and b.
+
+2)
+
+>>+              (PlacesUtils.nodeIsFolder(aNode.parent) &&
+>this didn't parse here either.
+>>+               aNode.parent != this._self.getResult().root)) {
+>Any case in which this is not sufficient?
+
+Oops, thanks.
+
+I intended to reverse logic of the change to itemInserted() to only care about notications to items who's parent is the personal toolbar.
+
+        itemInserted: function MV_V_itemInserted(aParentNode, aNode, aIndex) {
+          // don't insert new items into the toolbar
+          // if the parent is not the root
+          if (PlacesUtils.nodeIsFolder(aParentNode) &&
+              aParentNode == this._self.getResult().root) {
+
+What I really want is:
+
+          // for the toolbar,
+          // we only care if children of the root are changing 
+          if (!PlacesUtils.nodeIsFolder(aNode.parent) ||
+              aNode.parent != this._self.getResult().root)) {
+            return;
+          }
+3)
+
+>+          var children = this._self.childNodes;
+>+          for (var i = 0; i < children.length; i++) {
+>+            if (children[i].node == aNode) {
+>+              button = children[i];
+>+              break;
+
+>Please file a RFE on using node's viewIndex instead, like we do in
+>PlacesTreeView.
+
+Will do when I check in.
+
+4)
+
+> nit: trailing spaces (and in few other places).
+
+Ugh, curse my editor.  Fixed, thanks.
+
+5)
+
+>+          var title = aNode.title;
+>+          var url = aNode.uri;
+>+          if (PlacesUtils.nodeIsURI(aNode)) {
+>+            if (button.getAttribute("url") != url) {
+>+              button.setAttribute("url", url);
+>+            }
+
+>Hrm, I think we should make
+>http://lxr.mozilla.org/seamonkey/source/browser/base/content/browser-places.js#342
+>use node's uri directly and don't set this attribute at all.
+
+I've fixed that, thanks.
+6)
+
+> Here the livemark-service must have been already initialized.
+
+You are right, thanks.  I've fixed that.
+
+7)
+
+> the hasAttribute check is not necessary.
+
+Fixed both, thanks.
+
+8)
+
+> Hrm, it might worth checking whether boxObject.width of the DOM node has
+> changed (on a timeout) and only call updateChevron if so.
+
+To avoid many calls to updateChevron() in a short amount of time when a reloading a livemark, right? 
+
+Again, if it is ok with you, I'd prefer to spin that optimization off to another bug.
+Comment on attachment 266570
+revised patch
+
+whoops, wrong version of the patch.
+Created attachment 266578
+correct patch
+Comment on attachment 266578
+correct patch
+
+Please remove the braces around single-line blocks.
+
+r=mano.
+Created attachment 266624
+as checked in
+fixed.  now to log the spin of bugs.
+
+cvs ci base/content/browser-places.js components/places/content/toolbar.xml
+Checking in base/content/browser-places.js;
+/cvsroot/mozilla/browser/base/content/browser-places.js,v  <--  browser-places.j
+s
+new revision: 1.33; previous revision: 1.32
+done
+Checking in components/places/content/toolbar.xml;
+/cvsroot/mozilla/browser/components/places/content/toolbar.xml,v  <--  toolbar.x
+ml
+new revision: 1.88; previous revision: 1.87
+done
+spun off bugs logged, as promised
+
+bug #382464: in toolbar.xml's itemChanged() [itemRemoved(), itemReplaced(), etc], use viewIndex to find the desired node
+
+bug #382466:  in toolbar.xml, prevent lots of repeated work in updateChevron() by using a timer
+note, this change caused a regression.  see bug #383529
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

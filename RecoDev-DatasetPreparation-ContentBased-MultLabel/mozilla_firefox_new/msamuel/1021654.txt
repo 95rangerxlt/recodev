@@ -1,0 +1,1320 @@
+In order to unprivilege about:newtab, we need to make it use messages and a content script in order to work with e10s, and in order to be able to do certain things which would normally require privileges.
+
+AIUI we'd need a content script to communicate with the chrome process using messages, and we'd need the content script to use (custom) events to talk to the new tab page itself, but I could be wrong.
+
+In order to unprivilege about:newtab, we need to make it use messages and a content script in order to work with e10s, and in order to be able to do certain things which would normally require privileges.
+
+AIUI we'd need a content script to communicate with the chrome process using messages, and we'd need the content script to use (custom) events to talk to the new tab page itself, but I could be wrong.
+Had a long flight back. Will attach some patches soon.
+Created attachment 8485558
+0001-Bug-1021654-Make-about-newtab-communication-unprivil.patch
+
+This is a fairly large patch that makes about:newtab basically unprivileged and it should work in remote tabs as well. We can't quite make it unprivileged because we need some more fixes for that and would need to rewrite it to HTML for remote browser support anyway.
+
+All privileged communication sends a message to the content script. This decides whether it can answer immediately and execute the operation itself, or whether to relay it to NewTabUtils.jsm in the parent process to handle shared state.
+
+There are a lots of sync operations - I didn't want to touch those and spend my time fixing tests. There is a lot to refactor later but I'd just like to keep it as-is for now. Rewriting some of the communication might be even easier now as the communication layer is much clearer now.
+
+Tests are all passing locally for me with the next patch.
+Created attachment 8485559
+0002-Bug-1021654-Test-fixes.patch
+Note that this probably breaks about:newtab on Metro but... why is that folder still around? I know this is tough for the people involved but spending time on fixing the Metro code doesn't seem reasonable, right?
+(In reply to Tim Taubert [:ttaubert] from comment #4)
+> Note that this probably breaks about:newtab on Metro but... why is that
+> folder still around? I know this is tough for the people involved but
+> spending time on fixing the Metro code doesn't seem reasonable, right?
+
+Talked to Gavin and we can ignore the Metro breakage as we are not maintaining that anymore. Might be helpful to remove the folder in the future - but only if people stopped maintaining it in their free time, which I heard might be the case.
+Comment on attachment 8485558
+0001-Bug-1021654-Make-about-newtab-communication-unprivil.patch
+
+Review of attachment 8485558:
+-----------------------------------------------------------------
+
+Thanks for asking me to review, sorry for the delay.  This all looks fine, but I do have a comment or two on some architecture, so I'll feedback+ for now and wait to hear your thoughts.
+
+::: browser/base/content/content.js
+@@ +115,5 @@
+>        addEventListener("pagehide", UITour);
+>    }, false, true);
+>  }
+>  
+> +let AboutNewTabListener = {
+
+I would like to see this work more like ContentSearchMediator and WebChannel, where there's only one top-level type of message (and event) that's used to create a single always-open channel between content and chrome.  That removes the need for listening for pageshow/hide, _sendAsyncMessageWithResponse, and adding listeners for a big list of messages in AboutNewTab.jsm.
+
+Also, I'd like to see us stop adding everything inline to content.js.  It would be nice to move this to a JSM -- your AboutNewTab.jsm? -- and import it here.
+
+@@ +117,5 @@
+>  }
+>  
+> +let AboutNewTabListener = {
+> +
+> +  PREF_NEWTAB_ROWS: "browser.newtabpage.rows",
+
+The NEWTAB part is redundant.
+
+@@ +178,5 @@
+> +      case "IsLinkBlocked":
+> +      case "IsLinkPinned":
+> +      case "Links":
+> +      case "PinnedLinks":
+> +        result = sendSyncMessage("AboutNewTab:" + cmd, data)[0];
+
+Ideally we wouldn't send sync messages even from content, but this is pragmatic since it means we don't need to rework parts of the page that assume their calls are sync.
+
+To avoid this switch statement, I think it would be cool to encode whether the message is sync/async and whether it has a return type within its name.  e.g., "SyncGet*" to mean "sync returning a value", "AsyncGet*" to mean "async returning a value", and then "Sync*" and "Async*" for all others.  SyncGetCheckLink, SyncBlockLink, AsyncGetPopulateCache, AsyncUpdatePages.  A poor man's XPIDL.
+
+@@ +230,5 @@
+> +    if (Services.prefs.getBoolPref(this.PREF_INTRO_SHOWN)) {
+> +      return false;
+> +    }
+> +
+> +    Services.prefs.setBoolPref(this.PREF_INTRO_SHOWN, true);
+
+It looks like prefs are read-only from content, e.g.: http://mxr.mozilla.org/mozilla-central/source/modules/libpref/nsPrefBranch.cpp?rev=c840195920bd#153
+
+Also, "shouldShowIntro" doesn't sound like it has the side effect of making it so that the intro should not be shown again.  It does make sense to me that the same function that checks the status also sets it, so this is just a comment on the name.
+
+::: browser/base/content/newtab/comms.js
+@@ +5,5 @@
+> +#endif
+> +
+> +"use strict";
+> +
+> +let gComms = {
+
+I'm not sure I like this.  At first I thought it was another pragmatic design since it's basically a shim we can drop in so that we don't have to change all the callers that relied on the old functions.  But that's not actually the case: we have to change those callers anyway to call gComms.foo.  At that point why not have callers send events inline?  _sendEventWithAsyncResponse would still be useful, though.
+
+[After reading the whole patch, I think I changed my mind.  gComms/events are used everywhere, and it's probably nicer for them to be normal function calls instead of sendEvent("SomeEventName").  But I'll leave my comment here to see what you think.]
+
+::: browser/base/content/newtab/geometry.js
+@@ +33,5 @@
+> +  },
+> +
+> +  intersect(other) {
+> +    if (this.isEmpty() || other.isEmpty()) {
+> +      return new Rect(0, 0, 0, 0);
+
+This isn't necessary because the width or height in the Rect returned below will be zero in this case.
+
+::: browser/base/content/newtab/grid.js
+@@ +52,5 @@
+>        this._ready = true;
+>      });
+>      addEventListener("load", this);
+>      addEventListener("resize", this);
+> +    addEventListener("AboutNewTabUpdateThumbnail", this);
+
+Reiterating what I said above, I'd like to see a single top-level event type that simply forwards all messages from chrome.
+
+::: browser/base/content/newtab/page.js
+@@ +196,5 @@
+> +  onUpdateStatus: function () {
+> +    let enabled = gComms.isPageEnabled;
+> +    this._updateAttributes(enabled);
+> +
+> +    // Initialize the whole page if we haven't done that, yet.
+
+Übernit: comma not necessary :-)
+
+::: browser/modules/AboutNewTab.jsm
+@@ +7,5 @@
+> +let Cc = Components.classes;
+> +let Ci = Components.interfaces;
+> +let Cu = Components.utils;
+> +
+> +this.EXPORTED_SYMBOLS = ["AboutNewTab"];
+
+Nit: Please move this right below "use strict" so that it's as easy as possible to see what's exported at a quick glance.
+
+@@ +59,5 @@
+> +      msg.target.removeEventListener("SwapDocShells", msg, true);
+> +      msg.target.messageManager.sendAsyncMessage(msg.name + "Response");
+> +    }
+> +
+> +    function watchDocShellSwaps() {
+
+Since you call this everywhere you use sendAsyncResponse, would be nice to combine them, e.g.:
+
+case "AboutNewTab:PopulateCache":
+  NewTabUtils.links.populateCache(getSendAsyncResponseFn());
+
+where getSendAsyncResponseFn does what watchDocShellSwaps does and then returns a function that does what sendAsyncResponse does.
+
+@@ +68,5 @@
+> +      };
+> +      msg.target.addEventListener("SwapDocShells", msg, true);
+> +    }
+> +
+> +    switch (msg.name) {
+
+I really prefer the convention where messages are automatically dispatched to methods rather than big switch statements.
+
+::: toolkit/modules/NewTabUtils.jsm
+@@ +251,5 @@
+>    },
+>  
+>    /**
+>     * Updates all currently active pages but the given one.
+> +   * @param aExceptPageID The page ID to exclude from updating.
+
+sourcePageID (like you have below) really is a better name for this parameter, so could you please change it?
+
+@@ +1122,5 @@
+>    links: Links,
+>    allPages: AllPages,
+>    linkChecker: LinkChecker,
+>    pinnedLinks: PinnedLinks,
+> +  blockedLinks: BlockedLinks
+
+Nit: You could leave the comma at the end to preserve blame.
+Are the patches here something that's close to landing and contains the full fix and we just lost track of it and forgot to land it or something that's just a work in progress and needs a lot more work to get there, or something in between, or something different altogether?
+Not working on this currently. Hoped to get it done but I'm not sure I like the current patch. Maybe this can now be solved a little more elegantly using RemotePageManager.jsm?
+Created attachment 8629421
+Convert about:newtab to content process for e10s
+Comment on attachment 8629421
+Convert about:newtab to content process for e10s
+
+Patch above is a WIP patch. Here's a few comments on it:
+- allows newtab to run in content 
+- replaced instances of gPinnedLinks, gBlockedLinks, gLinks etc.... with async messages to stop content from doing privileged actions 
+- intro.js was writing to prefs - just commented it out for now but will have to send messages there too 
+- undo dialog wasn't showing up in content - needed to fix some xhtml/css for that which will most likely be added to patch in bug 1167601 instead of this one
+- interactions like pinning/unpinning, blocking, undo, restore all, dragging all work but it also pins when dropping a tile in a different location (probably not updating grid in the right way) and also throwing errors about messaging channels being closed.
+
+hooray for work in progress!
+i totally lied about the pinning when dropping being a bug - it's actually intended as a feature :)
+> - intro.js was writing to prefs - just commented it out for now but will
+> have to send messages there too 
+
+You may not need to do this depending on the outcome of bug 1176985. We might be removing onboarding completely... Though more likely we're just going to pref it off. Just thought I should point out the potential there :)
+Thanks Marina :) cc'ed myself on that bug to stay updated
+Created attachment 8630133
+Convert about:newtab to content process for e10s
+Created attachment 8631028
+Convert about:newtab to content process for e10s
+Comment on attachment 8631028
+Convert about:newtab to content process for e10s
+
+Another WIP patch. Comments:
+- Almost entirely decoupled from NewTabUtils.jsm (only need to do gLinkChecker)
+- It's very slow, I think because of all the message passing that's going on at the same time, so we'll probably need to find some efficient way to do it
+- Dragging works but on occasion freezes the tiles in their place. Will look into this as well
+- Customization panel interaction wasn't updating the site (enhanced tiles vs blank page) but that's been fixed as well
+- Last little behavioural issue is that the url bar relaod button is disabled for all preloaded newtab pages. It's an interesting issue that I'll continue to dive in to.
+Once that's done hopefully the rest will be polish work
+Created attachment 8631043
+Convert about:newtab to content process for e10s
+Created attachment 8631680
+Convert about:newtab to content process for e10s
+Comment on attachment 8631680
+Convert about:newtab to content process for e10s
+
+Review of attachment 8631680:
+-----------------------------------------------------------------
+
+You're on the right track.
+
+So, the one thing that's standing out for me is this pattern inside various methods of:
+
+1) Send message
+2) Set message handler for response
+
+Where 2 never gets unset, so when these methods get called, the message handlers keep getting added and added, and we're probably going to get really weird behaviour because there will be many message handlers handling a single message, and the problem will compound over time.
+
+We should change this pattern. Anything that the child needs to hear from the parent, it needs to set that message listener once, and once only - probably in the init functions of the various subscripts of newTab.js. Then use the same pattern that we use in AboutNewTab.jsm to dispatch the messages to methods defined on the various objects for the subscripts.
+
+::: browser/base/content/newtab/drag.js
+@@ +121,5 @@
+> +      // Check that we're not accepting URLs which would inherit the caller's
+> +      // principal (such as javascript: or data:).
+> +      let check = message.data.check;
+> +    });
+> +    return this.check;
+
+This is kinda broken - the caller to isValid is probably expecting this.check to be set immediately, but because we're waiting for a message, we can't do that.
+
+It seems to me that we should never get into a case where a link sent down to the content process can be "invalid". Like, we should probably just pass everything through LinkChecker.checkLoadURI in the parent before sending it down to the child.
+
+That way, the child doesn't need to make these checks.
+
+Does that make sense?
+
+::: browser/base/content/newtab/drop.js
+@@ +92,5 @@
+>      } else {
+>        let link = gDragDataHelper.getLinkFromDragEvent(aEvent);
+>        if (link) {
+>          // A new link was dragged onto the grid. Create it by pinning its URL.
+> +        sendAsyncMessage("NewTab:PinLink", {link: link, index: index});
+
+We should probably use a single message here instead of two.
+
+If there are occasions where we want to pin a link but not ensure it's unblocked, then we should probably send up a flag saying "Oh, unblock this too".
+
+If there are no such occasions, we should just do the unblocking in the parent as soon as somebody requests that we pin a link.
+
+Also, we never remove these message listeners, so we're keeping them around forever, which is going to do crazy things that we don't expect.
+
+What we should probably do instead of setting these message listeners here is to set the listeners in init, and have a separate method for handling them.
+
+::: browser/base/content/newtab/dropPreview.js
+@@ +115,5 @@
+>  
+>      // We need a pinned range only when dropping on a pinned site.
+>      if (aCell.containsPinnedSite()) {
+> +      sendAsyncMessage("NewTab:GetPinRange");
+> +      addMessageListener("NewTab:FetchLinks", (message) => {
+
+Same as before - we're setting this message listener, but never removing it. We should set up the listener in the init method or something so that it only gets added once. Have the handler for the message be a separate method on this object.
+
+::: browser/base/content/newtab/intro.js
+@@ +215,5 @@
+>      } else if (!Services.prefs.getBoolPref(PREF_UPDATE_INTRO_SHOWN)) {
+>        this._onboardingType = UPDATE;
+>        this.showPanel();
+>      }
+> +    //Services.prefs.setBoolPref(PREF_INTRO_SHOWN, true);
+
+We'll need to send up a message to do these.
+
+::: browser/components/nsBrowserGlue.js
+@@ +503,5 @@
+>        Services.search.defaultEngine = Services.search.currentEngine;
+>      }
+>    },
+>  
+> +  // initialization (called on application startup)
+
+Please revert the changes in this file.
+
+::: toolkit/components/osfile/modules/osfile_shared_front.jsm
+@@ +393,5 @@
+>   *
+>   * @return {number} The number of bytes actually written.
+>   */
+>  AbstractFile.writeAtomic =
+>       function writeAtomic(path, buffer, options = {}) {
+
+Please revert
+
+::: toolkit/components/thumbnails/PageThumbs.jsm
+@@ +220,5 @@
+>     * thumbnails if these checks fail. Note the final result of this call is
+>     * transitory as it is based on current navigation state and the type of
+>     * content being displayed.
+>     *
+> +   * @param aBrowser The target browser
+
+Please revert
+Comment on attachment 8631680
+Convert about:newtab to content process for e10s
+
+Review of attachment 8631680:
+-----------------------------------------------------------------
+
+::: toolkit/modules/NewTabUtils.jsm
+@@ -1244,5 @@
+> -  /**
+> -   * Adds a sanitization observer and turns itself into a no-op after the first
+> -   * invokation.
+> -   */
+> -  _addObserver: function Links_addObserver() {
+
+I believe this function is still being called from populateCache(). I was getting an error when I applied + ran this patch. "this._addObserver is not a function"
+Created attachment 8633141
+Convert about:newtab to content process for e10s
+Comment on attachment 8633141
+Convert about:newtab to content process for e10s
+
+Review of attachment 8633141:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +890,5 @@
+>    let mustChangeProcess = gMultiProcessBrowser &&
+>                            !E10SUtils.canLoadURIInProcess(uri, process);
+>    try {
+>      if (!mustChangeProcess) {
+> +      browser.webProgress;
+
+Luckily, with bug 1181601 fixed, you don't need this anymore.
+
+::: browser/base/content/newtab/customize.js
+@@ +28,5 @@
+>      this._nodes.blank.addEventListener("click", this);
+>      this._nodes.classic.addEventListener("click", this);
+>      this._nodes.enhanced.addEventListener("click", this);
+>      this._nodes.learn.addEventListener("click", this);
+> +    this._enhanced = Services.prefs.getBoolPref("browser.newtabpage.enhanced");
+
+This worries me, because I believe in certain error conditions, it's possible for our cache to go out of sync with the preferences.
+
+Since it looks like only updateSelected makes use of _enhanced and _enabled, let's get rid of those two member variables, and just read in the prefs in updateSelected.
+
+::: browser/base/content/newtab/grid.js
+@@ +110,5 @@
+>      cell.classList.add("newtab-cell");
+>  
+>      // Creates all the cells up to the maximum
+>      let fragment = document.createDocumentFragment();
+> +    this._rows = Math.max(1, Services.prefs.getIntPref("browser.newtabpage.rows"));
+
+What are _rows and _columns used for? Caching these values adds another place where things could go wrong if we don't invalidate correctly. Can we not just read in the pref values and not cache the _rows and _column values?
+
+::: browser/base/content/newtab/newTab.js
+@@ +7,5 @@
+>  let Cu = Components.utils;
+>  let Ci = Components.interfaces;
+>  
+>  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+>  Cu.import("resource://gre/modules/Services.jsm");
+
+Glad to see these go! :)
+
+::: browser/base/content/newtab/sites.js
+@@ +59,2 @@
+>      this._updateAttributes(true);
+> +    addMessageListener("NewTab:PinState", (message) => {
+
+This also worries me. We're just assuming that the next NewTab:PinState message we receive applies to this link.
+
+What I'd suggest instead is having something in one of the newTab.js scripts (probably not the individual Site instances, but something that has a single instance per newtab page) listen for a NewTab:PinState message.
+
+Have the NewTab:PinState message also include the link. Have that single-instance thing find the right Site (or Link, since it looks like we're just proxying to a Link) class based on that link, and have it update the pinned state.
+
+@@ +95,3 @@
+>        gUndoDialog.show(this);
+> +      sendAsyncMessage("NewTab:BlockLink", {link: this._link, windowID: gPage.windowID});
+> +      addMessageListener("NewTab:BlockState", (message) => {
+
+Same as above. We should definitely be avoiding the pattern of sending a message, and then immediately adding a message listener to receive a response for that message. Those are red flags.
+
+::: browser/base/content/newtab/undo.js
+@@ +93,5 @@
+>      if (!this._undoData)
+>        return;
+>  
+>      let {index, wasPinned, blockedLink} = this._undoData;
+> +    switch (wasPinned) {
+
+Might as well just do:
+
+if (wasPinned) {
+} else {
+}
+
+@@ +96,5 @@
+>      let {index, wasPinned, blockedLink} = this._undoData;
+> +    switch (wasPinned) {
+> +      case true:
+> +        sendAsyncMessage("NewTab:UnblockLink", {link: blockedLink, windowID: gPage.windowID});
+> +        sendAsyncMessage("NewTab:PinLink", {link: blockedLink, index: index, windowID: gPage.windowID});
+
+I think you've made it possible to pin and unblock a link in the same message?
+
+::: browser/modules/AboutNewTab.jsm
+@@ +55,5 @@
+> +  initializeGrid: function(message) {
+> +    NewTabUtils.links.populateCache(() => {
+> +      let links = NewTabUtils.links.getLinks();
+> +      let validLinks = [];
+> +      links = links.filter(function(link) {
+
+Luckily, filter means we don't need to use validLinks:
+
+links = links.filter((link) => NewTabUtils.linkChecker.checkLoadURI(link.url));
+
+@@ +60,5 @@
+> +        if (NewTabUtils.linkChecker.checkLoadURI(link.url)) {
+> +          validLinks.push(link);
+> +        }
+> +      });
+> +      message.target.sendAsyncMessage("NewTab:FetchLinks", {theLinks: validLinks});
+
+Might as well call this "links" instead of "theLinks".
+
+@@ +164,5 @@
+> +    Services.prefs.addObserver("browser.newtabpage.enabled", this, true);
+> +    Services.prefs.addObserver("browser.newtabpage.enhanced", this, true);
+> +    Services.obs.addObserver(this, "page-thumbnail:create", true);
+> +    Services.obs.addObserver(this, "browser:purge-session-history", true);
+> +    this._addObserver = function () {};
+
+I don't think we want to wipe out this function at the end. We do, however, want to make sure we remove these observers in the uninit function.
+
+::: browser/themes/shared/newtab/newTab.inc.css
+@@ +46,5 @@
+>    padding: 0;
+>    border: none;
+> +  height: 16px;
+> +  width: 16px;
+> +  float: right;
+
+Does this work correctly for RTL?
+
+@@ +48,5 @@
+> +  height: 16px;
+> +  width: 16px;
+> +  float: right;
+> +  right: 0;
+> +  background-image: -moz-image-rect(url(chrome://global/skin/icons/close.png), 0, 16, 16, 0);
+
+I think we can set the image once here in #newtab-undo-close-button, and then use -moz-image-region to select the right coordinates. See https://dxr.mozilla.org/mozilla-central/source/browser/themes/linux/downloads/downloads.css#181, for example.
+Comment on attachment 8633141
+Convert about:newtab to content process for e10s
+
+We should probably get Marina in here early for feedback as well to make sure we're not missing something hugely important.
+Comment on attachment 8633141
+Convert about:newtab to content process for e10s
+
+Review of attachment 8633141:
+-----------------------------------------------------------------
+
+This looks like it's on the right track to me. Just a couple of things:
+
+1) I don't see any test changes yet but I'm pretty skeptical that they all still pass given the size of this changeset.
+2) I mentioned to Ursula earlier, for remote newtab, we don't want to rely on anything Firefox-specific like Services, Components.utils, Components.interfaces, etc. However, I think that may be out of the scope of this bug. I'll likely need to do it for bug 1183206 though.
+
+I'm still working on top of the patches Ursula has been posting though, so I'll comment if I come across something unexpected as I go :)
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #22)
+> Comment on attachment 8633141
+> Convert about:newtab to content process for e10s
+> 
+> Review of attachment 8633141:
+> -----------------------------------------------------------------
+> ::: browser/themes/shared/newtab/newTab.inc.css
+> @@ +46,5 @@
+> >    padding: 0;
+> >    border: none;
+> > +  height: 16px;
+> > +  width: 16px;
+> > +  float: right;
+> 
+> Does this work correctly for RTL?
+> 
+> @@ +48,5 @@
+> > +  height: 16px;
+> > +  width: 16px;
+> > +  float: right;
+> > +  right: 0;
+> > +  background-image: -moz-image-rect(url(chrome://global/skin/icons/close.png), 0, 16, 16, 0);
+> 
+> I think we can set the image once here in #newtab-undo-close-button, and
+> then use -moz-image-region to select the right coordinates. See
+> https://dxr.mozilla.org/mozilla-central/source/browser/themes/linux/
+> downloads/downloads.css#181, for example.
+
+I'll add the CSS changes to the undo dialog to my patch for bug 1167601, since that's where it actually belongs.
+Thanks for the review!
+(In reply to Marina Samuel [:emtwo] from comment #24)
+> Comment on attachment 8633141
+> Convert about:newtab to content process for e10s
+> 
+> Review of attachment 8633141:
+> -----------------------------------------------------------------
+> 
+> This looks like it's on the right track to me. Just a couple of things:
+> 
+> 1) I don't see any test changes yet but I'm pretty skeptical that they all
+> still pass given the size of this changeset.
+> 2) I mentioned to Ursula earlier, for remote newtab, we don't want to rely
+> on anything Firefox-specific like Services, Components.utils,
+> Components.interfaces, etc. However, I think that may be out of the scope of
+> this bug. I'll likely need to do it for bug 1183206 though.
+> 
+> I'm still working on top of the patches Ursula has been posting though, so
+> I'll comment if I come across something unexpected as I go :)
+
+Thanks Marina! I've started on some changes for the tests but you're right, since it's a pretty huge change the tests will need a lot of work. I haven't posted the changes to the test on this patch (they're just really messy changes right now) but I definitely plan on adding them in upcoming patch :)
+Comment on attachment 8633141
+Convert about:newtab to content process for e10s
+
+Review of attachment 8633141:
+-----------------------------------------------------------------
+
+::: browser/modules/AboutNewTab.jsm
+@@ +24,5 @@
+>  
+>  let AboutNewTab = {
+>  
+>    pageListener: null,
+> +  windowID: null,
+
+I do have a question about why this was introduced. It seems that AboutNewTab receives the windowID for the last window that had a pinned, unpinned, blocked or unblocked a link. Then when it's time to update, we won't update a page that just triggered one of those actions.
+
+Did I understand that correctly? If so, why are we doing this?
+(In reply to Marina Samuel [:emtwo] from comment #27)
+> Comment on attachment 8633141
+> Convert about:newtab to content process for e10s
+> 
+> Review of attachment 8633141:
+> -----------------------------------------------------------------
+> 
+> ::: browser/modules/AboutNewTab.jsm
+> @@ +24,5 @@
+> >  
+> >  let AboutNewTab = {
+> >  
+> >    pageListener: null,
+> > +  windowID: null,
+> 
+> I do have a question about why this was introduced. It seems that
+> AboutNewTab receives the windowID for the last window that had a pinned,
+> unpinned, blocked or unblocked a link. Then when it's time to update, we
+> won't update a page that just triggered one of those actions.
+> 
+> Did I understand that correctly? If so, why are we doing this?
+
+Yeah we don't want to send an update to the page we're currently viewing for certain things (like pinning) because updating sends a message to the parent to refresh the entire grid, and that causes the tiles to flash very briefly as they're collecting all the new data from the update. That's fine for pages that we don't see (other newtab pages in the background) but for the page that we have open, it looks pretty bad. So that's why we don't want to update the current page that we're on
+Comment on attachment 8633141
+Convert about:newtab to content process for e10s
+
+Review of attachment 8633141:
+-----------------------------------------------------------------
+
+> Yeah we don't want to send an update to the page we're currently viewing for
+> certain things (like pinning) because updating sends a message to the parent
+> to refresh the entire grid, and that causes the tiles to flash very briefly
+> as they're collecting all the new data from the update. That's fine for
+> pages that we don't see (other newtab pages in the background) but for the
+> page that we have open, it looks pretty bad. So that's why we don't want to
+> update the current page that we're on
+
+Ah!
+
+::: browser/base/content/newtab/page.js
+@@ +98,5 @@
+> +  update(message, reason = "") {
+> +    let currentWindowID = this.windowID;
+> +    let windowID = message.data.windowID;
+> +
+> +    // Do not update the current page.
+
+In that case, can you please elaborate just a tiny bit more on this comment for why we don't update the current page?
+(In reply to Marina Samuel [:emtwo] from comment #29)
+> Comment on attachment 8633141
+> Convert about:newtab to content process for e10s
+> 
+> Review of attachment 8633141:
+> -----------------------------------------------------------------
+> 
+> > Yeah we don't want to send an update to the page we're currently viewing for
+> > certain things (like pinning) because updating sends a message to the parent
+> > to refresh the entire grid, and that causes the tiles to flash very briefly
+> > as they're collecting all the new data from the update. That's fine for
+> > pages that we don't see (other newtab pages in the background) but for the
+> > page that we have open, it looks pretty bad. So that's why we don't want to
+> > update the current page that we're on
+> 
+> Ah!
+> 
+> ::: browser/base/content/newtab/page.js
+> @@ +98,5 @@
+> > +  update(message, reason = "") {
+> > +    let currentWindowID = this.windowID;
+> > +    let windowID = message.data.windowID;
+> > +
+> > +    // Do not update the current page.
+> 
+> In that case, can you please elaborate just a tiny bit more on this comment
+> for why we don't update the current page?
+
+Absolutely :)
+An alternative that I just thought of that might be more resilient - instead of holding on to the windowID in AboutNewTab.jsm, how about when we send a message down to the children, we also pass down the outerWindowID of the current browser. That way, the content process doesn't need to send up a windowID, and the parent doesn't need to stash it in AboutNewTab.
+
+This is also nice because if the user switches from one newtab to another newtab while AboutNewTab.jsm is doing something async before updating the tiles (which I believe can happen?), we get a more up-to-date outerWindowID sent down to the child.
+
+The way to get the outerWindowID of the selected browser, and not just the browser that sent the message that AboutNewTab.jsm is responding to:
+
+let tabbrowser = message.browser.getTabBrowser();
+let outerWindowID = tabbrowser ? tabbrowser.selectedBrowser.outerWindowID
+                               : null;
+
+outerWindowID will be null in this case, if the browser that sent up the newtab message doesn't happen to be held within a tabbrowser (freaky cases, like somebody opening about:newtab in a sidebar browser or something).
+Created attachment 8634321
+Convert about:newtab to content process for e10s
+*** Bug 1176061 has been marked as a duplicate of this bug. ***
+Comment on attachment 8634321
+Convert about:newtab to content process for e10s
+
+Review of attachment 8634321:
+-----------------------------------------------------------------
+
+::: browser/base/content/newtab/sites.js
+@@ +68,2 @@
+>        this._updateAttributes(false);
+> +     // gUpdater.sendUpdate();
+
+Just noticed this. Did you mean to remote it?
+remote -> remove
+Comment on attachment 8634321
+Convert about:newtab to content process for e10s
+
+Review of attachment 8634321:
+-----------------------------------------------------------------
+
+::: browser/base/content/newtab/page.js
+@@ +309,5 @@
+> +
+> +  setBlockState: function Page_setBlockState(message) {
+> +    for (let site of gGrid.sites) {
+> +      if (site._link.url == message.data.link.url) {
+> +        link.blockState = message.data.blockState
+
+site._link.blockState ?
+Comment on attachment 8634321
+Convert about:newtab to content process for e10s
+
+Review of attachment 8634321:
+-----------------------------------------------------------------
+
+sorry for the ad-hoc reviews, just commenting as soon as I come across stuff so I don't forget!
+
+::: browser/base/content/newtab/page.js
+@@ +300,5 @@
+> +  },
+> +
+> +  setPinState: function Page_setPinState(message) {
+> +    for (let site of gGrid.sites) {
+> +      if (site._link.url == message.data.link.url) {
+
+You'll need to do `if (site && site._link.url == message.data.link.url)` as some sites may be null.
+
+@@ +308,5 @@
+> +  },
+> +
+> +  setBlockState: function Page_setBlockState(message) {
+> +    for (let site of gGrid.sites) {
+> +      if (site._link.url == message.data.link.url) {
+
+here too
+Comment on attachment 8634321
+Convert about:newtab to content process for e10s
+
+Review of attachment 8634321:
+-----------------------------------------------------------------
+
+::: browser/modules/AboutNewTab.jsm
+@@ +102,5 @@
+> +
+> +  unblock: function(message) {
+> +    let link = message.data.link;
+> +    NewTabUtils.blockedLinks.unblock(link);
+> +    message.target.sendAsyncMessage("NewTab:BlockState", {blockState: NewTabUtils.blockedLinks.isBlocked(message.data.link)});
+
+I think you'll want to send the link here as well. In page.js setBlockState() you do 'if (site && site._link.url == message.link.url)' but message.link would be undefined in that case
+(In reply to Marina Samuel [:emtwo] from comment #38)
+> Comment on attachment 8634321
+> Convert about:newtab to content process for e10s
+> 
+> Review of attachment 8634321:
+> -----------------------------------------------------------------
+> 
+> ::: browser/modules/AboutNewTab.jsm
+> @@ +102,5 @@
+> > +
+> > +  unblock: function(message) {
+> > +    let link = message.data.link;
+> > +    NewTabUtils.blockedLinks.unblock(link);
+> > +    message.target.sendAsyncMessage("NewTab:BlockState", {blockState: NewTabUtils.blockedLinks.isBlocked(message.data.link)});
+> 
+> I think you'll want to send the link here as well. In page.js
+> setBlockState() you do 'if (site && site._link.url == message.link.url)' but
+> message.link would be undefined in that case
+
+
+Thanks for all the review Marina :)
+Comment on attachment 8634321
+Convert about:newtab to content process for e10s
+
+Review of attachment 8634321:
+-----------------------------------------------------------------
+
+::: browser/base/content/newtab/undo.js
+@@ +106,5 @@
+> +   * Resets the pin state of the blocked link after undo-ing.
+> +   */
+> +  _resetStates: function UndoDialog_resetStates(message) {
+> +    let blockedLink = this._undoData;
+> +    blockedLink.pinState = message.data.pinState;
+
+We end up here whenever pin state changes, which does not necessarily mean this._undoData will exist. We want this code to only execute for links that are getting unblocked (not pinned or unpinned) right?
+
+An alternative way to accomplish that could be sending additional information (index, wasPinned) along with the NewTab:UnblockLink message above. Then in AboutNewTab.jsm, the unblock() function can directly call pinLink() if it sees the unblocked link was previously pinned.
+Created attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8634321
+Convert about:newtab to content process for e10s
+
+I suspect this is now out of date - I'll review the other one.
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+https://reviewboard.mozilla.org/r/14193/#review12903
+
+This looks really good, ursula! A few general comments below - nothing major.
+
+::: browser/base/content/newtab/drop.js:97
+(Diff revision 1)
+> -
+> +        sendAsyncMessage("NewTab:PinLink", {link: link, index: index, ensureUnblocked: true});
+
+Pro-tip! ES6 lets us avoid the `foo: foo` redundancy, so you can do:
+
+```
+sendAsyncMessage("NewTab:PinLink", { link, index, ensureUnblocked: true });
+```
+
+::: browser/base/content/newtab/dropPreview.js:118
+(Diff revision 1)
+> -      let links = gPinnedLinks.links;
+> +      sendAsyncMessage("NewTab:GetPinRange");
+
+I think this should be `"NewTab:GetPinnedRange"` - `"NewTab:GetPinRange"` doesn't have a handler.
+
+::: browser/base/content/newtab/dropPreview.js:119
+(Diff revision 1)
+> +      addMessageListener("NewTab:FetchLinks", (message) => {
+> +        removeEventListener("NewTab:FetchLinks", this);
+
+Do we actually need to fetch these?
+
+If the pinned links change, doesn't the parent get an update about it?
+
+So, suppose something in the content process holds onto the links that FetchLinks sends down anytime FetchLinks is sent to us... can't we just query that without sending a new message? I say that, because if something ends up changing the composition of pinned links, I would assume we'd send down a FetchLinks anyway, no?
+
+::: browser/base/content/newtab/grid.js:55
+(Diff revision 1)
+> +    addMessageListener("NewTab:FetchLinks", this.refresh.bind(this));
+
+I actually would prefer we name this something besides `NewTab:FetchLinks` - since that describes what we want, and not what will be sent back to us.
+
+Perhaps call this `NewTab:UpdateLinks`?
+
+::: browser/base/content/newtab/grid.js:140
+(Diff revision 1)
+> +    var event = new CustomEvent("NewTab:WaitForUpdatedPages");
+
+I also think we should name this event differently. Traditionally, we don't pseudo-namespace them with :, and I think we want to name this event after what it represents, and not what purpose it serves for some consumers... if that makes any sense.
+
+Perhaps name this:
+
+`"AboutNewTabUpdated"`
+
+Also, use let, not var, so, final result:
+
+```
+let event = new CustomEvent("AboutNewTabUpdated", { bubbles: true});
+document.dispatchEvent(event);
+```
+
+I would wager based on what you've shown me that this event already somehow bubbles, but we should make that explicit, hence my adding of { bubbles: true }.
+
+::: browser/base/content/newtab/intro.js:76
+(Diff revision 1)
+> +    sendAsyncMessage("NewTab:IntroPrefs", {introShown: true, updateIntroShown: true});
+
+How about we just call this:
+
+```
+sendAsyncMessage("NewTab:IntroShown");
+```
+
+Without any data, and the parent understands that we need to flip those two prefs?
+
+::: browser/base/content/newtab/newTab.js
+(Diff revision 1)
+> -let {
+> -  links: gLinks,
+> -  allPages: gAllPages,
+> -  linkChecker: gLinkChecker,
+> -  pinnedLinks: gPinnedLinks,
+> -  blockedLinks: gBlockedLinks,
+> -  gridPrefs: gGridPrefs
+> -} = NewTabUtils;
+
+Good riddance!
+
+::: browser/base/content/newtab/page.js:18
+(Diff revision 1)
+> +  get windowID() {
+> +    return window.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowUtils).outerWindowID;
+> +  },
+
+This shouldn't ever change, so we might as well make this a memoizer:
+
+```
+get windowID() {
+  delete this.windowID;
+  return this.windowID = window.QueryInterface(Ci.nsIInterfaceRequestor)
+                               .getInterface(Ci.nsIDOMWindowUtils)
+                               .outerWindowID;
+}
+```
+
+That way, repeated calls don't require us to go through all of that XPCOM gunk - we'll execute it once, and remember for the lifetime of this newtab.
+
+::: browser/base/content/newtab/page.js:27
+(Diff revision 1)
+> -    gAllPages.register(this);
+> -
+> -    // Listen for 'unload' to unregister this page.
+> +    addMessageListener("NewTab:Observe", (message) => {
+> +      this.observe(message.data.topic, message.data.data);
+> +    });
+
+If you wouldn't mind, I'd prefer we stick to the pattern you've laid out, and do:
+
+```
+addMessageListener("NewTab:Observe", this.observe.bind(this));
+```
+
+And then have observe take the single message parameter.
+
+::: browser/modules/AboutNewTab.jsm:165
+(Diff revision 1)
+> +    this.pageListener.sendAsyncMessage("NewTab:Observe", {topic: aTopic, data: aData});
+
+It seems that the child only cares about `NewTab:Observe` for the `page-thumbnail:create` and `nsPref:changed` topics.
+
+Especially for emtwo's project, I think it'd make more sense to expose less of Gecko here (since the observer service is very much Gecko specific), and send down individual messages for these individual topic cases.
+
+Probably not necessary here, but worth filing as a follow-up.
+
+::: browser/base/content/newtab/page.js:90
+(Diff revision 1)
+> -  update(reason = "") {
+> +  update(message, reason = "") {
+> +    let currentWindowID = this.windowID;
+
+What still calls this with a reason? It doesn't even look like we use the reason here...
+
+::: browser/modules/AboutNewTab.jsm:68
+(Diff revision 1)
+> +    this.windowID = message.data.windowID;
+
+I don't think this is used anymore, is it?
+
+::: browser/modules/AboutNewTab.jsm:78
+(Diff revision 1)
+> +  unpinLink: function(message) {
+
+I would love some documentation for all of these methods, describing what function they serve, and what they expect inside message.data.
+
+Format it like:
+
+```
+/**
+ * Does foo and bar. Lorem ipsum blah diddly blah and
+ * hogwarts horcrux.
+ *
+ * @param message
+ *        A RemotePageManager message with the following data:
+ *        
+ *        foo (String):
+ *          Blah blah blah
+ *        bar (Object):
+ *          Something or other that contains:
+ *           
+ *          baz (Integer):
+ *            Roflmao
+ */
+
+```
+
+::: browser/modules/AboutNewTab.jsm:70
+(Diff revision 1)
+> +    message.target.sendAsyncMessage("NewTab:PinState", {pinState: NewTabUtils.pinnedLinks.links[index].pinState, link: link});
+
+Please try to keep these lines under 80 char if you can. You can use an intermediary variable like:
+
+```
+let browser = message.target;
+browser.sendAsyncMessage("NewTab:PinState", {
+  pinState: NewTabUtils.pinnedLinks.links[index].pinState,
+  link: link,
+});
+```
+
+Note the trailing comma after link - a little trick that lets us ensure that we don't needlessly affect the blame on that line if we ever have to pass more to it.
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+https://reviewboard.mozilla.org/r/14193/#review12791
+
+::: browser/base/content/newtab/page.js
+(Diff revision 1)
+> -      case "unload":
+
+What was the reason to remove this? We need to be calling handleUnloadEvent() for newtab page telemetry.
+
+::: browser/base/content/newtab/grid.js:140
+(Diff revision 1)
+> +    var event = new CustomEvent("NewTab:WaitForUpdatedPages");
+
+Who listens to this Event? I see it dispatched here and in updater.js
+
+::: browser/base/content/newtab/sites.js:286
+(Diff revision 1)
+> +    addMessageListener("NewTab:URI", this._getURI.bind(this));
+
+So there's an interesting little bug here... If you visit multiple sites and have more than one history tile, you'll notice that the thumbnails appear the same for all of them.
+
+This is because each history tile listens to NewTab:URI messages that might be directed at other tiles.
+
+There are a couple of ways to fix this that come to mind:
+
+1) The NewTab:URI response message can include the url of the site it's providing an image for and when a site receives this message, it must check if the url matches its own before updating background image
+
+2) Create unique messages for each site, perhaps by adding the site's url as part of the message (e.g. domain.com will listen to messages called "NewTab:domain.com:URI"
+
+I personally like #2 more because we avoid having many discarded messages.
+
+::: browser/modules/AboutNewTab.jsm:173
+(Diff revision 1)
+> +    Services.prefs.addObserver("browser.newtabpage.columns", this, true);
+
+Looking at page.js observe(), I don't see where changes in rows and columns is handled. Do we need to update the grid in that case?
+
+::: browser/base/content/newtab/dropPreview.js:119
+(Diff revision 1)
+> +      addMessageListener("NewTab:FetchLinks", (message) => {
+
+I'm concerned about NewTab:FetchLinks having multiple listeners that are not intended to listen in all cases.
+
+For example, the FetchLinks we are listening to here is in response to the "GetPinRange" message. However, it would also trigger the FetchLinks listeners in grid.js and update.js. 
+
+This may not be directly harmful but it changes the expected behaviour and may trigger some extra refreshes that we don't want.
+
+I would create a different message for each type of FetchLinks request (e.g. NewTab:PinRange:FetchLinks, NewTab:UpdateGrid:FetchLinks)
+(In reply to Marina Samuel [:emtwo] from comment #44)
+> Comment on attachment 8639297
+> MozReview Request: Bug 1021654 - Convert about:newtab to content process for
+> e10s
+> 
+> https://reviewboard.mozilla.org/r/14193/#review12791
+> 
+> ::: browser/base/content/newtab/grid.js:140
+> (Diff revision 1)
+> > +    var event = new CustomEvent("NewTab:WaitForUpdatedPages");
+> 
+> Who listens to this Event? I see it dispatched here and in updater.js
+> 
+
+This is used for testing, to ensure that all the pages to update before performing the next check. I can add a comment to make it more clear :)
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Created attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+One thing I've noticed with this set of patches is that I'm getting the "flash" of the grid updating in the tab when I drag tiles around. Did the outer window ID check somehow fail?
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #52)
+> One thing I've noticed with this set of patches is that I'm getting the
+> "flash" of the grid updating in the tab when I drag tiles around. Did the
+> outer window ID check somehow fail?
+
+What looks like is happening is that the update message gets sent twice, and one of the times the outerWindowID property is undefined and that's when the flash happens. Should probably look into why the message is being sent twice
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+https://reviewboard.mozilla.org/r/14191/#review13561
+
+::: browser/modules/AboutNewTab.jsm:62
+(Diff revision 5)
+> +    message.target.sendAsyncMessage("NewTab:UpdateLinks", {
+
+You still have two separate listeners that will both be called when you send UpdateLinks message. In grid.js and updater.js.
+
+Was this intended?
+https://reviewboard.mozilla.org/r/14191/#review13575
+
+::: browser/modules/AboutNewTab.jsm:183
+(Diff revision 5)
+> +    this.pageListener.sendAsyncMessage("NewTab:Observe", {topic: aTopic, data: aData});
+
+The observer listening in page.js seems to only care about "browser.newtabpage.enabled", "browser.newtabpage.enhanced", and "page-thumbnail:create"
+
+Can we avoid sending NewTab:Observe for other cases? (browser.newtabpage.pinned, browser.newtabpage.blocked, browser:purge-session-history)
+I would recommend running DirectoryLinksProvider.reportSitesAction in the parent in AboutNewTab rather than in the content immediately after clicking on pin/unpin/block, etc. This is because reportSitesAction is expecting the pin/unpin/block action to have occurred already, but since we're sending a message to the parent to do these actions, the states have not yet been updated.
+
+If we move reportSitesAction into AboutNewTab or something after these actions have occurred, then we can guarantee that the states have been set by the time it's called because we're doing them synchronously in the parent.
+try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=82a682d93980
+https://reviewboard.mozilla.org/r/14191/#review13575
+
+> The observer listening in page.js seems to only care about "browser.newtabpage.enabled", "browser.newtabpage.enhanced", and "page-thumbnail:create"
+> 
+> Can we avoid sending NewTab:Observe for other cases? (browser.newtabpage.pinned, browser.newtabpage.blocked, browser:purge-session-history)
+
+We need these observers to fire so that updatePages can be sent down to the child. That way the child can notice changes that were made from the parent, say when a link was pinned through about:config, instead of doing it from the front end UI
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+https://reviewboard.mozilla.org/r/14193/#review13577
+
+::: browser/base/content/newtab/drop.js:60
+(Diff revision 5)
+> -    gUpdater.updateGrid();
+> +   // gUpdater.sendUpdate();
+
+What do we need to do here?
+
+::: browser/base/content/newtab/drop.js:97
+(Diff revision 5)
+> -
+> +        sendAsyncMessage("NewTab:PinLink", {link, index, ensureUnblocked: true});
+
+Is there ever a case where we'll want to pin a link but keep it blocked? I'm under the impression that this is not a state we should actually be able to get in.
+
+If that's the case, I wonder if ensureUnblocked is even necessary - like, I'll bet we should uniformly ensure that whatever is being pinned is also unblocked.
+
+::: browser/base/content/newtab/grid.js:107
+(Diff revision 5)
+> -  refresh() {
+> +  refresh: function(message) {
+
+Nit: We can actually keep the new function definition style here:
+
+```
+refresh(message) {
+  // ...
+}
+```
+
+::: browser/base/content/newtab/intro.js:75
+(Diff revision 5)
+> +    sendAsyncMessage("NewTab:IntroShown");
+
+It's probably only necessary if !Services.prefs.getBoolPref(PREF_INTRO_SHOWN) to send this message. Might as well put this back inside the conditional.
+
+::: browser/base/content/newtab/page.js:96
+(Diff revision 5)
+> -  update(reason = "") {
+> +  update(message) {
+
+So, we had a brief discussion about this this morning, but now I forget - do we still want to pass down a reason here?
+
+::: browser/base/content/newtab/page.js:102
+(Diff revision 5)
+> +    if (currentWindowID == message.data.outerWindowID || message.data.refresh == false) {
+
+Might as well just use this.windowID instead of currentWindowID.
+
+Also, !message.data.refresh.
+
+::: browser/base/content/newtab/page.js:312
+(Diff revision 5)
+> +        site._link.pinState = message.data.pinState
+
+Is it ever possible that we have two sites with the same URL? If not, maybe we should break after the first match.
+
+Also, I wonder if it's worth considering having aGrid.sites be a map mapping URLs to Site objects to avoid these kinds of loops.
+
+Maybe as work for a follow-up.
+
+::: browser/base/content/newtab/sites.js:58
+(Diff revision 5)
+> +    sendAsyncMessage("NewTab:PinLink", {link: this._link, index: aIndex});
+
+I'm feeling kinda wishy-washy about this, but I wonder if we should consider setting the pin state synchronously in here? Or are we certain there are no callers that assume that a link will return true for isPinned immediately after calling pin?
+
+If we were to do that, we'd also need to set the state for the other bits that are implied when binning (not blocked, history, etc).
+
+::: browser/base/content/newtab/sites.js:240
+(Diff revision 5)
+> -    let link = gAllPages.enhanced && DirectoryLinksProvider.getEnhancedLink(this.link) ||
+> +    let link = message.data.enhanced && DirectoryLinksProvider.getEnhancedLink(this.link) || this.link;
+
+I wonder if we can just make sure that when the parent sends down the link that it's the enhanced link object if available?
+
+::: browser/base/content/newtab/sites.js:279
+(Diff revision 5)
+> +    addMessageListener("NewTab:"+ this.url +"URI", this._getURI.bind(this));
+
+I mentioned this in person, but we probably don't want to have a single message listener per site like this.
+
+We probably want to have a general NewTab:ThumbnailURI or something message that passes down the URI, and then have a listener down here iterate the sites (or, if we convert to a Map, just O(1) ourselves to the Site object), and set the site URI.
+
+::: browser/base/content/newtab/undo.js:110
+(Diff revision 5)
+> +  _restore: function UndoDialog_restore() {
+
+Hrm. So when we receive NewTab:Restore, we'll send an update message to the parent again? Is there a way to avoid this ping-ponging?
+
+::: browser/base/content/newtab/updater.js:24
+(Diff revision 5)
+> -  updateGrid: function Updater_updateGrid(aCallback) {
+> +  updateGrid: function Updater_updateGrid(message) {
+
+I mentioned this before, but calling it out again - we probably don't want to pass around these opaque messages unless we really need to. Instead, we should pass around individual parameters from message.data.
+
+::: browser/modules/AboutNewTab.jsm:78
+(Diff revision 5)
+> +      this.unblock(message);
+> +    }
+> +    this.updatePages(message);
+
+This is going to cause multiple updatePages to be called - one via unblock, and another via updatePages.
+
+If we follow this pattern (each method calling into one another like this), I expect we'll find that one action can cause many, many messages to be fired.
+
+Thoughts on how we could reduce how much these are all intertwined?
+
+::: browser/components/about/AboutRedirector.cpp:93
+(Diff revision 5)
+> +    nsIAboutModule::URI_MUST_LOAD_IN_CHILD |
+
+Something I just realized - this means that the preloaded about:newtab page can now crash.
+
+The oop-browser-crashed event handler in tabbrowser.xml assumes that any browsers that crash will be visible tabs that the user can switch. We should add handling in the tabbrowser.xml oop-browser-crashed handler such that if the crashing browser is the preloaded browser, that we simply null out the preloaded browser instead of attempting to show about:tabcrashed in it.
+https://reviewboard.mozilla.org/r/14193/#review13673
+
+::: browser/base/content/newtab/drop.js:97
+(Diff revision 5)
+> -
+> +        sendAsyncMessage("NewTab:PinLink", {link, index, ensureUnblocked: true});
+
+If a user pins a link, blocks the link, then clicks undo in order to restore that link, if it was pinned before it should come back as pinned. So we need to keep track of the links that have both been pinned and blocked.
+https://reviewboard.mozilla.org/r/14193/#review13677
+
+::: browser/base/content/newtab/undo.js:110
+(Diff revision 5)
+> +  _restore: function UndoDialog_restore() {
+
+(I know I have the ping pong too) But so the reason this was done this way was because in AboutNewTab.jsm, undoAll() will execute a callback only once NewTabUtils has finished a bunch of stuff (clearing storage, resetting links cache, grabbing new links etc...). The callback is to send a message to the child saying that the grid is now ready to restore, and only once the child recieves that message can it restore the grid with the new links.
+
+Without waiting on the parent to send a message as a callback, the child carries on restoring the grid, but with empty links since it didn't wait for the new data.
+https://reviewboard.mozilla.org/r/14193/#review14021
+
+::: browser/base/content/newtab/page.js:312
+(Diff revision 5)
+> +        site._link.pinState = message.data.pinState
+
+Hmmm, I believe all the sites on the grid will have unique URLs. NewTabUtils has functionality to remove duplicate base domains before returning the set of links, and since we're only iterating over the set of links on the grid, there shouldn't be two sites with the same URL. 
+
+Having a mapping would be a good follow-up, it would definitely remove the need to iterate over all the sites which would be great. I may take that on once everything else is done :)
+
+::: browser/base/content/newtab/sites.js:58
+(Diff revision 5)
+> +    sendAsyncMessage("NewTab:PinLink", {link: this._link, index: aIndex});
+
+I think we spoke about this earlier, but I think setting the pin state here would risk the parent and the child falling out of sync? Like we should wait for the parent to return an updated pin state and then set the child's pin state to that, to make sure they're always on the same page about states.
+
+::: browser/base/content/newtab/page.js:96
+(Diff revision 5)
+> -  update(reason = "") {
+> +  update(message) {
+
+From my understanding the reason no longer needs to be sent down. I added it back and noticed no change in behaviour. I *think* it was only being used for when the providers set of links change to ensure that we don't update the visible page with the new links, but we handle that now with the windowID check. The other opened newtabs should refresh their grid which will grab the new set of links anyways so I don't think the reason is necessary anymore.
+Created attachment 8646634
+Convert about:newtab to content process for e10s
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5caad6a82be5
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+https://reviewboard.mozilla.org/r/14193/#review14355
+
+This is looking good to me. I'm going to wait until a try run comes in looking green though.
+
+::: browser/base/content/newtab/sites.js:294
+(Diff revision 6)
+> +    addMessageListener("NewTab:ThumbnailURI", this._findURL.bind(this));
+
+So there's no "singleton" in the newTab space that can listen for this message, and find the site to set the thumbnail URL on?
+
+::: browser/components/about/AboutRedirector.cpp:93
+(Diff revision 6)
+> +    nsIAboutModule::URI_MUST_LOAD_IN_CHILD |
+
+I know we already talked about this, but we might want to extract this out to a seperate patch if the tests aren't passing for mochitest-bc e10s just yet.
+
+::: browser/modules/AboutNewTab.jsm:61
+(Diff revision 6)
+> +   *          Sets the value which will enable or disable the 'New Tab Page' feature.
+> +   *        enhanced (Boolean):
+> +   *          Sets the value which will enable or disable the enhancement of history tiles feature.
+
+Nit - try to keep these < 80 chars.
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Bug 1021654 - Convert about:newtab to content process for e10s
+Comment on attachment 8640541
+MozReview Request: Bug 1021654 - Tests for about:newtab in e10s
+
+Bug 1021654 - Tests for about:newtab in e10s
+Comment on attachment 8639297
+MozReview Request: Bug 1021654 - Convert about:newtab to content process for e10s
+
+Clearing the review flag on myself. I think this patch is part of a larger Content Services play that will be developing while I'm on PTO. Happy to look at things when I get back.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=bc755e7b1bb5
+*** Bug 1193865 has been marked as a duplicate of this bug. ***
+Marking this as resolved, since it's been merged into the repos which are implementing Bug 1183206. The repos which make use of the code in this bug are found here:
+https://github.com/mozilla/remote-newtab and https://github.com/mozilla/newtab-dev. More specifically the changes to AboutNewTab.jsm are found here: https://github.com/mozilla/newtab-dev/blob/master/browser/components/newtab/AboutNewTab.jsm. We've used the patch in this bug as a base for all the work now being done to remotely host about:newtab, and it will be landed separately.
+
+
+Unprivileged about:newtab: Convert about:newtab to use messages and a content script in order to work well in e10s
+

@@ -1,0 +1,309 @@
+I'm unsure why it is not right now, being a module we would not re-read it for each new window, since it would be shared, like PlacesUtils. And it would not pollute the global space of the window with its own stuff. Plus it would be usable by extensions. And whatever.
+
+I'm unsure why it is not right now, being a module we would not re-read it for each new window, since it would be shared, like PlacesUtils. And it would not pollute the global space of the window with its own stuff. Plus it would be usable by extensions. And whatever.
+Created attachment 436783
+patch v1.0
+
+probably still needs some minor check, but tests seem passing (i need a tryserver run).
+
+Notice i moved Cc, Ci, Cr out of the module but i left them in PlacesOverlay.xul, since i think getting rid of them is another bug.
+
+Dietrich pointed at bug 406371, that is probably correct, but i'm unsure we want to bring on this shortcuts everywhere, files that can be used by extensions (like our views) should not depend on them. Thus in this patch i've made Places frontend files use the extended Components.classes and Components.interfaces version.
+
+Unfortunately having these defined in main window scope brought other devs to use them in their browser code, and i can't eradicate that here, thus i've only moved their definition.
+note to self: this is leaking, check windows references that could be stored in the module.
+looks like i have not been able to get rid of the leak so far, i'm going to split patch in smaller pieces and start pushing some of them, that could also help me finding what is leaking, maybe cross references across modules? Also i won't convert Ci, Cc now, since Mano is working on a views rewrite to get rid of bindings and that would hurt his work.
+and the leak is pretty similar to the one in bug 411997, or Bug 413871, nobody ever took care of fixing those :( Weird.
+Ugh, a "leak the world" issue?
+hm no, i figured out we were leaking transactions manager...
+Created attachment 439253
+Part 1: expose more from PlacesUtils
+Created attachment 439254
+Part 2: Use Services.jsm in Microsummaries svc
+Created attachment 439255
+Part 3: PlacesUtils is added twice at build time
+Created attachment 439256
+Part 4: PlacesUIUtils should be a module
+
+first 3 parts are already returning green from Tryserver, part 4 is still building. i think i'll push part 4 in a different day, so that finding eventual regranges will be easier.
+Created attachment 439494
+Part 4: PlacesUIUtils should be a module
+
+a small update for stupid copy-paste error
+Tryserver runs look good enough so far, some unrelated oranges, i'm only missing Windows result.
+yay! Windows gave a full GREEN!
+Comment on attachment 439253
+Part 1: expose more from PlacesUtils
+
+
+>diff --git a/browser/components/places/content/editBookmarkOverlay.js b/browser/components/places/content/editBookmarkOverlay.js
+>--- a/browser/components/places/content/editBookmarkOverlay.js
+>+++ b/browser/components/places/content/editBookmarkOverlay.js
+
+should just have a lazy getter in the global scope for a local |microsummaries| here, but that's a nit.
+
+>diff --git a/browser/components/places/tests/browser/browser_423515.js b/browser/components/places/tests/browser/browser_423515.js
+>--- a/browser/components/places/tests/browser/browser_423515.js
+>+++ b/browser/components/places/tests/browser/browser_423515.js
+>@@ -172,11 +172,11 @@ function test() {
+> 
+>         is(shortcutNode.itemId, shortcutId, "shortcut id and shortcut node item id match");
+> 
+>-        LOG("can move shortcut id?");
+>+        dump("can move shortcut id?/n");
+>         is(PlacesControllerDragHelper.canMoveContainer(shortcutId),
+>            true, "should be able to move special folder shortcut id");
+> 
+>-        LOG("can move shortcut node?");
+>+        dump("can move shortcut node?/n");
+>         is(PlacesControllerDragHelper.canMoveNode(shortcutNode),
+>            true, "should be able to move special folder shortcut node");
+>       }
+
+what magical significance does "/n" have?! ;)
+Comment on attachment 439255
+Part 3: PlacesUtils is added twice at build time
+
+sheesh, i really should've named that file better.
+(In reply to comment #14)
+> what magical significance does "/n" have?! ;)
+
+Man, I just wanted to tell you in this commentwhy dump() needs a \n when I realized this is /n and not \n ;-)
+(In reply to comment #15)
+> (From update of attachment 439255 [details])
+> sheesh, i really should've named that file better.
+
+I very much believe it would be good to rename it to PlacesUtils.jsm - but I fear a lot of our code and probably add-ons use it by this suboptimal name. :(
+Comment on attachment 439494
+Part 4: PlacesUIUtils should be a module
+
+
+>diff --git a/browser/components/places/content/placesOverlay.xul b/browser/components/places/content/placesOverlay.xul
+>--- a/browser/components/places/content/placesOverlay.xul
+>+++ b/browser/components/places/content/placesOverlay.xul
+>@@ -51,8 +51,15 @@
+>           src="chrome://global/content/globalOverlay.js"/>
+>   <script type="application/javascript"
+>           src="chrome://browser/content/utilityOverlay.js"/>
+>-  <script type="application/javascript" 
+>-          src="chrome://browser/content/places/utils.js"/>
+>+  <script type="application/javascript"><![CDATA[
+>+    // A bunch of browser code depends on us defining these, sad but true :(
+>+    var Cc = Components.classes;
+>+    var Ci = Components.interfaces;
+>+    var Cr = Components.results;
+
+can you make that comment a TODO and note the bug # for fixing it?
+
+>@@ -63,6 +66,7 @@ __defineGetter__("PlacesUtils", function
+> const MIN_TRANSACTIONS_FOR_BATCH = 5;
+> 
+> function placesTransactionsService() {
+>+  Services.obs.addObserver(this, "xpcom-shutdown", false);
+>   this.mTransactionManager = Cc["@mozilla.org/transactionmanager;1"].
+>                              createInstance(Ci.nsITransactionManager);
+> }
+>@@ -72,8 +76,19 @@ placesTransactionsService.prototype = {
+>   classID: CLASS_ID,
+>   contractID: CONTRACT_ID,
+> 
+>-  QueryInterface: XPCOMUtils.generateQI([Ci.nsIPlacesTransactionsService,
+>-                                         Ci.nsITransactionManager]),
+>+  QueryInterface: XPCOMUtils.generateQI([
+>+    Ci.nsIPlacesTransactionsService,
+>+    Ci.nsITransactionManager,
+>+    Ci.nsIObserver,
+>+  ]),
+>+
+>+  // nsIObserver
+>+  observe: function PlacesTxn_observe(aSubject, aTopic, aData) {
+>+    if (aTopic == "xpcom-shutdown") {
+>+      Services.obs.removeObserver(this, "xpcom-shutdown");
+>+      delete this.mTransactionManager;
+>+    }
+>+  },
+> 
+>   aggregateTransactions:
+>   function placesTxn_aggregateTransactions(aName, aTransactions) {
+
+was this leaking? what's up with this?
+
+>diff --git a/browser/components/places/tests/chrome/Makefile.in b/browser/components/places/tests/chrome/Makefile.in
+>--- a/browser/components/places/tests/chrome/Makefile.in
+>+++ b/browser/components/places/tests/chrome/Makefile.in
+>@@ -47,8 +47,8 @@ _CHROME_TEST_FILES = \
+> 	test_treeview_date.xul \
+> 	test_bug485100-change-case-loses-tag.xul \
+> 	test_bug427633_no_newfolder_if_noip.xul \
+>-	test_multiple_left_pane.xul \
+>-	test_bug510634.xul \
+>+	test_0_multiple_left_pane.xul \
+>+	test_0_bug510634.xul \
+> 	$(NULL)
+> 
+> libs:: $(_CHROME_TEST_FILES)
+
+what's going on here with this change?
+
+r=me with some answers to the above.
+(In reply to comment #14)
+> what magical significance does "/n" have?! ;)
+
+\n is boring, this is innovative instead!
+(In reply to comment #18)
+> >+  QueryInterface: XPCOMUtils.generateQI([
+> >+    Ci.nsIPlacesTransactionsService,
+> >+    Ci.nsITransactionManager,
+> >+    Ci.nsIObserver,
+> >+  ]),
+> >+
+> >+  // nsIObserver
+> >+  observe: function PlacesTxn_observe(aSubject, aTopic, aData) {
+> >+    if (aTopic == "xpcom-shutdown") {
+> >+      Services.obs.removeObserver(this, "xpcom-shutdown");
+> >+      delete this.mTransactionManager;
+> >+    }
+> >+  },
+> > 
+> >   aggregateTransactions:
+> >   function placesTxn_aggregateTransactions(aName, aTransactions) {
+> 
+> was this leaking? what's up with this?
+
+the transaction manager survives to the window, since now PUIU survives as a module too and has a local getter, was leaking it. I must note transaction manager (not the places one, the service) has CC implemented, but could be they missed something, i'll probably file a bug, i've seen a leak similar to mine in other dialog closing bugs. 
+
+> >--- a/browser/components/places/tests/chrome/Makefile.in
+> >+++ b/browser/components/places/tests/chrome/Makefile.in
+> >@@ -47,8 +47,8 @@ _CHROME_TEST_FILES = \
+> > 	test_treeview_date.xul \
+> > 	test_bug485100-change-case-loses-tag.xul \
+> > 	test_bug427633_no_newfolder_if_noip.xul \
+> >-	test_multiple_left_pane.xul \
+> >-	test_bug510634.xul \
+> >+	test_0_multiple_left_pane.xul \
+> >+	test_0_bug510634.xul \
+> > 	$(NULL)
+> > 
+> > libs:: $(_CHROME_TEST_FILES)
+> 
+> what's going on here with this change?
+
+since this is now a module the "leftPaneFolder" code is now inited just once, so tests using it should run first, for the sake of peace in the world (of oranges)
+(In reply to comment #17)
+> (In reply to comment #15)
+> > (From update of attachment 439255 [details] [details])
+> > sheesh, i really should've named that file better.
+> 
+> I very much believe it would be good to rename it to PlacesUtils.jsm - but I
+> fear a lot of our code and probably add-ons use it by this suboptimal name. :(
+
+file a bug, we could try to contact extension authors using it and notify the change to them before... maybe.
+Created attachment 439615
+Part1: expose more from PlacesUtils. now with even more endl!
+Part 1: http://hg.mozilla.org/mozilla-central/rev/267c1cddf0ec
+Part 2: http://hg.mozilla.org/mozilla-central/rev/3b8ad8c926d7
+Part 3: http://hg.mozilla.org/mozilla-central/rev/bb09fa6cd1ff
+
+As i said before, to simplify finding eventual regression ranges, i'll push part 4 in the NEXT nightly.
+Part 4: http://hg.mozilla.org/mozilla-central/rev/4cf9cdbdae0a
+Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.3a5pre) Gecko/20100418 Minefield/3.7a5pre
+
+The bookmarks star doesn't work on an unbookmarked page anymore, nor does the Bookmark This Page menuitem. I think it was part 4 of this bug that caused it.
+Forgot to look in the Error Console. It shows:
+
+Error: DESCRIPTION_ANNO is not defined
+Source File: chrome://browser/content/browser.js
+Line: 766
+
+Which is this line:
+
+      var descAnno = { name: DESCRIPTION_ANNO, value: description };
+
+I think this is missing a PlacesUIUtils.
+Also reported in the mozillazine forums:
+http://forums.mozillazine.org/viewtopic.php?p=9188465#p9188465
+(In reply to comment #21)
+> (In reply to comment #17)
+> > I very much believe it would be good to rename it to PlacesUtils.jsm - but I
+> > fear a lot of our code and probably add-ons use it by this suboptimal name. :(
+> 
+> file a bug, we could try to contact extension authors using it and notify the
+> change to them before... maybe.
+
+This is bug 560104 now.
+Comment on attachment 439494
+Part 4: PlacesUIUtils should be a module
+
+>+    <script type="application/javascript"><![CDATA[
+>+      Components.utils.import("resource://gre/modules/utils.js");
+>+      Components.utils.import("resource://gre/modules/PlacesUIUtils.jsm");
+>+    ]]></script>
+
+Oh, just ran across this when porting to SeaMonkey - actually, PlacesUIUtils is not in toolkit/XULRunner/"GRE" but in the application, so it's resource:///modules/PlacesUIUtils.jsm ("gre" is correct for utils.js, though).
+
+This doesn't break anything in our usual setup, but in a XULRunner-based setup, it might.
+thanks, will push a followup
+this should fix both reported issues, sorry for bookmarks breaking, i'll file a bug to add a b-c test for simple star bookmarking (i think we have a mozmill test but it's not automatic)
+
+http://hg.mozilla.org/mozilla-central/rev/f60133d3febe
+and http://hg.mozilla.org/mozilla-central/rev/f0a64b8f33b2 (damn tests :))
+filed bug 560109 to add a b-c test for Star Panel/Bookmark This Page
+*** Bug 560123 has been marked as a duplicate of this bug. ***
+so does that mean this will be fixed in the next build?  I am confused...
+I don't know if this is caused by this bug fix landing or not.
+I did see it at the same time as Comments 25-27 above though, and it relates to creating new Bookmarks.
+
+For the complete description please see "http://forums.mozillazine.org/viewtopic.php?f=23&t=1857765&p=9191695#p9191695": (I copied 'some' of it here);
+
+Using build: Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.3a5pre) Gecko/20100418 Minefield/3.7a5pre ID:20100418130654
+
+I can not "drag a tab to my 'Bookmarks Sidebar' or the 'Bookmarks Library' page. To copy a bookmark to my bookmarks list...".
+
+I checked the error console and here are the errors that show when trying to drop the Tab on the 'Bookmarks Sidebar';
+      When dragging the Tab (this error);
+            Error: Components.classes['@mozilla.org/content/dropped-link-handler;1'] is undefined
+            Source File: chrome://global/content/bindings/browser.xml
+            Line: 1142
+      When dropping the Tab on the Sidebar (this);
+            Error: TAB_DROP_TYPE is not defined
+            Source File: file:///C:/Program%20Files/Minefield/modules/PlacesUIUtils.jsm
+            Line: 314
+
+And, if you try to drop the Tab on the 'Bookmarks Library' page, you get the same errors as listed above, plus this error;
+      (before the "Error: TAB_DROP_TYPE is not defined"):
+            Error: uncaught exception: [Exception... "Component returned failure code: 0x80070057 (NS_ERROR_ILLEGAL_VALUE) [nsINavHistoryContainerResultNode.getChild]" nsresult: "0x80070057 (NS_ERROR_ILLEGAL_VALUE)" location: "JS frame :: chrome://browser/content/places/treeView.js :: PTV__getNodeForRow :: line 247" data: no]
+
+
+I found a workaround to this problem.
+
+Instead of dragging the Tab to the 'Bookmarks Sidebar or Library' you can drag the Favicon/URL from the Navigation Toolbar to the 'Bookmarks Sidebar or Library' and it works...
+
+Except, the error console shows the following error(s):
+      New error (Before the "Error: Components.classes is undefined"):
+            Error: Services.droppedLinkHandler is undefined
+            Source File: chrome://browser/content/browser.js
+            Line: 4872
+      But, the last error (Error: TAB_DROP_TYPE is not defined), is not shown...
+(In reply to comment #36)
+
+Drop Link Handler sounds like fallout from bug 545714 and probably file a new regression bug with that error.
+(In reply to comment #37)
+Could the other error, been caused by this Bug landing?
+    When dropping the Tab on the Bookmarks Sidebar or Library;
+            Error: TAB_DROP_TYPE is not defined
+            Source File:
+file:///C:/Program%20Files/Minefield/modules/PlacesUIUtils.jsm
+            Line: 314
+(In reply to comment #38)
+> (In reply to comment #37)
+> Could the other error, been caused by this Bug landing?
+>     When dropping the Tab on the Bookmarks Sidebar or Library;
+>             Error: TAB_DROP_TYPE is not defined
+>             Source File:
+> file:///C:/Program%20Files/Minefield/modules/PlacesUIUtils.jsm
+>             Line: 314
+
+yep, this is real, will push a followup.
+Added TYPE_TAB_DROP to PlacesUIUtils, should be fixed in today's nightly (When it'll be available)
+http://hg.mozilla.org/mozilla-central/rev/85c3175de68f
+Since the nightly is starting in minutes, i won't take any other followup in this bug, please file new bugs for eventual other issues once 19 April's nightly is out.

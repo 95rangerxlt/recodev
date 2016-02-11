@@ -1,0 +1,480 @@
+In bug 873060, Blake discovered that wrapping of toolbaritems is pretty expensive, and that it's making the transition choppy as it causes reflows as the transition is happening.
+
+We can make this better by waiting for the transition to finish before we wrap the toolbaritems. We can also give the event loop some room to breathe by dispatching each wrap operation via Services.tm.currentThread.dispatch.
+
+This significantly smoothed the entering of customization mode for me on OSX.
+
+In the event that we can't get exiting finished, we might want to land this on the try build for our user research build.
+
+In bug 873060, Blake discovered that wrapping of toolbaritems is pretty expensive, and that it's making the transition choppy as it causes reflows as the transition is happening.
+
+We can make this better by waiting for the transition to finish before we wrap the toolbaritems. We can also give the event loop some room to breathe by dispatching each wrap operation via Services.tm.currentThread.dispatch.
+
+This significantly smoothed the entering of customization mode for me on OSX.
+
+In the event that we can't get exiting finished, we might want to land this on the try build for our user research build.
+Created attachment 761166
+WIP Patch 1
+Building this on top of Mike de Boer's work in bug 880701.
+Created attachment 761628
+WIP Patch 2
+
+Checkpointing work...
+Created attachment 761641
+WIP Patch 3
+Created attachment 761682
+Patch v1
+
+Hey Jared,
+
+So I'm making some progress here. This seems to smooth out the transition a bit (although it's a bit glitchy on OSX - maybe you've got some ideas on that).
+
+The big changes here are:
+
+1) I don't use TabsInTitlebar.allowedBy to change the top margin of the tabstrip, since that doesn't animate. I've gone back to the 2em all around padding. This is probably related to the OSX glitch.
+
+2) I've introduced a dispatchFunction function that fires a function on the next tick, and created versions of (un)wrapToolbarItem that act asynchronously and return Promises.
+
+3) I've restructured the enter and exit steps to give priority to the animation, and then to do all of the other work afterwards.
+
+Thoughts?
+Hrm, this also causes test failures in browser_878452_drag_to_panel.js...
+Created attachment 762087
+Patch v1.1
+Created attachment 762102
+Patch v1.2
+Comment on attachment 762102
+Patch v1.2
+
+Note that this still glitches the titlebar a little when exiting customization on OSX. Still not sure what's happening here.
+
+This does seem to smoothify the transition, since we postpone wrapping items and populating the palette until after the transition completes... it's still not 100% smooth, but it's better than what we had before - and this is probably as good as we can get for our user research build.
+
+Jared - this should apply cleanly on top of bug 880701.
+
+Might look funky on OSX and Linux, but I'd be willing to fix that in follow-ups, since we want smoothification for our Windows-based user research subjects.
+
+Gijs - since CustomizeMode.enter and CustomizeMode.exit are no longer synchronous, I had to update the exitCustomization function to ensure that we were done customizing before setting the URL to about:blank in the selected tab.
+Comment on attachment 762102
+Patch v1.2
+
+Review of attachment 762102:
+-----------------------------------------------------------------
+
+Wow, this must have taken a lot of work! It's looking good, generally, but some things (related to the order in which we do things and begin/endBatchUpdate) confuse me, so I've cancelled review for now.
+
+::: browser/components/customizableui/src/CustomizeMode.jsm
+@@ +18,5 @@
+>  Cu.import("resource:///modules/CustomizableUI.jsm");
+>  Cu.import("resource://gre/modules/LightweightThemeManager.jsm");
+>  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> +Cu.import("resource://gre/modules/Task.jsm");
+> +Cu.import("resource://gre/modules/Promise.jsm");
+
+You will be my favourite person ever if you also update the tests' usage of promises to use the same module, assuming this is preferred over whatever's in the SDK. Consistency for the win!
+
+@@ +27,5 @@
+>  function CustomizeMode(aWindow) {
+>    this.window = aWindow;
+>    this.document = aWindow.document;
+>    this.browser = aWindow.gBrowser;
+> +  this._profiler = Cc["@mozilla.org/tools/profiler;1"].getService(Ci.nsIProfiler);
+
+So I get that we want this in here for now. I admit that I don't really know anything about our builtin profiling. Does this need to go out before merging/release/beta/something? If so, can you file a bug and/or leave a comment/ifdef in here so we don't forget?
+
+@@ +121,2 @@
+>  
+> +      yield this._doTransition(true);
+
+Both here and in the exit() routine, why are we moving the sync things before the first yield into the Task? Is there a benefit, or could we leave them alone?
+
+(this is me with my "I am scared of changes" hat on)
+
+@@ +131,4 @@
+>  
+> +      this._showPanelCustomizationPlaceholders();
+> +
+> +      window.PanelUI.beginBatchUpdate();
+
+This is the second time you're calling this. Is calling it twice necessary, and if not, can we remove the one that's not necessary?
+
+@@ +132,5 @@
+> +      this._showPanelCustomizationPlaceholders();
+> +
+> +      window.PanelUI.beginBatchUpdate();
+> +      yield this._wrapToolbarItems();
+> +      window.PanelUI.endBatchUpdate();
+
+Similarly, AFAICT from the code in bug bug880701, this turns off a boolean about those mutations already - right before calling this.populatePalette(). Is that what you want?
+
+@@ +153,5 @@
+> +      let customizableToolbars = document.querySelectorAll("toolbar[customizable=true]:not([autohide=true]):not([collapsed=true])");
+> +      for (let toolbar of customizableToolbars)
+> +        toolbar.setAttribute("customizing", true);
+> +
+> +      window.PanelUI.endBatchUpdate();
+
+And then here you turn it off again. That seems wrong.
+
+@@ +157,5 @@
+> +      window.PanelUI.endBatchUpdate();
+> +      this._customizing = true;
+> +      this._transitioning = false;
+> +      this.dispatchToolboxEvent("customizationready");
+> +    }.bind(this));
+
+Nit: The functions you pass to dispatchFunction() are all => notation. Can we settle on either that or .bind(this) for the file? (last I was told, at least, the arrow notation implies binding |this| as well) :-)
+
+@@ +162,4 @@
+>    },
+>  
+>    exit: function() {
+> +    let caller = Components.stack.caller;
+
+Debugging leftover?
+
+@@ +191,3 @@
+>  
+> +      let browser = document.getElementById("browser");
+> +      browser.parentNode.selectedPanel = browser;
+
+I must be missing something, but isn't this switching the selected panel of the deck before we transition? Shouldn't it be the other way around? Certainly when entering, we first switch the panel and then transition, so my instincts would say that here we need to do the reverse: first transition, then switch the panel.
+
+@@ +260,5 @@
+> +
+> +  _doTransition: function(aEntering) {
+> +    let deferred = Promise.defer();
+> +    let originalSmoothScroll = this.browser.tabContainer.mTabstrip.smoothScroll;
+> +    this.browser.tabContainer.mTabstrip.smoothScroll = false;
+
+Can you leave a comment about why we're doing this?
+
+@@ +310,5 @@
+> +    return Task.spawn(function() {
+> +      let unusedWidgets = CustomizableUI.getUnusedWidgets(toolboxPalette);
+> +      for (let widget of unusedWidgets) {
+> +        let paletteItem = this.makePaletteItem(widget, "palette");
+> +        yield this._deferredAppendChild(fragment, paletteItem);
+
+You're appending to the fragment here, which isn't in the DOM (yet). Naively, I don't see why that needs to be async. Is this worth the complexity?
+
+@@ +403,5 @@
+>      // a parent, in which case we skip replacing it. This can happen if a
+>      // toolbar item has been dragged into the palette. In that case, we tell
+>      // CustomizableUI to remove the widget from its area before putting the
+>      // widget in the palette - so the node will have no parent.
+> +
+
+Nit: don't put a newline between the comment and the bit it's commenting on.
+
+::: browser/components/customizableui/test/head.js
+@@ +106,4 @@
+>  
+> +    // If we stop early enough, this might actually be about:blank.
+> +    if (newTabBrowser.contentDocument.location.href == "about:blank") {
+> +      return deferredEndCustomizing.promise;
+
+This is harmless, but might as well make it return nothing, right?
+Comment on attachment 762102
+Patch v1.2
+
+I'll wait to review this until Gijs' feedback is addressed.
+Created attachment 762178
+Patch v1.3
+Created attachment 762224
+Patch v1.4
+
+Gonna do a quick self-review, and then I'll re-request review from Gijs and jaws
+Created attachment 762232
+Patch v1.5
+
+Ok, I think I'm starting to see the light at the end of the tunnel here.
+
+(In reply to :Gijs Kruitbosch from comment #10)
+> Comment on attachment 762102
+> Patch v1.2
+> 
+> Review of attachment 762102:
+> -----------------------------------------------------------------
+> 
+> Wow, this must have taken a lot of work! It's looking good, generally, but
+> some things (related to the order in which we do things and
+> begin/endBatchUpdate) confuse me, so I've cancelled review for now.
+> 
+
+Yeah, beginBatchUpdate and endBatchUpdate was done in a kinda bad way. I think with the changes I've made in bug 880701, this is a bit better now.
+
+> ::: browser/components/customizableui/src/CustomizeMode.jsm
+> @@ +18,5 @@
+> >  Cu.import("resource:///modules/CustomizableUI.jsm");
+> >  Cu.import("resource://gre/modules/LightweightThemeManager.jsm");
+> >  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> > +Cu.import("resource://gre/modules/Task.jsm");
+> > +Cu.import("resource://gre/modules/Promise.jsm");
+> 
+> You will be my favourite person ever if you also update the tests' usage of
+> promises to use the same module, assuming this is preferred over whatever's
+> in the SDK. Consistency for the win!
+> 
+
+Done!
+
+> @@ +27,5 @@
+> >  function CustomizeMode(aWindow) {
+> >    this.window = aWindow;
+> >    this.document = aWindow.document;
+> >    this.browser = aWindow.gBrowser;
+> > +  this._profiler = Cc["@mozilla.org/tools/profiler;1"].getService(Ci.nsIProfiler);
+> 
+> So I get that we want this in here for now. I admit that I don't really know
+> anything about our builtin profiling. Does this need to go out before
+> merging/release/beta/something? If so, can you file a bug and/or leave a
+> comment/ifdef in here so we don't forget?
+> 
+
+I think I'm just going to remove this stuff for now. Talking to BenWa, the AddMarker thing is pretty new anyhow. I'll wait until it's used more throughout m-c before putting it back (if ever).
+
+> @@ +121,2 @@
+> >  
+> > +      yield this._doTransition(true);
+> 
+> Both here and in the exit() routine, why are we moving the sync things
+> before the first yield into the Task? Is there a benefit, or could we leave
+> them alone?
+> 
+
+Good point. The advantage of putting them into Task.spawn is that it lets the event loop pump a little before running them. Not a huge deal though - I've put them back outside of the Task.
+
+> (this is me with my "I am scared of changes" hat on)
+> 
+> @@ +131,4 @@
+> >  
+> > +      this._showPanelCustomizationPlaceholders();
+> > +
+> > +      window.PanelUI.beginBatchUpdate();
+> 
+> This is the second time you're calling this. Is calling it twice necessary,
+> and if not, can we remove the one that's not necessary?
+> 
+
+All of that stuff was bogus. Should be clearer now.
+
+> @@ +132,5 @@
+> > +      this._showPanelCustomizationPlaceholders();
+> > +
+> > +      window.PanelUI.beginBatchUpdate();
+> > +      yield this._wrapToolbarItems();
+> > +      window.PanelUI.endBatchUpdate();
+> 
+> Similarly, AFAICT from the code in bug bug880701, this turns off a boolean
+> about those mutations already - right before calling this.populatePalette().
+> Is that what you want?
+> 
+
+Same as above.
+
+> @@ +153,5 @@
+> > +      let customizableToolbars = document.querySelectorAll("toolbar[customizable=true]:not([autohide=true]):not([collapsed=true])");
+> > +      for (let toolbar of customizableToolbars)
+> > +        toolbar.setAttribute("customizing", true);
+> > +
+> > +      window.PanelUI.endBatchUpdate();
+> 
+> And then here you turn it off again. That seems wrong.
+> 
+
+It was!
+
+> @@ +157,5 @@
+> > +      window.PanelUI.endBatchUpdate();
+> > +      this._customizing = true;
+> > +      this._transitioning = false;
+> > +      this.dispatchToolboxEvent("customizationready");
+> > +    }.bind(this));
+> 
+> Nit: The functions you pass to dispatchFunction() are all => notation. Can
+> we settle on either that or .bind(this) for the file? (last I was told, at
+> least, the arrow notation implies binding |this| as well) :-)
+> 
+
+I'll go with bind, since I sometimes need the names of the functions to de-register event listeners, and according to http://wiki.ecmascript.org/doku.php?id=harmony:arrow_function_syntax, named arrow functions aren't with us yet.
+
+> @@ +162,4 @@
+> >    },
+> >  
+> >    exit: function() {
+> > +    let caller = Components.stack.caller;
+> 
+> Debugging leftover?
+> 
+
+Indeed! Good eye.
+
+> @@ +191,3 @@
+> >  
+> > +      let browser = document.getElementById("browser");
+> > +      browser.parentNode.selectedPanel = browser;
+> 
+> I must be missing something, but isn't this switching the selected panel of
+> the deck before we transition? Shouldn't it be the other way around?
+> Certainly when entering, we first switch the panel and then transition, so
+> my instincts would say that here we need to do the reverse: first
+> transition, then switch the panel.
+> 
+
+Good call. I've switched these around.
+
+> @@ +260,5 @@
+> > +
+> > +  _doTransition: function(aEntering) {
+> > +    let deferred = Promise.defer();
+> > +    let originalSmoothScroll = this.browser.tabContainer.mTabstrip.smoothScroll;
+> > +    this.browser.tabContainer.mTabstrip.smoothScroll = false;
+> 
+> Can you leave a comment about why we're doing this?
+> 
+
+Another experiment that I forgot to remove. It turns out that by the time this transition starts, the new tab has already started to animate open, so I don't think it matters whether or not we've set smoothScroll. We might want to investigate other solutions to this though, because the tabstrip animation really janks things up.
+
+> @@ +310,5 @@
+> > +    return Task.spawn(function() {
+> > +      let unusedWidgets = CustomizableUI.getUnusedWidgets(toolboxPalette);
+> > +      for (let widget of unusedWidgets) {
+> > +        let paletteItem = this.makePaletteItem(widget, "palette");
+> > +        yield this._deferredAppendChild(fragment, paletteItem);
+> 
+> You're appending to the fragment here, which isn't in the DOM (yet).
+> Naively, I don't see why that needs to be async. Is this worth the
+> complexity?
+> 
+
+Nope! I'll leave it in the Task though to pump the event loop.
+
+> @@ +403,5 @@
+> >      // a parent, in which case we skip replacing it. This can happen if a
+> >      // toolbar item has been dragged into the palette. In that case, we tell
+> >      // CustomizableUI to remove the widget from its area before putting the
+> >      // widget in the palette - so the node will have no parent.
+> > +
+> 
+> Nit: don't put a newline between the comment and the bit it's commenting on.
+> 
+
+Fixed.
+
+> ::: browser/components/customizableui/test/head.js
+> @@ +106,4 @@
+> >  
+> > +    // If we stop early enough, this might actually be about:blank.
+> > +    if (newTabBrowser.contentDocument.location.href == "about:blank") {
+> > +      return deferredEndCustomizing.promise;
+> 
+> This is harmless, but might as well make it return nothing, right?
+
+Fixed.
+Comment on attachment 762232
+Patch v1.5
+
+Review of attachment 762232:
+-----------------------------------------------------------------
+
+Awesome, thanks!
+
+::: browser/components/customizableui/src/CustomizeMode.jsm
+@@ +222,5 @@
+> +      // or the TabSelect event handler will think that we are exiting
+> +      // customization mode for a second time.
+> +      this._customizing = false;
+> +
+> +      if (this.browser.selectedBrowser.currentURI.spec == kAboutURI) {
+
+This was here before, but looking at it with a critical eye, I don't understand how this could ever not be true. If you do, please add a comment if we're touching blame anyway. :-)
+
+(if not, let's file a followup to see what happens if we get rid of it... but please don't block this bug on that)
+
+@@ +554,4 @@
+>  
+> +      this._updateResetButton();
+> +      this._showPanelCustomizationPlaceholders();
+> +    }.bind(this));
+
+So this is now async - did you check that we don't have tests that don't pass the result back to teardown/Task.jsm? We basically always want to wait for this to have finished, I think...
+Created attachment 762946
+Patch v1.6
+
+I filed bug 883397 about the kAboutURI check that may or may not be necessary.
+
+Good call on those tests that were calling reset on clean-up. I've added a facility to our runTests function that calls an optional asynchronous cleanup function where we yield for the reset promise.
+Comment on attachment 762946
+Patch v1.6
+
+Review of attachment 762946:
+-----------------------------------------------------------------
+
+Thanks! :-)
+
+::: browser/components/customizableui/test/head.js
+@@ +53,5 @@
+> +      window.gCustomizeMode.exit();
+> +    } else {
+> +      yield CustomizableUI.reset();
+> +    }
+> +  });
+
+Please simplify to just having returning (the promise of?) CustomizableUI.reset(). The "are we still customizing" check is in there because before, this was part of the end-of-mochitest cleanup code, so if a test failed (and failed to clean up) we'd make a best effort to still clean up. This code will now no longer run if the individual test block teardown code failed disastrously (because there's no try catch blocks of any sort in the test runner), so it doesn't seem worth keeping.
+
+Unfortunately mochitest-browser doesn't have a way for the registered cleanup function to be async. If you're feeling thorough you can file a followup bug for that but I'm not sure that'll ever get implemented. For now, this method of taking care of this should be fine - no need for another review.
+Created attachment 763551
+Patch v1.7 (r+'d by Gijs)
+
+Thanks Gijs! Simplified that method as suggested.
+Landed in UX as https://hg.mozilla.org/projects/ux/rev/27b111789845
+Comment on attachment 763551
+Patch v1.7 (r+'d by Gijs)
+
+Review of attachment 763551:
+-----------------------------------------------------------------
+
+::: browser/themes/windows/browser.css
+@@ +2514,5 @@
+>    background-attachment: fixed;
+>  }
+>  
+>  #main-window[customizing] #tab-view-deck {
+> +  padding: 2em;
+
+Why did this get change to remove the padding-top:0; ? This breaks dragging the window when customizing on Windows.
+(In reply to Jared Wein [:jaws] from comment #20)
+> Comment on attachment 763551
+> Patch v1.7 (r+'d by Gijs)
+> 
+> Review of attachment 763551:
+> -----------------------------------------------------------------
+> 
+> ::: browser/themes/windows/browser.css
+> @@ +2514,5 @@
+> >    background-attachment: fixed;
+> >  }
+> >  
+> >  #main-window[customizing] #tab-view-deck {
+> > +  padding: 2em;
+> 
+> Why did this get change to remove the padding-top:0; ? This breaks dragging
+> the window when customizing on Windows.
+
+As I mentioned today in Vidyo, it was because we wanted smooth animation for the transition. Before, we were moving the tabs down with TabsInTitlebar.allowedBy. That caused the frames to jump down in 1 frame, as opposed to smoothly transitioning.
+
+Yeah, the window is no longer movable. :/ I wonder if we should perhaps attach a dragwindow binding?
+(In reply to Mike Conley (:mconley) from comment #21)
+> Yeah, the window is no longer movable. :/ I wonder if we should perhaps
+> attach a dragwindow binding?
+
+Chenxia filed bug 886444 about this.
+https://hg.mozilla.org/mozilla-central/rev/27b111789845
+
+
+Wrap and unwrap toolbaritems after customization mode transition finishes
+
+
+
+Bug 881909 - Wrap and unwrap toolbaritems after customization mode transition finishes. r=Gijs. 

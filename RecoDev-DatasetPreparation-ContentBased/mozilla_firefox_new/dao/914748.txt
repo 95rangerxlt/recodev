@@ -1,0 +1,131 @@
+_openURIInNewTab can return null in various cases, which gives us things like:
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/browser_pluginnotification.js | uncaught exception - NS_ERROR_XPC_JAVASCRIPT_ERROR_WITH_DETAILS: '[JavaScript Error: "browser is null" {file: "chrome://browser/content/browser.js" line: 13192}]' when calling method: [nsIBrowserDOMWindow::openURI] at chrome://global/content/contentAreaUtils.js:1088
+
+_openURIInNewTab can return null in various cases, which gives us things like:
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/browser_pluginnotification.js | uncaught exception - NS_ERROR_XPC_JAVASCRIPT_ERROR_WITH_DETAILS: '[JavaScript Error: "browser is null" {file: "chrome://browser/content/browser.js" line: 13192}]' when calling method: [nsIBrowserDOMWindow::openURI] at chrome://global/content/contentAreaUtils.js:1088
+Created attachment 802464
+openURI should not try to get .contentWindow on a null browser.
+Apparently openURIInFrame has the same problem.
+Comment on attachment 802464
+openURI should not try to get .contentWindow on a null browser.
+
+Ah, thank you.  Let's try the relevant reviewer!
+Created attachment 802799
+openURI should not try to get .contentWindow on a null browser, and openURL should not try to focus null windows.
+That last patch causes openURL to actually work, but browser_pluginnotification.js depends on it being broken: it times out with the patch.  So I guess I'll just fix it to silently not work...
+Created attachment 803035
+openURI should not try to get .contentWindow on a null browser, and openURL should not try to focus null windows.
+Comment on attachment 803035
+openURI should not try to get .contentWindow on a null browser, and openURL should not try to focus null windows.
+
+>--- a/toolkit/content/contentAreaUtils.js
+>+++ b/toolkit/content/contentAreaUtils.js
+>@@ -1087,17 +1087,19 @@ function openURL(aURL)
+>     protocolSvc.loadUrl(uri);
+>   }
+>   else {
+>     var recentWindow = Services.wm.getMostRecentWindow("navigator:browser");
+>     if (recentWindow) {
+>       var win = recentWindow.browserDOMWindow.openURI(uri, null,
+>                                                       recentWindow.browserDOMWindow.OPEN_DEFAULTWINDOW,
+>                                                       recentWindow.browserDOMWindow.OPEN_NEW);
+>-      win.focus();
+>+      if (win) {
+>+        win.focus();
+>+      }
+>       return;
+>     }
+
+I don't think it's ok to return here if win is null.
+
+Also, did you see comment 2?
+> I don't think it's ok to return here if win is null.
+
+What do you suggest then?  We have tests that depend on this code not pressing on past this point if window is null; see comment 5.  I tried to figure out what that test is doing, and failed.  Do you want to deal with it?
+
+> Also, did you see comment 2?
+
+Missed that.  I can fix that codepath, sure.
+(In reply to Boris Zbarsky [:bz] from comment #8)
+> > I don't think it's ok to return here if win is null.
+> 
+> What do you suggest then?  We have tests that depend on this code not
+> pressing on past this point if window is null; see comment 5.  I tried to
+> figure out what that test is doing, and failed.  Do you want to deal with it?
+
+Looks like that test causes openURL to be called from browser-plugins.js. If I replace that openURL with openUILinkIn(..., "tab"), the test passes. So I suppose the test is OK and openURL is still wonky. As far as I can tell, 'win' shouldn't even be null here, because the window this test runs in is (supposedly) a perfectly well browser window capable of opening a new tab...
+Created attachment 803746
+openURL fix
+
+This fixes it for me. openUILinkIn never fails and also takes care of focusing the window.
+
+I still don't what went wrong with the browserDOMWindow.openURI call, though.
+Dão, thank you for picking this up!
+Created attachment 804323
+openURI and openURIInFrame fix
+Dão, with that first patch, I seem to get b-c test failures:
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/browser_pluginnotification.js | Test 18a, Update link should open up the plugin check page
+
+and lots of timeouts.
+Created attachment 804875
+openURL fix v2
+
+(In reply to Boris Zbarsky [:bz] from comment #13)
+> Dão, with that first patch, I seem to get b-c test failures:
+> 
+> TEST-UNEXPECTED-FAIL |
+> chrome://mochitests/content/browser/browser/base/content/test/
+> browser_pluginnotification.js | Test 18a, Update link should open up the
+> plugin check page
+> 
+> and lots of timeouts.
+
+Oops, erroneously passed 'uri' (an nsIURI) to openUILinkIn. This needs to be uri.spec.
+I wasn't quite sure which patches needed review and what combination needs to land, but I looked at them both and it looks reasonable. Still strange that those calls would fail in the first place..
+https://hg.mozilla.org/integration/fx-team/rev/3ec60fd59b9c
+https://hg.mozilla.org/integration/fx-team/rev/cb091c9fe504
+Comment on attachment 804875
+openURL fix v2
+
+>diff --git a/toolkit/content/contentAreaUtils.js b/toolkit/content/contentAreaUtils.js
+
+>     if (recentWindow) {
+>-      var win = recentWindow.browserDOMWindow.openURI(uri, null,
+>-                                                      recentWindow.browserDOMWindow.OPEN_DEFAULTWINDOW,
+>-                                                      recentWindow.browserDOMWindow.OPEN_NEW);
+>-      win.focus();
+>+      recentWindow.openUILinkIn(uri.spec, "tab");
+>       return;
+>     }
+
+IIRC openURI was used because it didn't depend on an app-specific method like openUILinkIn. This probably broke Thunderbird (SeaMonkey seems to have it)?
+Mark, see comment 17 (and redirect as necessary)?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #17)
+> IIRC openURI was used because it didn't depend on an app-specific method
+> like openUILinkIn. This probably broke Thunderbird (SeaMonkey seems to have
+> it)?
+
+Thunderbird doesn't have navigator:browser windows.
+https://hg.mozilla.org/mozilla-central/rev/3ec60fd59b9c
+https://hg.mozilla.org/mozilla-central/rev/cb091c9fe504
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #17)
+> IIRC openURI was used because it didn't depend on an app-specific method
+> like openUILinkIn. This probably broke Thunderbird (SeaMonkey seems to have
+> it)?
+
+(In reply to Dão Gottwald [:dao] from comment #19)
+> Thunderbird doesn't have navigator:browser windows.
+
+Yeah, that's true, I think we're fine here. Thanks for the heads-up.
+
+
+openURI should not throw exceptions in the OPEN_NEWTAB case when it fails to create a new browser
+
+regression
+
+Bug 914748 - openURI and openURIInFrame should not throw exceptions in the OPEN_NEWTAB case when they didn't create a new browser. r=felipe 
+
+Bug 914748 - Let openURL call openUILinkIn rather than browserDOMWindow.openURI, as the latter may do nothing and return null. r=felipe 

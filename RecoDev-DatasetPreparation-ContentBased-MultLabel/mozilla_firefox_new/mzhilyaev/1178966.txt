@@ -1,0 +1,170 @@
+We need to better understand if suggest tiles changes anything.
+For that we need to add FHR probe in the new tab page to measure eyeball time.
+
+We need to better understand if suggest tiles changes anything.
+For that we need to add FHR probe in the new tab page to measure eyeball time.
+Adding relevant IRC conversation with bsmedberg:
+
+1) in terms of measurement, a histogram of the duration newtab was visible should suffice
+2) the basic “unloadtime - loadtime” metric could be ok, but we may exclude long-leaved, "lost" tabs (like leaving newtab open overnight)
+3) telemetry will do the bucketing for the values we report
+4) it's unclear which "questions" the newtab "visible" time distribution will help answer
+5) we should do A/B testing on the same audience e.g. run an experiment with suggested tiles enabled/disabled
+6) need clarity about what the results mean. 
+  Is the goal to maximize or minimize time?
+  Are you comparing mean or median? 
+  Compare distributions? 
+  Are you going to exclude long outliers?
+7) basics FHR steps are here https://developer.mozilla.org/en-US/docs/Mozilla/Performance/Adding_a_new_Telemetry_probe
+
+NOTES:
+
+1) It will be easier to remove outliers from collected data rather then invent threshold in the client. I suggest collecting "visible time" for all newtabs and cutting outliers off during data analysis
+
+2) A/B testing - will telemetry be able to generate two different data sets for A/B users, does it know the distinction or the client implements instrumentation for A/B testing?
+
+3) How to analyze collected data?
+ - We can run statistical test to verify that A-histogram and B-histogram come from same population. I believe chi-square test will provide necessary insight (or we can choose something more thoughtful)
+ - if chi-square test succeeds, we know that suggested tiles made no impact on "eye balls"
+ - if chi-square test fails, we suspect that there is an impact and wish to measure it
+
+4) impact measure
+if there's truly a pause that user takes because of a suggested tile, it should surface in short lived newtabs somehow. If a large number of newtabs that lived less than 5 seconds without suggested tiles suddenly extend to 30 seconds with them, the impact is probably there. A left tail shift in "visible time" distribution will tell us a lot.
+Created attachment 8628084
+v1. newtab life-span probe
+
+Configured histogram for maximum life-span of 10 mins.
+I doubt users will stare at tiles much longer :)
+
+Big questions:
+1) Is there a document I need to update with a description of new probe?
+2) Do I need to worry about A/B testing in the client? Technically, when the code released and we turn suggested tiles on 1% of FX population, the probe will produce data for both sets of users. Can telemetry back end compute different histograms for users that have suggested tiles on, and for the rest of them?  
+3) If telemetry can't do it, would you recommend to simply create two distinct probes and fill them differently for user that have (have not) suggested tiles?
+Comment on attachment 8628084
+v1. newtab life-span probe
+
+implementation is incorrect. we have to have two probes for suggested and not, because same user can experience both.  the patch needs to be refactored
+The best way to do A/B tests is via an experiment.
+
+So, add the probe here as normal. Make sure that suggested tiles can be enabled/disable via an extension (via flipping a pref is easiest). Then the experiment extension can flip the pref. Telemetry already records the presence of an experiment and then it's pretty easy to correlate.
+
+https://wiki.mozilla.org/Telemetry/Experiments has details on experiments, and this one should be very simple.
+
+We treat Histograms.json as self-documenting, so you don't need a separate doc. I'll look over the code shortly.
+(In reply to Benjamin Smedberg  [:bsmedberg] from comment #4)
+
+Comments inline:
+
+> The best way to do A/B tests is via an experiment.
+
+I believe that Content Services want to test on 1% of release too (this will be server.
+My understanding that telemetry experiment works on beta only.
+Is there a way to extend telemetry experiment to release users?
+
+> 
+> So, add the probe here as normal. Make sure that suggested tiles can be
+> enabled/disable via an extension (via flipping a pref is easiest). Then the
+> experiment extension can flip the pref. Telemetry already records the
+> presence of an experiment and then it's pretty easy to correlate.
+> 
+
+There's such pref: browser.newtabpage.enhanced. Since this pref is on by default, we turn it off for 25% of beta via experiment, and that will give us two sets: 25% suggested off, and 75% suggested on. Then we study histograms collected over the life-span of experiment. Did I get the process right?
+
+Keep in mind though, that same user may or may not see a suggested tile in newtab page: the stats may be blurred unless we count separately for newtabs with and without a suggested tiles.
+Created attachment 8628530
+v2. two histogram scheme
+after conversation with bsmedberg, we decided that:
+
+1) two separate histogram will be filled for newtabs with and without suggested tile
+2) the main use case are short-lived newtabs where a user transitions to a different page. 
+For that use case, life-span and visibility are the same, however life-span allows significantly simpler implementation. Hence, the newtab life-span will be used to "measure eye balls" for this phase of experiment.
+3) time is measured with 1/2 second precision to make low end of histogram linear and not loose the change in user attention.
+Comment on attachment 8628530
+v2. two histogram scheme
+
+nit misspelling: "send telmetry probe"
+
+It's very strange that you're dividing by 500 yourself. You should let the telemetry system do that for you. Examples:
+
+Linear histogram:
+NEWTAB_PAGE_LIFESPAN_MS
+"kind": "linear"
+"low": 0
+"high": 50000
+"n_buckets": 100
+In this all measurements greater than 50000 will be in the last bucket.
+
+Exponential:
+NEWTAB_PAGE_LIFESPAN_MS
+"kind": "exponential"
+"low": 0
+"high": 180000
+"n_buckets": 100
+With this you get greater granularity at the low end, and more range at the high end. I recommend this.
+
+Recommendation: rather than doing Date.now()= computations by hand, it would be better to use TelemetryStopwatch.
+
+I'm sorry this took so long. I promise future revisions will be really quick.
+(In reply to Benjamin Smedberg  [:bsmedberg] from comment #8)
+> Comment on attachment 8628530
+> v2. two histogram scheme
+> 
+> nit misspelling: "send telmetry probe"
+> 
+> It's very strange that you're dividing by 500 yourself. You should let the
+> telemetry system do that for you. Examples:
+
+I actually spent a few hours simulating how buckets work: https://github.com/mzhilyaev/testrappor/blob/master/telemetry_buckets.py
+
+There was a good reason why I had to implement 1/2 interval.
+The newtab click happens between 1 and 30 seconds from the load, so the first 30 seconds are the most interesting.  However, the rest is also interesting, so we want to have calibration that makes left side if histogram linear, while the middle and right side is still meaningful. 
+
+So, suppose I just go with linear kind and let telemetry divide 600 seconds into 100 buckets.... Well, then my bucket size is 6 seconds - which is WAY to coarse. We will not be able to measure the potential pause that a user may take when he sees content tile. We want left buckets be at least 1/2 second size to catch a change in user behavior. 
+
+Ok, let me then use milliseconds and exponential kind, for same 600 seconds.  Here's how buckets fall out in this case:
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 23, 26, 29, 33, 37, 42, 48, 54, 61, 69, 78, 88, 100, 113, 128, 145, 164, 186, 211, 239, 271, 307, 348, 394, 446, 505, 572, 648, 734, 831, 941,....]
+
+So, my first 50 buckets will be almost empty, because a user will not be doing any action in the first millisecond of the newtab appearance.
+
+Which is why 1/2 second calibration was chosen:
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 51, 54, 57, 60, 63, 66, 70, 74, 78, 82, 86, 91, 96, 101, 106, 112, 118, 124, 131, 138, 145, 153, 161, 170, 179, 189, 199, 210, 221, 233, 246, 259, 273, 288, 304, 320, 337, 355, 374, 394, 415, 438, 462, 487, 514, 542, 571, 602, 635, 670, 706, 744, 785, 828, 873, 921, 971, 1024, 1080, 1138, 1200]
+
+As you can see the first 40 buckets (which corresponds to first 30 seconds) are almost linear, and 1/2 second is small enough to catch the user "pause", and the right tail will still provide useful info.
+
+So, I would like to keep this implementation unchanged.
+
+>> I'm sorry this took so long. I promise future revisions will be really quick.
+
+Aha! I hold you to the promise then, and requesting info and second review on the issue. Thanks a ton
+If 0.5s is the minimum granularity with which we want to measure eyeball time, then the bucketing approach makes sense to me given the linearity requirement for the first 30s.
+
+One more reason to add some form of histograms with dynamic ranges to Telemetry in the future.
+Comment on attachment 8628530
+v2. two histogram scheme
+
+ok.
+I'm concerned that measuring how long about:newtab is open is not going to produce meaningful numbers.
+
+You could get a more accurate measurement of eyeball time by defining it as "how long is the newtab page in focus". 
+
+You can implement this using the following event listeners:
+
+- monitor tab unload (for tab-close and navigating to another page)
+- use the page visibility API to monitor how long about:newtab is the foreground tab in its window https://developer.mozilla.org/en-US/docs/Web/Guide/User_experience/Using_the_Page_Visibility_API
+- monitor window focus for detecting when the user switches to another application or switches to another Firefox window
+Vladan,
+
+You are, indeed, correct.  I would've been more accurate to measure "in focus" time, but it does require some non-trivial surgery to newtab code, which we felt is not justified for the use case.  The reason for this probe is to see if a user "pauses" when he sees a suggested "content" tile. We want to see this "pause" for short-lived newtabs where a user transitions to a different page.  We also suspect that such transitional newtabs are dominant majority.  Since "in focus" and "life span" for short-lived newtabs are same, a simpler implementation is likely to provide sufficient data.
+
+I discussed it with bsmedberg, and we decided on simple "life span" probe for the phase 1. Should the data prove us wrong I will refactor the probe (using your excellent recommendation).
+Created attachment 8631274
+v2. fix reviewer comments
+https://hg.mozilla.org/integration/fx-team/rev/df44450ebebc
+https://hg.mozilla.org/mozilla-central/rev/df44450ebebc
+
+
+Add FHR probe to measure eyeball time spent on newtab
+
+
+
+Bug 1178966 - Add FHR probe to measure eyeball time spent on newtab [r=bsmedberg] 

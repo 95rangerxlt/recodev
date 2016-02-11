@@ -1,0 +1,314 @@
+Split off from bug 723561.  In peptest, I see these errors regularly:
+
+PEP WARNING    | MOZMILL fail {"message":"[JavaScript Error: \"TelemetryStopwatch: key \"FX_SESSION_RESTORE_COLLECT_DATA_MS\" was already initialized\" {file: \"resource:///modules/TelemetryStopwatch.jsm\" line: 53}]"}
+
+Gavin says that "saveState can return early without finish()ing FX_SESSION_RESTORE_COLLECT_DATA_MS."
+
+Split off from bug 723561.  In peptest, I see these errors regularly:
+
+PEP WARNING    | MOZMILL fail {"message":"[JavaScript Error: \"TelemetryStopwatch: key \"FX_SESSION_RESTORE_COLLECT_DATA_MS\" was already initialized\" {file: \"resource:///modules/TelemetryStopwatch.jsm\" line: 53}]"}
+
+Gavin says that "saveState can return early without finish()ing FX_SESSION_RESTORE_COLLECT_DATA_MS."
+This also shows up during browser-chrome tests, e.g. https://tbpl.mozilla.org/php/getParsedLog.php?id=9813797&tree=Firefox&full=1
+
+And the same occurs for the key FX_SESSION_RESTORE_WRITE_FILE_MS
+
+Will this be a matter of starting up the timer later, or adding a cancel() method for the stopwatch? or allow start to override the previous counter?
+(In reply to Felipe Gomes (:felipe) from comment #1)
+> This also shows up during browser-chrome tests, e.g.
+> https://tbpl.mozilla.org/php/getParsedLog.php?id=9813797&tree=Firefox&full=1
+> 
+> And the same occurs for the key FX_SESSION_RESTORE_WRITE_FILE_MS
+
+That one is a bit odd, though we've never handled a non-success case in asynccopy, so I guess we should... It could be that we're in the middle of a save and the sanitize tests trigger a delete which confuses things (because async?)
+
+> Will this be a matter of starting up the timer later, or adding a cancel()
+> method for the stopwatch? or allow start to override the previous counter?
+
+I think a cancel makes sense so that we can be explicit. That way we can distinguish legitimate cancellations from problems.
+(In reply to Paul O'Shannessy [:zpao] from comment #2)
+> > And the same occurs for the key FX_SESSION_RESTORE_WRITE_FILE_MS
+> 
+> That one is a bit odd
+
+Isn't it possible for _writeFile to be called again before the previous async operation has completed? Can it be called in quick succession? E.g. when called via the PB "exit" observer in addition to a normal delayed write?
+(In reply to Gavin Sharp (use gavin@gavinsharp.com for email) from comment #3)
+> (In reply to Paul O'Shannessy [:zpao] from comment #2)
+> > > And the same occurs for the key FX_SESSION_RESTORE_WRITE_FILE_MS
+> > 
+> > That one is a bit odd
+> 
+> Isn't it possible for _writeFile to be called again before the previous
+> async operation has completed? Can it be called in quick succession? E.g.
+> when called via the PB "exit" observer in addition to a normal delayed write?
+
+Ah yea, that could happen and actually makes sense looking at the logs. They're all in clearing private data and private browsing tests, both cases where we explicitly call saveState (or _saveStateObject) directly.
+*** Bug 742766 has been marked as a duplicate of this bug. ***
+Created attachment 626751
+Adding ability to cancel a telemtry timer v1
+
+This doesn't solve the real problem with the async copying issue, but it does add the cancel function.
+
+I'm not sure if this is exactly what :felipe had in mind, but it does solve the problem where this error is causing some of our QA Automation tests to fail.  You can make this happen every single time by simply opening the addons manager tab.  I'll attach a mozmill test for that (how we found it) but it's a trivial test and we can make it into a browser-chrome test later if this fix is something we want to take.
+Created attachment 626752
+The mozmill test
+
+The mozmill test - this just opens the addons tab, waits 10s and closes it.  It reproduces the telemtrystopwatch error without fail.
+Comment on attachment 626751
+Adding ability to cancel a telemtry timer v1
+
+I don't think we want to do this - this just masks valid bugs that we otherwise need to fix. Let's fix the bad callers (sessionstore).
+So why do we have to call Cu.report for the message to appear in the Error Console? Why can't it simply be a message instead?
+I'm not sure what you mean. The message indicates an error that needs to be fixed, so we use reportError.
+Do you know why this error message is frequent in Nightlies since a few weeks?
+Each time I start Nightly, it spams the error console and comes back regularly:
+
+Timestamp: 24/07/2012 17:51:47
+Error: TelemetryStopwatch: key "FX_SESSION_RESTORE_COLLECT_DATA_MS" was already initialized
+Source File: resource://gre/modules/TelemetryStopwatch.jsm
+Line: 53
+Created attachment 660990
+Patch: Fixed error "key was already initialized"
+
+Added code to manage the cancellation of an unfinished telemetry timer before start it again. We ensure timers: FX_SESSION_RESTORE_COLLECT_DATA_MS or FX_SESSION_RESTORE_WRITE_FILE_MS are now cleared before start them.
+Comment on attachment 660990
+Patch: Fixed error "key was already initialized"
+
+# HG changeset patch
+# User Bellindira Castillo [:bellindira] <bellindira@appcoast.com>
+# Date 1347570973 21600
+# Node ID 1d6f8f009de7cb6d283e81a4aee6804b865167fb
+# Parent  fdfaef738a00c5808782864cd991494d53eaf680
+Bug 732874 - Telemetry stopwatch: key was already initialized errors in logs
+
+diff --git a/browser/components/sessionstore/src/SessionStore.jsm b/browser/components/sessionstore/src/SessionStore.jsm
+--- a/browser/components/sessionstore/src/SessionStore.jsm
++++ b/browser/components/sessionstore/src/SessionStore.jsm
+@@ -2897,17 +2897,17 @@ let SessionStoreInternal = {
+         aTabs = aTabs.splice(selectedTabIndex, 1).concat(aTabs);
+         aTabData = aTabData.splice(selectedTabIndex, 1).concat(aTabData);
+       }
+       aTabBrowser.selectedTab = selectedTab;
+     }
+ 
+     return [aTabs, aTabData];
+   },
+-  
++
+   /**
+    * Manage history restoration for a window
+    * @param aWindow
+    *        Window to restore the tabs into
+    * @param aTabs
+    *        Array of tab references
+    * @param aTabData
+    *        Array of tab data
+@@ -2950,17 +2950,17 @@ let SessionStoreInternal = {
+ 
+     if (aTabs.length == 0) {
+       // this is normally done in restoreHistory() but as we're returning early
+       // here we need to take care of it.
+       this._setWindowStateReady(aWindow);
+       return;
+     }
+ 
+-    // Sets the tabs restoring order. 
++    // Sets the tabs restoring order.
+     [aTabs, aTabData] =
+       this._setTabsRestoringOrder(tabbrowser, aTabs, aTabData, aSelectTab);
+ 
+     // Prepare the tabs so that they can be properly restored. We'll pin/unpin
+     // and show/hide tabs as necessary. We'll also set the labels, user typed
+     // value, and attach a copy of the tab's data in case we close it before
+     // it's been restored.
+     for (t = 0; t < aTabs.length; t++) {
+@@ -3643,16 +3643,20 @@ let SessionStoreInternal = {
+     // if we're in private browsing mode, do nothing
+     if (this._inPrivateBrowsing)
+       return;
+ 
+     // If crash recovery is disabled, we only want to resume with pinned tabs
+     // if we crash.
+     let pinnedOnly = this._loadState == STATE_RUNNING && !this._resume_from_crash;
+ 
++    // saveState can be called again before a previous call has completed
++    // depending on user actions (E.g. Pin/Unpin tab + shutdown). So, we require
++    // cancelling any unfinished telemetry timer before start a new one.
++    TelemetryStopwatch.cancel("FX_SESSION_RESTORE_COLLECT_DATA_MS");
+     TelemetryStopwatch.start("FX_SESSION_RESTORE_COLLECT_DATA_MS");
+ 
+     var oState = this._getCurrentState(aUpdateAll, pinnedOnly);
+     if (!oState)
+       return;
+ 
+ #ifndef XP_MACOSX
+     // We want to restore closed windows that are marked with _shouldRestore.
+@@ -4424,16 +4428,20 @@ let SessionStoreInternal = {
+   /**
+    * write file to disk
+    * @param aFile
+    *        nsIFile
+    * @param aData
+    *        String data
+    */
+   _writeFile: function ssi_writeFile(aFile, aData) {
++    // _writeFile can be called again before a previous call has completed
++    // depending on user actions (eg. Exit PB + normal delayed write). So, we
++    // require cancelling any unfinished telemetry timer before start a new one.
++    TelemetryStopwatch.cancel("FX_SESSION_RESTORE_WRITE_FILE_MS");
+     TelemetryStopwatch.start("FX_SESSION_RESTORE_WRITE_FILE_MS");
+     // Initialize the file output stream.
+     var ostream = Cc["@mozilla.org/network/safe-file-output-stream;1"].
+                   createInstance(Ci.nsIFileOutputStream);
+     ostream.init(aFile, 0x02 | 0x08 | 0x20, 0600, ostream.DEFER_OPEN);
+ 
+     // Obtain a converter to convert our data to a UTF-8 encoded input stream.
+     var converter = Cc["@mozilla.org/intl/scriptableunicodeconverter"].
+diff --git a/toolkit/components/telemetry/TelemetryStopwatch.jsm b/toolkit/components/telemetry/TelemetryStopwatch.jsm
+--- a/toolkit/components/telemetry/TelemetryStopwatch.jsm
++++ b/toolkit/components/telemetry/TelemetryStopwatch.jsm
+@@ -54,16 +54,48 @@ let TelemetryStopwatch = {
+       return false;
+     }
+ 
+     timers[aHistogram] = Date.now();
+     return true;
+   },
+ 
+   /**
++   * Deletes the timer associated with a telemetry histogram. The timer can be
++   * directly associated with a histogram, or with a pair of a histogram and
++   * an object. Important: Only use this method when a legitimate cancellation
++   * should be done.
++   *
++   * @param aHistogram a string which must be a valid histogram name
++   *                   from TelemetryHistograms.json
++   *
++   * @param aObj Optional parameter. If specified, the timer is associated
++   *             with this object, meaning that multiple timers for a same
++   *             histogram may be run concurrently, as long as they are
++   *             associated with different objects.
++   *
++   * @return true if the timer exist and it was cleared, false otherwise.
++   */
++  cancel: function ts_cancel(aHistogram, aObj) {
++    if (!validTypes(aHistogram, aObj))
++      return false;
++
++    let timers = aObj
++                 ? objectTimers.get(aObj, {})
++                 : simpleTimers;
++
++    if (timers.hasOwnProperty(aHistogram)) {
++      delete timers[aHistogram];
++      return true;
++    }
++
++    return false;
++  },
++
++  /**
+    * Stops the timer associated with the given histogram (and object),
+    * calculates the time delta between start and finish, and adds the value
+    * to the histogram.
+    *
+    * @param aHistogram a string which must be a valid histogram name
+    *                   from TelemetryHistograms.h. If an invalid name
+    *                   is given, the function will throw.
+    *
+Created attachment 660994
+Patch: Fixed error "key was already initialized"
+
+Updated patch. I'm sorry, I uploaded a wrong file previously.
+As explained in comment #3, _writeFile can be called quickly in succession - that's what gives the error message we're trying to fix. Now if we cancel the current timer and just start a new one the first _writeFile call will probably finish earlier and mess up the timestamps. The second .finish() call will then "fail" silently.
+
+We should be able to support measuring execution time for code paths that may run at the same time. We could for example let Stopwatch.start() return a unique id (just a simple counter) that needs to be passed to Stopwatch.finish() as well to uniquely identify the measurement.
+
+This should work well for SessionStore. Not sure if that introduces too much overhead for other callers?
+Comment on attachment 660994
+Patch: Fixed error "key was already initialized"
+
+Review of attachment 660994:
+-----------------------------------------------------------------
+
+Yeah, what ttaubert said. The cancel() method implemented here is useful to fix the FX_SESSION_RESTORE_COLLECT_DATA_MS timer, which is started but the function can return without finishing it, so a cancel() before the return is needed.
+
+For the other timer though you can't cancel it because the measured time will be shorter than reality as the finish() call will be unpaired. The second parameter of start|finish can be easily used to fix this, just create a blank object inside the function and use it both for the start and the finish call which is inside the callback
+Created attachment 664298
+Patch v3
+
+Updated patch.
+Comment on attachment 664298
+Patch v3
+
+Review of attachment 664298:
+-----------------------------------------------------------------
+
+Can you add a test to test_TelemetryStopwatch.js covering the cancel function?
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +3648,5 @@
+>      // if we crash.
+>      let pinnedOnly = this._loadState == STATE_RUNNING && !this._resume_from_crash;
+>  
+> +    let refObj = {};
+> +    TelemetryStopwatch.start("FX_SESSION_RESTORE_COLLECT_DATA_MS", refObj);
+
+the FX_SESSION_RESTORE_COLLECT_DATA_MS case shouldn't need a refObj, the cancel() should be enough
+Created attachment 665104
+Patch v4
+
+Added tests and suggested change.
+Comment on attachment 665104
+Patch v4
+
+Review of attachment 665104:
+-----------------------------------------------------------------
+
+Perfect, thanks!
+Pushed to try: https://tbpl.mozilla.org/?tree=Try&rev=dd6222871478
+All green, just a couple of intermittent oranges. https://tbpl.mozilla.org/?tree=Try&rev=dd6222871478
+https://hg.mozilla.org/integration/mozilla-inbound/rev/b03d512f566e
+https://hg.mozilla.org/mozilla-central/rev/b03d512f566e
+This is a regression bug in 17.0esr and even in 17.0.1esr.
+Error console is continuously spammed with this error messages and therefore almost unusable.
+Please reopen this bug.
+Andres, is this something that would be safe to uplift to 17esr? If so, can you request approval?
+
+Wolfgang, unfortunately this landed for Firefox 18, so it didn't get in before 17esr branched off. The way forward at this point is for uplift to be requested (which I asked Andres to do above). If the release drivers decide that uplift is acceptable, we can then fix it on the esr too.
+This is the first I've heard that this makes the console "unusable". I don't think this exception should be firing that often.
+
+Wolfgang, if you could provide more detail about how frequently it occurs and what the exact error message you see is (preferably in a new bug report, or you could just email me directly), that would be useful. We shouldn't be uplifting this until we better understand the issue we're trying to solve.
+This happens to me when I try to use instawallet.org
+It happens at alomost every web page. Only one example:
+
+Go to http://maps.google.com
+
+After every new search you'll get the following error message in the error console
+
+Timestamp: 06.12.2012 09:50:56
+Error: TelemetryStopwatch: key "FX_SESSION_RESTORE_COLLECT_DATA_MS" was already initialized
+Source File: resource://gre/modules/TelemetryStopwatch.jsm
+Line: 53
+It happens intermittently when refreshing any page, even an empty .html file.
+It happens on (almost) every page, and multiple times per page.
+
+Timestamp: 12/21/2012 9:56:45 PM
+Error: TelemetryStopwatch: key "FX_SESSION_RESTORE_COLLECT_DATA_MS" was already initialized
+Source File: resource://gre/modules/TelemetryStopwatch.jsm
+Line: 53
+
+Firefox 17.0.1 on Windows Home Premium 64bit SP1
+This bug will be fixed in the release of Firefox 18, which is scheduled for the week of January 6th.
+Please merge the fix back to esr17; we're seeing this frequently in Selenium tests, manifested as an indefinite browser hang.
+This bug is just about log spam; if you're seeing hangs this patch won't help you (unless they're caused by overly large logs, but that seems unlikely!).
+This bug does still exist in the newest 17.0.3 esr.
+No possibility to get rid of it in the next esr?
+I am also experiencing the selenium hanging in FF17, as described by Daniel.
+
+
+Telemetry stopwatch: "key was already initialized" errors in logs
+
+
+
+Bug 732874 - Telemetry stopwatch: key was already initialized errors in logs. r=felipc 

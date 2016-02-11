@@ -1,0 +1,807 @@
+For now, we load all actors during DebuggerServer initialisation.
+It ends up taking a significant time to load as reported in bug 987951.
+We even load actor modules that I think, we won't even use on FxOS like gcli (it is firefox specific, right?).
+In any case, loading all actors no matter what when we attach to a child process freeze app startup whereas at the end we may only use one actors!
+
+For now, we load all actors during DebuggerServer initialisation.
+It ends up taking a significant time to load as reported in bug 987951.
+We even load actor modules that I think, we won't even use on FxOS like gcli (it is firefox specific, right?).
+In any case, loading all actors no matter what when we attach to a child process freeze app startup whereas at the end we may only use one actors!
+Not sure if the GCLI actor is useful in mobile, CCing Joe. Perhaps it allows you to run the commands on the device? In that case, given how easy it is to write GCLI commands, it should be quite useful as a DIY tool.
+
+In regards to your main point though, the server needs to communicate the existing actors to the client before the latter is ready to choose the one it needs to connect to. The actor module currently includes the registration code. If we are to lazy-load the actor file, we will have to move the registration somewhere else, which would probably be uglier. But maybe there is a better way I haven't thought of.
+Created attachment 8397290
+patch
+
+Here is what I had in mind.
+It ends up facing the complicity of the whole actor registration workflow,
+where we hack prototype with various attributes, bind functions, ...
+But it demonstrates that we can lazily load them.
+The declaration of actors is more cumbersome as we have to declare
+actor prefix, name uri,... That's something we may simplify a bit
+with some conventions on naming, but tbh it clearly worth the gain!
+
+Such work highlights the need of modularisation of all actors,
+as modifying the load order of actors break on cross dependencies.
+(webconsole defines "devtools" global for webbrowser...)
+
+This patch is a WIP, as it will most likely break many tests,
+mostly because of registerModule modification.
+(In reply to Panos Astithas [:past] from comment #1)
+> Not sure if the GCLI actor is useful in mobile, CCing Joe. Perhaps it allows
+> you to run the commands on the device? In that case, given how easy it is to
+> write GCLI commands, it should be quite useful as a DIY tool.
+
+The GCLI actor isn't currently used on mobile, but I hope it will be soon, and I agree that it could be very useful there, especially given the restricted size.
+Comment on attachment 8397290
+patch
+
+Review of attachment 8397290:
+-----------------------------------------------------------------
+
+Yes, that's what I had in mind pretty much. The "ugliness" I mentioned before is mostly the verbosity in registerFoo() calls, which would probably be somewhat alleviated by using an options object as an (the?) argument, and a bit of object destructuring. The memory savings should trump any code clarity issues in this case I think.
+
+What I'm more concerned about though, is backwards compatibility. We now have a number of add-ons that use the existing registration API and we can't just remove it until they are updated. I believe the number is very small, probably a handful, at most a dozen. We should be able to reach out to those developers directly and explain the necessary changes, but we would have to ship both the new and the old API for a while. Firebug and Ember Inspector are the first two that come to mind and would be good test cases for the migration.
+
+Deprecation warnings when the old API is used should be straightforward. We should also keep around some tests for the existing API to make sure we don't accidentally break it after all the code in the tree is converted to the new API.
+
+::: toolkit/devtools/server/actors/device.js
+@@ -26,5 @@
+> -  handle.addGlobalActor(DeviceActor, "deviceActor");
+> -};
+> -
+> -exports.unregister = function(handle) {
+> -};
+
+How come we never unregister the device actor?
+
+::: toolkit/devtools/server/actors/preference.js
+@@ -14,5 @@
+> -  handle.addGlobalActor(PreferenceActor, "preferenceActor");
+> -};
+> -
+> -exports.unregister = function(handle) {
+> -};
+
+...aaand the preference actor?
+I think we should also get Dave's feedback on this.
+Comment on attachment 8397290
+patch
+
+Dave, what do you think about such move, but slightly more conservative as Panos just suggested?
+Regarding unregistering - the ModuleAPI object didn't let a registration last longer than the module, so it didn't actually need to unregister itself.
+
+I'm not against the change.
+Although actually I really don't like multiple-boolean arguments - could you make registerModule take an option array maybe?  If the property name were included we could let registerModule add additional stuff in the future too:
+
+DebuggerServer.registerModule("devtools/server/actors/device", "DeviceActor", {
+  globalActor: "webappsActor"
+});
+
+DebuggerServer.registerModule("devtools/server/actors/inspector", "InspectorActor" {
+  tabActor: "inspector"
+});
+Created attachment 8407120
+Expose an API to load actors lazily
+
+Tweaked according to first round of feedback.
+Mainly kept original registerModule behavior as-is to prevent breaking external code.
+Also started using an object as argument, but I kept booleans as the actor name
+is always the same between global and tab actors.
+Finally, I tried to minimize the number of repetition of actor id,name,prefix,...
+So that we only give the actor prefix and compute all other strings out of it
+with few conventions.
+
+I would like to continue working on this patch to simplify the whole factories, actor pool, actorID story.
+The codepath related to actorID definition is quite complex for what looks like historical reasons.
+My patch pile up on top of this complex codepath.
+I would prefer modifying this codepath to include the necessary modification to have lazy actors.
+
+Also, instead of implementing a "lazy addActors" for old actors,
+it looks simplier to just convert all old actors to modules (not necessarely by switching to protocol.js),
+and then make them use the async registerModule.
+
+This patch doesn't actually change how actors are loaded,
+to prove that this patch doesn't break the soon deprecated codepath.
+Created attachment 8407121
+Convert all protocol.js actors to lazy loading
+Created attachment 8407122
+Convert webconsole to a module
+
+So here is an example, based on tracer.js, on how to convert console actor to a module,
+without having to do the hard work of converting it to protocol.js.
+I also renamed the constructor name to match the convention on naming
+I formalized in registerModule.
+https://tbpl.mozilla.org/?tree=Try&rev=13b96ba7bc3e
+Alex, do you think we can go through a round of feedback on your patches?
+Created attachment 8472834
+Expose an API to load actors lazily
+
+New version of this patch.
+As I said in comment 9, instead of hacking on top of existing code,
+I now tried to integrate lazy loading within the existing code.
+So it can feel more risky, but I also hope it can simplify and help
+following actor registration code.
+I must say that the ActorPool can be intimidating as we don't store only actor
+instances but also actor factories and we do non-naive bind() and set various 
+attributes on either/both the factories and actor instances.
+My naming of classes may not be perfect,
+but each (ActorFactory, ConnectionActorFactory)
+highlights a precise lifetime of actor creation.
+
+I'm open to alternative paths or any suggestion to help following this code
+while integrating lazy actor loading!
+
+This patch only introduces lazy actor loading feature, the other patch focus 
+on converting all actors to be lazy.
+Created attachment 8472835
+Convert all protocol.js actors to lazy loading
+
+https://tbpl.mozilla.org/?tree=Try&rev=e5cf106a5cf1
+
+Thanks to the new patch, this one is more conservative.
+There is no need to rename some actors constructors.
+The main thing is to convert DebuggerServer.add*Actors() and
+ensure that actors constructors are correctly exported!
+
+(Note that there is something really weird with profiler.js,
+I don't know how it works today, without the
+'const Services = require("Services")'!!!)
+
+Otherwise, some numbers about the benefit of this patch!
+
+I can see a drop of 4MB when opening a toolbox with just the webconsole on e10s.
+(we no longer load all others actors, nor their deps)
+Also I can see a drop of 4MB when opening a toolbox and then all default tools
+in non-e10s Fx (console, inspector, debugger, profiler, netmon).
+But I'm less confident about the number, 4MB, as there is a lot of noise
+in memory profiles in non-e10s runs!
+
+On b2g, the number are stable and show another major gain.
+My test scenario is opening an app (settings) and querying only one actor,
+the memory actor (hacked to not use protocol.js).
+That hightlight quite well the minimal memory cost of a debugger server.
+I can see a drop of 4.9MB of memory spike (=before GC) and 5.17MB of final
+memory consumption (=after GC).
+Also, with this gain, it means that the final cost of debugger server drops from 8MB to 3MB (spike, before GC).
+[or 7.4MB to 2.31 final consumption after GC).
+
+\o/
+New try to address black boxing failure. As I ended up removing register/unregister, we rely on the fact that modules are reloaded. It ends up introducing some issues in tests as we were reusing the same loader between two tests, so that we ended reusing the same script.js instance from webbrowser.js. That because we were loading script.js at webbrower.js header, which wasn't reloaded...
+
+In the new patches I'm ensuring to unload actor modules (really unload them by nuking their sandboxes, like what we do when we close tabs), and I also ensure pulling new modules from webbrowser.js.
+
+https://tbpl.mozilla.org/?tree=Try&rev=4cccf7cd6454
+Created attachment 8484122
+Expose an API to load actors lazily
+
+Finally got a green try - https://tbpl.mozilla.org/?tree=Try&rev=7d61f9c37863
+
+Some comments about this patch, as it isn't trivial.
+I hope you will appreciate the efforts to be slightly more explicit
+around the usage of {tab,global}TabActorFactories.
+
+Today we store in these dictionaries two very different things:
+ - actor factories (functions)
+ - actor instances (objects)
+
+And the magic operates within DebuggerServerConnection.getOrCreateActor
+where we eventually transform an actor factory into an actor instance.
+There is a bunch of attributes that have to be transfered and have the same values
+between the factory and the instance.
+Today, we are relying on prototype inheritance to keep the attributes,
+but in this patch we end up being a bit more explicit about which attributes
+are important to be transfered.
+
+Instead of storing functions/constructors in {tab,global}TabActorFactories,
+we now store only instances of ActorFactory on actor registration (on registerModule call).
+Then during listTabs, when we start sending actor prefix+ID to clients (in createExtraActor),
+we instanciates ConnectionActorFactory instances and register them into actor pools.
+These instances now have a final actor ID, so that clients can start requesting them,
+but the related actor module isn't loaded yet.
+It is only loaded the first time we receive a request for the given actor ID.
+DebuggerServerConnection.getOrCreateActor checks if we have an instance of ConnectionActorFactory,
+in such scenario, we start loading the module and replace in actor Pools,
+the factory by an actor instance, with the same actorID.
+
+I tried to put quite a few comments to help follow this workflow
+and hopefully, these classes will help understanding each state.
+Created attachment 8484134
+Convert all protocol.js actors to lazy loading
+
+And now the patch that actually convert actors to be lazy loaded.
+Also some comments about it, as I had hard time getting green try for it...
+
+First, I removed all register/unregister as in 99% cases it was just useless
+and is now done by part of registerModule/unregisterModule API automatically!
+Then, in various actors, I ensured to export the actor constructor.
+Finally... script.js. script.js is special! It isn't a tab actor nor a global actor.
+We never instanciate it via listTabs returned actors prefixes.
+Instead it is instanciated during the call to TabActor.attach -> TabActor._pushContext.
+So I removed it from addTabActors registration.
+But tests rely on the fact that we cleanup script.js globals on DebuggerServer destruction.
+(_blackBoxedSources, breakPointStore, ...)
+Before this patch, it was cleaned by calling register/unregister on each DebuggerServer instanciation/destruction.
+But now, script.js isn't part of the regular actors list...
+so I ended up calling script.js's cleanup method from DebuggerServer.destroy.
+
+Note that you can ignore comment 17. I no longer try to unload actor modules
+as it breaks many tests. We are far from being ready to unload them.
+In many places we import some actors in module headers and it ends up
+keeping references to unloaded modules and throws everywhere...
+Comment on attachment 8484122
+Expose an API to load actors lazily
+
+Review of attachment 8484122:
+-----------------------------------------------------------------
+
+This is a more extensive set of changes, but I like it. I'm not on board yet with using two factories for making an actor lazy, but I've spent too much time in Java land in the past and maybe its just my gut reaction to that. I'll give it some more thought in the next round. Other than that I mostly have minor comments and nits, but they are enough to warrant another round.
+
+::: toolkit/devtools/server/actors/common.js
+@@ +9,5 @@
+>  /**
+> + * Objects being registered in DebuggerServer.{tab|global}ActorFactories
+> + */
+> +function ActorFactory(options, prefix) {
+> +  // By default we use for actorID's prefix, the same prefix we use for listTabs
+
+Nit: "By default the actor name will also be used for the actorID prefix."
+
+@@ +13,5 @@
+> +  // By default we use for actorID's prefix, the same prefix we use for listTabs
+> +  // actor names.
+> +  this.prefix = prefix;
+> +  if (typeof options == "function") {
+> +    // Old actor case, where options is a function that is the actor constructor.
+
+From a clarity and performance standpoint it would be better to put the other branch first, as it's more likely to be taken from now on.
+
+@@ +14,5 @@
+> +  // actor names.
+> +  this.prefix = prefix;
+> +  if (typeof options == "function") {
+> +    // Old actor case, where options is a function that is the actor constructor.
+> +    this.constructor = function () options;
+
+This is old SpiderMonkey-specific syntax and we are trying to move away from those. We have a standards-blessed option now:
+this.constructor = () => options;
+
+@@ +25,5 @@
+> +    if (options.prototype.actorPrefix) {
+> +      this.prefix = options.prototype.actorPrefix;
+> +    }
+> +  } else {
+> +    // Lazy actor definition, where options contains all informations to load
+
+Nit: "all the information required"
+
+@@ +33,5 @@
+> +      let mod;
+> +      try {
+> +        mod = require(options.id);
+> +      } catch(e) {
+> +        throw new Error("Unable to load actor module '" + options.id + "'.\n" +
+
+If we are just going to throw anyway, why not leave the try/catch block out and let the original error propagate up the stack?
+
+@@ +63,5 @@
+> +
+> +  // `actorPrefix` will be used by ActorPool.addActor to compute the actor id
+> +  this.actorPrefix = prefix;
+> +
+> +  // Both attributes are set by ActorPool.addActor, just after being instanciated:
+
+Typo: "instantiated" (here and elsewhere in this file).
+
+@@ +69,5 @@
+> +  this.registeredPool = null;
+> +}
+> +ConnectionActorFactory.prototype.createActor = function () {
+> +  // Fetch the actor constructor
+> +  let c = this.constructor();
+
+Are you trying to grab a reference to the constructor or construct an actual instance? The comment and the code seem to be at odds here.
+
+::: toolkit/devtools/server/main.js
+@@ +303,5 @@
+>  
+>    /**
+>     * Register a CommonJS module with the debugger server.
+>     * @param id string
+> +   *    The ID of a CommonJS module.  This module must export 'register'
+
+Nit: indent to "id" above, like elsewhere in this file.
+
+@@ +310,5 @@
+> +   *     immediately, but loaded only when a client starts sending packets
+> +   *     to an actor with the same id.
+> +   *
+> +   * @param options object (optional)
+> +   *    Object with 3 mandatory attributes:
+
+I had a few nits for this comment, but I decided I would spare you the trouble and reword it a bit myself. Let's hope splinter doesn't mess up whitespace too much:
+
+   * @param options object (optional)
+   *        An object with 3 mandatory attributes:
+   *        - prefix (string):
+   *          The prefix of an actor is used to compute:
+   *          - the `actorID` of each new actor instance (ex: prefix1).
+   *            (See ActorPool.addActor)
+   *          - the actor name in the listTabs request. Sending a listTabs
+   *            request to the root actor returns actor IDs. IDs are in
+   *            dictionaries, with actor names as keys and actor IDs as values.
+   *            The actor name is the prefix to which the "Actor" string is
+   *            appended. So for an actor with the `console` prefix, the actor
+   *            name will be `consoleActor`.
+   *        - constructor (string):
+   *          the name of the exported symbol to be used as the actor
+   *          constructor.
+   *        - type (an array of the following strings):
+   *          - "global"
+   *            registers a global actor instance, if present. A global actor
+   *            has the root actor as its parent.
+   *          - "tab"
+   *            registers a tab actor instance, if present. A new actor will be
+   *            created for each tab and each app.
+
+@@ +324,5 @@
+> +   *           `consoleActor`.
+> +   *      - constructor (string)
+> +   *        Designate the name of the exported symbol to be used as actor's
+> +   *        constructor.
+> +   *      - type (array of strings)
+
+There are only 3 supported states currently (tab, global, both) and an array of strings for only 2 bits of information seems like a lot of waste.
+
+Why not: {tab: true, global: true}?
+
+@@ +341,5 @@
+> +    if (options) {
+> +      // Lazy loaded actors
+> +      let {prefix, constructor, type} = options;
+> +      if (typeof(prefix) !== "string") {
+> +        throw new Error("Lazy actor definition for '" + id + "' requires a 'prefix' option.");
+
+"requires a string 'prefix' option", otherwise one might wonder what is wrong with prefix: 100.
+
+@@ +344,5 @@
+> +      if (typeof(prefix) !== "string") {
+> +        throw new Error("Lazy actor definition for '" + id + "' requires a 'prefix' option.");
+> +      }
+> +      if (typeof(constructor) !== "string") {
+> +        throw new Error("Lazy actor definition for '" + id + "' requires a 'constructor' option.");
+
+Same here.
+
+@@ +863,5 @@
+>      }
+>      if (DebuggerServer.globalActorFactories.hasOwnProperty(name)) {
+>        throw Error(name + " already exists");
+>      }
+> +    DebuggerServer.globalActorFactories[name] = new ActorFactory(aFunction, aName);
+
+Why aName is only passed here and not in DS_addTabActor? And why aName and not name?
+
+@@ +1148,5 @@
+>            "Error occurred while creating actor '" + actor.name,
+>            e));
+>        }
+> +    } else if (typeof actor == "function") {
+> +      // ActorPools should now contain only actor instances (=objects)
+
+Nit: "actor instances (i.e. objects)"
+
+Also, why not make the check more generic and true to the comment, just in case?
+
+} else if (typeof actor != "object") {
+
+@@ +1150,5 @@
+>        }
+> +    } else if (typeof actor == "function") {
+> +      // ActorPools should now contain only actor instances (=objects)
+> +      // or ConnectionActorFactory instances.
+> +      throw new Error("Unexpected actor constructor/function in ActorPool.");
+
+Adding the actor name to the error message will be useful for debugging.
+
+::: toolkit/devtools/server/tests/unit/registertestactors-03.js
+@@ +1,5 @@
+> +/* Any copyright is dedicated to the Public Domain.
+> +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> +
+> +let protocol = require("devtools/server/protocol");
+> +let {method, preEvent, types, Arg, Option, RetVal} = protocol;
+
+This file doesn't use most of these and the destructuring doesn't include Actor, Front and FrontClass that it does use.
+
+@@ +10,5 @@
+> +
+> +  initialize: function(conn, id) {
+> +    protocol.Actor.prototype.initialize.call(this, conn);
+> +
+> +    Services.obs.notifyObservers(null, "actor", "instanciated");
+
+Typo: "instantiated"
+
+::: toolkit/devtools/server/tests/unit/test_register_actor.js
+@@ +56,5 @@
+> +  let isActorInstanciated = false;
+> +  function onActorEvent(subject, topic, data) {
+> +    if (data == "loaded") {
+> +      isActorLoaded = true;
+> +    } else if (data == "instanciated") {
+
+This typo is in a bunch of places in this file.
+
+@@ +66,5 @@
+> +    prefix: "lazy",
+> +    constructor: "LazyActor",
+> +    type: ["global", "tab"]
+> +  });
+> +  // The actor is immediatly register, but not loaded
+
+"immediately registered"
+Comment on attachment 8484134
+Convert all protocol.js actors to lazy loading
+
+Review of attachment 8484134:
+-----------------------------------------------------------------
+
+Looks good I think, but I've only given it a cursory look as it is bound to be changed with the other patch.
+Created attachment 8487151
+Expose an API to load actors lazily
+Created attachment 8487153
+Convert all protocol.js actors to lazy loading
+Comment on attachment 8487151
+Expose an API to load actors lazily
+
+Review of attachment 8487151:
+-----------------------------------------------------------------
+
+(In reply to Panos Astithas [:past] from comment #20)
+> Comment on attachment 8484122
+> 
+> This is a more extensive set of changes, but I like it. I'm not on board yet
+> with using two factories for making an actor lazy, but I've spent too much
+> time in Java land in the past and maybe its just my gut reaction to that.
+> I'll give it some more thought in the next round. Other than that I mostly
+> have minor comments and nits, but they are enough to warrant another round.
+
+I used the word Factory as we already had that in {tab,global}ActorFactories,
+but we can call that constructor if that help ;-)
+Otherwise, I would like to highlight that each "factory" has a concrete meaning
+in the complex workflow to instanciate actors. It took me a while
+to identify each step and have a good description for each:
+
+ - ActorFactory: "real" factories, global and shared across client/connections.
+Those are the one stored in {tab,global}ActorFactories.
+ - ConnectionActorFactory: then once a client connects, we generate another kind of factories (we already do that on master, it isn't only because of lazy load). This time it creates a kind of actor larva during call to listTabs.
+We still keep the actor constructor in actor pools, but start setting final actorID attribute on it.
+ - Objects/"real actors": finally, on first request to the actor with the same ID, we end up calling the constructor and really instanciate the actor and replace the contructor/factory with the actor object/instance in the actor pool.
+
+I think ConnectionActorFactory thing helps following this workflow, but may be the name can be tweaked?
+(as well as ActorFactory?) 
+Compared to current state where we just store "javascript constructors",
+it helps by having something with a name we can designated and document explicitely.
+
+
+> @@ +14,5 @@
+> > +  // actor names.
+> > +  this.prefix = prefix;
+> > +  if (typeof options == "function") {
+> > +    // Old actor case, where options is a function that is the actor constructor.
+> > +    this.constructor = function () options;
+> 
+> This is old SpiderMonkey-specific syntax and we are trying to move away from
+> those. We have a standards-blessed option now:
+> this.constructor = () => options;
+
+Oh I didn't knew "function () foo" wasn't standard!
+
+> @@ +33,5 @@
+> > +      let mod;
+> > +      try {
+> > +        mod = require(options.id);
+> > +      } catch(e) {
+> > +        throw new Error("Unable to load actor module '" + options.id + "'.\n" +
+> 
+> If we are just going to throw anyway, why not leave the try/catch block out
+> and let the original error propagate up the stack?
+
+I think it will help understanding what is wrong by explicitely saying a module is broken
+and most likely has a typo in it.
+It may just be about saving you from reading a huge stack.
+I kept it, but I can be convinced it is useless.
+
+> @@ +69,5 @@
+> > +  this.registeredPool = null;
+> > +}
+> > +ConnectionActorFactory.prototype.createActor = function () {
+> > +  // Fetch the actor constructor
+> > +  let c = this.constructor();
+> 
+> Are you trying to grab a reference to the constructor or construct an actual
+> instance? The comment and the code seem to be at odds here.
+
+I pulls a reference to the contructor, without calling it.
+I renamed it to `getConstructor` and tweaked the comment.
+
+> @@ +324,5 @@
+> > +   *           `consoleActor`.
+> > +   *      - constructor (string)
+> > +   *        Designate the name of the exported symbol to be used as actor's
+> > +   *        constructor.
+> > +   *      - type (array of strings)
+> 
+> There are only 3 supported states currently (tab, global, both) and an array
+> of strings for only 2 bits of information seems like a lot of waste.
+> 
+> Why not: {tab: true, global: true}?
+
+Done.
+
+> @@ +863,5 @@
+> >      }
+> >      if (DebuggerServer.globalActorFactories.hasOwnProperty(name)) {
+> >        throw Error(name + " already exists");
+> >      }
+> > +    DebuggerServer.globalActorFactories[name] = new ActorFactory(aFunction, aName);
+> 
+> Why aName is only passed here and not in DS_addTabActor? And why aName and
+> not name?
+
+We don't have any usecase where custom prefix matters for tab actors,
+but I modified it to also pass it for the sake of simplicity.
+Also switched to pass `name` for the same reason.
+
+
+
+https://tbpl.mozilla.org/?tree=Try&rev=5051b3dee8d6
+Comment on attachment 8487153
+Convert all protocol.js actors to lazy loading
+
+Review of attachment 8487153:
+-----------------------------------------------------------------
+
+r=me with comments addressed.
+
+::: toolkit/devtools/server/actors/tracer.js
+@@ +11,5 @@
+>  const { getOffsetColumn } = require("devtools/server/actors/common");
+>  
+>  // TODO bug 943125: remove this polyfill and use Debugger.Frame.prototype.depth
+>  // once it is implemented.
+> +function getFrameDepth(frame) {
+
+Why this change? What's wrong with a polyfill that we can quickly remove once we fix the platform? Now we have to chase down every caller of this function.
+
+::: toolkit/devtools/server/main.js
+@@ +282,5 @@
+> +    // Script actor is special. It isn't initialized as all other ones
+> +    // it isn't a tab, nor a global actor. Instead, it is loaded by TabActor
+> +    // on `attach` request. But tests are expecting to see its state
+> +    // being reseted when DebuggerServer is reseted, so explicitely
+> +    // reset it from here.
+
+Slight rewording: "The thread actor is special. It isn't registered as all the other ones with a global or tab scope. It is loaded instead by its parent tab actor on an 'attach' request. But tests still expect to observe its state being reset when DebuggerServer is reset, so let's explicitly reset it here."
+
+::: toolkit/devtools/server/tests/unit/head_dbg.js
+@@ +204,5 @@
+>  function initTestDebuggerServer(aServer = DebuggerServer)
+>  {
+> +  aServer.registerModule("devtools/server/actors/script", {
+> +    prefix: "script",
+> +    constructor: "ScriptActor",
+
+This is not right, prefix should be "context" and constructor should be "ThreadActor" here and elsewhere in this file.
+
+::: toolkit/devtools/transport/tests/unit/head_dbg.js
+@@ +190,5 @@
+>   */
+>  function initTestDebuggerServer() {
+> +  DebuggerServer.registerModule("devtools/server/actors/script", {
+> +    prefix: "script",
+> +    constructor: "ScriptActor",
+
+Same here.
+Comment on attachment 8487151
+Expose an API to load actors lazily
+
+Review of attachment 8487151:
+-----------------------------------------------------------------
+
+OK, you sold me on the two factories. However, I don't feel that ConnectionActorFactory adequately explains the point of that additional factory, probably because it doesn't focus on what we do (partially initialize the actor), but rather on how we do it (by providing the connection, among others). And although I find your "larva actor" term insightful, it is arguably rather obscure.
+
+I've been thinking that the introduction of an actor into the server goes through 3 steps that correspond to the states an actor can be after its module is loaded. Just for kicks let's pretend that the actor is a new smartphone you just bought. Trust me, it's going to be fun. Here are the possible states of the phone (actor):
+
+1. arrived (registered): the box has arrived, but is not yet unpacked (the actor's definition is available, but nobody cares about it yet)
+2. unboxed (observed): the phone is unboxed, but not yet turned on (a client interacted with another actor and as a result the actor is now initialized, e.g. listTabs on the root actor makes global actors observable)
+3. turned on (initialized): the phone is booted and working normally (the actor is receiving protocol requests)
+
+I think this sums up well the way we buy a phone, err, load an actor. Given the above, a name that sounds more appropriate than ConnectionActorFactory to me is ObservedActorFactory. It describes the kind (state) of the actor this factory creates. On a similar note, I think renaming ActorFactory to the more accurate RegisteredActorFactory would make more sense. Using generic names in such cases is a recipe for confusion (e.g. is ActorFactory the factory that creates the final actor or not?).
+
+OK, that was enough rambling. I don't have anything else to suggest other than some comment improvements. Good work!
+
+::: toolkit/devtools/server/actors/common.js
+@@ +8,5 @@
+>  
+>  /**
+> + * Objects being registered in DebuggerServer.{tab|global}ActorFactories
+> + */
+> +function ActorFactory(options, prefix) {
+
+This comment needs to describe the shape of an ActorFactory instance. We don't have it documented elsewhere and the code is not straightforward.
+
+@@ +54,5 @@
+> +/**
+> + * Fake actor objects being registered in ActorPools until
+> + * one real actor instance is created from DebuggerServer._getOrCreateActor.
+> + */
+> +function ConnectionActorFactory(getConstructor, prefix, conn, parentActor) {
+
+The code of this constructor is straightforward, but it would still be a good idea to document the shape of the instance in the comment.
+
+@@ +69,5 @@
+> +}
+> +ConnectionActorFactory.prototype.createActor = function () {
+> +  // Fetch the actor constructor
+> +  let c = this.getConstructor();
+> +  // Instanciate a new actor instance
+
+Typo: instantiate
+
+@@ +125,5 @@
+>    // Walk over global actors added by extensions.
+>    for (let name in aFactories) {
+>      let actor = this._extraActors[name];
+>      if (!actor) {
+> +      // Register another factory, but this time specific to this connection.
+
+I think it would help here to be more explicit about what we are doing and why we are doing it, like: "Fill in the blanks to partially initialize the actor, but not so far as to actually create an instance."
+
+::: toolkit/devtools/server/main.js
+@@ +310,5 @@
+> +   *        immediately, but loaded only when a client starts sending packets
+> +   *        to an actor with the same id.
+> +   *
+> +   * @param options object (optional)
+> +   *        An object with 3 mandatory attributes:
+
+Let's add an additional note here that "This parameter is still optional, but not providing it is deprecated and will result in eagerly loading the actor module with the memory overhead that entails."
+
+@@ +813,1 @@
+>    addTabActor: function DS_addTabActor(aFunction, aName) {
+
+{add,remove}{Tab,Global}Actor method comments and signatures need to be updated to indicate that the first argument will usually be an object from now on.
+
+::: toolkit/devtools/server/tests/unit/registertestactors-03.js
+@@ +1,4 @@
+> +/* Any copyright is dedicated to the Public Domain.
+> +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> +
+> +let {method, RetVal, Actor, ActorClass, Front, FrontClass} = 
+
+Trailing whitespace.
+
+::: toolkit/devtools/server/tests/unit/test_register_actor.js
+@@ +66,5 @@
+> +    prefix: "lazy",
+> +    constructor: "LazyActor",
+> +    type: { global: true, tab: true }
+> +  });
+> +  // The actor is immediately register, but not loaded
+
+Typo: "immediately registered"
+
+@@ +104,3 @@
+>    DebuggerServer.destroy();
+> +
+> +  // Check that all actor are unregistered on server destroy
+
+Nit: "Check that all actors are unregistered on server destruction."
+(In reply to Panos Astithas [:past] from comment #25)
+> Comment on attachment 8487153
+> Convert all protocol.js actors to lazy loading
+> 
+> Review of attachment 8487153:
+> -----------------------------------------------------------------
+> 
+> r=me with comments addressed.
+> 
+> ::: toolkit/devtools/server/actors/tracer.js
+> @@ +11,5 @@
+> >  const { getOffsetColumn } = require("devtools/server/actors/common");
+> >  
+> >  // TODO bug 943125: remove this polyfill and use Debugger.Frame.prototype.depth
+> >  // once it is implemented.
+> > +function getFrameDepth(frame) {
+> 
+> Why this change? What's wrong with a polyfill that we can quickly remove
+> once we fix the platform? Now we have to chase down every caller of this
+> function.
+
+This polyfill doesn't work lazily :/
+I haven't verified exactly why, but I would say that's because
+the `depth` attribute set on Debugger.Frame.prototype is set too late.
+Either, Debugger.Frame ends up being a different instance, or 
+the prototype hack ends up being overriden if done after some initialization process.
+
+
+> ::: toolkit/devtools/server/tests/unit/head_dbg.js
+> @@ +204,5 @@
+> >  function initTestDebuggerServer(aServer = DebuggerServer)
+> >  {
+> > +  aServer.registerModule("devtools/server/actors/script", {
+> > +    prefix: "script",
+> > +    constructor: "ScriptActor",
+> 
+> This is not right, prefix should be "context" and constructor should be
+> "ThreadActor" here and elsewhere in this file.
+ 
+It looks like if it was completely wrong, these calls were unecessary.
+Tests seems to be still green without it.
+script.js is loaded during onAttach, we shouldn't need to load it as a regular actor.
+(In reply to Panos Astithas [:past] from comment #26)
+> Comment on attachment 8487151
+> Just for kicks let's pretend that the actor is a new
+> smartphone you just bought. Trust me, it's going to be fun.
+
+It matches pretty well phone unboxing, where you unboxing one while looking at this patch ? :p
+
+> I think this sums up well the way we buy a phone, err, load an actor. Given
+> the above, a name that sounds more appropriate than ConnectionActorFactory
+> to me is ObservedActorFactory. It describes the kind (state) of the actor
+> this factory creates. On a similar note, I think renaming ActorFactory to
+> the more accurate RegisteredActorFactory would make more sense. Using
+> generic names in such cases is a recipe for confusion (e.g. is ActorFactory
+> the factory that creates the final actor or not?).
+
+RegisteredActorFactory sounds great to me, and yes, the generic name was misleading!
+ObservedActorFactory sounds more vague to me but I switched to it as I don't have better name in mind.
+(In reply to Alexandre Poirot [:ochameau] from comment #27)
+> This polyfill doesn't work lazily :/
+> I haven't verified exactly why, but I would say that's because
+> the `depth` attribute set on Debugger.Frame.prototype is set too late.
+> Either, Debugger.Frame ends up being a different instance, or 
+> the prototype hack ends up being overriden if done after some initialization
+> process.
+
+Bah, I see. OK.
+
+> It looks like if it was completely wrong, these calls were unecessary.
+> Tests seems to be still green without it.
+> script.js is loaded during onAttach, we shouldn't need to load it as a
+> regular actor.
+
+OK, let's either remove them entirely or make them not give a false impression.
+
+(In reply to Alexandre Poirot [:ochameau] from comment #28)
+> It matches pretty well phone unboxing, where you unboxing one while looking
+> at this patch ? :p
+
+I wish! Still waiting for the mailman to knock on my door.
+Created attachment 8489987
+Expose an API to load actors lazily
+
+https://tbpl.mozilla.org/?tree=Try&rev=81053ff5dc20
+Created attachment 8489989
+Convert all protocol.js actors to lazy loading
+Created attachment 8489991
+interdiff
+
+Here is an interdiff for both patches from last r+ patches.
+Panos, feel free to suggest any additional comments regarding new documentation I introduced in these new patches!
+Panos, Do not hesitate to suggest tweaks against the interdiff, I will surely address comment tweaks/typos as followups.
+https://hg.mozilla.org/integration/fx-team/rev/0a00bbfcec31
+https://hg.mozilla.org/integration/fx-team/rev/c2fec0000820
+https://hg.mozilla.org/mozilla-central/rev/0a00bbfcec31
+https://hg.mozilla.org/mozilla-central/rev/c2fec0000820
+
+
+Actors modules should be loaded on-demand
+
+
+
+Bug 988237 - Expose an API to load actors lazily. r=past 
+
+Bug 988237 - Convert all protocol.js actors to lazy loading. r=past 

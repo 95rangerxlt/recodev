@@ -1,0 +1,199 @@
+
+
+
+Created attachment 8534514
+1105014-sync-waterfall-view.patch
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=9ec1af2dbd23
+Comment on attachment 8534514
+1105014-sync-waterfall-view.patch
+
+Review of attachment 8534514:
+-----------------------------------------------------------------
+
+Can this wait for bug 1077457 pretty please?
+
+::: browser/devtools/performance/test/browser_perf-details-waterfall-render-02.js
+@@ +22,5 @@
+> +  rendered = once(WaterfallView, EVENTS.WATERFALL_RENDERED);
+> +  OverviewView.emit(EVENTS.OVERVIEW_RANGE_SELECTED, { beginAt: 0, endAt: 10 });
+> +  yield rendered;
+> +
+> +  ok(true, "Waterfall rerenders when a range in the overview graph is selected.");
+
+Would be nice if we checked if this actually happens. I think we have a test for this in the timeline folder though. How about filing a bug for moving all existing profiler and timeline tests into the new performance folder once we're done with all of this?
+
+::: browser/devtools/performance/views/details-waterfall.js
+@@ +64,1 @@
+>      this.emit(EVENTS.WATERFALL_RENDERED);
+
+Even though this looks like it works, we still need to sync everything to account for the time differences caused by the async requests to the profiler and timeline actors.
+
+For the framerate, markers and memory measurements, we get this for free, because they're all started synchronously. However, the timeline actor's start time is not equal to the profiler's start time, so we need to pad one of the two by their start time deltas.
+
+Here's a breakdown:
+
+* the samples taken in the profiler actor all have timestamps relative to when the gecko profiler module was started; we offset everything in the front by this start time, essentially making all samples relative to 0; this doesn't mean the first sample is taken at 0 though, usually it's in the next few milliseconds; however, this gap can quickly get increasingly big when the profiler's internal circular buffer starts running out.
+
+* the refresh driver ticks taken in the framerate actor (and emitted through the timeline actor) are all timestamps relative to the top-level chrome window's last navigation (which in this case means when browser.xul was loaded, so when the browser was opened); this doesn't matter too much, because we use those timestamps to measure framerate, not track time, and everything is offset in the actor to be relative to 0, while recording; just like with the profiler, this doesn't mean the first tick is at 0, but usually in the next few milliseconds; there's no circular buffer here.
+
+* the markers and memory measurements taken in the timeline actor all have timestamps relative to epoch; there's a docshell start time available, but no magic happens, nothing is offset.
+
+Since time passes with the same speed regardless of the start time and how it's measured (jokes aside), all we need to do is offset everything to be relative to 0, and then account for the amount of time it takes between starting the profiler and starting the timeline actor (since the markers, memory *and* framerate recording is triggered synchronously, at the same time, in the backend).
+
+Basically:
+
+For the profiler data, we need to offset by the profiler start time. This already happens, everything is relative to 0.
+
+For the framerate data, we need to offset by when the framerate recording started. Again, this already happens this is relative to 0.
+
+For the markers and memory data, we need to offset by the docshell start time. This isn't done yet.
+
+However, the profiler and timeline actors don't start at the exact same time, so we need to offset either one of them by a delta. On local connections, this is usually negligible, but can be very obvious over the wire, or wifi. This massage should happen in our fake front.
+
+Obviously, we'll need a test for this.
+
+@@ +77,5 @@
+> +    let { beginAt, endAt } = params || {};
+> +
+> +    // The `startAt` and `endAt` values are delta from `this._startTime`,
+> +    let start = this._startTime + (beginAt || 0);
+> +    let end = this._startTime + (endAt || this._endTime);
+
+See above.
+yeah we can wait for bug 1077457 no prob.
+
+Let's talk more about the syncing of fronts tomorrow -- to keep things small, as well, we can land this, and do the tight syncing in another patch.
+Stealing.
+Created attachment 8552005
+part 1: make times consistent and sync selections
+
+Tests will follow soon because I'm too sober now.
+Created attachment 8552006
+part 2: make the old timeline work again
+
+This is ugly, but we don't care.
+Comment on attachment 8552005
+part 1: make times consistent and sync selections
+
+Review of attachment 8552005:
+-----------------------------------------------------------------
+
+This is going to be awful to rebase ontop of
+
+::: browser/devtools/performance/modules/recording-model.js
+@@ +7,3 @@
+>  
+> +loader.lazyRequireGetter(this, "PerformanceIO",
+> +  "devtools/performance/io", true);
+
+I really dislike the implicit scope loading. Looking at this, I can't tell that we just added
+
+@@ +285,5 @@
+> +  for (let marker of markers) {
+> +    marker.start -= timeOffset;
+> +    marker.end -= timeOffset;
+> +  }
+> +}
+
+Can we put these in modules/utils or something?
+
+::: browser/devtools/performance/performance-controller.js
+@@ +251,5 @@
+>     *        The file to stream the data into.
+>     */
+>    exportRecording: Task.async(function*(_, recording, file) {
+> +    yield recording.exportRecording(file);
+> +    this.emit(EVENTS.RECORDING_EXPORTED, recording);
+
+Good
+
+::: browser/devtools/performance/views/details-flamegraph.js
+@@ +83,5 @@
+> +  _onRangeChange: function (_, interval) {
+> +    if (DetailsView.isViewSelected(this)) {
+> +      this.render(interval);
+> +    } else {
+> +      this._dirty = interval;
+
+I don't understand this `_dirty` property -- it's not commented anywhere on what this is, and I wouldn't assume that this is interval data. Goes for all details views
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #8)
+> Comment on attachment 8552005
+> 
+> @@ +285,5 @@
+> > +  for (let marker of markers) {
+> > +    marker.start -= timeOffset;
+> > +    marker.end -= timeOffset;
+> > +  }
+> > +}
+> 
+> Can we put these in modules/utils or something?
+> 
+
+Sure.
+
+> ::: browser/devtools/performance/performance-controller.js
+> @@ +251,5 @@
+> >     *        The file to stream the data into.
+> >     */
+> >    exportRecording: Task.async(function*(_, recording, file) {
+> > +    yield recording.exportRecording(file);
+> > +    this.emit(EVENTS.RECORDING_EXPORTED, recording);
+> 
+> Good
+> 
+> ::: browser/devtools/performance/views/details-flamegraph.js
+> @@ +83,5 @@
+> > +  _onRangeChange: function (_, interval) {
+> > +    if (DetailsView.isViewSelected(this)) {
+> > +      this.render(interval);
+> > +    } else {
+> > +      this._dirty = interval;
+> 
+> I don't understand this `_dirty` property -- it's not commented anywhere on
+> what this is, and I wouldn't assume that this is interval data. Goes for all
+> details views
+
+Ok, I'll add a comment.
+Created attachment 8552701
+part 1: make times consistent and sync selections
+
+Addressed comments, rebased.
+Created attachment 8552702
+part 2: make the old timeline work again
+Created attachment 8552703
+part 3: tests
+Comment on attachment 8552703
+part 3: tests
+
+Review of attachment 8552703:
+-----------------------------------------------------------------
+
+Whew, looks good. Going to have to update bug 1122639 tests to make sure that frames/memory is on for some of the overview tests, good reminder
+Thanks Jordan
+Created attachment 8553189
+part 1: make times consistent and sync selections
+
+fixed some failing tests
+Created attachment 8553190
+part 2: make the old timeline work again
+Created attachment 8553191
+part 3: tests
+https://hg.mozilla.org/integration/fx-team/rev/d97cb539d872
+https://hg.mozilla.org/integration/fx-team/rev/55aeb3256b6c
+https://hg.mozilla.org/integration/fx-team/rev/2dd88e466daf
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=0dba54b69da1
+https://hg.mozilla.org/mozilla-central/rev/d97cb539d872
+https://hg.mozilla.org/mozilla-central/rev/55aeb3256b6c
+https://hg.mozilla.org/mozilla-central/rev/2dd88e466daf
+*** Bug 1109763 has been marked as a duplicate of this bug. ***
+
+
+Sync actor times and overview selection with all the detail views in the new performance tool
+
+
+
+Bug 1105014 - Part 1: Sync actor times and overview selection with all the detail views in the new performance tool, r=jsantell 
+
+Bug 1105014 - Part 2: Make the old timeline panel work again, r=jsantell 
+
+Bug 1105014 - Part 3: Fix existing tests and add a few more, r=jsantell 

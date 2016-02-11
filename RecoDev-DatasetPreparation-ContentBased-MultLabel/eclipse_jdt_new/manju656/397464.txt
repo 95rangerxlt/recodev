@@ -1,0 +1,123 @@
+Follow-up to bug 163633 comment 5:
+> Manju, there could be an additional complication with package-info in the
+> source attachment.
+> 
+> E.g. in jdk7, the src.zip contains java/lang/package-info.java, but since
+> the package declaration doesn't carry annotations, no package-info.class
+> file is generated. Hence, the IClassFile for package-info doesn't exist and
+> getSource() probably doesn't work. Once you've verified that this is really
+> a problem, please file a bug for JDT/Core requesting that
+> IClassFile#getSource() should still work in this special case.
+
+When I remove the Javadoc location for a JDK7 and leave the source attachment untouched, I don't get Javadoc in the view or hover for java.lang.
+
+Follow-up to bug 163633 comment 5:
+> Manju, there could be an additional complication with package-info in the
+> source attachment.
+> 
+> E.g. in jdk7, the src.zip contains java/lang/package-info.java, but since
+> the package declaration doesn't carry annotations, no package-info.class
+> file is generated. Hence, the IClassFile for package-info doesn't exist and
+> getSource() probably doesn't work. Once you've verified that this is really
+> a problem, please file a bug for JDT/Core requesting that
+> IClassFile#getSource() should still work in this special case.
+
+When I remove the Javadoc location for a JDK7 and leave the source attachment untouched, I don't get Javadoc in the view or hover for java.lang.
+In the case of 'java.lang' from source, we run into the NPE from bug 397455 and hence no Javadoc. But we also forgot to search the 'package-info.java' in the source attachment.
+
+Fixed with http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=a7ec327fd0ef595c2c4bf8d664efb7ad16c44b25
+Dani, we had a discussion about searching the 'package-info.java' file in the source attachment. It was concluded that for Java class files, core will make the necessary association after considering the source attachment path and thus through getSource() method we will get the source content. For HTML file we will explicitly make the search in the source attachment path.
+
+So the current fix to search the source attachment path for package-info.java will not help, as we still need a Java element corresponding to the compilation unit and getJavaElement() on the compilation unit returns null in this particular scenario which Markus has pointed. JDT Core needs to give us a fix for this case.
+(In reply to comment #2)
+> Dani, we had a discussion about searching the 'package-info.java' file in
+> the source attachment. It was concluded that for Java class files, core will
+> make the necessary association after considering the source attachment path
+> and thus through getSource() method we will get the source content. 
+
+Sure, but only if there is a class file.
+
+
+> So the current fix to search the source attachment path for
+> package-info.java will not help, as we still need a Java element
+> corresponding to the compilation unit and getJavaElement() on the
+> compilation unit returns null in this particular scenario which Markus has
+> pointed.
+
+Please provide exact steps here, that show it doesn't work.
+With the current fix, the string content of package-info.java is retrieved and this is used to create an ASTNode of type CompilationUnit. To get the Javadoc from this ASTNode we need its JavaElement. This is null. Without a proper Java element we cannot retrieve the Javadoc.
+(In reply to comment #4)
+> With the current fix, the string content of package-info.java is retrieved
+> and this is used to create an ASTNode of type CompilationUnit. To get the
+> Javadoc from this ASTNode we need its JavaElement. This is null. Without a
+> proper Java element we cannot retrieve the Javadoc.
+
+Well, I think my fix worked before (except for the NPE which didn't always occur) and now, due to the newly added assertions it will always fail.
+
+Please add the steps as requested in comment 4 and take a look at a fix for the AST creation code. Thanks.
+Let's take a step back here. JavadocContentAccess2#createAST(ITypeRoot typeRoot) is unnecessary and should be removed. Bindings are too expensive for Javadoc hovers, so the whole implementation has been written to work without bindings. (We only resolve links when the user actually clicked a link.)
+
+#createAST(..) should be inlined again. The code is not reused/reusable, and the name is wrong (creates a cuNode, not an AST; creates a very specific temporary AST).
+
+Then, you need a new method that works similar to #getJavadocNode(..). That method should use #createASTParser(..), but then it should create an AST from the whole package-info type root and then get the Javadoc via cuNode.getPackage().getJavadoc().
+
+
+#getJavadocFromAST(..) will also be removed. BTW: The implementation of that method had two more problems:
+- cuNode.getCommentList() is always non-null, so the null check is unnecessary
+- cuNode.getCommentList() returns all comment nodes. If someone writes a package-info.java like this, you'd get the wrong comment:
+/** Doc */
+package pack;
+/** End */
+(In reply to comment #6)
+> - cuNode.getCommentList() returns all comment nodes. If someone writes a
+> package-info.java like this, you'd get the wrong comment:
+> /** Doc */
+> package pack;
+> /** End */
+
+Good catch!
+(In reply to comment #2)
+> So the current fix to search the source attachment path for
+> package-info.java will not help, as we still need a Java element
+> corresponding to the compilation unit and getJavaElement() on the
+> compilation unit returns null in this particular scenario which Markus has
+> pointed. JDT Core needs to give us a fix for this case.
+
+Since we already have the code that opens the source attachment and looks for the package.html file there, I think we should just reuse that to find the package-info.java there as well. That will avoid special cases in JDT/Core to fake a package-info.class just to let us get the package-info.java's source.
+
+=> If we have an existing ITypeRoot for package-info, then we should use that one to create the AST. Otherwise, we look it up in the source attachment, and then we just use ASTParser#setSource(char[]) to create the AST.
+Re resolving links in package-info.java via JavaElementLinks#parseURI(URI): 
+
+For Javadoc on an IMember, we can use IType#resolveType(String) to resolve the second segment of the URI. But for the package-info.java, there's no similar API that resolves the imports of the package-info.java file. We could file an API request for IPackageDeclaration#resolveType(String), but that would only work as long as the package-info element exists. For the case were we use the package-info.java from the source attachment, that also wouldn't work.
+
+I think the best solution is to implement this on our own for package-info.java: create an AST and try to resolve the type name against the non-static imports. For on-demand imports and if nothing matched, use IJavaProject#findType(..).
+Created attachment 225809
+Proposed Fix
+
+This patch also contains the fix for bug 397455, as both the fix was related to the same file.
+
+The review comments from Markus(https://bugs.eclipse.org/bugs/show_bug.cgi?id=397464#c6) is taken care off. Also we have handled re-resolving links in package-info.java when the corresponding class file does not exist. To resolve the links we are checking for the below condition
+1. Whether the type is fully qualified 
+2. Whether the type is from the enclosing package
+3. Whether the type belongs to an on-demand-import or type import
+4. Whether the type belongs to java.lang package
+(In reply to comment #10)
+> Created attachment 225809 [details] [diff]
+> Proposed Fix
+
+The fix still had a few issues (e.g. it concatenated package-info.java content with "class C{}" and then created an AST on the bad source; fElements could contain bogus elements; links to members like {@link javax.annotation.Generated#date()} didn't work; problems in the source attachment lookup order).
+
+The imports resolution in JavaElementLinks also didn't adhere to the JLS7 rules. However, when I was done with the correct implementation, I found that the scoping rules for Javadoc links in package-info.java are broken anyway, see bug 216451 comment 4. In the end, I commented out the implementation and went with what the javadoc.exe supports (only fully-qualified type references).
+
+Fixed with http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=3dc7c2a368684cdcd97bee9b8d41b031ee17aef3
+*** Bug 397455 has been marked as a duplicate of this bug. ***
+.
+
+
+No Javadoc for package-info.java in source attachment when package-info.class doesn't exist
+
+
+
+Bug 397464: No Javadoc for package-info.java in source attachment when package-info.class doesn't exist 
+
+Fixed bug 397464: No Javadoc for package-info.java in source attachment when package-info.class doesn't exist 

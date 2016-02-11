@@ -1,0 +1,179 @@
+maxResults is integrated into the SQL query, and any post-SQL filtering can affect it's validity be reducing the size of the final result set.
+
+maxResults is integrated into the SQL query, and any post-SQL filtering can affect it's validity be reducing the size of the final result set.
+thanks to walters for spotting this issue.
+
+from irc:
+
+<walters> dietrich: it seems like options.maxResults happens before searchTerms?
+<walters> dietrich: i.e. if i'm trying to do a search limited to N items, I only get matches from the first N items, not at most N matches
+<dietrich> walters: hrm, that might be right. iirc the search term filtering happens post-query
+
+one idea:  when there is a search term, don't set the LIMIT on the query, and instead do the limiting in the post-SQL filtering.
+Created attachment 279706
+process history maxResults option after filtering if there are search terms
+
+Hi, this patch should address the bug.  Some notes:
+
+- Test suite passes (and it fixes my app), I'll add my own test for this tomorrow
+- I was a little unsure about nsNavHistory::EvaluateQueryForNode, I think passing 0 for the limit there is right since it doesn't recurse.
+- My first original mozilla patch, be gentle =)
+this bug is blocking the menu work for bug #387996.
+
+specifically, I'm using maxResults of 10 for each of the menus and that is leading to incorrect results.
+
+I'm going to look at Colin's patch, and if it does the trick, drive it in.
+
+I'm a little nervous about performance, as we're no longer setting the limit on the query (in this scenario), but we need correctness.  I'll test with the evil ispiked profile to see if perf is an issue.
+didn't mean to steal the bug.  testing Colin's patch now.
+note, because of folder inclusion (and exclusion), we need to expand the test for when we can't push LIMIT into the query.
+
+updated version of colin's patch coming.
+Created attachment 282368
+patch, updated to the trunk, and expanded to only use SQL LIMIT if we aren't going to do any post-query filtering
+note to dietrich, this blocks bug #387996 as without it, the pre-populated "places" folder queries will not return the right results (as I'm use maxResults=10 for those queries)
+
+thanks again to colin for the initial patch.
+
+Comment on attachment 282368
+patch, updated to the trunk, and expanded to only use SQL LIMIT if we aren't going to do any post-query filtering
+
+
+>+static
+>+PRBool NeedToFilterResultSet(const nsCOMArray<nsNavHistoryQuery>& aQueries, 
+>+                             nsNavHistoryQueryOptions *aOptions)
+>+{
+>+  // optimize the case where we just want a list with no grouping: this
+>+  // directly fills in the results and we avoid a copy of the whole list
+>+  PRBool resultAsList = PR_TRUE;
+
+per irc, this is never used
+
+> // nsNavHistory::FilterResultSet
+> //
+> //    This does some post-query-execution filtering:
+> //      - searching on title & url
+> //      - parent folder (recursively)
+> //      - excludeQueries
+>+//      - tags
+>+//      - limit count
+
+please add a note to the effect that any addition or removal of filtering in FilterResultSet will require an update of NeedToFilterResultSet also.
+
+> 
+> nsresult
+> nsNavHistory::FilterResultSet(nsNavHistoryQueryResultNode* aQueryNode,
+>                               const nsCOMArray<nsNavHistoryResultNode>& aSet,
+>                               nsCOMArray<nsNavHistoryResultNode>* aFiltered,
+>-                              const nsCOMArray<nsNavHistoryQuery>& aQueries)
+>+                              const nsCOMArray<nsNavHistoryQuery>& aQueries,
+>+                              PRInt32 aLimitCount)
+
+it would be more forwardly-flexible if you just pass in aOptions itself. we've had to do this with other apis in the query system, iirc.
+
+r=me otherwise
+Created attachment 282557
+updated patch
+
+carrying forward dietrich's review
+fixed.
+
+Checking in nsNavHistory.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavHistory.cpp,v  <--  nsNavHis
+tory.cpp
+new revision: 1.173; previous revision: 1.172
+done
+Checking in nsNavHistory.h;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavHistory.h,v  <--  nsNavHisto
+ry.h
+new revision: 1.103; previous revision: 1.102
+done
+I think this turned tinderbox orange due to failed tests:
+
+../../../../_tests/xpcshell-simple/test_places/unit/test_history.js: FAIL
+../../../../_tests/xpcshell-simple/test_places/unit/test_history.js.log:
+>>>>>>>
+*** test pending
+*** exiting
+*** CHECK FAILED: 0 == 2
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/head.js :: do_throw :: line 99
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/head.js :: do_check_eq :: line 114
+JS frame :: ../../../../_tests/xpcshell-simple/test_places/unit/test_history.js :: run_test :: line 101
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/tail.js :: _execute_test :: line 41
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/execute_test.js :: <TOP_LEVEL> :: line 38
+2147500036
+*** FAIL ***
+
+<<<<<<<
+
+...
+
+../../../../_tests/xpcshell-simple/test_places/unit/test_tagging.js: FAIL
+../../../../_tests/xpcshell-simple/test_places/unit/test_tagging.js.log:
+>>>>>>>
+*** test pending
+*** exiting
+*** CHECK FAILED: 3 == 2
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/head.js :: do_throw :: line 99
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/head.js :: do_check_eq :: line 114
+JS frame :: ../../../../_tests/xpcshell-simple/test_places/unit/test_tagging.js :: run_test :: line 93
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/tail.js :: _execute_test :: line 41
+JS frame :: /Users/robcee/slave/trunk_osx2/mozilla/tools/test-harness/xpcshell-simple/execute_test.js :: <TOP_LEVEL> :: line 38
+2147500036
+*** FAIL ***
+
+<<<<<<<
+
+I backed this out due to the above tinderbox orange.
+> I backed this out due to the above tinderbox orange.
+
+thanks for backing me out.
+
+in addition to the orange, there is a performance regression with my patch.  we want to use LIMIT for the optimized history menu query.
+
+I've got the simple fix for that, but I'm working on the test bustage now.
+my patch (insanely) removes this code:
+
+-  PRInt32 i;
+-  for (i = 0; i < aQueries.Count(); i ++) {
+-    PRInt32 clauseParameters = 0;
+-    rv = BindQueryClauseParameters(statement, numParameters,
+-                                   aQueries[i], aOptions, &clauseParameters);
+-    NS_ENSURE_SUCCESS(rv, rv);
+-    numParameters += clauseParameters;
+-  }
+
+cheese and rice, I hope no one is cc'd on this bug.
+Created attachment 282802
+patch that passes tests (and doesn't regression history menu performance)
+Comment on attachment 282802
+patch that passes tests (and doesn't regression history menu performance)
+
+looks ok, thanks for fixing this. shame on me for not seeing that during the first review pass.
+> shame on me for not seeing that during the first review pass.
+
+shame one me for not running the tests before seeking review and checking in.
+
+fixed.
+
+Checking in toolkit/components/places/src/nsNavHistory.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavHistory.cpp,v  <--  nsNavHistory.cpp
+new revision: 1.175; previous revision: 1.174
+done
+Checking in toolkit/components/places/src/nsNavHistory.h;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavHistory.h,v  <--  nsNavHistory.h
+new revision: 1.105; previous revision: 1.104
+done
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

@@ -1,0 +1,194 @@
+Looks like the recent changes to the leak threshold revealed some leaks in the places tests with compartment-per-global. The landing is on track for sometime in the next 24 hours, and I don't think this should block the landing. So my plan is to bump the threshold by 11 and land CPG, unless someone disagrees. We should definitely figure out what's going on in these tests, though.
+
+The unique leaks (ones that didn't occur before) appear to be as follows:
+
+[browser/components/places/tests/browser/browser_bookmarksProperties.js]
+  1 window(s) [url = chrome://browser/content/bookmarks/bookmarksPanel.xul]
+  1 window(s) [url = about:blank]
+  1 window(s) [url = chrome://browser/content/places/bookmarkProperties.xul]
+
+[browser/components/places/tests/browser/browser_410196_paste_into_tags.js]
+  1 window(s) [url = about:blank]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+
+[browser/components/places/tests/browser/browser_416459_cut.js]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+  1 window(s) [url = about:blank]
+
+[browser/components/places/tests/browser/browser_library_batch_delete.js]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+  1 window(s) [url = about:blank]
+
+[browser/components/places/tests/browser/browser_library_left_pane_commands.js]
+  1 window(s) [url = about:blank]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+
+Looks like the recent changes to the leak threshold revealed some leaks in the places tests with compartment-per-global. The landing is on track for sometime in the next 24 hours, and I don't think this should block the landing. So my plan is to bump the threshold by 11 and land CPG, unless someone disagrees. We should definitely figure out what's going on in these tests, though.
+
+The unique leaks (ones that didn't occur before) appear to be as follows:
+
+[browser/components/places/tests/browser/browser_bookmarksProperties.js]
+  1 window(s) [url = chrome://browser/content/bookmarks/bookmarksPanel.xul]
+  1 window(s) [url = about:blank]
+  1 window(s) [url = chrome://browser/content/places/bookmarkProperties.xul]
+
+[browser/components/places/tests/browser/browser_410196_paste_into_tags.js]
+  1 window(s) [url = about:blank]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+
+[browser/components/places/tests/browser/browser_416459_cut.js]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+  1 window(s) [url = about:blank]
+
+[browser/components/places/tests/browser/browser_library_batch_delete.js]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+  1 window(s) [url = about:blank]
+
+[browser/components/places/tests/browser/browser_library_left_pane_commands.js]
+  1 window(s) [url = about:blank]
+  1 window(s) [url = chrome://browser/content/places/places.xul]
+Marking traction to make sure we look into this before release.
+Oy, oy. OY! Oy vey!
+
+I haven't looked into this leak, but I'm almost sure the places-transaction-service "trick" is the culprit.
+
+Very long ago, we've introduced the places-transaction-service (imitating the exact pre-places solution...) to avoid leaking windows.
+
+Here's how it works (in pre-cpg world):
+
+1. Some window asks the service to create some places transaction.
+2. The transaction was created *in the context of the component* rather than in some window, and returned to the window that way.
+3. The window then called doTransaction for that transaction. The transaction was cached by a native transaction manager.
+4. When the window was closed, it wasn't leaked, because the "owner" of the transaction was the places-transactions-service.
+
+Pseudo-code:
+1] [in window context] let t = TheService.giveMeThatFancyTransaction() ---> (return new thatFancyNativeTransaction() )
+2] TheService.doTransaction(t) ----> TheNativeService.doTransaction(t);
+
+Correct me if I'm wrong, this is no longer useful practice in cpg mode. That is, t is a wrapper, that has the windows as its owner (rather than the service, as in pre-cpg mode).
+
+Oh well.
+
+Possible fixes:
+1. Create-and-do transactions within the transactions service, without returning transaction back to the window in the middle. This should avoid wrapping the transaction in another global.
+2. Change the native transaction manger to support weak references.
+3. Loose the feature of having places-transaction cached in a singleton service that works across windows, meaning that each windows would have its own transactions manger.
+
+1) will break the places-transaction-service api quite a bit. 2) is risky. 3) is the safest option, but it would break long standing behavior.
+One correction: it's now part of the placesutils js-module rather than a service. The problems are the same, with the addition problem of making the third solution at all not safe at all (We cannot, and we don't want, to "createInstance" PlacesUtils).
+
+Remaining options:
+1. Break PlacesUtils transactions api. I'm sure there are various addons out there that rely on it.
+2. Fix the native transaction manger to support nsIWeakReference etc.  Expect crashes...
+To be clear: this isn't just the tests that leak. Both browser windows and the places library would leak in the same way if any is performed (starring a page, for example).
+
+I cannot tell if this should block cpg, but, fwiw, this is worse than the places stuff we fixed so far for cpg.
+Thinking further, this probably isn't as severe as I thought. The only problem should be that doTransaction is called from UI windows directly on the *native* transactionmnger; we do:
+
+[window.]PlacesUtils.transactionManager.doTransaction(SomeObjectCreatedInTheCOntextOfPlacesUtilsButNowWrappedForThisWindow)
+
+If I understand cpg correctly, making PlacesUtils.transactionManager a js object a "proxy" for the native transaction-manager should fix this leak, because, when the "wrapper" doTranasaction (in PlacesUtils) is called, it'll have the transaction "re-wrapped" for the placesutils global.
+
+Easy fix, in that case.
+Created attachment 619842
+Quick and undocumented, to ensure this fixes the leak
+
+Bobby, I don't have a cpg build at the moment. Could you check for me if this changes anything wrt. the leaking tests?
+Comment on attachment 619842
+Quick and undocumented, to ensure this fixes the leak
+
+Does the trick! Let's get this reviewed and landed.
+
+Thanks for tracking this down so quickly Mano! :-)
+Hurray!
+
+I need to add in some comments explaining this dark magic, so I won't remove it the next time I visit this code ;)
+
+Note for Marco and future-me:
+It turns out CPG removes the need to have transactions-prototypes declared in PlacesUtils, as as a measure to avoid leaking windows.  On the other hand, it forces us to never call native doTransaction directly from a window. It must be called from PlacesUtils.
+Bobby: CPG is trunk-only (Firefox/Gecko 15), right?
+Question: If, in CPG, js objects can move to new globals so eaisly, shouldn't we also introduce some kind of global for native code?
+
+What happens (with my patch):
+1. The transaction has PlacesUtils js-module as its global
+2. It has the places library as its global
+3. It has PlacesUtils as its global.
+4. It's strong-referenced by native cpp code, and therefore it still has PlacesUtils as its global.
+
+This means that if the native transactions-manger was not native, i.e. if it was implemented in JS, this leak would never happen: at (4) the transaction would have the transactions-manager global.
+
+So, I wonder if this limitation is justified.
+(In reply to Mano from comment #9)
+> Bobby: CPG is trunk-only (Firefox/Gecko 15), right?
+
+Yes. It will land in the next day or so.
+
+(In reply to Mano from comment #10)
+> Question: If, in CPG, js objects can move to new globals so eaisly,
+
+What do you mean by 'move to new globals'?
+
+> shouldn't we also introduce some kind of global for native code?
+> 
+> What happens (with my patch):
+> 1. The transaction has PlacesUtils js-module as its global
+> 2. It has the places library as its global
+> 3. It has PlacesUtils as its global.
+> 4. It's strong-referenced by native cpp code, and therefore it still has
+> PlacesUtils as its global.
+
+I'm not grokking you here (probably my fault - I didn't dive into comment 2 very deeply, so I still don't have a great picture of what the underlying issue is). What are 1, 2, 3, and 4? Are they moments in time? Different objects?
+Mano just explained this on IRC, and I understand it now. The transaction manager is a native XPCOM component, so we get one per compartment (and thus one per global). doTransaction accepts an XPCWrappedJS, which, depending on the scope, will be parented either to the window or to the JSM. Since the native code holds on to this, we need it to be parented to the JSM to avoid leaking. This means that the call to doTransaction has to happen in the scope of the JSM. IMO this is the correct fix.
+Can we add assertions to doTransaction to ensure that it runs in the scope of the JSM?  Is this the kind of thing that extensions might be getting wrong?
+Kyle, I'm not sure what you mean by adding "assertions to doTransaction to ensure that it runs in the scope of the JSM". If you're referring to the native doTransaction, 99% of the time it's invoked for stuff completely unrelated to places...
+
+As for the places TM, addons won't get this wrong, no. With this change, the module only exports the "forwarder" transaction manager rather than the native transaction manager. We should be good.
+
+Of course, addons can create their own transaction mangers (for other purposes), and get it wrong their own way. It's, however, a very long standing issue with transaction managers. There's not much we can do about that.
+Comment on attachment 619842
+Quick and undocumented, to ensure this fixes the leak
+
+Review of attachment 619842:
+-----------------------------------------------------------------
+
+This looks fine. The Places transactions code is well covered test-wise, so r=me with a green try push.
+Dietrich, I didn't ask for review because this patch isn't ready. I'll post the patch for review tomorrow morning (in about 8 hours, that is).
+
+This patch won't break anything though and works as it is, so, if you've to land something now, go ahead. I'll tweak it in a followup patch in that case.
+(In reply to Mano from comment #16)
+> Dietrich, I didn't ask for review because this patch isn't ready. I'll post
+> the patch for review tomorrow morning (in about 8 hours, that is).
+> 
+> This patch won't break anything though and works as it is, so, if you've to
+> land something now, go ahead. I'll tweak it in a followup patch in that case.
+
+My bad - I asked dietrich for an emergency review because I'm aiming to land CPG tomorrow morning. Are there substantive things that need to change? Or can we just land this and do a followup?
+Created attachment 620193
+patch
+Comment on attachment 620193
+patch
+
+Review of attachment 620193:
+-----------------------------------------------------------------
+
+::: toolkit/components/places/PlacesUtils.jsm
+@@ +2255,5 @@
+> +  // Indeed doing so ensures thet, as long as the transaction "belongs" to this
+> +  // module in the first place (namely, it's an instance of any of the
+> +  // Places...Transaction objects declated in this module), the object
+> +  // referenced by the transaction manager wouldn't be a js-proxy of it in
+> +  // another global.
+
+I think from "Indeed..." to the end, there is a bit of repetition.
+I'd probably sum up that part a bit like:
+// Doing so ensures that, as long as the transaction is any of the
+// PlacesXXXTransaction objects declared in this module, the object
+// referenced by the transaction manager has the module itself as global.
+https://hg.mozilla.org/mozilla-central/rev/7dfc17047d12
+
+
+Places transactions leak windows in CPG
+
+mlk, regression
+
+Bug 750269 - Fix places transactions leak with cpg (r=mak,a=not-in-libxul) 

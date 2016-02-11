@@ -1,0 +1,430 @@
+If changing the engine in the upper right changes the selectedEngine preference, then changing the selectedEngine preference should change the search engine in the upper right.
+
+You shouldn't be able to get the two out of sync by changing the one in preferences via about:config.
+
+If changing the engine in the upper right changes the selectedEngine preference, then changing the selectedEngine preference should change the search engine in the upper right.
+
+You shouldn't be able to get the two out of sync by changing the one in preferences via about:config.
+Why? No one should be changing the selectedEngine pref, it's a search service implementation detail. Use the search service API (or the search UI in Firefox) to set the selected engine.
+As you point out in bug 738818 comment 104, not doing this make it possible for extensions to subvert the user-choice link between the exposed preferences and the behavior. Similar issues with defaultenginename.
+Discussed this briefly with mikedeboer:
+- add an observer for SEARCH_ENGINE_DEFAULT in search.xml, have it update its notion of the selected engine (and keep the defaultEngine and currentEngine in sync)
+- add pref observers for both "currentEngine" and "defaultEngine" in the search service
+- be careful to add logic to both of those to avoid getting into infinite loops :)
+I just found a bug and wanted to mention it here to see if I should open a new bug here. It's related to all of this.
+
+Open about:config and search on defaultenginename. Keep it open.
+Change your search engine to something other then Google (I used Twitter).
+Select Manage Search Engines.
+Delete the engine you selected as default.
+Then click Restore Defaults.
+Then click OK.
+
+Your defaultenginename is changed to Google, but your selected engine is still what you selected.
+
+So keyword and search engine are out of sync.
+The plan from comment 3 should address that.
+
+Mike, can you take this?
+Added to my schedule for this week, so yes! :)
+One more bug to see if this fixes.
+
+If you go to a site like https://duckduckgo.com/ that installs a search engine, it becomes the default engine, but the keyword search doesn't change.
+Created attachment 738504
+Make sure that defaultEngine and currentEngine stay in sync
+Comment on attachment 738504
+Make sure that defaultEngine and currentEngine stay in sync
+
+>diff --git a/browser/components/search/content/search.xml b/browser/components/search/content/search.xml
+
+>             case "engine-current":
+>               // The current engine was changed.  Rebuilding the menu appears to
+>               // confuse its idea of whether it should be open when it's just
+>               // been clicked, so we force it to close now.
+>               this._popup.hidePopup();
+>+            case "engine-default":
+
+Add an explicit "// fall through" comment to indicate that this is intentional.
+
+>+              let self = this;
+>+              let ss = this.searchService;
+>+              setTimeout(function() {
+>+                if (self.currentEngine.name == ss.defaultEngine.name)
+>+                  return;
+>+                if (aVerb == "engine-current")
+>+                  ss.defaultEngine = ss.currentEngine;
+>+                else
+>+                  ss.currentEngine = ss.defaultEngine;
+>+              });
+
+Use .bind() instead of "self". But why is the setTimeout needed?
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>   set defaultEngine(val) {
+>     this._ensureInitialized();
+>-    if (!(val instanceof Ci.nsISearchEngine))
+>+    if (!(val instanceof Ci.nsISearchEngine) && !(val instanceof Engine))
+>       FAIL("Invalid argument passed to defaultEngine setter");
+
+Why this change? That check should be redundant.
+
+>     let newDefaultEngine = this.getEngineByName(val.name);
+>     if (!newDefaultEngine)
+>       FAIL("Can't find engine in store!", Cr.NS_ERROR_UNEXPECTED);
+> 
+>     if (newDefaultEngine == this._defaultEngine)
+>       return;
+> 
+>+    // set a flag to keep track that this setter was called properly, not by
+>+    // setting the pref alone.
+>+    this._changingDefaultEngine = true;
+
+Rather than setting this flag here and clearing it in the observer, can't you just set it before the call to setLocalizedPref, and clear it after?
+
+Same comments apply to the currentEngine setter.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #9)
+> >diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+> 
+> >   set defaultEngine(val) {
+> >     this._ensureInitialized();
+> >-    if (!(val instanceof Ci.nsISearchEngine))
+> >+    if (!(val instanceof Ci.nsISearchEngine) && !(val instanceof Engine))
+> >       FAIL("Invalid argument passed to defaultEngine setter");
+> 
+> Why this change? That check should be redundant.
+
+This change almost split my head in half... I was doing this.(default|current)Engine = engine and it just would NOT cooperate. `engine.toString()` also gave me `object [Object]` instead the expected `xpcom wrapped blahblah...`. In the end I saw no other way than to add this check against a privately declared constructor.
+Created attachment 739536
+Make sure that defaultEngine and currentEngine stay in sync
+
+addressed comments from comment 9
+(In reply to Mike de Boer [:mikedeboer] from comment #10)
+> This change almost split my head in half... I was doing
+> this.(default|current)Engine = engine and it just would NOT cooperate.
+> `engine.toString()` also gave me `object [Object]` instead the expected
+> `xpcom wrapped blahblah...`. In the end I saw no other way than to add this
+> check against a privately declared constructor.
+
+I don't understand. Are you adding a case where the new check fails? That would generally be a problem that we need to fix at some other layer. And if you're not adding a set that fails the new check, then the new check isn't necessary.
+Bug 863280 highlights that there might be another case we need to deal with - on update, users might have pre-existing conflicting defaultEngine/currentEngine pref values (due to search hijacking). We should probably add a migration step to ensure they are in sync.
+FYI, I found one other bug here. I used the addEngine API from a web page and chose to make the search engine my default engine, but it didn't change defaultengine, just selected engine.
+Comment on attachment 739536
+Make sure that defaultEngine and currentEngine stay in sync
+
+This looks good, but I still don't understand the "val instanceof Engine" additions, and we really could use some tests for this stuff. An xpcshell test covering making sure that the getters stay in sync with the prefs, etc., and a browser-chrome test that checks that our UI keeps defaultEngine == currentEngine in various scenarios (like some of the ones Mike mentions).
+
+(It's actually slightly inefficient for the search.xml observer to handle this stuff, because there is one of them per-window, so you end up with a lot of unnecessary short-circuiting due to currentEngine.name == defaultEngine.name. But those windows have to observe "engine-current" anyhow, so it's probably not worth worrying about.)
+Agreed, will add tests asap.
+Created attachment 741758
+unit test coverage
+Oh, about the "vla instanceof Engine": the list of engines is loaded from cache and/ or disk and each individual engine is instantiated with `new Engine(...)`.
+http://mxr.mozilla.org/mozilla-central/source/toolkit/components/search/nsSearchService.js#2896
+
+Each `Engine` instance is tacked to the internal array `_engines` in http://mxr.mozilla.org/mozilla-central/source/toolkit/components/search/nsSearchService.js#2823, thus contains a list of non-wrapped JS objects.
+
+Before this patch, the default-/currentEngine setters accepted only wrapped Ci.nsISearchEngine objects. The code in this patch passes the engine retrieved via `getEngineByName()`, which returns objects as they were constructed; not wrapped. Now it will also accept `this.defaultEngine = new Engine(...);`
+
+Does this make sense?
+(In reply to Mike de Boer [:mikedeboer] from comment #18)
+> Before this patch, the default-/currentEngine setters accepted only wrapped
+> Ci.nsISearchEngine objects. The code in this patch passes the engine
+> retrieved via `getEngineByName()`, which returns objects as they were
+> constructed; not wrapped. Now it will also accept `this.defaultEngine = new
+> Engine(...);`
+> 
+> Does this make sense?
+
+I guess so; I wish I understood why this behavior changed exactly, though.
+Created attachment 747918
+unit test coverage
+
+update the test to fix a race condition as described in bug 866104
+Comment on attachment 747918
+unit test coverage
+
+>diff --git a/toolkit/components/search/tests/xpcshell/test_prefSync.js b/toolkit/components/search/tests/xpcshell/test_prefSync.js
+
+>+  setLocalizedPref("browser.search.defaultenginename", engine2.name);
+>+  // Do tests on a new stack for OMT prefs service
+>+  do_timeout(0, function() {
+
+This comment is kind of confusing (there's nothing "OMT" about the prefs service). I'm not sure why the timeout is necessary, either - the change should all happen synchronously from under the preference change observer.
+
+>+    // selected engines should be synced with the pref
+>+    do_check_eq(search.defaultEngine.name, "A second test engine");
+>+    do_check_eq(search.defaultEngine.searchForm, "https://duckduckgo.com");
+>+    do_check_eq(search.currentEngine.name, "A second test engine");
+>+    do_check_eq(search.currentEngine.searchForm, "https://duckduckgo.com");
+
+I still don't understand how this test works - there's nothing in the search service itself that enforces defaultEngine is always the same as currentEngine - that happens in the application logic (search.xml), which shouldn't be involved in an xpcshell test.
+
+So I would expect these currentEngine checks to fail - setting the defaultEngineName pref shouldn't impact currentEngine's value.
+
+>+function run_test() {
+
+>+  let search = Services.search; // Cause service initialization
+
+As mentioned in another bug, let's stop spreading this incorrect comment :) (and just get rid of the local variable)
+
+This looks good otherwise, with these comments addressed.
+Comment on attachment 739536
+Make sure that defaultEngine and currentEngine stay in sync
+
+Sorry, I think I'm changing my mind about the last part of comment 15, since I thought of a case this doesn't handle. Since it's possible for the search bar to not exist (if it was customized away), we shouldn't make the logic for keeping defaultEngine==currentEngine in the Firefox application dependent on it. So I think we should add a new browser-search-engine-modified observer to nsBrowserGlue that takes care of this, instead of sticking this logic into the existing one in search.xml (that also happens to be per-window).
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #21)
+> 
+> I still don't understand how this test works - there's nothing in the search
+> service itself that enforces defaultEngine is always the same as
+> currentEngine - that happens in the application logic (search.xml), which
+> shouldn't be involved in an xpcshell test.
+> 
+> So I would expect these currentEngine checks to fail - setting the
+> defaultEngineName pref shouldn't impact currentEngine's value.
+> 
+
+I suspect this line to be the culprit and I don't think this if-clause is needed anymore: http://mxr.mozilla.org/mozilla-central/source/toolkit/components/search/nsSearchService.js#3632
+Oh, I see. The intent of that code was to avoid saving a "current engine" pref if the user set the current engine to the build's default, so that if we change the default engine in the future, that change would impact users who had switched away from and then back to the build's "default" engine (see bug 344159).
+
+I think we want to maintain that behavior, but now that this.defaultEngine doesn't represent the build's default engine, that probably needs to be a different check. We may need to use something like what we used to have as originalDefaultEngine.
+Created attachment 749336
+Make sure that defaultEngine and currentEngine stay in sync
+
+Moved engine selection change observer to nsBrowserGlue
+Created attachment 749337
+unit test coverage
+
+cleaned up the test and ensured that the tested subject is properly covered.
+Comment on attachment 749336
+Make sure that defaultEngine and currentEngine stay in sync
+
+>diff --git a/browser/components/nsBrowserGlue.js b/browser/components/nsBrowserGlue.js
+
+>+  XPCOMUtils.defineLazyServiceGetter(this, "_searchService",
+
+Just use Services.search.
+
+>+      case "browser-search-engine-modified":
+>+        if (!/^engine-(?:current|default)$/.test(data)) {
+>+          break;
+
+Eww regex. Just break this into an if (data != "engine-default" && data != "engine-current")
+
+It's probably worth a comment about why we're doing this here. Something like:
+
+// Enforce that the search service's defaultEngine always be equal to its currentEngine.
+// The search service will notify us any time either of them are changed (either by directly
+// setting the relevant prefs, i.e. if add-ons try to change this directly, or if the
+// nsIBrowserSearchService setters are called).
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>   set defaultEngine(val) {
+>     this._ensureInitialized();
+>-    if (!(val instanceof Ci.nsISearchEngine))
+>+    if (!(val instanceof Ci.nsISearchEngine) && !(val instanceof Engine))
+>       FAIL("Invalid argument passed to defaultEngine setter");
+
+Comment here too:
+
+// Sometimes we get wrapped nsISearchEngine objects (external XPCOM callers),
+// and sometimes we get raw Engine JS objects (callers in this file), so handle
+// both.
+
+(also needed in the currentEngine setter)
+
+>   set currentEngine(val) {
+
+>     if (this._currentEngine == this.defaultEngine) {
+>       Services.prefs.clearUserPref(currentEnginePref);
+>     }
+>     else {
+>       setLocalizedPref(currentEnginePref, this._currentEngine.name);
+>     }
+
+We'll need to change this, per comment 24. This is tricky, because our "keep currentEngine==defaultEngine" kind of conflicts with the search service's behavior of falling back to defaultEngine if currentEngine isn't set. I think it requires re-introducing the originalDefaultEngine concept (though it can be private to the search service, not exposed via the API), and then using that here instead of defaultEngine. Also, we'll need to use it as fallback in the current engine getter. I think that will enforce the same behavior that we currently have (where if we change the default shipped engine, users who were using the old default will switch to the new default).
+
+r- for this last bit, but this is otherwise quite close!
+Comment on attachment 749336
+Make sure that defaultEngine and currentEngine stay in sync
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>+  setEngineByPref: function(aEngineType, aPref) {
+
+One nit: name this _setEngineByPref since it's internal. Also I was trying to keep internal methods ordered separately from exposed API methods in this file, but we may have already failed at that so that's not a big deal.
+
+>+    this._ensureInitialized();
+>+    let newEngine = this.getEngineByName(getLocalizedPref(aPref, ""));
+>+    if (!newEngine)
+>+      FAIL("Can't find engine in store!", Cr.NS_ERROR_UNEXPECTED);
+
+Hmm, should we handle this more gracefully? I guess the status quo is that we don't really properly support people setting these prefs to bogus values (doesn't impact the current session, but changes the getters return values in subsequent sessions), so this isn't really getting any worse. Maybe worth cleaning up in a followup, though.
+Comment on attachment 749337
+unit test coverage
+
+>diff --git a/toolkit/components/search/tests/xpcshell/test_prefSync.js b/toolkit/components/search/tests/xpcshell/test_prefSync.js
+
+>+function search_observer(aSubject, aTopic, aData) {
+
+>+  setLocalizedPref("browser.search.defaultenginename", engine2Name);
+>+  // Default engine should be synced with the pref
+>+  do_check_eq(search.defaultEngine.name, engine2Name);
+>+  // Current engine should've stayed the same
+>+  do_check_eq(search.currentEngine.name, engine1Name);
+
+Better to test engine objects instead of just the names.
+
+Some additional tests that cover the scenario from comment 27 would be good. That likely involves setting defaultenginename on the default pref branch (to modify the return value of _originalDefaultEngine), and then setting the current engine to that engine, and seeing whether the selectedEngine pref gets cleared accordingly.
+Created attachment 751070
+Make sure that defaultEngine and currentEngine stay in sync
+
+Patch now also includes unit tests.
+Created attachment 751125
+additional changes to fix test
+
+I found two issues with the test:
+- you want to be testing that the selectedEngine pref doesn't have a user value (i.e. doesn't exist) rather than testing that its value is ""
+- to set a localized pref on the default branch, you need to set it in a format that getComplexValue(nsIPLS) will read. That means you need to set a char pref that points to a URI of a properties file that contains the pref value. We can use a data: URI for this to simplify.
+Created attachment 752664
+Make sure that defaultEngine and currentEngine stay in sync
+
+merged Gavin's test fixes into main patch
+Comment on attachment 752664
+Make sure that defaultEngine and currentEngine stay in sync
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>   set currentEngine(val) {
+
+>+    // If we change the default engine in the future, that change would impact
+>+    // users who have switched away from and then back to the build's "default"
+>+    // engine. For that case we revert back to the original default.
+
+I would re-word:
+ - s/would/should/
+ - change the last sentence to be: "So clear the user pref when the currentEngine is set to the default engine, so that the currentEngine getter falls back to whatever the default is."
+
+>-    if (this._currentEngine == this.defaultEngine) {
+>+    if (this._currentEngine == this._originalDefaultEngine) {
+
+There's a potential issue here: for this to work, the currentEngine getter has to default to returning _originalDefaultEngine when the pref isn't set. Otherwise, in the scenario we care about (first-run after an upgrade with a default engine change), the getter will fall back to returning defaultEngine, which will just be equivalent to what the currentEngine pref would have been anyhow.
+
+Though actually, probably the best way to fix this would be to just introduce the same behavior for the defaultEngine setter. That way, when the "stay in sync" code in browser sets the defaultEngine (in response to the currentEngine being set), it will also clear the defaultenginename pref, and then on next startup both defaultenginename and selectedEngine will have default values (and fall back to the default pref).
+
+Sorry this is going through many cycles (with some delay on my end each time). There's a lot of complication and legacy/untested behavior to care about, so it's hard to move fast. Feels like we're almost there now, though :)
+Created attachment 754480
+Make sure that defaultEngine and currentEngine stay in sync
+Comment on attachment 754480
+Make sure that defaultEngine and currentEngine stay in sync
+
+We still need to figure out what to do about comment 13, but that is kind of complicated, so I can file a new bug about that.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/498f79c24e70
+Backed out for failures in:
+browser/components/search/test/browser_contextmenu.js
+browser/components/search/test/browser_healthreport.js
+browser/components/search/test/browser_private_search_perwindowpb.js
+browser/components/search/test/browser_426329.js
+Created attachment 759913
+test fix
+
+So the reason the tests were failing was that this patch caused the order of notifications from the search service to change. There's code from part 2 of bug 738818 in the search service's removeEngine that calls clearUserPref on defaultenginename when removing the default engine. With the pref observing changes from this patch, that ended up calling the defaultEngine setter, which in turn calls the currentEngine setter via the nsBrowserGlue syncing logic, resetting currentEngine and notifying about it from under the removeEngine call. This caused the observers in those tests (e.g. http://hg.mozilla.org/mozilla-central/annotate/9ca690835a5e/browser/components/search/test/browser_contextmenu.js#l22) to get a spurious "engine-current" notification that they weren't expecting.
+
+My solution was to just remove that clearUserPref call in removeEngine. Since the defaultEngine getter deals with the pref being set to a non-existent or hidden engines already, even after restarts, it doesn't seem necessary. Also, if you remove and then re-install an engine, it doesn't seem to bad to persist its "defaultness" state. Though it is a bit weird that defaultEngine will potentially change without an engine-default notification in that case - hrm. I guess the upside is that bug 493051 means that this can't currently happen, since engine installation will almost always change selectedEngine (and notify engine-current, which sets defaultEngine in Firefox desktop). I will file a followup bug about looking into this.
+
+I also added a search service test specifically for the notification orders in this scenario, which fails with the nsSearchService change undone.
+Comment on attachment 759913
+test fix
+
+Review of attachment 759913:
+-----------------------------------------------------------------
+
+I like having more test coverage and I don't see any issues with you proposed fix.
+
+But whichever way I try, I can't make the tests fail on my macbook pro. I tried for an hour to make the tests you mentioned fail (running 'em multiple times, with and without the patch applied)...
+
+With the current m-c build `browser/components/search/test/browser_contextmenu.js` perma-fails for me due to memleaks, which is a different issue altogether.
+
+So in this case I have to 'assume' this fixes the oranges.
+
+Apart from all this as more general thing, in my humble experience (IMHE) when working with a pubsub pattern, relying on the _order_ of events is an anti-pattern that should be avoided. Not in all cases, like 'onready'-like deferred execution style, but in this case I think no search service consumer ought to rely on notification emission order.
+
+::: toolkit/components/search/nsSearchService.js
+@@ -3371,5 @@
+>  
+>      if (engineToRemove == this.currentEngine) {
+>        this._currentEngine = null;
+>      }
+> -    
+
+OMG! Kill all the whitespacezzzz!
+
+::: toolkit/components/search/tests/xpcshell/test_notifications.js
+@@ +46,5 @@
+> +        Services.search.removeEngine(engine);
+> +      });
+> +      break;
+> +    case "engine-removed":
+> +      expectedLog = expectedLog.map(l => l + engineNameOutput);
+
+I love the arrow syntax :) Could you use a different arg name than 'l'? I had to blink to discern it from a '1', honestly :P
+
+And there's no reaaaal need to declare `engineNameOutput` on top, instead of right above the `map` call, right?
+(In reply to Mike de Boer [:mikedeboer] from comment #39)
+> Apart from all this as more general thing, in my humble experience (IMHE)
+> when working with a pubsub pattern, relying on the _order_ of events is an
+> anti-pattern that should be avoided. Not in all cases, like 'onready'-like
+> deferred execution style, but in this case I think no search service
+> consumer ought to rely on notification emission order.
+
+I generally agree, though in this particular case, given the message semantics, there is at least some enforced ordering ("loaded" must come before "added", which must come before "current"/"default", etc.), so this doesn't seem so bad. Either way we're clearly past the point of being able to say "don't rely on ordering" :)
+
+> I love the arrow syntax :) Could you use a different arg name than 'l'? I
+> had to blink to discern it from a '1', honestly :P
+> 
+> And there's no reaaaal need to declare `engineNameOutput` on top, instead of
+> right above the `map` call, right?
+
+Fixed these.
+Created attachment 763732
+combined patch
+https://hg.mozilla.org/integration/mozilla-inbound/rev/9d6db6508757
+https://hg.mozilla.org/mozilla-central/rev/9d6db6508757
+Comment on attachment 763732
+combined patch
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): bug 738818
+User impact if declined: strange/unpredictable behavior for searching when extensions have changed search prefs, with no way to easily address it 
+Testing completed (on m-c, etc.): on m-c, automated tests
+Risk to taking this patch (and alternatives if risky): relatively low risk. we really need this patch as a complement to the changes in bug 738818, not many other options
+String or IDL/UUID changes made by this patch: none
+https://hg.mozilla.org/releases/mozilla-aurora/rev/fa866cae8117
+Tested on: Win 7 64bit, Ubuntu 12.10 32bit and Mac OSX 10.8 with Firefox 23 beta 1, build ID: 20130625125232. 
+
+1) when changing the engines from the search bar (Yahoo, Bing, eBay, etc.),  "browser.search.defaultenginename" and "browser.search.selectedEngine" change their values too, and these are all the same
+
+2) when installing a new search engine (for example: Duck Duck Go) and selecting it from the search bar, the 2 prefs also update to the correct value
+
+1) and 2) work correctly.
+
+But there is an issue I've found: after removing a search engine (for example: Duck Duck Go) from the Manage Search Engines dialog, the search engine from the search bar automatically switches to Google, but the 2 prefs still have "DuckDuckGo" as value, even after a browser restart. And when performing the 3 searches (from URL bar, from about:home and from the search bar), all of them are using Google search engine. Any thoughts on this?
+(In reply to Manuela Muntean [:Manuela] [QA] from comment #46)
+> But there is an issue I've found: after removing a search engine (for
+> example: Duck Duck Go) from the Manage Search Engines dialog, the search
+> engine from the search bar automatically switches to Google, but the 2 prefs
+> still have "DuckDuckGo" as value, even after a browser restart. And when
+> performing the 3 searches (from URL bar, from about:home and from the search
+> bar), all of them are using Google search engine. Any thoughts on this?
+
+This is expected at the moment, but may need to be revisited in bug 885351.
+Marking this verified for Fx 23, based on comment 46 and comment 47. Thanks Gavin!
+I have just started using Firefox 23.0 and noticed that now this behaviour has been implemented (had not heard of it before since I do not currently use any testing versions of Firefox or follow what is going on regarding suggestions).
+It has always felt odd to change the default search engine using about:config and I have always secretely wished for it to be adjustable using some more intuitive settings, but I have also enjoyed using the default search engine for general searches invoked from the address field and the search field for searches on, say, Wikipedia.
+
+My question now is this: What is the point in having a dedicated search engine field when typing the query into the address field does pretty much the same thing?
+See bug 738818 comment 142 and 143 and
+https://addons.mozilla.org/en-US/firefox/addon/keyword-search/ (ext to restore old behaviour)
+
+No more comments about this subject, please.
+mass remove verifyme requests greater than 4 months old

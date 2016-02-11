@@ -1,0 +1,265 @@
+Open the webconsole and type "window.O".
+The only possible completion is "window.Object".
+Yet, no completion is provided.
+
+The reason for that is that currently, the webconsole only lists enumerable properties in its completion system.
+
+Open the webconsole and type "window.O".
+The only possible completion is "window.Object".
+Yet, no completion is provided.
+
+The reason for that is that currently, the webconsole only lists enumerable properties in its completion system.
+Created attachment 644125
+Better autocompletion using the full scope.
+
+With this patch, autocompletion in the webconsole now uses all properties of each object, not just enumerable properties.
+Comment on attachment 644125
+Better autocompletion using the full scope.
+
+Quick feedback:
+
+>       // If obj is undefined or null, then there is no chance to run completion
+>       // on it. Exit here.
+>-      if (typeof obj === "undefined" || obj === null) {
+>+      if (obj == null) {
+>         return null;
+>       }
+
+Please update the comment to reflect the fact that obj==null also tests obj===undefined.
+
+>@@ -920,7 +920,7 @@ function JSPropertyProvider(aScope, aInp
+> 
+>   // If obj is undefined or null, then there is no chance to run
+>   // completion on it. Exit here.
+>-  if (typeof obj === "undefined" || obj === null) {
+>+  if (obj == null) {
+>     return null;
+>   }
+
+Same here.
+
+>+  function getRealScope(obj) {
+>+    let names = getScope(obj);
+>+    for (let prop in obj) {
+>+      if (names.indexOf(prop) === -1) {
+>+        names.push(prop);
+>+      }
+>+    }
+>+    return names;
+>+  }
+>+
+>   let matches = [];
+>-  for (let prop in obj) {
+>+  let names = getRealScope(obj);
+>+  for (let i = 0; i < names.length; i++) {
+>+    let prop = names[i];
+>     if (prop.indexOf(matchProp) == 0) {
+>       matches.push(prop);
+>     }
+
+
+Decide if you want to use == or === (===-1 / ==0).
+Use (let prop of names).
+
+And we need tests.
+Created attachment 644139
+Better autocompletion using the full scope.
+
+I added a test that ensures that "window.O" autocompletes to "window.Object".
+
+Paul, I took care of your comments.
+Created attachment 644196
+Better autocompletion using the full scope.
+
+This patch features better performance than the previous one,
+a fix for a mistake in the algorithm used to get all accessible properties of the object,
+and a great deal of test changes.
+
+All tests pass on my machine, I submitted this patch to try at https://tbpl.mozilla.org/?tree=Try&rev=8917a5333238.
+Comment on attachment 644196
+Better autocompletion using the full scope.
+
+Review of attachment 644196:
+-----------------------------------------------------------------
+
+I am not sure if we really want all of the non-enumerable properties in autocomplete - or maybe not in the current user experience. There's a reason why we skipped them. There's a lot of stuff now that I am not sure I want all the time.
+
+Let's ask for Rob's opinion as well.
+
+Rob: do we want *all* of the properties?
+
+It would be nice if we could show the properties from inherited objects *except the native ones*. For example, if the author has a complicated object with lots of properties inherited through the prototype chain... then, yes, it makes sense to show those properties. However, native things like __defineGetter__ or the overly-common toString ... I don't see too much value in having these in the list.
+
+Another idea: it could be nice to have all of the non-enumerable properties available for autocomplete via keyboard, but not have them all displayed in the list. Kinda weird, but it might be worth looking into?
+
+On a related note, we need a bug about limiting the number of items we display in the popup. In some cases it can get overloaded.
+
+::: browser/devtools/webconsole/WebConsoleUtils.jsm
+@@ +951,1 @@
+>      if (prop.indexOf(matchProp) == 0) {
+
+For performance concerns this can be rewritten as:
+
+matches = []
+function filterProperties (obj) {
+  for prop in obj: // loop through the enumerable prototypes.
+    if prop.indexOf(matchProp):
+      matches.push(prop)
+  let proto = getproto obj
+  if proto:
+    filterProperties proto
+}
+
+filterProperties(obj)
+
+
+... this pseudo code shows we can loop far fewer times through the properties.
+Mihai: this work was motivated by people I know wondering why certain properties,
+most notably |window.Object|, didn't show up as a possible completion.
+
+On the other hand, your performance ideas motivated me to tune
+the algorithm further.
+
+1. Adding only filtered properties, as you suggested.
+It does feel slightly faster, although I have made no measurements.
+
+2. A huge number of possible completions.
+I noted that writing the following sequence of commands in the web console
+(meaning the one that is already shipped!):
+
+> window.a = []
+> for (var i = 0; i < 1000000; i++)  window.a.push(i);
+> window.a.<TAB>
+
+results in the browser freezing for two minutes or so, and then displaying
+the infamous "A script on this page may be busy.
+Do you want to stop it? Do you want to debug it?" window.
+
+[As a side-note, debugging that script fails, for obvious reasons.]
+
+I added a maximum number of properties.
+512 seems like a reasonable maximum number; what do you think?
+
+3. I cannot use your algorithm as you suggest it, because the prototype of
+window contains window, which would create a duplicate.
+I used an Object whose keys are the properties I want to ensure unicity,
+and I do |Object.keys| to collect all properties as an Array, which is faster
+than looping over them.
+
+I'll publish here my new patch when the tests are modified accordingly.
+(In reply to Mihai Sucan [:msucan] from comment #5)
+> I am not sure if we really want all of the non-enumerable properties in
+> autocomplete - or maybe not in the current user experience. There's a reason
+> why we skipped them. There's a lot of stuff now that I am not sure I want
+> all the time.
+
+Something to note is that all our competitors provide all the information
+that developers might need, or expect.
+Google Chrome, Safari, Opera, IE, all autocomplete |window.O| to |window.Object|.
+
+To be exact, they have more than just one completion for |window.O|.
+Opera has |window.OCSSKeyframesRule| and |window.Option|, and
+Chrome has |window.OfflineAudioCompletionEvent|, |window.Option|, |window.OverflowEvent|.
+
+The fact remains that if |e = {}|, |e.|
+autocompletes to |e.__defineGetter__| first.
+(In reply to Thaddee Tyl [:espadrine] from comment #6)
+> Mihai: this work was motivated by people I know wondering why certain
+> properties,
+> most notably |window.Object|, didn't show up as a possible completion.
+> 
+> On the other hand, your performance ideas motivated me to tune
+> the algorithm further.
+> 
+> 1. Adding only filtered properties, as you suggested.
+> It does feel slightly faster, although I have made no measurements.
+
+I haven't done measurements either, but adding only filtered properties, skipping to loop through all of the properties multiple times... was something that made sense when I read the code. Easy to optimize.
+
+> 2. A huge number of possible completions.
+> I noted that writing the following sequence of commands in the web console
+> (meaning the one that is already shipped!):
+> 
+> > window.a = []
+> > for (var i = 0; i < 1000000; i++)  window.a.push(i);
+> > window.a.<TAB>
+> 
+> results in the browser freezing for two minutes or so, and then displaying
+> the infamous "A script on this page may be busy.
+> Do you want to stop it? Do you want to debug it?" window.
+
+Yep, known problem...
+
+> [As a side-note, debugging that script fails, for obvious reasons.]
+> 
+> I added a maximum number of properties.
+> 512 seems like a reasonable maximum number; what do you think?
+
+For me this sounds good.
+
+
+> 3. I cannot use your algorithm as you suggest it, because the prototype of
+> window contains window, which would create a duplicate.
+> I used an Object whose keys are the properties I want to ensure unicity,
+> and I do |Object.keys| to collect all properties as an Array, which is faster
+> than looping over them.
+
+My pseudo code wasn't complete (must've included some mistakes :) ), and yeah, I forgot to suggest the use of Object.keys. I mainly wanted a change in the code that only adds the filtered props, once and it's all done.
+
+> I'll publish here my new patch when the tests are modified accordingly.
+
+Thank you!
+
+
+On the aspect of providing non-enumerable properties: if all others do it, we need to include them as well. Can't say no that. :)
+Created attachment 644842
+Better autocompletion using the full scope.
+
+Performance improvements.
+Comment on attachment 644842
+Better autocompletion using the full scope.
+
+Review of attachment 644842:
+-----------------------------------------------------------------
+
+Thanks for your update.
+
+Suggestions (not binding to the review):
+- place the MAX_COMPLETIONS constant where other constants are defined. Search for const STATE_NORMAL = ... (for example).
+  - then you can use the constant in getMatchedProps(), without needing the third argument.
+- function arguments are prefixed with "a".
+- please use double quotes where possible.
+
+Please push the patch to the try server. Thanks!
+Created attachment 645027
+[in-fx-team] Better autocompletion using the full scope.
+
+Mihai: I took care about your comments. (Maybe I didn't catch all the '' strings.)
+I have a test run on the try branch with that patch at https://tbpl.mozilla.org/?tree=Try&rev=499994468fd6.
+(In reply to Thaddee Tyl [:espadrine] from comment #12)
+> I have a test run on the try branch with that patch at
+> https://tbpl.mozilla.org/?tree=Try&rev=499994468fd6.
+
+The try run is green, but I've previously seen dbg-specific failures.
+
+Please include debug builds and optimized build in a new try run. Also, please include all linux, mac and windows variants.
+Latest try run:
+https://tbpl.mozilla.org/?tree=Try&rev=04a62ff808e6
+
+Results look good. Thank you Thaddee!
+Comment on attachment 645027
+[in-fx-team] Better autocompletion using the full scope.
+
+Landed:
+https://hg.mozilla.org/integration/fx-team/rev/981a3fc38a15
+https://hg.mozilla.org/mozilla-central/rev/981a3fc38a15
+f+ :)
+
+I think we should show it all. Nice improvement Thaddée!
+
+
+Web Console autocomplete should include full scope
+
+
+
+Bug 775812 - Web Console autocomplete should include full scope; r=msucan 

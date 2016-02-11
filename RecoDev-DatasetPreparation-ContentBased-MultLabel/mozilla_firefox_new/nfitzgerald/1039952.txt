@@ -1,0 +1,403 @@
+Right now we have to repeat some logic for managing debuggee global sets in each actor that wants to use a Debugger instance. Since the sets will always be for either a tab, an addon, or the whole browser regardless of which actor is using the debugger, the RootActor/TabActor/AddonActor should manage the set of debuggees, not each actor that wants to use a particular set of debuggees.
+
+This WIP patch works for tabs, almost for addons (dynamically added scripts don't work, eg added via a new Cu.import or a new tab after we are already debugging), and I haven't tried chrome debugging yet.
+
+Right now we have to repeat some logic for managing debuggee global sets in each actor that wants to use a Debugger instance. Since the sets will always be for either a tab, an addon, or the whole browser regardless of which actor is using the debugger, the RootActor/TabActor/AddonActor should manage the set of debuggees, not each actor that wants to use a particular set of debuggees.
+
+This WIP patch works for tabs, almost for addons (dynamically added scripts don't work, eg added via a new Cu.import or a new tab after we are already debugging), and I haven't tried chrome debugging yet.
+Created attachment 8457814
+make-debugger.patch
+
+Mossop, I feel like I'm bashing my head into a brick wall. Hopefully it's just cause it's late. But, could you give this a quick glance over and see if there is any obvious reason dynamically added scripts don't show up in the addon debugger?
+
+See the added debug comments in browser/devtools/debugger/test/browser_dbg_addon-modules-unpacked.js (which is failing).
+
+Thanks!
+Comment on attachment 8457814
+make-debugger.patch
+
+Nevermind, figured it out. Needed to be more careful about when I have a wrapped global vs unwrapped global.
+
+Cleaning some stuff up, then a new patch will be forthcoming.
+Created attachment 8457903
+make-debugger.patch
+
+https://tbpl.mozilla.org/?tree=Try&rev=e217953f2b5d
+Comment on attachment 8457903
+make-debugger.patch
+
+Review of attachment 8457903:
+-----------------------------------------------------------------
+
+Lots of breakage in the try run, so I'll wait for an updated patch.
+Created attachment 8459816
+make-debugger.patch
+
+Properly rebased on fx-team. I think I messed up last time when I had to resolve some failures to apply hunks manually. xpcshell tests are passing for me, but I can't get mochitest-dt to pass on fx-team without patches applied, but it looks all good on TBPL, so I think the problem is local.
+
+Anyways, here is a new try push: https://tbpl.mozilla.org/?tree=Try&rev=2bf330bb5c60
+Comment on attachment 8459816
+make-debugger.patch
+
+Review of attachment 8459816:
+-----------------------------------------------------------------
+
+I have a few comments that warrant another iteration.
+
+Bug 736078, which just landed, introduced the inspector to the Debugger API. You should refactor that too.
+
+It seems to me that splitting helper functions in separate modules is rather stretching the module concept. unwrapDebuggerObjectGlobal in particular is always used in tandem with makeDebugger, so why split them apart? I assume that this is done to save some memory on b2g, but without actual data it's more of a premature optimization.
+
+::: toolkit/devtools/server/Makefile.in
+@@ +7,5 @@
+>  libs::
+>  	$(INSTALL) $(IFLAGS1) $(srcdir)/*.jsm $(FINAL_TARGET)/modules/devtools
+>  	$(INSTALL) $(IFLAGS1) $(srcdir)/*.js $(FINAL_TARGET)/modules/devtools/server
+>  	$(INSTALL) $(IFLAGS1) $(srcdir)/actors/*.js $(FINAL_TARGET)/modules/devtools/server/actors
+> +	$(INSTALL) $(IFLAGS1) $(srcdir)/actors/utils/*.js $(FINAL_TARGET)/modules/devtools/server/actors/utils
+
+I believe this will need an approval from a build peer.
+
+::: toolkit/devtools/server/actors/root.js
+@@ +94,5 @@
+>    this._onTabListChanged = this.onTabListChanged.bind(this);
+>    this._onAddonListChanged = this.onAddonListChanged.bind(this);
+>    this._extraActors = {};
+> +
+> +  this.makeDebugger = makeDebugger.bind(null, {
+
+A comment that this creates a debugger set up for chrome debugging would be nice.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +4734,5 @@
+>    /**
+>     * Override the eligibility check for scripts and sources to make sure every
+>     * script and source with a URL is stored when debugging chrome.
+>     */
+> +  _allowSource: function(aSourceURL) !!aSourceURL
+
+Fix the SpiderMonkey-ism while you are here?
+
+@@ -4850,5 @@
+> -   */
+> -  globalManager: {
+> -    findGlobals: function () {
+> -      // Add every global known to the debugger as debuggee.
+> -      this.dbg.addAllGlobalsAsDebuggees();
+
+Why can't we keep this optimization in the new world order? It would be a shame to stop using it as we've been trying to optimize the startup path of the chrome debugger.
+
+How about makeDebugger() expecting an extra optional addDebuggees() function, and attach its own when it's missing? Or perhaps this can be used as the findDebuggees() implementation of the root actor?
+
+::: toolkit/devtools/server/actors/utils/make-debugger.js
+@@ +96,5 @@
+> +    }
+> +  } catch (e) {
+> +    let msg = "safeAddDebuggee: Ignoring attempt to add the debugger's "
+> +            + "compartment as a debuggee";
+> +    reportException(msg, e);
+
+This pollutes the console and terminal with scary warnings that are not necessary. The only way for addDebuggee to fail is if the global's compartment is the same as the debugger's, which we are already expecting.
+
+You could use a dumpn() call if you feel strongly about logging this error, so that it will only bother browser developers like us.
+
+::: toolkit/devtools/server/actors/webconsole.js
+@@ -1010,5 @@
+>  
+>      // If we have an object to bind to |_self|, create a Debugger.Object
+>      // referring to that object, belonging to dbg.
+>      let bindSelf = null;
+> -    let dbgWindow = dbg.makeGlobalObjectReference(this.evalWindow);
+
+Why was this removed? It's required in the code below.
+(In reply to Panos Astithas [:past] from comment #6)
+> Comment on attachment 8459816
+> make-debugger.patch
+> 
+> Review of attachment 8459816:
+> -----------------------------------------------------------------
+> 
+> I have a few comments that warrant another iteration.
+> 
+> Bug 736078, which just landed, introduced the inspector to the Debugger API.
+> You should refactor that too.
+> 
+> It seems to me that splitting helper functions in separate modules is rather
+> stretching the module concept. unwrapDebuggerObjectGlobal in particular is
+> always used in tandem with makeDebugger, so why split them apart? I assume
+> that this is done to save some memory on b2g, but without actual data it's
+> more of a premature optimization.
+
+Its actually required in two different files, otherwise I would have kept it as a helper in make-debugge.js. Generally, I try to have modules export a single thing. Any helpers for that thing won't be split out, but as soon as they are needed elsewhere (as the case was here) they get split out.
+
+Empirically, contributors have a lot of trouble navigating our files because it isn't clear which modules export which thing. The practice of a module-per-exported-thing really helps, although there are definitely cases when it makes sense not to.
+
+> @@ -4850,5 @@
+> > -   */
+> > -  globalManager: {
+> > -    findGlobals: function () {
+> > -      // Add every global known to the debugger as debuggee.
+> > -      this.dbg.addAllGlobalsAsDebuggees();
+> 
+> Why can't we keep this optimization in the new world order? It would be a
+> shame to stop using it as we've been trying to optimize the startup path of
+> the chrome debugger.
+> 
+> How about makeDebugger() expecting an extra optional addDebuggees()
+> function, and attach its own when it's missing? Or perhaps this can be used
+> as the findDebuggees() implementation of the root actor?
+
+I just tested the difference in my main profile with 25 tabs open + 20 something addons.
+
+addAllGlobalsAsDebuggees     - 13ms
+findAllGlobals + addDebuggee - 20ms
+
+Sure, I can add the `addDebuggees` method, but is the 7ms really worth it?
+
+> ::: toolkit/devtools/server/actors/webconsole.js
+> @@ -1010,5 @@
+> >  
+> >      // If we have an object to bind to |_self|, create a Debugger.Object
+> >      // referring to that object, belonging to dbg.
+> >      let bindSelf = null;
+> > -    let dbgWindow = dbg.makeGlobalObjectReference(this.evalWindow);
+> 
+> Why was this removed? It's required in the code below.
+
+The exact same line is repeated below it. I assume this was just the result of a bad rebase/merge.
+Created attachment 8461116
+make-debugger.patch
+
+Changes in this version:
+
+* Added comment for the RootActor's makeDebugger.
+* Drive-by removal of a SpiderMonkey-ism.
+* No more "exception" reporting for attempting to add the debugger's compartment as a debuggee.
+
+:gps, can you review the oneline change in toolkit/devtools/server/Makefile.in? Thanks!
+
+New try push: https://tbpl.mozilla.org/?tree=Try&rev=428808d343eb
+Comment on attachment 8461116
+make-debugger.patch
+
+Review of attachment 8461116:
+-----------------------------------------------------------------
+
+r+ covers Makefile.in only.
+
+::: toolkit/devtools/server/Makefile.in
+@@ +7,5 @@
+>  libs::
+>  	$(INSTALL) $(IFLAGS1) $(srcdir)/*.jsm $(FINAL_TARGET)/modules/devtools
+>  	$(INSTALL) $(IFLAGS1) $(srcdir)/*.js $(FINAL_TARGET)/modules/devtools/server
+>  	$(INSTALL) $(IFLAGS1) $(srcdir)/actors/*.js $(FINAL_TARGET)/modules/devtools/server/actors
+> +	$(INSTALL) $(IFLAGS1) $(srcdir)/actors/utils/*.js $(FINAL_TARGET)/modules/devtools/server/actors/utils
+
+Strictly speaking, we should be using INSTALL_TARGETS. But the pattern is already in this file, so meh.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #7)
+> (In reply to Panos Astithas [:past] from comment #6)
+
+> > Bug 736078, which just landed, introduced the inspector to the Debugger API.
+> > You should refactor that too.
+
+What about this?
+
+> > It seems to me that splitting helper functions in separate modules is rather
+> > stretching the module concept. unwrapDebuggerObjectGlobal in particular is
+> > always used in tandem with makeDebugger, so why split them apart? I assume
+> > that this is done to save some memory on b2g, but without actual data it's
+> > more of a premature optimization.
+> 
+> Its actually required in two different files, otherwise I would have kept it
+> as a helper in make-debugge.js. Generally, I try to have modules export a
+> single thing. Any helpers for that thing won't be split out, but as soon as
+> they are needed elsewhere (as the case was here) they get split out.
+> 
+> Empirically, contributors have a lot of trouble navigating our files because
+> it isn't clear which modules export which thing. The practice of a
+> module-per-exported-thing really helps, although there are definitely cases
+> when it makes sense not to.
+
+But the convention that modules export a single function is not common in mozilla code, as far as I can see. I can see your point, but I don't see why someone who wants to use, say makeInfallible, would go through the exported symbols in each file, instead of looking for existing callers of that function and how they import it.
+
+The specific concern in the case of makeDebugger and unwrapDebuggerObjectGlobal is that they are always needed at the same time, so why not group them together to reinforce that dependency (and avoiding dumb errors when forgetting to require one or the other)?
+
+My broader concern is that without a clear guideline on when it's advisable to use a separate module for a function we could end up with a boatload of modules, which would increase boilerplate code (e.g. require calls), if nothing else.
+
+If my arguments don't sway you however, I'm not going to insist.
+
+> > > -      this.dbg.addAllGlobalsAsDebuggees();
+> > 
+> > Why can't we keep this optimization in the new world order? It would be a
+> > shame to stop using it as we've been trying to optimize the startup path of
+> > the chrome debugger.
+> > 
+> > How about makeDebugger() expecting an extra optional addDebuggees()
+> > function, and attach its own when it's missing? Or perhaps this can be used
+> > as the findDebuggees() implementation of the root actor?
+> 
+> I just tested the difference in my main profile with 25 tabs open + 20
+> something addons.
+> 
+> addAllGlobalsAsDebuggees     - 13ms
+> findAllGlobals + addDebuggee - 20ms
+> 
+> Sure, I can add the `addDebuggees` method, but is the 7ms really worth it?
+
+Perhaps not, I'll defer to you on this one.
+
+> > Why was this removed? It's required in the code below.
+> 
+> The exact same line is repeated below it. I assume this was just the result
+> of a bad rebase/merge.
+
+Oh you are right, I somehow missed that.
+Comment on attachment 8461116
+make-debugger.patch
+
+Review of attachment 8461116:
+-----------------------------------------------------------------
+
+I don't have much to add to the previous comments. Don't forget about inspector.js.
+
+::: toolkit/devtools/server/actors/tracer.js
+@@ -95,5 @@
+> -  // former.
+> -  this.global = aParentActor.window;
+> -  if (!Cu.isXrayWrapper(this.global)) {
+> -      this.global = this.global.wrappedJSObject;
+> -  }
+
+So this is no longer needed, huh? Nice.
+
+::: toolkit/devtools/server/actors/utils/make-debugger.js
+@@ +82,5 @@
+> +
+> +  return dbg;
+> +};
+> +
+> +const reportDebuggerHookException = e => reportException("Debugger Hook", e);
+
+Is this used in more than 1 place?
+
+::: toolkit/devtools/server/actors/utils/unwrap-debugger-object-global.js
+@@ +16,5 @@
+> + * @returns {Object|undefined}
+> + *          Returns the unwrapped global object or |undefined| if unwrapping
+> + *          failed.
+> + */
+> +module.exports = function unwrapDebuggerObjectGlobal(wrappedGlobal) {
+
+I promise I won't mention it again, but seriously, a module for a method call in a try/catch block?
+(In reply to Panos Astithas [:past] from comment #11)
+> ::: toolkit/devtools/server/actors/utils/make-debugger.js
+> @@ +82,5 @@
+> > +
+> > +  return dbg;
+> > +};
+> > +
+> > +const reportDebuggerHookException = e => reportException("Debugger Hook", e);
+> 
+> Is this used in more than 1 place?
+
+No but this way there is only ever one `reportDebuggerHookException` function allocated that is shared by all Debugger instances. If I inlined it into `makeDebugger`, then there would be a function for every Debugger instance. Not a big deal, but all else being equal...
+Good call.
+Created attachment 8461689
+make-debugger-pt-0.patch
+
+Ok, got rid of the unwrapDebuggerObjectGlobal module :P
+Created attachment 8461690
+make-debugger-pt-1.patch
+
+This is just the changes for the inspector.
+
+Can land separately from the first patch.
+
+Try push: https://tbpl.mozilla.org/?tree=Try&rev=f6c95417c7d6
+Created attachment 8463457
+make-debugger-pt-0.patch
+
+Just forgot to bind _shouldAddNewGlobalAsDebuggee in my last minor refactoring of part 0.
+
+Try push: https://tbpl.mozilla.org/?tree=Try&rev=b98d7b6cfd1e
+Created attachment 8463633
+make-debugger-pt-0.patch
+
+Sigh. Forgot to bind this in another place. Can't wait till bug 1042921 is fixed and I can run mochitests locally again...
+
+https://tbpl.mozilla.org/?tree=Try&rev=e843a1569f38
+https://hg.mozilla.org/integration/fx-team/rev/e024d12f7ee5
+https://hg.mozilla.org/integration/fx-team/rev/fea2a90e2d22
+https://hg.mozilla.org/mozilla-central/rev/e024d12f7ee5
+https://hg.mozilla.org/mozilla-central/rev/fea2a90e2d22
+This patch broke worker debugging, because WorkerThreadActors don't have direct access to their parent (which lives on the main thread).
+(In reply to Eddy Bruel [:ejpbruel] from comment #20)
+> This patch broke worker debugging, because WorkerThreadActors don't have
+> direct access to their parent (which lives on the main thread).
+
+Can you override the `dbg` getter and manually manager your debuggees then? You should still be able to take advantage of the `makeDebugger` function.
+https://hg.mozilla.org/integration/fx-team/rev/ddcde29ad05a
+https://hg.mozilla.org/mozilla-central/rev/ddcde29ad05a
+This last push, in contrary to what is stated in the commit message, duplicated existing code instead of removing it. This is the kind of thing peer review would have easily caught and why it is required for any substantial change (besides test-only ones). Why was it rushed in like that?
+(In reply to Panos Astithas [:past] from comment #24)
+> This last push, in contrary to what is stated in the commit message,
+> duplicated existing code instead of removing it. This is the kind of thing
+> peer review would have easily caught and why it is required for any
+> substantial change (besides test-only ones). Why was it rushed in like that?
+
+Yeah you're right, I'm not sure how I added that in the first place, I don't think it matters much since the Jetpack tests aren't being run anyhow though.
+
+I felt rushed because this has to be uplifted now because it was forgotten about, and I didn't want that to happen to it again.
+
+I think the better question to ask is why were the first two parts not reverted when you discovered they broke jetpack tests?  Then that code could have been reviewed properly.
+(In reply to Erik Vold [:erikvold] [:ztatic] from comment #25)
+> I think the better question to ask is why were the first two parts not
+> reverted when you discovered they broke jetpack tests?  Then that code could
+> have been reviewed properly.
+
+I don't know, but I'm not the right person to ask, since I wasn't actually aware until now that jetpack tests were in fact broken. In general we quickly backout patches that burn the tree, so I'm assuming jetpack tests aren't visible by default on tbpl?
+
+In any case, mistakes will always happen, that's for sure. What is important right now is to remove the forgotten declarations from script.js. Can you whip up a patch to do that?
+(In reply to Panos Astithas [:past] from comment #26)
+> (In reply to Erik Vold [:erikvold] [:ztatic] from comment #25)
+> > I think the better question to ask is why were the first two parts not
+> > reverted when you discovered they broke jetpack tests?  Then that code could
+> > have been reviewed properly.
+> 
+> I don't know, but I'm not the right person to ask, since I wasn't actually
+> aware until now that jetpack tests were in fact broken. In general we
+> quickly backout patches that burn the tree, so I'm assuming jetpack tests
+> aren't visible by default on tbpl?
+> 
+> In any case, mistakes will always happen, that's for sure. What is important
+> right now is to remove the forgotten declarations from script.js. Can you
+> whip up a patch to do that?
+
+sure, I think I'm going to just revert that patch and make a new one, sound good?
+Fine by me!
+The reason the original patch wasn't backed out was because I wasn't aware that any JP tests were broken until like a week later, after a bunch of patches dependant on this one landed as well. TBPL was reporting everything green.
+
+It would be nice if JP tests were better integrated with TBPL so that we could more easily determine when there are failures.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #29)
+> The reason the original patch wasn't backed out was because I wasn't aware
+> that any JP tests were broken until like a week later, after a bunch of
+> patches dependant on this one landed as well. TBPL was reporting everything
+> green.
+> 
+> It would be nice if JP tests were better integrated with TBPL so that we
+> could more easily determine when there are failures.
+
+Yes that would be nice, we had this and then releng removed it, see bug 1020473.
+
+In the meantime though you can still run and see the jetpack tests on the try server.
+
+
+Debuggee global sets should be managed by top level actors
+
+
+
+Bug 1039952 - Part 1: Make the inspector use makeDebugger. r=past 
+
+Bug 1039952 - Part 0: Make the parent actors manage the set of debuggees. r=fitzgen 
+
+Bug 1039952 - Part 2: Move getInnerId to actors/webbrowser.js. r=me 

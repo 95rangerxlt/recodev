@@ -1,0 +1,113 @@
+When loading a script's source, if we can't use the Debugger.Source text (sourcemapped, etc) we try to load it from the cache to skip another GET request. However we can't load it from cache all the time, for example we don't know when sourcemapped sources are updated.
+
+I'm a little confused about our rules for this and the code isn't clear to me, so I want to make sure it's working correctly after the big Debugger.Source change. Right now in `_getSourceText` it roughly follows this steps:
+
+1. if there's a sourcemap and it has the source contents for my url, return it
+2. if I have a Debugger.Source object, and my contentType is javascript, return the `text` property of the D.S object
+3. otherwise, do a GET request of my url, loading from cache if I do NOT have a Debugger.Source object
+
+For #3, we hit that when the source is sourcemapped or it's the special source representing the HTML page. Both don't have a Debugger.Source property or a contentType. The loading from cache logic here feels wrong, as the comment implies we should only load from the cache if it's not sourcemapped:
+
+        // XXX bug 865252: Don't load from the cache if this is a source mapped
+        // source because we can't guarantee that the cache has the most up to date
+        // content for this source like we can if it isn't source mapped.
+        let sourceFetched = fetch(this.url, { loadFromCache: !this.source });
+
+Since we load the source from the Debugger.Source.prototype.text property now, I can't even remember when we get to this point and we *can* load from cache. When is that even possible? If we are here, we either don't have a source or the contentType is not JS, which would always imply sourcemapped right? Is there a time when we DO have a Debugger.Source object but the contentType is NOT javascript?
+
+When loading a script's source, if we can't use the Debugger.Source text (sourcemapped, etc) we try to load it from the cache to skip another GET request. However we can't load it from cache all the time, for example we don't know when sourcemapped sources are updated.
+
+I'm a little confused about our rules for this and the code isn't clear to me, so I want to make sure it's working correctly after the big Debugger.Source change. Right now in `_getSourceText` it roughly follows this steps:
+
+1. if there's a sourcemap and it has the source contents for my url, return it
+2. if I have a Debugger.Source object, and my contentType is javascript, return the `text` property of the D.S object
+3. otherwise, do a GET request of my url, loading from cache if I do NOT have a Debugger.Source object
+
+For #3, we hit that when the source is sourcemapped or it's the special source representing the HTML page. Both don't have a Debugger.Source property or a contentType. The loading from cache logic here feels wrong, as the comment implies we should only load from the cache if it's not sourcemapped:
+
+        // XXX bug 865252: Don't load from the cache if this is a source mapped
+        // source because we can't guarantee that the cache has the most up to date
+        // content for this source like we can if it isn't source mapped.
+        let sourceFetched = fetch(this.url, { loadFromCache: !this.source });
+
+Since we load the source from the Debugger.Source.prototype.text property now, I can't even remember when we get to this point and we *can* load from cache. When is that even possible? If we are here, we either don't have a source or the contentType is not JS, which would always imply sourcemapped right? Is there a time when we DO have a Debugger.Source object but the contentType is NOT javascript?
+This bug is a continuation from https://bugzilla.mozilla.org/show_bug.cgi?id=905700#c57
+> Since we load the source from the Debugger.Source.prototype.text property now,
+> I can't even remember when we get to this point and we *can* load from cache.
+
+We do not load from D.S.p.t for an HTML page and the source actor will not have `this.source`, but the cache should have the HTML page (and the most up to date version with respect to the page we are debugging) because the browser _just_ requested it in order to display it / run JS / etc.
+
+We cannot rely on the cache for source mapped sources because the browser will generally never request the original source files unless the debugger is open. Even if it was in the cache, it is from an old debugging session (and therefore can't be trusted to be up to date), because the browser doesn't request these files automatically, unlike non source mapped sources, or HTML pages, etc.
+Renaming because I figured out what we need to do
+Created attachment 8598213
+1118332.patch
+
+The old code always felt a little wrong to me, and I think it was. I think I made it so that getting the original contents of a sourcemapped source *was* loading from cache again, which is bad. It was `loadFromCache: !this.source` which means for sourcemapped sources (which don't have `source`) it would load from cache. We made it this was in the first place because the HTML page did not have a source, so this told it to load the HTML page from the cache.
+
+I made it a lot more explicit and easy to reason about. Sources are now explicitly marked as an inline source (basically, the SourceActor represents the HTML page) and we only load from cache is it is an inline source.
+Comment on attachment 8598213
+1118332.patch
+
+Review of attachment 8598213:
+-----------------------------------------------------------------
+
+Great change, thanks!
+
+::: toolkit/devtools/server/actors/script.js
+@@ +2433,5 @@
+> +        // there are inline sources). Otherwise, we can't trust the
+> +        // cache because we are most likely here because we are
+> +        // fetching the original text for sourcemapped code, and the
+> +        // page hasn't requested it before (if it has, it was a
+> +        // previous debugging session)
+
+Super nit: period
+Created attachment 8598785
+1118332.patch
+
+comments addressed
+ https://treeherder.mozilla.org/#/jobs?repo=try&revision=6b4c6b718f5f
+asan build seem broken, saw that in other bugs too
+https://hg.mozilla.org/integration/fx-team/rev/74ce17691f86
+https://hg.mozilla.org/integration/fx-team/rev/74ce17691f86
+https://hg.mozilla.org/mozilla-central/rev/74ce17691f86
+Firefox JavaScript Debugger Shows "This page has no sources."
+
+=== special comment ===
+Confirmed in Release and Nightly 42 Build (7/3/2015) (Linux + OSX).
+
+=== screenshot ===
+https://bugzilla.mozilla.org/attachment.cgi?id=8629607
+
+=== similar effects ===
+https://bugzilla.mozilla.org/show_bug.cgi?id=1013547
+https://bugzilla.mozilla.org/show_bug.cgi?id=1060732
+https://bugzilla.mozilla.org/show_bug.cgi?id=927673
+https://bugzilla.mozilla.org/show_bug.cgi?id=1146161
+https://bugzilla.mozilla.org/show_bug.cgi?id=984645
+
+=== possible cause ===
+/toolkit/devtools/server/actors/script.js
+
+_getSourceText: function () 
+
+  if (this.source &&
+      this.source.text !== "[no source]" &&
+      this._contentType &&
+      this._contentType.indexOf('javascript') !== -1) {
+    return toResolvedContent(this.source.text);
+  }
+
+=== questions ===
+1. What actually displays "This page has no sources."
+2. Is there anyway to simplify the if() and just always display the source?
+3. Is it possible that the else() case is the cause; meaning the source is detected it just doesn't display?
+4. Is there anyway to write a test case? (test_sourcemaps)
+Please file a new bug!
+
+
+Only load the HTML page from browser cache in the debugger
+
+
+
+Bug 1118332 - only load the HTML source from cache in the debugger r=fitzgen 

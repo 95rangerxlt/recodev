@@ -1,0 +1,403 @@
+As a result, when null analysis is enabled, the following code has one compilation error where there is none when not enabled:
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+public class Test {}
+
+class X {
+	class Y {
+		public void foo( @A X. @B Y this) {}
+	}
+}
+@Target(value={ElementType.TYPE_USE})
+@interface A {}
+@Target(value={ElementType.TYPE_USE})
+@interface B {}
+
+The result is a ParameterizedTypeBinding when null analysis is enabled and MemberTypeBinding otherwise for the explicit receiver type.
+
+As a result, when null analysis is enabled, the following code has one compilation error where there is none when not enabled:
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+public class Test {}
+
+class X {
+	class Y {
+		public void foo( @A X. @B Y this) {}
+	}
+}
+@Target(value={ElementType.TYPE_USE})
+@interface A {}
+@Target(value={ElementType.TYPE_USE})
+@interface B {}
+
+The result is a ParameterizedTypeBinding when null analysis is enabled and MemberTypeBinding otherwise for the explicit receiver type.
+See also bug 394539
+See also https://bugs.eclipse.org/bugs/show_bug.cgi?id=403457.
+
+I think the present approach in captureTypeAnnotations is problematic as it
+will spoil TypeBinding identity between an instance that has null annotations
+and another that doesn't.
+
+We could take the annotation holder approach and maintain a map between AST
+nodes and annotations - this will help us preserve binding identity.
+(In reply to comment #2)
+> See also https://bugs.eclipse.org/bugs/show_bug.cgi?id=403457.
+> 
+> I think the present approach in captureTypeAnnotations is problematic as it
+> will spoil TypeBinding identity between an instance that has null annotations
+> and another that doesn't.
+
+Not just an issue of type equality, the present code also create a parameterized
+type where it should not.
+Alright, I had a first look at this and see several dimensions to this discussion:
+
+(A) The implementation of bug 392099 (incl. sub tasks) is incomplete indeed. 
+I put that one on hold because a full solution depends on bug 383624 (via bug 392384).
+This is because without the capability to restore null type annotations from class files most of the existing tests for null annotations cannot work with null *type annotations*.
+Do you see a better strategy than waiting for a fix in bug 383624?
+
+(B) The immediate issue can be fixed by mending a simple oversight in TypeReference#captureTypeAnnotations:
+if no null annotations are present, the original argType should be returned.
+
+(C) In a receiver declaration @Nullable should be reported as an error any way, receivers are implicitly @NonNull by construction.
+
+(D) Isn't the check in AMD.resolveReceiver() a bit too strict: JSR 308 spec says:
+ "The type of the this formal parameter must be the same as the class that contains the
+  method and *may* include type arguments if that class has any."
+(my emphasis on "may").
+-> Shouldn't that check use original(), actually?
+
+
+Back to my implementation strategy for bug 392099:
+
+(E) I admit I'm stretching the notion of "ParameterizedTypeBinding" but I'm intentionally creating PTBs even if no type arguments are given.
+The motivation is: I'd like to interpret "@NonNull X" as an 'instantiation' of a 'generic type' X, even if X has no type parameters.
+Please consider the basic example in this context:
+   List<@NonNull String> strings = ...;  // (1)
+   ...
+   strings.add(null); // (2) 
+At location (2) we want to detect a null contract violation, but for doing so we need to instantiate "add(T)" to "add(@NonNull String)".
+At that point all we have is a variable binding for "strings", no reference to an AST element that holds the annotation.
+That's why I think the straight-forward solution is by using a type binding to represent "@NonNull String" (as the type argument in another type binding "List<@NonNull String>").
+I'm aware that perhaps a large number of identity checks have to be revisited to see if they are spoiled when instantiating some "X" to "@NonNull X".
+OTOH, many situations already call original() before doing identity comparison. Those locations are always fine.
+
+
+With this preliminary analysis, do you consent to deferring the discussion till after bug bug 383624 has been fixed and after I've done some assessment of the impact of my intended solution?
+
+(F) If my proposed solution proves too hard to get right, we need to invent a new encoding to create a representation for "List<@NonNull String>", which could be sketched as 
+  PTB List {
+      arguments = { String }
+      type-annotations = { { @NonNull } }
+  }
+And then instantiating members of "List" will have to re-merge the information from "arguments" and "type-annotations".
+Similarly, "List<@Nullable Map<@NonNull String, @Nullable Object>>" would be represented like:
+  PTB List {
+     arguments = {
+         PTB Map {
+            arguments = { String, Object }
+            type-annotations = { { @NonNull }, {  @Nullable } }
+         }
+     }
+     type-annotations = { { @Nullable } }
+  }
+This would help to avoid the identity issue, but would make substitution considerably more involved.
+Also all other locations where types can occur would need to be checked whether a place for storing the annotation is available.
+Right now, I still prefer the proposed "deep instantiation" of type bindings with null type annotations.
+(In reply to comment #4)
+> Alright, I had a first look at this and see several dimensions to this
+> discussion:
+> 
+> (A) The implementation of bug 392099 (incl. sub tasks) is incomplete indeed. 
+> I put that one on hold because a full solution depends on bug 383624 (via
+> bug 392384).
+
+Stephan, I understand that you are tracking the dependencies and somethings
+will take time to cook - That is fine. Nothing needs to be rushed.
+
+> (B) The immediate issue can be fixed by mending a simple oversight in
+> TypeReference#captureTypeAnnotations:
+> if no null annotations are present, the original argType should be returned.
+
+Yes, please. This would be great, because two of us tripped into this
+inadvertently this week and had to spend some time to understand what is 
+going on.
+
+> (D) Isn't the check in AMD.resolveReceiver() a bit too strict: JSR 308 spec
+> says:
+>  "The type of the this formal parameter must be the same as the class that
+> contains the
+>   method and *may* include type arguments if that class has any."
+> (my emphasis on "may").
+
+Jay, can you please check if the following compiles with a recent 308 JDK ?
+
+// --
+public class X<T> {
+	void foo(X this) {
+	}
+}
+
+> -> Shouldn't that check use original(), actually?
+
+This shouldn't be required since we are inside the class and not dealing
+with any particular parameterization.
+
+> (E) I admit I'm stretching the notion of "ParameterizedTypeBinding" but I'm
+> intentionally creating PTBs even if no type arguments are given.
+> The motivation is: I'd like to interpret "@NonNull X" as an 'instantiation'
+> of a 'generic type' X, even if X has no type parameters.
+> Please consider the basic example in this context:
+>    List<@NonNull String> strings = ...;  // (1)
+>    ...
+>    strings.add(null); // (2) 
+> At location (2) we want to detect a null contract violation, but for doing
+> so we need to instantiate "add(T)" to "add(@NonNull String)".
+> At that point all we have is a variable binding for "strings", no reference
+> to an AST element that holds the annotation.
+> That's why I think the straight-forward solution is by using a type binding
+> to represent "@NonNull String" (as the type argument in another type binding
+> "List<@NonNull String>").
+> I'm aware that perhaps a large number of identity checks have to be
+> revisited to see if they are spoiled when instantiating some "X" to
+> "@NonNull X".
+> OTOH, many situations already call original() before doing identity
+> comparison. Those locations are always fine.
+
+I didn't mean it to be just a JDT/Core issue = I am not sure whether 
+refactoring and such may be broken due to binding differences. They either 
+would depend on binding == or the binding key being the same to decide 
+which elements should be affected by refactoring - no ?
+
+> With this preliminary analysis, do you consent to deferring the discussion
+> till after bug bug 383624 has been fixed and after I've done some assessment
+> of the impact of my intended solution?
+
+By all means. As discussed above, let us just mend the oversight in 
+captureTypeAnnotations and other fixes can come in due course. At that time
+after experiments, you can propose what you decide on and that can be analyzed
+for any issues before full blown implementation.
+Jay, can you please check if the following compiles with a recent 308 JDK ?
+
+// --
+public class X<T> {
+	void foo(X this) {
+	}
+}
+(In reply to comment #4)
+
+> (E) I admit I'm stretching the notion of "ParameterizedTypeBinding" but I'm
+> intentionally creating PTBs even if no type arguments are given.
+> The motivation is: I'd like to interpret "@NonNull X" as an 'instantiation'
+> of a 'generic type' X, even if X has no type parameters.
+> Please consider the basic example in this context:
+>    List<@NonNull String> strings = ...;  // (1)
+>    ...
+>    strings.add(null); // (2) 
+> At location (2) we want to detect a null contract violation, but for doing
+> so we need to instantiate "add(T)" to "add(@NonNull String)".
+
+Whenever this is taken up, we need to see if this creates problems in:
+
+    List<@NonNull String> strings = ...;  // (1)
+    List<String> someStrings;
+
+    someStrings = strings;
+
+I see that LocalVariableBinding already has a reference to the declaration.
+Perhaps augmenting FieldBinding likewise could lend a clean soultion - but
+that is putting the cart before the horse. Let us wait for full investigation
+in due course.
+(In reply to comment #5)
+> Stephan, I understand that you are tracking the dependencies and somethings
+> will take time to cook - That is fine. Nothing needs to be rushed.
+
+Thanks.
+
+> > (D) Isn't the check in AMD.resolveReceiver() a bit too strict: JSR 308 spec
+> > says:
+> >  "The type of the this formal parameter must be the same as the class that
+> > contains the
+> >   method and *may* include type arguments if that class has any."
+> > (my emphasis on "may").
+> 
+> Jay, can you please check if the following compiles with a recent 308 JDK ?
+> 
+> // --
+> public class X<T> {
+> 	void foo(X this) {
+> 	}
+> }
+> 
+> > -> Shouldn't that check use original(), actually?
+> 
+> This shouldn't be required since we are inside the class and not dealing
+> with any particular parameterization.
+
+True for enclosingReceiverType, but maybe we should say
+	if (enclosingReceiver != resolvedReceiverType.original()) {
+(inside AMD.resolveReceiver())?
+(In reply to comment #5)
+> > (B) The immediate issue can be fixed by mending a simple oversight in
+> > TypeReference#captureTypeAnnotations:
+> > if no null annotations are present, the original argType should be returned.
+> 
+> Yes, please. This would be great, because two of us tripped into this
+> inadvertently this week and had to spend some time to understand what is 
+> going on.
+
+that part has been released to the branch via commit 9673337e54ce81e8d22e9d4de37e3f9f0230c274
+
+tests are in commit 97b509ed0492c1ec5d604a591a307ac7d4bc5ef4
+
+Leaving this bug open for the more general issues.
+
+A TODO for the time of revisiting this bug: I noticed that 
+captureTypeAnnotations can be called before resolveAnnotations which
+means we don't yet have the compilerAnnotations, mh...
+To be challenged by replacing @A and @B in comment 0 with null annotations.
+(In reply to comment #7)
+> Whenever this is taken up, we need to see if this creates problems in:
+> 
+>     List<@NonNull String> strings = ...;  // (1)
+>     List<String> someStrings;
+> 
+>     someStrings = strings;
+
+Right, currently such assignments are reported as incompatible, where we
+need to differentiate which direction is reported as an unchecked conversion
+and which is OK.
+ 
+> I see that LocalVariableBinding already has a reference to the declaration.
+> Perhaps augmenting FieldBinding likewise could lend a clean soultion - but
+> that is putting the cart before the horse. Let us wait for full investigation
+> in due course.
+
+... the FieldBinding could come from a binary type with no AST ...
+(In reply to comment #6)
+> Jay, can you please check if the following compiles with a recent 308 JDK ?
+> 
+> // --
+> public class X<T> {
+> 	void foo(X this) {
+> 	}
+> }
+
+I get this:
+
+X.java:2: error: the receiver type does not match the enclosing class type
+        void foo(X this) {
+                   ^
+1 error
+
+which goes away if I use replace X<T> for the receiver.
+Some related stuff has been resolved by now, incl. bug 383624, bug 392384, bug 394539.
+So let me take stock on where we are in this issue:
+
+-------------------------------------------------------------------
+(In reply to comment #0)
+> As a result, when null analysis is enabled, the following code has one
+> compilation error where there is none when not enabled:
+
+I already added the test as NullTypeAnnotationTest.testBug403216_1().
+It passes in HEAD of BETA_JAVA8. See below.
+
+-------------------------------------------------------------------
+(In reply to comment #4)
+> (A) The implementation of bug 392099 (incl. sub tasks) is incomplete indeed. 
+> I put that one on hold because a full solution depends on bug 383624 (via
+> bug 392384).
+> This is because without the capability to restore null type annotations from
+> class files most of the existing tests for null annotations cannot work with
+> null *type annotations*.
+> Do you see a better strategy than waiting for a fix in bug 383624?
+
+Waiting is over :)
+ 
+-------------------------------------------------------------------
+> (B) The immediate issue can be fixed by mending a simple oversight in
+> TypeReference#captureTypeAnnotations:
+> if no null annotations are present, the original argType should be returned.
+
+This fix has already been released (commit 97b509ed0492c1ec5d604a591a307ac7d4bc5ef4)
+and indeed fixed the immediate bug.
+ 
+-------------------------------------------------------------------
+> (C) In a receiver declaration @Nullable should be reported as an error any
+> way, receivers are implicitly @NonNull by construction.
+
+Will be done via bug 392238.
+
+-------------------------------------------------------------------
+> (D) Isn't the check in AMD.resolveReceiver() a bit too strict: JSR 308 spec
+> says:
+>  "The type of the this formal parameter must be the same as the class that
+> contains the
+>   method and *may* include type arguments if that class has any."
+> (my emphasis on "may").
+> -> Shouldn't that check use original(), actually?
+
+(In reply to comment #11)
+> (In reply to comment #6)
+> > Jay, can you please check if the following compiles with a recent 308 JDK ?
+> > 
+> > // --
+> > public class X<T> {
+> > 	void foo(X this) {
+> > 	}
+> > }
+> 
+> I get this:
+> 
+> X.java:2: error: the receiver type does not match the enclosing class type
+>         void foo(X this) {
+>                    ^
+> 1 error
+> 
+> which goes away if I use replace X<T> for the receiver.
+
+I'm surprised. This doesn't match my understanding of "may" in the spec.
+
+ACTION ITEM 1:
+Since usage of original() is not mandated here, the comparison must be
+  "enclosingReceiver != resolvedReceiverType.unannotated()"
+Test & fix to be released here.
+
+-------------------------------------------------------------------
+(In reply to comment #7)
+> Whenever this is taken up, we need to see if this creates problems in:
+> 
+>     List<@NonNull String> strings = ...;  // (1)
+>     List<String> someStrings;
+> 
+>     someStrings = strings;
+
+This is accepted (I'm adding this as testBug403216_2()).
+Note that meanwhile, ReferenceBinding#isCompatibleWith(..) uses 
+TypeBinding#unannotated() to get a clean story for compatibility just based on JLS.
+Any annotation related incompatibilities are detected separately.
+
+ACTION ITEM 2:
+Add the promised test.
+
+-------------------------------------------------------------------
+(In reply to comment #9)
+> A TODO for the time of revisiting this bug: I noticed that 
+> captureTypeAnnotations can be called before resolveAnnotations which
+> means we don't yet have the compilerAnnotations, mh...
+> To be challenged by replacing @A and @B in comment 0 with null annotations.
+
+I can no longer reproduce this situation. Using the example from comment 0
+resolveAnnotations() is invoked *before* captureTypeAnnotations(), both from
+STB#resolveTypesFor(..):
+- resolveAnnotations() via getAnnotationTagBits() at the top (2nd block)
+- captureTypeAnnotations() via methodDecl.receiver.type.resolveType(..) several blocks down
+
+
+This leaves us with two action items before this bug can be closed.
+Remaining items are resolved via commit d72243e9032009ede789d14b49acc668f280d583.
+(incl. a fix in PTB#isAnnotatedTypeWithoutArguments() for use by PTB#unannotated()).

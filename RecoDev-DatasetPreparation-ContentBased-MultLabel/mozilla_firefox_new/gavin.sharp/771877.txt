@@ -1,0 +1,152 @@
+Messages like social.initialize and social.ambient-notification-area need to be handled by the provider class itself, rather than left up to individual clients.
+
+This is basically copying workerAPI.js from the add-on code.
+
+Messages like social.initialize and social.ambient-notification-area need to be handled by the provider class itself, rather than left up to individual clients.
+
+This is basically copying workerAPI.js from the add-on code.
+Created attachment 640033
+patch
+
+This implements a basic provider.workerAPI object. In the future, we can add a link from the workerAPI to the provider object, so that it can expose properties (e.g. "username") via the provider. It might also make sense to expose some methods/properites on workerAPI itself - for now I just added "initialized", and invented a new "social.initialize.response" message which sets it, and which is the expected response to "social.initialize".
+Comment on attachment 640033
+patch
+
++  terminate: function terminate() {
+
+it might be nice to prefix the anon functions with something like SocialProvider_terminate or at least sp_terminate, but that's my own preference.
+
+
++WorkerAPI.prototype = {
++  _handleMessage: function (event) {
+
+name the function?
+Comment on attachment 640033
+patch
+
+Review of attachment 640033:
+-----------------------------------------------------------------
+
+::: toolkit/components/social/WorkerAPI.jsm
+@@ +14,5 @@
+> +  if (!port)
+> +    throw new Error("Can't initialize WorkerAPI with a null port");
+> +
+> +  this.port = port;
+> +  this.port.onmessage = this._handleMessage.bind(this);
+
+The new WorkerAPI.jsm now allows two different places to get a port from. These two ports are the same since each call to getFrameWorkerHandle increments the port number. Can you add an underscore on |port| so it is more obvious that it is internal?
+
+@@ +40,5 @@
+> +    }
+> +  },
+> +
+> +  handlers: {
+> +    "social.initialize.response": function (data) {
+
+nit: the convention used by the API is to hyphenate the part following the first period, so this message name should be "social.initialize-response"
+
+::: toolkit/components/social/test/browser/browser_workerAPI.js
+@@ +25,5 @@
+> +  port.onmessage = function onMessage(event) {
+> +    let {topic, data} = event.data;
+> +    if (topic == "test-initialization-complete") {
+> +      is(provider.workerAPI.initialized, true, "workerAPI is now initialized");
+> +      executeSoon(finish);
+
+Why is the executeSoon here necessary?
+
+@@ +28,5 @@
+> +      is(provider.workerAPI.initialized, true, "workerAPI is now initialized");
+> +      executeSoon(finish);
+> +    }
+> +  }
+> +  port.postMessage({topic: "test-initialization"});
+
+I'm not sure why the "test-initialization"/"test-initialization-complete" act here is necessary. As far as I can tell, initialization of the workerAPI doesn't happen because of this. It seems that this is merely here as a way to delay checking |provider.workerAPI.initialized|. Is this true? Should we just build something into WorkerAPI (maybe an event) so that code that interacts with it has a way of knowing when the WorkerAPI state is updated?
+
+::: toolkit/components/social/test/browser/head.js
+@@ +47,5 @@
+>    runNextTest();
+>  }
+>  
+> +function makeWorkerUrl(runner) {
+> +  return "data:application/javascript," + encodeURI("let run=" + runner.toSource()) + ";run();"
+
+Why is this function moved to head.js? I can only find usage of it within browser_frameworker.js. My guess is that it got moved to head.js while browser_workerAPI.js was being worked on but then the worker got split out to its own file.
+(In reply to Jared Wein [:jaws] from comment #3)
+> nit: the convention used by the API is to hyphenate the part following the
+> first period, so this message name should be "social.initialize-response"
+
+Not sure there's much benefit to this convention.
+
+> > +      executeSoon(finish);
+> 
+> Why is the executeSoon here necessary?
+
+Just an old habit of mine, to let the stack unwind before moving on to the next test. This used to be necessary because the test harness didn't always do that, but I think it does now (since bug 528469, I think).
+
+> It seems that this is merely here as a way
+> to delay checking |provider.workerAPI.initialized|. Is this true?
+
+Yep.
+
+> Should we just build something into WorkerAPI (maybe an event) so that code that
+> interacts with it has a way of knowing when the WorkerAPI state is updated?
+
+I thought of that, but couldn't think of a model that made sense. We can certainly investigate in a followup.
+
+> Why is this function moved to head.js?
+
+Just a leftover cleanup from when I thought I'd use it in the other test.
+Created attachment 640117
+patch
+
+Shane and Jared's comments addressed, and made one other tweak (check that getWorkerPort() is non-null rather than checking workerURL before creating workerAPI, since we'll probably want to make getWorkerPort() always return null when social functionality is disabled).
+Comment on attachment 640117
+patch
+
+Should terminate clear WorkerAPI from the SocialProvider class?  Not sure if the WorkerAPI needs a terminate to close the port.  Maybe function names for the anon functions in the workerapi handlers.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #6)
+> Should terminate clear WorkerAPI from the SocialProvider class?  Not sure if
+> the WorkerAPI needs a terminate to close the port.
+
+I considered this, since the add-on module does it, but when looking into it further it seems unnecessary - terminating the worker terminates all of its ports, including the workerAPI's, so there's no need to close the workerAPI port explicitly. I guess this does bring up the fact that a provider needs to be re-usable after having been terminated, though, since I imagine we'll be using terminate() to shut down providers when you've toggled the global enable state, and that can be un-toggled.
+
+I will file a followup for this.
+
+> Maybe function names for the anon functions in the workerapi handlers.
+
+Can't use "." in a function name, and seems unlikely that names would be useful for these, so I didn't bother with this.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #7)
+> I will file a followup for this.
+
+Bug 771980.
+Created attachment 640147
+patch with comments addressed
+
+One more minor tweak for test bustage: had to make failure to create a FrameWorker non-fatal, since the Provider constructor now triggers the creation of one, and that fails in xpcshell where there is no hidden window.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/034afcc038c9
+Sorry had to back out for b-c leaks:
+https://tbpl.mozilla.org/?tree=Mozilla-Inbound&rev=034afcc038c9
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/1fc78d08e3f7
+Created attachment 640462
+patch with leak fix
+
+The test needs to terminate its provider to avoid "leaking" a window until shutdown.
+
+Pushed to try: https://tbpl.mozilla.org/?tree=Try&rev=223ca4f20f52
+Take 2: https://hg.mozilla.org/integration/mozilla-inbound/rev/4de086e95f6b
+https://hg.mozilla.org/mozilla-central/rev/4de086e95f6b
+
+
+associate WorkerAPI object with SocialProvider for centralized management of the "Worker API" messages
+
+
+
+Bug 771877: add WorkerAPI, r=jaws/mixedpuppy 
+
+Backout 034afcc038c9 (bug 771877) for mochitest-browser-chrome leaks 
+
+Bug 771877: add WorkerAPI, r=jaws/mixedpuppy 

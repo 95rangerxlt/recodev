@@ -1,0 +1,182 @@
+I need this for my patches in bug 801232.
+
+I need this for my patches in bug 801232.
+Created attachment 687454
+Patch (v1)
+Do we need XPCOM here or would a JS-only API (e.g. as part of PrivateBrowsingUtils) be sufficient?
+We don't need XPCOM here strictly, but the code we need to implement this lives in nsBrowserGlue, and because of the z-order hacks that we have there, I'd really like us to not have to duplicate that logic to PrivateBrowsingUtils, even if it's at the expense of adding an XPCOM method... :/
+ping?
+Comment on attachment 687454
+Patch (v1)
+
+(In reply to Ehsan Akhgari [:ehsan] from comment #3)
+> We don't need XPCOM here strictly, but the code we need to implement this
+> lives in nsBrowserGlue, and because of the z-order hacks that we have there,
+> I'd really like us to not have to duplicate that logic to
+> PrivateBrowsingUtils, even if it's at the expense of adding an XPCOM
+> method... :/
+
+You can just move the implementation to a JS module and let nsBrowserGlue utilize that. This way we can also avoid the suboptimal "...WithPrivacyStatus" API style by letting the JS-only API accept an options object:
+getMostRecentBrowserWindow({ private: true })
+Created attachment 689044
+Patch (v2)
+Comment on attachment 689044
+Patch (v2)
+
+>diff --git a/browser/components/Makefile.in b/browser/components/Makefile.in
+
+>+EXTRA_PP_JS_MODULES = RecentWindow.jsm
+
+Should put this in browser/modules.
+
+>diff --git a/browser/components/RecentWindow.jsm b/browser/components/RecentWindow.jsm
+
+>+  getMostRecentBrowser: function RW_getMostRecentBrowser(aOptions) {
+>+    let forcePrivate = typeof(aOptions) == "object" &&
+>+                       "private" in aOptions &&
+>+                       aOptions.private;
+
+Don't need the "in" check.
+
+>+    function matchesPrivacyStatus(win) {
+
+>+      return PrivateBrowsingUtils.isWindowPrivate(win) == aIsPrivate;
+
+Shouldn't that aIsPrivate be "forcePrivate"?
+
+Rather than having both mathcesPrivacyStatus and isFullBrowserWindow, seems like it would be simpler to  just combine them and call it isSuitableBrowserWindow or something like that.
+Created attachment 689075
+Patch (v3)
+Comment on attachment 689075
+Patch (v3)
+
+>+++ b/browser/modules/RecentWindow.jsm
+>@@ -0,0 +1,69 @@
+>+/* This Source Code Form is subject to the terms of the Mozilla Public
+>+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+>+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+>+
+>+"use strict";
+>+
+>+this.EXPORTED_SYMBOLS = ["RecentWindow"];
+>+
+>+const Cu = Components.utils;
+>+const Cc = Components.classes;
+>+const Ci = Components.interfaces;
+
+You need neither Cc nor Ci.
+
+>+   * @param aOptions an object accepting the arguments for the search.
+>+   *        Set the private property to true in order to restrict the
+>+   *        search to private windows only.
+>+   */
+>+  getMostRecentBrowser: function RW_getMostRecentBrowser(aOptions) {
+>+    let forcePrivate = typeof(aOptions) == "object" &&
+>+                       aOptions.private;
+>+
+>+    function isSuitableBrowserWindow(win) {
+>+      if (win.closed ||
+>+          !win.toolbar.visible) {
+>+        return false;
+>+      }
+>+      if (!forcePrivate) {
+>+        return true;
+>+      }
+>+      return PrivateBrowsingUtils.isWindowPrivate(win) == forcePrivate;
+>+    }
+
+You need to distinguish between 'private' being omitted and being false. Otherwise you can't use this to get only a non-private window.
+Comment on attachment 689075
+Patch (v3)
+
+>+  getMostRecentBrowser: function RW_getMostRecentBrowser(aOptions) {
+
+I'd prefer getMostRecentBrowserWindow for clarity and consistency with nsIBrowserGlue.
+Created attachment 689180
+Patch (v4)
+Comment on attachment 689180
+Patch (v4)
+
+>+  getMostRecentBrowserWindow: function RW_getMostRecentBrowserWindow(aOptions) {
+>+    let checkPrivacy = typeof(aOptions) == "object" &&
+
+nit: typeof aOptions == "object"
+
+>+    let forcePrivate = checkPrivacy && aOptions.private;
+
+I don't really like forcePrivate since it may sound like you'd want to make a non-private window private. Maybe something like wantPrivate or needPrivate would be better. Also, I'd prefer a variable name that can be read both ways, i.e. when it's false it should be clear that the caller wants a non-private window rather than that it doesn't care about the privacy status.
+
+>+    function isSuitableBrowserWindow(win) {
+>+      if (win.closed ||
+>+          !win.toolbar.visible) {
+>+        return false;
+>+      }
+>+      if (!checkPrivacy) {
+>+        return true;
+>+      }
+>+      return PrivateBrowsingUtils.isWindowPrivate(win) == forcePrivate;
+>+    }
+
+I think I'd prefer:
+
+    function isSuitableBrowserWindow(win) {
+      return (!win.closed &&
+              win.toolbar.visible &&
+              (!checkPrivacy ||
+                 PrivateBrowsingUtils.isWindowPrivate(win) == forcePrivate));
+    }
+
+It's more compact and seems at least as readable.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f0112085d836
+Backed out <https://hg.mozilla.org/integration/mozilla-inbound/rev/cb7f10e936c0> for a mochitest orange which I'm not sure I understand:
+
+https://tbpl.mozilla.org/php/getParsedLog.php?id=17671501&tree=Mozilla-Inbound
+
+165790 INFO TEST-START | /tests/uriloader/exthandler/tests/mochitest/test_handlerApps.xhtml
+165791 INFO TEST-PASS | /tests/uriloader/exthandler/tests/mochitest/test_handlerApps.xhtml | webHandler launchWithURI (existing window/tab) started
+165792 ERROR TEST-UNEXPECTED-FAIL | /tests/uriloader/exthandler/tests/mochitest/test_handlerApps.xhtml | uncaught exception - NS_ERROR_XPC_JAVASCRIPT_ERROR_WITH_DETAILS: '[JavaScript Error: "RecentWindow is not defined" {file: "resource://gre/components/nsBrowserGlue.js" line: 1577}]' when calling method: [nsIBrowserGlue::getMostRecentBrowserWindow] at chrome://browser/content/browser.js:11482
+165793 INFO TEST-END | /tests/uriloader/exthandler/tests/mochitest/test_handlerApps.xhtml | finished in 333ms
+(In reply to Dão Gottwald [:dao] from comment #12)
+> >+    let forcePrivate = checkPrivacy && aOptions.private;
+> 
+> I don't really like forcePrivate since it may sound like you'd want to make
+> a non-private window private. Maybe something like wantPrivate or
+> needPrivate would be better. Also, I'd prefer a variable name that can be
+> read both ways, i.e. when it's false it should be clear that the caller
+> wants a non-private window rather than that it doesn't care about the
+> privacy status.
+
+To address the second point, you could just get rid of the variable and use aOptions.private directly (still guarded by checkPrivacy, of course).
+(In reply to comment #15)
+> (In reply to DÃ£o Gottwald [:dao] from comment #12)
+> > >+    let forcePrivate = checkPrivacy && aOptions.private;
+> > 
+> > I don't really like forcePrivate since it may sound like you'd want to make
+> > a non-private window private. Maybe something like wantPrivate or
+> > needPrivate would be better. Also, I'd prefer a variable name that can be
+> > read both ways, i.e. when it's false it should be clear that the caller
+> > wants a non-private window rather than that it doesn't care about the
+> > privacy status.
+> 
+> To address the second point, you could just get rid of the variable and use
+> aOptions.private directly (still guarded by checkPrivacy, of course).
+
+Will do before relanding.
+Comment on attachment 689180
+Patch (v4)
+
+Review of attachment 689180:
+-----------------------------------------------------------------
+
+::: browser/modules/Makefile.in
+@@ +28,4 @@
+>  	KeywordURLResetPrompter.jsm \
+>  	$(NULL)
+>  
+> +EXTRA_PP_JS_MODULES = RecentWindow.jsm
+
+on Windows this is being overwritten by:
+
+EXTRA_PP_JS_MODULES = \
+  WindowsJumpLists.jsm
+https://hg.mozilla.org/mozilla-central/rev/80b3907e5c6a

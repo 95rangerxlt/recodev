@@ -1,0 +1,263 @@
+browser-fullZoom.js / viewZoomOverlay.js contain a bunch of code that manages the zoom level for a given page, by interacting with browser.markupDocumentViewer.fullZoom/textZoom.
+
+We need to make this work in e10s mode, where those properties can't be set directly. I wonder whether we can just implement a shim markupDocumentViewer that remotes things correctly, or whether we want to rework the API.
+
+browser-fullZoom.js / viewZoomOverlay.js contain a bunch of code that manages the zoom level for a given page, by interacting with browser.markupDocumentViewer.fullZoom/textZoom.
+
+We need to make this work in e10s mode, where those properties can't be set directly. I wonder whether we can just implement a shim markupDocumentViewer that remotes things correctly, or whether we want to rework the API.
+I'll try this.
+
+Gavin, in bug 666804 you said you wanted a browser.priority property, rather than, for example, implementing a browser.loadGroup proxy object with methods that forward to the real load group in content.  Those are also potential solutions to this bug here: add properties and methods to browser that implement nsIMarkupDocumentViewer, or make a shim browser.markupDocumentViewer object that forwards calls to content.  It seems like these two potential fixes are applicable to a bunch of e10s work.  Do you prefer one approach over the other or have a general approach in mind?
+I think we should avoid shims where possible, in favor of introducing simplified APIs that can be remoted from the start (e.g. browser.fullZoom property).
+Created attachment 567257
+WIP patch
+
+There's the same problem as in bug 666804: somebody other than the browser may change the zoom, so there ought to be a zoom listener in content.js that tells the browser when it changes.  But that's probably going to be the case for a lot of e10s work, so maybe we should just say you have to go through the browser to set all these properties.
+*** Bug 698604 has been marked as a duplicate of this bug. ***
+I was thinking about taking the same approach here as the NetworkPrioritizer bug 666804:  no getters, only setters, so that the browser doesn't need to keep cached shadows of remote values up to date.  But it won't be as easy here, because zoom getters are used in several places, including at least 8 tests.
+I am working on this now.
+Created attachment 809248
+WIP patch
+
+I worked on this for a short time last week, need to spend more time on it. But at least he basic functionally seems to work. One very confusing thing is that the "TextZoomChange" event is called twice for every set, with the old value the first time.
+I am not sure if working with the outerWindowID is valid in e10s and how to replace the docShell check in isCurrent. I would love to hear some feedback here.
+I don't know either.  Maybe Felipe or someone else working on e10s would?  I think the reason it uses outer IDs at all is because they're convenient, and the outer-window-destroyed notification includes the destroyed window's outer ID, making it possible to map from the window to its entry in _browserTokenMap.  Is outer-window-destroyed available under e10s?  If not, there's probably some equivalent that would work fine.  Instead of using the outer ID as the key, you could use the browser element itself or some related object in a WeakMap.
+
+As for the docShell check in isCurrent, it's only checking that the browser's XBL properties haven't been unbound from the object.  You could use any XBL property, or maybe there's a better way to test for that that I don't know about.
+Comment on attachment 809248
+WIP patch
+
+Review of attachment 809248:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser-fullZoom.js
+@@ +451,5 @@
+>          // hasn't been received yet.  In that case, the browser is unusable, it
+>          // has no properties, so return false.  Check for this case by getting a
+>          // property, say, docShell.
+> +        return map.get(outerID) === this.token;
+> +        //return map.get(outerID) === this.token && browser.docShell;
+
+I think we can indeed keep using outerID, and do what Drew suggested about replacing the .docShell getter with any other property that will work.  (maybe a check for .parentNode will yield the right result and also be more correct)
+
+@@ +536,3 @@
+>             QueryInterface(Ci.nsIInterfaceRequestor).
+>             getInterface(Ci.nsIWebNavigation).
+>             QueryInterface(Ci.nsILoadContext);
+
+this change is tough.. It doesn't change anything in practice since there's no support for per-browser PB, but in theory it makes we bypass it if it ever worked.
+
+This function now is just a top-level's loadContext in disguise, so perhaps we should drop it and access the property directly, or just give it a fair name. 
+
+I'll ask around and think about it and get back to you
+
+::: browser/base/content/tabbrowser.xml
+@@ +2818,5 @@
+> +                onset="this.mCurrentBrowser.textZoom = val;"/>
+> +
+> +      <property name="isSyntheticDocument"
+> +                onget="return this.mCurrentBrowser.isSyntheticDocument;"
+> +                readonly="true"/>
+
+these new properties in tabbrowser are not used
+
+::: toolkit/content/browser-child.js
+@@ +241,5 @@
+> +});
+> +
+> +addEventListener("FullZoomChange", function (aEvent) {
+> +  dump("FullZoom Change : " + _getMarkupViewer().fullZoom + "\n");
+> +  sendAsyncMessage("FullZoomChange", { value: _getMarkupViewer().fullZoom });
+
+Are these new events+listeners because other things may change the browser zoom? Any examples?
+
+In the case of it being set through the message above I imagine it will cause an unecessary roundtrip, is there any way to avoid it? We could store the value received from the message and only re-send it back to the parent if it's different
+
+::: toolkit/content/widgets/remote-browser.xml
+@@ +132,5 @@
+> +      </property>
+> +
+> +      <field name="_isSyntheticDocument">false</field>
+> +
+> +      <property name="isSyntheticDocument">
+
+not fully implemented, right?
+I started working on this again. Sorry for the long wait.
+
+(In reply to :Felipe Gomes from comment #10)
+> Comment on attachment 809248
+> WIP patch
+> 
+> Review of attachment 809248:
+> -----------------------------------------------------------------
+> 
+> ::: browser/base/content/browser-fullZoom.js
+> @@ +451,5 @@
+> >          // hasn't been received yet.  In that case, the browser is unusable, it
+> >          // has no properties, so return false.  Check for this case by getting a
+> >          // property, say, docShell.
+> > +        return map.get(outerID) === this.token;
+> > +        //return map.get(outerID) === this.token && browser.docShell;
+> 
+> I think we can indeed keep using outerID, and do what Drew suggested about
+> replacing the .docShell getter with any other property that will work. 
+> (maybe a check for .parentNode will yield the right result and also be more
+> correct)
+> 
+Nice that sounds good & easy for us.
+> @@ +536,3 @@
+> >             QueryInterface(Ci.nsIInterfaceRequestor).
+> >             getInterface(Ci.nsIWebNavigation).
+> >             QueryInterface(Ci.nsILoadContext);
+> 
+> this change is tough.. It doesn't change anything in practice since there's
+> no support for per-browser PB, but in theory it makes we bypass it if it
+> ever worked.
+> 
+> This function now is just a top-level's loadContext in disguise, so perhaps
+> we should drop it and access the property directly, or just give it a fair
+> name. 
+> 
+> I'll ask around and think about it and get back to you
+> 
+Shouldn't we have a loadContent on the parent side as well? I feel like I saw that somewhere. Using CPOWs here seems really bad and I don't know why I did that here.
+> ::: browser/base/content/tabbrowser.xml
+> @@ +2818,5 @@
+> > +                onset="this.mCurrentBrowser.textZoom = val;"/>
+> > +
+> > +      <property name="isSyntheticDocument"
+> > +                onget="return this.mCurrentBrowser.isSyntheticDocument;"
+> > +                readonly="true"/>
+> 
+> these new properties in tabbrowser are not used
+> 
+We actually end up there:
+get_fullZoom@chrome://browser/content/tabbrowser.xml:2831
+ZoomManager_getZoomForBrowser@chrome://global/content/viewZoomOverlay.js:45
+ZoomManager.zoom@chrome://global/content/viewZoomOverlay.js:40
+ZoomManager_enlarge@chrome://global/content/viewZoomOverlay.js:82
+FullZoom_enlarge@chrome://browser/content/browser.js:1722
+oncommand@chrome://browser/content/browser.xul:1
+> ::: toolkit/content/browser-child.js
+> @@ +241,5 @@
+> > +});
+> > +
+> > +addEventListener("FullZoomChange", function (aEvent) {
+> > +  dump("FullZoom Change : " + _getMarkupViewer().fullZoom + "\n");
+> > +  sendAsyncMessage("FullZoomChange", { value: _getMarkupViewer().fullZoom });
+> 
+> Are these new events+listeners because other things may change the browser
+> zoom? Any examples?
+> 
+> In the case of it being set through the message above I imagine it will
+> cause an unecessary roundtrip, is there any way to avoid it? We could store
+> the value received from the message and only re-send it back to the parent
+> if it's different
+>
+I think we send something like two messages when the zoom changes, we should limit that. But this is asychronous and other stuff like layers is a lot more heavy so I wouldn't care about these messages too much.
+> ::: toolkit/content/widgets/remote-browser.xml
+> @@ +132,5 @@
+> > +      </property>
+> > +
+> > +      <field name="_isSyntheticDocument">false</field>
+> > +
+> > +      <property name="isSyntheticDocument">
+> 
+> not fully implemented, right?
+Yeah, turns out it's actually not that easy to find a good place to check when the document changes in the child.
+Created attachment 8356769
+WIP patch v2
+
+So this fixes most of the nits. I changed the token map to a weak map based on the browser, because that seems more straightforward. Bill is going to look into the loadContext stuff. If we want to land this, we could also have to paths, one getting the exact loadContext and the other one which is based on the whole browser window.
+
+This patch still has the problem that per-domain zoom level don't seem to be applied.
+Created attachment 8356775
+zoom
+
+Here a version without all the debugging junk.
+I filed bug 957427 for the load context thing.
+Created attachment 8359477
+zoom
+
+Tom, I think this is ready. I looked at the APZC test failure you were seeing, and it turns out that it was also present on the parent changeset. You can see here:
+  https://tbpl.mozilla.org/?tree=Mozilla-Inbound&rev=1ac9a01f2d00
+
+I hope you don't mind me posting this; I think it's ready. The only change I made is to remove the fix for the WebProgressListener issue we found during the work week. I backed out bug 673569, so we don't need that any more.
+Comment on attachment 8359477
+zoom
+
+Review of attachment 8359477:
+-----------------------------------------------------------------
+
+r+ with the two questions clarified
+
+::: browser/components/customizableui/src/CustomizableWidgets.jsm
+@@ +364,5 @@
+>        function updateZoomResetButton() {
+>          //XXXgijs in some tests we get called very early, and there's no docShell on the
+>          // tabbrowser. This breaks the zoom toolkit code (see bug 897410). Don't let that happen:
+>          let zoomFactor = 100;
+> +        try {
+
+with a change to customizableui/ we will need to mark this patch with [Australis] when landing.  It's probably good to check with gijs if the  comment above should be removed..
+
+But the zoomFactor won't be set properly with e10s, right?
+
+::: toolkit/content/browser-child.js
+@@ +261,5 @@
+> +  _getMarkupViewer().textZoom = aMessage.data.value;
+> +});
+> +
+> +addEventListener("FullZoomChange", function (aEvent) {
+> +  sendAsyncMessage("FullZoomChange", { value: _getMarkupViewer().fullZoom });
+
+can you remind me when listening to these events is important?  i.e. when would they happen without being triggered by the message listeners above?
+(In reply to :Felipe Gomes from comment #16)
+> Comment on attachment 8359477
+> zoom
+> 
+> Review of attachment 8359477:
+> -----------------------------------------------------------------
+> 
+> r+ with the two questions clarified
+> 
+> ::: browser/components/customizableui/src/CustomizableWidgets.jsm
+> @@ +364,5 @@
+> >        function updateZoomResetButton() {
+> >          //XXXgijs in some tests we get called very early, and there's no docShell on the
+> >          // tabbrowser. This breaks the zoom toolkit code (see bug 897410). Don't let that happen:
+> >          let zoomFactor = 100;
+> > +        try {
+> 
+> with a change to customizableui/ we will need to mark this patch with
+> [Australis] when landing.  It's probably good to check with gijs if the 
+> comment above should be removed..
+> 
+Ok. I guess, I could just put this in a different commit, so that we don't get backed out for some weird Australis stuff.
+> But the zoomFactor won't be set properly with e10s, right?
+> 
+No the zoomFactor is right in e10s.
+> ::: toolkit/content/browser-child.js
+> @@ +261,5 @@
+> > +  _getMarkupViewer().textZoom = aMessage.data.value;
+> > +});
+> > +
+> > +addEventListener("FullZoomChange", function (aEvent) {
+> > +  sendAsyncMessage("FullZoomChange", { value: _getMarkupViewer().fullZoom });
+> 
+> can you remind me when listening to these events is important?  i.e. when
+> would they happen without being triggered by the message listeners above?
+These are important, because they basically allow us to have the correct textZoom and fullZooom values in the parent, which we send here when they change. It's important, because you can change the zoom with the keyboard, which wouldn't be noticed in the parent otherwise.
+(In reply to Tom Schuster [:evilpie] from comment #17)
+> Ok. I guess, I could just put this in a different commit, so that we don't
+> get backed out for some weird Australis stuff.
+
+Alright, yeah splitting it up in a separate patch is a good idea. Don't forget to add [australis] to the commit message of that patch, otherwise a pre-commit hook won't allow the patch.
+
+Let's land it!
+Try: https://tbpl.mozilla.org/?tree=Try&rev=7919a6436e83
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/29567f7cdd3d
+remote:   https://hg.mozilla.org/integration/fx-team/rev/75f53b728edf
+https://hg.mozilla.org/mozilla-central/rev/29567f7cdd3d
+https://hg.mozilla.org/mozilla-central/rev/75f53b728edf

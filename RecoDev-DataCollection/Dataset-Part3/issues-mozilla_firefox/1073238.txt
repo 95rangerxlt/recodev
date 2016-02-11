@@ -1,0 +1,770 @@
++++ This bug was initially created as a clone of Bug #941428 +++
+
+Broken down from bug 941428.
+
+This doesn't seem too bad.  UITour.jsm already communicates to the page using events.  Most of the UITour "actions" access chrome given some primitive data from content (like strings) and don't touch content at all.
+
+Mainly we just need to insert an object in content.js that shuttles messages and events back and forth, like how ContentSearchMediator, AboutHomeListener, WebChannel et al. do.  UITour.jsm would send messages to this object instead of firing events, and then the object would forward the messages on to content by firing events.
+
+Below are other problems that should be called out.  I'm sure I'm missing things that might be obvious when someone actually gets into the implementation.  I don't think it's necessary to break this down any further, but I'll file another bug to fix the tests.
+
+ensureTrustedOrigin: Uses content doc.  Instead, the aforementioned object in content.js should filter out page events that are untrusted, forwarding only trusted events on to chrome as messages.  The permission manager appears to be read-only in content, which is fine.
+
+resolveURL: Uses contentDoc.documentURIObject.  Could use browser.documentURI instead, which is defined on both remote and non-remote xul:browsers.
+
+startUrlbarCapture: Uses contentDoc.nodePrincipal.  Could use browser.contentPrincipal instead, which is defined on both remote and non-remote browsers.  Or, it looks like scriptSecurityManager.checkLoadURIWithPrincipal may be safe from content, and if so, could check the principle from content.js before forwarding on the message.
+
+showFirefoxAccounts: Sets contentDoc.location.href.  Could use browser.webNavigation.loadURI instead, which will work for both remote and non-remote browsers.  Or maybe there's a more straightforward way to change the URI.  Or this could be handled entirely in the content script.
+
+Detecting when tabs are detached: UITour accesses content docs to determine whether a newly selected tab is actually a previously torn-off tab.  I think we can use the SwapDocShells event instead of listening for a pair of TabBecomingWindow and TabSelect.  SwapDocShells gives us the new browser in event.detail.  Then we can stop firing TabBecomingWindow altogether since it was only added for this purpose (bug 970321, http://mxr.mozilla.org/mozilla-central/search?string=TabBecomingWindow).
+
++++ This bug was initially created as a clone of Bug #941428 +++
+
+Broken down from bug 941428.
+
+This doesn't seem too bad.  UITour.jsm already communicates to the page using events.  Most of the UITour "actions" access chrome given some primitive data from content (like strings) and don't touch content at all.
+
+Mainly we just need to insert an object in content.js that shuttles messages and events back and forth, like how ContentSearchMediator, AboutHomeListener, WebChannel et al. do.  UITour.jsm would send messages to this object instead of firing events, and then the object would forward the messages on to content by firing events.
+
+Below are other problems that should be called out.  I'm sure I'm missing things that might be obvious when someone actually gets into the implementation.  I don't think it's necessary to break this down any further, but I'll file another bug to fix the tests.
+
+ensureTrustedOrigin: Uses content doc.  Instead, the aforementioned object in content.js should filter out page events that are untrusted, forwarding only trusted events on to chrome as messages.  The permission manager appears to be read-only in content, which is fine.
+
+resolveURL: Uses contentDoc.documentURIObject.  Could use browser.documentURI instead, which is defined on both remote and non-remote xul:browsers.
+
+startUrlbarCapture: Uses contentDoc.nodePrincipal.  Could use browser.contentPrincipal instead, which is defined on both remote and non-remote browsers.  Or, it looks like scriptSecurityManager.checkLoadURIWithPrincipal may be safe from content, and if so, could check the principle from content.js before forwarding on the message.
+
+showFirefoxAccounts: Sets contentDoc.location.href.  Could use browser.webNavigation.loadURI instead, which will work for both remote and non-remote browsers.  Or maybe there's a more straightforward way to change the URI.  Or this could be handled entirely in the content script.
+
+Detecting when tabs are detached: UITour accesses content docs to determine whether a newly selected tab is actually a previously torn-off tab.  I think we can use the SwapDocShells event instead of listening for a pair of TabBecomingWindow and TabSelect.  SwapDocShells gives us the new browser in event.detail.  Then we can stop firing TabBecomingWindow altogether since it was only added for this purpose (bug 970321, http://mxr.mozilla.org/mozilla-central/search?string=TabBecomingWindow).
+Created attachment 8504220
+uitour-e10s.patch
+
+Please ignore all dump/logs now.
+
+This may be seen as part 1: messages. This patch basically introduces the e10s style communication which is the first step to e10sifying the UITour. So the status is that all the tests are (should) be passing with no e10s and nightly tour works (tested manually) with e10s on.
+
+I didn't address all the issues raised by adw since it does not make sense to do them and not fix the tests and this patch is already pretty big. I'll do that as a follow-up.
+No try push? :-)
+
+(going through it now, but doing a try push is a Good Idea for big changes like this)
+
+I'm also a bit confused because comment #0 explicitly mentions tests have been split out, but this doesn't split out the tests, so... :-)
+Comment on attachment 8504220
+uitour-e10s.patch
+
+Review of attachment 8504220:
+-----------------------------------------------------------------
+
+This is on the right track, but needs cleanup. As noted below, getting the actual review from drew or MattN or Unfocused is probably a good idea.
+
+::: browser/base/content/content.js
+@@ +135,5 @@
+> +    if (!this.ensureTrustedOrigin()) {
+> +      return;
+> +    }
+> +    sendAsyncMessage("UITour:onPageEvent", {detail: event.detail, type: event.type});
+> +    addMessageListener("UITour:SendPageCallback", this);
+
+Nit: listen before you send to avoid races here.
+
+@@ +138,5 @@
+> +    sendAsyncMessage("UITour:onPageEvent", {detail: event.detail, type: event.type});
+> +    addMessageListener("UITour:SendPageCallback", this);
+> +  },
+> +
+> +  // FIXME: This is copied from UITour.jsm. Can we avoid this duplication?
+
+Could use an #include? Not sure if you can Cu.import the jsm from the content process.
+
+@@ +187,5 @@
+> +    });
+> +    doc.dispatchEvent(event);
+> +  }
+> +};
+> +UITourListener.init(this);
+
+This seems to be a useless call/method?
+
+::: browser/components/nsBrowserGlue.js
+@@ +519,5 @@
+>      ShumwayUtils.init();
+>  #endif
+>      webrtcUI.init();
+>      AboutHome.init();
+> +    UITour.init();
+
+Whoa. Why is this necessary all of a sudden?
+
+::: browser/modules/UITour.jsm
+@@ +252,4 @@
+>      // Do this before bailing if there's no tab, so later we can pick up the pieces:
+>      window.gBrowser.tabContainer.addEventListener("TabSelect", this);
+> +
+> +    if (!window.gMultiProcessBrowser) { // non-e10s
+
+See below.
+
+@@ +457,5 @@
+>          break;
+>        }
+>      }
+>  
+> +    if (!window.gMultiProcessBrowser) { // non-e10s
+
+So this means we need a followup bug for fixing the e10s case for tab detaching, right? We should make sure we fix that in the same release as this...
+
+@@ +641,5 @@
+>  
+>      return true;
+>    },
+>  
+> +  resolveURL: function(window, aURL) {
+
+Nit: aWindow or url, but don't mix argument styles.
+
+@@ +646,2 @@
+>      try {
+> +      let uri = Services.io.newURI(aURL, null, window.gBrowser.currentURI);
+
+Use window.gBrowser.documentURI instead, as suggested by drew. currentURI isn't the same, I think; I'm not sure the difference will ever be particularly material, but this has security implications so we should probably be conservative :-)
+
+@@ +1158,1 @@
+>      let data = this.availableTargetsCache.get(window);
+
+I am kind of surprised we can reference windows for the content pages here, but if it works... it'd probably be a good idea for drew and/or MattN to do the actual review here once this is cleaned up.
+
+::: browser/modules/test/browser_UITour2.js
+@@ +7,5 @@
+>  let gContentAPI;
+>  let gContentWindow;
+>  
+>  Components.utils.import("resource:///modules/UITour.jsm");
+> +Components.utils.import("resource://gre/modules/Task.jsm");
+
+Nit: this should be in head.js
+
+Nit: if you're adding UITour.jsm in head.js, you should remove it from these tests (or not add it in head.js...)
+
+@@ +58,5 @@
+>                isnot(PanelUI.panel.state, "closed",
+>                      "Menu should remain open since UITour didn't open it in the first place");
+>                gContentAPI.hideMenu("appMenu");
+> +
+> +              waitForElementToBeHidden(window.PanelUI.panel, () => {
+
+Nit: note that I think some of these events can be sync, in which case implementing waitForElementToBeHidden using popuphidden would break this code, because you're hiding before waiting...
+
+That's not currently the case, but I think we should avoid the pattern. :-)
+
+::: browser/modules/test/browser_UITour3.js
+@@ +22,5 @@
+>      let desc = document.getElementById("UITourTooltipDescription");
+>      let icon = document.getElementById("UITourTooltipIcon");
+>      let buttons = document.getElementById("UITourTooltipButtons");
+>  
+> +    gContentAPI.showInfo("urlbar", "a title", "some text", "image.png");
+
+This should go after the popup's animation setattribute, which I'm 99% sure is to avoid failures in automation...
+
+@@ +28,5 @@
+>      // Disable the animation to prevent the mouse clicks from hitting the main
+>      // window during the transition instead of the buttons in the popup.
+>      popup.setAttribute("animate", "false");
+>  
+> +    yield promisePanelElementShown(window, popup);
+
+And this depends on an event which is fired and races with gContentAPI.showInfo.
+
+So store the promise and then call showInfo and then yield, to avoid race conditions.
+
+@@ +52,2 @@
+>  
+> +    yield promisePanelElementShown(window, popup);
+
+Nit: see above for promise/show/yield sequence.
+
+@@ +52,3 @@
+>  
+> +    yield promisePanelElementShown(window, popup);
+> +      
+
+Nit: whitespace
+
+@@ +70,2 @@
+>  
+> +    executeSoon(() => EventUtils.synthesizeMouseAtCenter(buttons.childNodes[0], {}, window));
+
+Why is this an executeSoon? Maybe for the reason outlined above? :-)
+
+Try getting the promise, then synthesizing the mouse, then yielding.
+
+@@ +78,4 @@
+>  
+> +    is(gContentWindow.callbackResult, "button1", "Correct callback should have been called");
+> +  }),
+> +  taskify(function* test_info_buttons_2() {
+
+Same nits in this fn as in the previous one.
+
+(bonus points if you can refactor this so it doesn't duplicate so much...)
+
+@@ +141,5 @@
+> +
+> +    is(gContentWindow.callbackResult, "target", "target callback called");
+> +    is(gContentWindow.callbackData.target, "appMenu", "target callback was from the appMenu");
+> +    is(gContentWindow.callbackData.type, "popupshown", "target callback was from the mousedown");
+> +    popup.removeAttribute("animate");
+
+Whoa. This should hide the panel again (not your bug, but we should do that).
+
+::: browser/modules/test/browser_UITour_detach_tab.js
+@@ +24,5 @@
+>  }
+>  
+> +/**
+> + * When tab is changed we're tearing the tour down. So the UITour client has always be aware of this
+> + * fact and so he wants to listen to visibilitychange events.
+
+Looking at the code changes for tab detaching, I'm unsure how this test could be working in e10s mode.
+
+@@ +46,5 @@
+>      let onBrowserDelayedStartup = (aWindow, aTopic, aData) => {
+> +      dump('xxx: opened new window\n')
+> +
+> +      let highlight = aWindow.document.getElementById("UITourHighlight");
+> +      waitForElementToBeVisible(highlight, () => {
+
+After all the beautiful task refactoring, this just gets a callback? Sadfaces. Can we do a task thing here so this doesn't reindent all the things?
+
+@@ +48,5 @@
+> +
+> +      let highlight = aWindow.document.getElementById("UITourHighlight");
+> +      waitForElementToBeVisible(highlight, () => {
+> +
+> +        gOpenedWindow = aWindow;
+
+Why does this not stay at the top here? Why do we need to wait for the callback before doing this?
+
+::: browser/modules/test/head.js
+@@ +3,5 @@
+>  
+>  Cu.import("resource://gre/modules/Promise.jsm");
+> +Cu.import("resource:///modules/UITour.jsm");
+> +
+> +function waitForConditionPromise(condition, timeoutMsg) {
+
+Nit: it should be possible to implement this as a thin wrapper over the existing waitForCondition and adding a fourth parameter for a failure fn to call...
+I'll address those issues, push to try and send the result tomorrow.
+
+Just to quickly answer main questions:
+
+1. Tests: so I'm not even fixing the tests for e10s here. The reason for those changes is that the communication was made more async with this patch so the tests were failing for non-e10s (as they expected sync code). We can't just regress the non-e10s tests.
+2. The special if for detaching is just so you can see nightly uitour working with e10s enabled (otherwise it'll fail with detaching related code). We can even leave it there for now since normal detaching does not work for e10s.
+3. The pattern:
+
+showInfo
+yield waitForInfoShownPromise
+
+I like it much more than:
+
+promise = waitForInfoShownPromise
+showInfo
+yield promise
+
+it's just enough to make sure that showInfo is async. We may even make it like:
+
+yield showInfo
+
+which means showInfo could just return a promise that'll be resolved once info is shown. This would be the nicest and I think we should make it this way. It also encapsulates the "Is showInfo truly async?" question.
+Comment on attachment 8504220
+uitour-e10s.patch
+
+Review of attachment 8504220:
+-----------------------------------------------------------------
+
+I'll upload the updated patch in a second. Try run for this one went well: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=6456a9e30b1d.
+
+::: browser/base/content/content.js
+@@ +135,5 @@
+> +    if (!this.ensureTrustedOrigin()) {
+> +      return;
+> +    }
+> +    sendAsyncMessage("UITour:onPageEvent", {detail: event.detail, type: event.type});
+> +    addMessageListener("UITour:SendPageCallback", this);
+
+Done. I hope, however, that sendAsyncMessage is (always) async.
+
+@@ +138,5 @@
+> +    sendAsyncMessage("UITour:onPageEvent", {detail: event.detail, type: event.type});
+> +    addMessageListener("UITour:SendPageCallback", this);
+> +  },
+> +
+> +  // FIXME: This is copied from UITour.jsm. Can we avoid this duplication?
+
+I don't like the idea of doing preprocessor's #include just to use this one function. But it looks like I can just use UITour.jsm module.
+
+@@ +187,5 @@
+> +    });
+> +    doc.dispatchEvent(event);
+> +  }
+> +};
+> +UITourListener.init(this);
+
+Right. I was just following the AboutHomeListener pattern. I can remove it.
+
+::: browser/components/nsBrowserGlue.js
+@@ +519,5 @@
+>      ShumwayUtils.init();
+>  #endif
+>      webrtcUI.init();
+>      AboutHome.init();
+> +    UITour.init();
+
+Now, after including UITour.jsm in content.js it makes more sense.
+
+So UITour.init is called here and not in the module itself just like other modules.
+
+::: browser/modules/UITour.jsm
+@@ +457,5 @@
+>          break;
+>        }
+>      }
+>  
+> +    if (!window.gMultiProcessBrowser) { // non-e10s
+
+I already commented on that but just for reference: this is just a preparation work changing the communication to messages. e10s is not supposed to work with this patch yet.
+
+@@ +641,5 @@
+>  
+>      return true;
+>    },
+>  
+> +  resolveURL: function(window, aURL) {
+
+Done.
+
+@@ +646,2 @@
+>      try {
+> +      let uri = Services.io.newURI(aURL, null, window.gBrowser.currentURI);
+
+There's no such thing as window.gBrowser.documentURI. That's the reason I used currentURI. documentURI is a property of document which we cannot access.
+
+@@ +1158,1 @@
+>      let data = this.availableTargetsCache.get(window);
+
+By the way, you saw this code some lines above as well in form of:
+
+let browser = aMessage.target;
+let window = browser.ownerDocument.defaultView;
+
+It's a chrome window so it does not look very suspicious.
+
+::: browser/modules/test/browser_UITour2.js
+@@ +7,5 @@
+>  let gContentAPI;
+>  let gContentWindow;
+>  
+>  Components.utils.import("resource:///modules/UITour.jsm");
+> +Components.utils.import("resource://gre/modules/Task.jsm");
+
+Right. It should be in the same file as taskify helper.
+
+@@ +58,5 @@
+>                isnot(PanelUI.panel.state, "closed",
+>                      "Menu should remain open since UITour didn't open it in the first place");
+>                gContentAPI.hideMenu("appMenu");
+> +
+> +              waitForElementToBeHidden(window.PanelUI.panel, () => {
+
+Will move it.
+
+::: browser/modules/test/browser_UITour3.js
+@@ +22,5 @@
+>      let desc = document.getElementById("UITourTooltipDescription");
+>      let icon = document.getElementById("UITourTooltipIcon");
+>      let buttons = document.getElementById("UITourTooltipButtons");
+>  
+> +    gContentAPI.showInfo("urlbar", "a title", "some text", "image.png");
+
+It's for mouse clicks that are later in the code, it doesn't matter that much here. But I can move it.
+
+By the way, that's pretty bad that this is just in the first test. Because of this you cannot selectively comment out the tests.
+
+@@ +28,5 @@
+>      // Disable the animation to prevent the mouse clicks from hitting the main
+>      // window during the transition instead of the buttons in the popup.
+>      popup.setAttribute("animate", "false");
+>  
+> +    yield promisePanelElementShown(window, popup);
+
+I much more like the current pattern with gContentAPI.showInfo being async. But even better I'll add showInfoPromise.
+
+@@ +141,5 @@
+> +
+> +    is(gContentWindow.callbackResult, "target", "target callback called");
+> +    is(gContentWindow.callbackData.target, "appMenu", "target callback was from the appMenu");
+> +    is(gContentWindow.callbackData.type, "popupshown", "target callback was from the mousedown");
+> +    popup.removeAttribute("animate");
+
+Will do. But why is this important?
+
+::: browser/modules/test/browser_UITour_detach_tab.js
+@@ +24,5 @@
+>  }
+>  
+> +/**
+> + * When tab is changed we're tearing the tour down. So the UITour client has always be aware of this
+> + * fact and so he wants to listen to visibilitychange events.
+
+Again, it's not supposed to work yet ;-)
+
+@@ +46,5 @@
+>      let onBrowserDelayedStartup = (aWindow, aTopic, aData) => {
+> +      dump('xxx: opened new window\n')
+> +
+> +      let highlight = aWindow.document.getElementById("UITourHighlight");
+> +      waitForElementToBeVisible(highlight, () => {
+
+I didn't taskify the whole test since it requires more changes to this file. I can do it.
+
+@@ +48,5 @@
+> +
+> +      let highlight = aWindow.document.getElementById("UITourHighlight");
+> +      waitForElementToBeVisible(highlight, () => {
+> +
+> +        gOpenedWindow = aWindow;
+
+This change is not necessary.
+
+::: browser/modules/test/head.js
+@@ +3,5 @@
+>  
+>  Cu.import("resource://gre/modules/Promise.jsm");
+> +Cu.import("resource:///modules/UITour.jsm");
+> +
+> +function waitForConditionPromise(condition, timeoutMsg) {
+
+Not really. waitForCondition is using ok so it'll write onto stdout which we don't want with the promise. We can, however, do it the other way round and implement waitForCondition using promise which I'm going to do.
+Created attachment 8505078
+uitour-e10s.patch
+
+This is an updated version addressing issues raised by :Gijs.
+
+Again, this is just the first part splitting UITour.jsm into chrome-content parts that communicate via messages. Once this is in I'll do a follow-up fixing at least some e10s bugs.
+
+As a bonus: I tested it manually on https://www.mozilla.org/en-US/firefox/36.0a1/tour/ and it works for both {non-,}e10s.
+Comment on attachment 8505078
+uitour-e10s.patch
+
+Review of attachment 8505078:
+-----------------------------------------------------------------
+
+::: browser/base/content/content.js
+@@ +122,5 @@
+> +  UITourListener.handleEvent(event);
+> +}, false, true);
+> +
+> +
+> +let UITourListener = {
+
+Please move this to content-UITour.js and #include it.
+
+::: browser/components/nsBrowserGlue.js
+@@ +524,5 @@
+>      ShumwayUtils.init();
+>  #endif
+>      webrtcUI.init();
+>      AboutHome.init();
+> +    UITour.init();
+
+This will cause it to no longer be loaded lazily
+I'd really prefer it if we could avoid #including anything in content.js. It's really nice to be able to change it and not have to re-run make. If we absolutely have to split it up, let's just call loadFrameScript on multiple scripts. Frame scripts share a compartment, so there's no memory overhead. The IPC cost should be small since there's no roundtrip.
+(In reply to Bill McCloskey (:billm) from comment #8)
+> If we absolutely have to split it up
+
+We do have to split it up so it doesn't end up like browser.js. We've learned from that mistake.
+Comment on attachment 8505078
+uitour-e10s.patch
+
+Review of attachment 8505078:
+-----------------------------------------------------------------
+
+Next I'll review the tests
+
+::: browser/modules/UITour.jsm
+@@ +163,5 @@
+>      }, {}));
+> +
+> +    // listen for messages
+> +    let mm = Cc["@mozilla.org/globalmessagemanager;1"].getService(Ci.nsIMessageListenerManager);
+> +    mm.addMessageListener("UITour:onPageEvent", this);
+
+Perhaps this should also be removed to avoid a leak. Maybe it's not necessary but I'm not sure. Billm would know.
+
+@@ +230,3 @@
+>  
+> +    let browser = aMessage.target;
+> +    let window = browser.ownerDocument.defaultView;
+
+since |window| is an overloaded term I wish this |chromeWindow| instead but I guess you shouldn't change that in your patch.
+
+@@ -625,5 @@
+> -    if (!this.isSafeScheme(uri))
+> -      return false;
+> -
+> -    let permission = Services.perms.testPermission(uri, UITOUR_PERMISSION);
+> -    return permission == Services.perms.ALLOW_ACTION;
+
+You'll want to port my recent changes to ensureTrustedOrigin when you rebase.
+
+@@ +635,2 @@
+>      try {
+> +      let uri = Services.io.newURI(aURL, null, aWindow.gBrowser.currentURI);
+
+This can be wrong if the selected tab isn't the tour. Using the URI from the <browser> that sent the message would be safer.
+
+@@ +644,5 @@
+>      return null;
+>    },
+>  
+> +  sendPageCallback: function(aMessage, aCallbackID, aData = {}) {
+> +    let mm = aMessage.target.messageManager;
+
+Passing around the message manager seems cleaner than passing around an old message. With what you have it would be reasonable to expect that aMessage is the message to send.
+Comment on attachment 8505078
+uitour-e10s.patch
+
+Review of attachment 8505078:
+-----------------------------------------------------------------
+
+I think we can resummarize this bug to describe what you're actually doing and move the follow-up work to another bug. You can then remove "e10s'ify UITour - part 1. " from the commit message.
+
+::: browser/modules/test/browser_UITour2.js
+@@ +101,3 @@
+>  
+> +    gContentAPI.hideMenu("bookmarks");
+> +    waitForConditionPromise(() => {
+
+I think you want to yield on this
+
+::: browser/modules/test/browser_UITour3.js
+@@ +45,5 @@
+>      let desc = document.getElementById("UITourTooltipDescription");
+>      let icon = document.getElementById("UITourTooltipIcon");
+>  
+> +    let buttons = gContentWindow.makeButtons();
+> +    
+
+Nit: whitespace
+
+@@ +116,4 @@
+>      let popup = document.getElementById("UITourTooltip");
+>      let closeButton = document.getElementById("UITourTooltipClose");
+> +    let infoOptions = gContentWindow.makeInfoOptions();
+> +    
+
+Ditto
+
+::: browser/modules/test/browser_UITour_detach_tab.js
+@@ +21,5 @@
+>    UITourTest();
+>  }
+>  
+> +/**
+> + * When tab is changed we're tearing the tour down. So the UITour client has always be aware of this
+
+s/has/has to/
+
+@@ +22,5 @@
+>  }
+>  
+> +/**
+> + * When tab is changed we're tearing the tour down. So the UITour client has always be aware of this
+> + * fact and so he wants to listen to visibilitychange events.
+
+Nit: s/so he wants to listen to/therefore listens for/
+
+@@ +62,4 @@
+>  
+> +    gContentWindow = yield browserStartupDeferred.promise;
+> +
+> +    // This highlight should be shown thanks to visibilitychange listener.
+
+s/to/to the/
+
+::: browser/modules/test/head.js
+@@ +119,5 @@
+>  }
+>  
+> +function hideInfoPromise() {
+> +  let popup = document.getElementById("UITourTooltip");
+> +  gContentAPI.hideInfo.apply(gContentAPI, arguments);
+
+You should rarely need to use |arguments| in new code. Use rest parameters and the spread operator instead as it makes the function signature much more clear.
+Created attachment 8509136
+uitour-e10s.patch
+
+New patch with addressed issues and rebased.
+I can't call loadFrameScript from content.js (or at least I tried to find some reference to some message manager but I couldn't). Should I then load it in browser.js right after http://hg.mozilla.org/mozilla-central/annotate/29fbfc1b31aa/browser/base/content/browser.js#l855?
+By the way here's try for the patch in comment 12 https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=f0a5fa4bcaa1.
+(In reply to Tomasz Kołodziejski [:tomasz] from comment #13)
+> I can't call loadFrameScript from content.js (or at least I tried to find
+> some reference to some message manager but I couldn't). Should I then load
+> it in browser.js right after
+> http://hg.mozilla.org/mozilla-central/annotate/29fbfc1b31aa/browser/base/
+> content/browser.js#l855?
+
+Yes, that should be fine.
+Comment on attachment 8509136
+uitour-e10s.patch
+
+Waiting for an update patch
+Created attachment 8510653
+uitour-e10s.patch
+
+I updated the patch so that it uses loadFrameScript instead of preprocessing. Also I did a tiny nit for content-UITour.js -- addEventListener now uses UITourListener directly (no additional function).
+Try run: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=5c07c268929c
+Comment on attachment 8510653
+uitour-e10s.patch
+
+Review of attachment 8510653:
+-----------------------------------------------------------------
+
+::: browser/base/content/content-UITour.js
+@@ +33,5 @@
+> +    }
+> +    return false;
+> +  },
+> +
+> +  // This function is copied from UITour module.
+
+s/UITour module/UITour.jsm/
+
+::: browser/components/nsBrowserGlue.js
+@@ +2533,5 @@
+> +// Listen for UITour messages.
+> +// Do it here instead of the UITour module itself so that the UITour module is lazy loaded
+> +// when the first message is received.
+> +let mm = Cc["@mozilla.org/globalmessagemanager;1"].getService(Ci.nsIMessageListenerManager);
+> +mm.addMessageListener("UITour:onPageEvent", function(aMessage) {
+
+Since there are multiple message managers, we may want to call this globalMM like some other code does.
+
+::: browser/modules/UITour.jsm
+@@ +242,4 @@
+>      // Do this before bailing if there's no tab, so later we can pick up the pieces:
+>      window.gBrowser.tabContainer.addEventListener("TabSelect", this);
+> +
+> +    if (!window.gMultiProcessBrowser) { // non-e10s
+
+Include a bug number to fix this in the comment
+
+@@ +635,2 @@
+>      try {
+> +      let uri = Services.io.newURI(aURL, null, aWindow.gBrowser.currentURI);
+
+I thought I mentioned in a past review that this can be wrong if the tab changes and I think it's confusing for a chrome window to be passed to a function to resolve a content URI. The first argument should be from content e.g. the contentWindow, not chrome. The callers should pass browser.… as the argument.
+
+@@ +919,5 @@
+>  
+>    /**
+>     * Show an info panel.
+>     *
+> +   * @param {Object}   aMessageManager
+
+Nit: {nsIMessageSender}
+
+@@ +1194,2 @@
+>      Task.spawn(function*() {
+> +      let window = aWindow;
+
+If this is a chrome window, indicate that in the name: aChromeWindow. We can clean up the existing variables named |window| in a different bug.
+
+::: browser/modules/test/head.js
+@@ +1,5 @@
+>  /* Any copyright is dedicated to the Public Domain.
+>   * http://creativecommons.org/publicdomain/zero/1.0/ */
+>  
+>  Cu.import("resource://gre/modules/Promise.jsm");
+> +Cu.import("resource:///modules/UITour.jsm");
+
+Since UITour still does its init upon import, I think this should either be lazy or we move these tests to a UITour subdirectory to avoid UITour code running during an unrelated test in this directory. I've wanted to move these to their own directory to make running them easier anyways but you don't have to do that in this bug if you don't want.
+Comment on attachment 8510653
+uitour-e10s.patch
+
+Review of attachment 8510653:
+-----------------------------------------------------------------
+
+I'll post an updated patch in a sec.
+
+::: browser/base/content/content-UITour.js
+@@ +33,5 @@
+> +    }
+> +    return false;
+> +  },
+> +
+> +  // This function is copied from UITour module.
+
+Done.
+
+::: browser/components/nsBrowserGlue.js
+@@ +2533,5 @@
+> +// Listen for UITour messages.
+> +// Do it here instead of the UITour module itself so that the UITour module is lazy loaded
+> +// when the first message is received.
+> +let mm = Cc["@mozilla.org/globalmessagemanager;1"].getService(Ci.nsIMessageListenerManager);
+> +mm.addMessageListener("UITour:onPageEvent", function(aMessage) {
+
+Done.
+
+::: browser/modules/UITour.jsm
+@@ +242,4 @@
+>      // Do this before bailing if there's no tab, so later we can pick up the pieces:
+>      window.gBrowser.tabContainer.addEventListener("TabSelect", this);
+> +
+> +    if (!window.gMultiProcessBrowser) { // non-e10s
+
+Done.
+
+@@ +635,2 @@
+>      try {
+> +      let uri = Services.io.newURI(aURL, null, aWindow.gBrowser.currentURI);
+
+You did. I commented back but apparently it got lost somewhere. I just realized that you're (and were) right. Passing browser sounds like the right way, thanks!
+
+@@ +919,5 @@
+>  
+>    /**
+>     * Show an info panel.
+>     *
+> +   * @param {Object}   aMessageManager
+
+Done.
+
+@@ +1194,2 @@
+>      Task.spawn(function*() {
+> +      let window = aWindow;
+
+Done.
+
+::: browser/modules/test/head.js
+@@ +1,5 @@
+>  /* Any copyright is dedicated to the Public Domain.
+>   * http://creativecommons.org/publicdomain/zero/1.0/ */
+>  
+>  Cu.import("resource://gre/modules/Promise.jsm");
+> +Cu.import("resource:///modules/UITour.jsm");
+
+Running is not a big deal since you can just "mach run browser_UITour_*". But it would be better to move it to a separate folder.
+
+I definitely don't want to do it in this bug. But I can do it in a follow-up.
+Created attachment 8511402
+uitour-e10s.patch
+Try run: ttps://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=f788623afdae
+https://hg.mozilla.org/integration/fx-team/rev/0121cf3ba5d7
+https://hg.mozilla.org/mozilla-central/rev/0121cf3ba5d7
+I see there are several tests in the patch. Is manual testing needed here? If yes, could you please specify what would need to be tested?
+Tests coverage looks good and the tests are passing. It looks like no manual testing is needed.
+head.js-only changes for Beta since the new helpers are depended on by Hello tests:
+https://hg.mozilla.org/releases/mozilla-beta/rev/8eae475fe082

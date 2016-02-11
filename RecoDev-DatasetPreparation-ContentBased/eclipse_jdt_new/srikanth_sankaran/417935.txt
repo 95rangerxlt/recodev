@@ -1,0 +1,179 @@
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+
+public class Snippet {
+
+	void foo() {
+		Collections.sort(new ArrayList<String>(Arrays.asList("c", "b", "a")),
+				new Comparator<String>() {
+					@Override
+					public int compare(String o1, String o2) {
+						return o1.compareTo(o2); //[1]
+					}
+				});
+
+		Collections.sort(new ArrayList<String>(Arrays.asList("c", "b", "a")),
+				(String o1, String o2) -> o1.compareTo(o2)); //[2]
+	}
+}
+-------------------------
+
+Hover over #compareTo at the specified locations [1] and [2].
+Javadoc is shown on hover only at [1] and not at [2].
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+
+public class Snippet {
+
+	void foo() {
+		Collections.sort(new ArrayList<String>(Arrays.asList("c", "b", "a")),
+				new Comparator<String>() {
+					@Override
+					public int compare(String o1, String o2) {
+						return o1.compareTo(o2); //[1]
+					}
+				});
+
+		Collections.sort(new ArrayList<String>(Arrays.asList("c", "b", "a")),
+				(String o1, String o2) -> o1.compareTo(o2)); //[2]
+	}
+}
+-------------------------
+
+Hover over #compareTo at the specified locations [1] and [2].
+Javadoc is shown on hover only at [1] and not at [2].
+That's because ICU#codeSelect doesn't work on references to a lambda parameter ("o1") nor on method invocations on such a reference ("o1.compareTo").
+
+I don't expect that we have to do anything here, so moving this bug to core.
+I have a fix for this problem - but it suffers from three issues:
+
+1. There is no java model element corresponding to lambda's (yet)
+As a result, if the selected element is a lambda parameter, it seems
+to show up as a child of the enclosing java element:
+
+i.e
+
+Given:
+
+void foo()
+    I i = (xyz) -> {
+    return xyz;
+}
+
+when you select xyz in the return statement, we answer:
+
+"xyz [in foo() [in X [in [Working copy] X.java [in <default> [in src [in Resolve]]]]]]
+
+I don't know whether this is an issue for UI. The navigation does work correctly
+in the IDE.
+
+2. When the lambda parameter types are elided, we don't always information on
+the target type - Selection and completion parsers by design build very minimal
+sparse trees with just the bare minimum nodes hierarchically placed in
+scopes, declarations and such. This will require a significant rework if
+we want to change to include nodes pertinent to context information. Since
+the Expression grammar is highly recursive, pretty much every node will be
+considered for retention.
+
+As a result of the sparse tree, if you hover over an elided parameter
+you won't get the type information in many situations. That is such a shame,
+because this is one of the classic places where hover would be useful/required.
+
+3. I reopened https://bugs.eclipse.org/bugs/show_bug.cgi?id=291040 due
+to bad interactions with lambda's in constructor calls as arguments. This
+backing out is only on BETA_JAVA8 and will be repaired before 4.4 ships.
+Thanks for the type arguments ;-)
+
+Fix and tests released here:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=59b98ddf9de3ca94b46b4e5e55051cbf72bde23a
+
+I raised bug 422468 for discussion and follow up type elided parameter
+related issues.
+(In reply to Srikanth Sankaran from comment #2)
+> 1. There is no java model element corresponding to lambda's (yet)
+> As a result, if the selected element is a lambda parameter, it seems
+> to show up as a child of the enclosing java element:
+
+I think it's fine for now to do without a lambda model element. Other scope boundaries are also not available in the Java model (blocks and statements that declare new variables). And even if we had lambda elements, we would have to filter them out e.g. in the Outline, just because they will be so numerous.
+
+> 2. When the lambda parameter types are elided, we don't always information on
+> the target type
+
+I agree bug 422468 is problematic, and I'm looking forward to eventually get the correct type for implicitly-typed lambda variables.
+(In reply to Markus Keller from comment #4)
+
+> I agree bug 422468 is problematic, and I'm looking forward to eventually get
+> the correct type for implicitly-typed lambda variables.
+
+The problem looked very complex, but there could be a simple solution: JDT's
+grammar closely follows JLS for this part and there is a single method that
+gets entered when an expression statement is reduced by the parser. That should
+provide for a clean opportunity to traverse the recovered elements bottom up
+and toss out all recovered elements that fall within the range of the expression
+statement just reduced and replace them with an instance of a new abstraction
+say: RecoveredExpressionStatement - which will simply answer the corresponding
+ASTNode for its updatedParseTree() call.
+
+Actually, this opens up exciting possibilities for improving code assist for 
+Java 7.
+
+Given the following program:
+
+// --
+class X {
+	String string;
+	
+	void goo(String s, int x, int y) {
+	 
+	}
+	void foo() {
+		goo(string, 123456, 56789);
+	}
+}
+// --
+
+If you code select or code complete on the first argument to the call to goo,
+this is how the recovered parse tree looks like:
+
+class X {
+  String string;
+  X() {
+  }
+  void goo(String s, int x, int y) {
+  }
+  void foo() {
+    <SelectOnName:string>;
+  }
+}
+
+We have completely tossed out the pertinent fact that selection/completion
+is happening on a method argument expression. Such a fact is much more
+valuable for completion in that we could boost the relevant of certain
+proposals based on the parameter type and weed out several others.
+(In reply to Srikanth Sankaran from comment #5)
+> We have completely tossed out the pertinent fact that selection/completion
+> is happening on a method argument expression. Such a fact is much more
+> valuable for completion in that we could boost the relevant of certain
+> proposals based on the parameter type and weed out several others.
+
+FWIW:
+If I get this proposal right, this one in particular would allow us to build a great parameter completion in recommenders or even a crowdsourced one that ranks variables or static methods/fields (like SWT.* constants in constructors or addListener methods) properly.
+
+For instance, in "new Button(SWT.|<^space>)" --> we could learn that users often used SWT.BORDER, CHECK or RADIO.
+
+
+In general:
+I'd love to get as much information as possible in code selections and code completions. Every single bit more in information will help us to build additional tools on top of this. I don't mind internal APIs if you don't want to make this public available.
+
+
+[1.8][code select] ICU#codeSelect doesn't work on reference to lambda parameter
+
+
+
+Fixed Bug 417935 - [1.8][code select] ICU#codeSelect doesn't work on reference to lambda parameter 

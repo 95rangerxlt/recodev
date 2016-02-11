@@ -1,0 +1,513 @@
+Created attachment 8662623
+IMG_1479_edit.jpg
+
+User Agent: Mozilla/5.0 (Windows NT 10.0; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0
+Build ID: 20150826023504
+
+Steps to reproduce:
+
+I create a FedEx shipping label on eBay, open in in PDF.js and print it.
+
+
+Actual results:
+
+The label prints fine but the barcodes in the label do not print at all
+
+
+Expected results:
+
+The barcaodes should print on the label fine
+
+Created attachment 8662623
+IMG_1479_edit.jpg
+
+User Agent: Mozilla/5.0 (Windows NT 10.0; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0
+Build ID: 20150826023504
+
+Steps to reproduce:
+
+I create a FedEx shipping label on eBay, open in in PDF.js and print it.
+
+
+Actual results:
+
+The label prints fine but the barcodes in the label do not print at all
+
+
+Expected results:
+
+The barcaodes should print on the label fine
+We need the PDF file, we can't fix without that.
+Sorry, was out of town and just returned.  Just a question, if I add it to attachments wont the public have access to it ?
+Yes, it's public, but you can email the PDF to devs.
+okay, what address should I sent it to ?
+You can send it to Brendan (above) and me (I'll search for a possible regression). Right click on names to have the email address.
+Just sent the email.
+Indeed, the barcodes are missing on the print output (I tested with MS XPS Document Writer).
+I tried with several utilities, the only one that doesnt print the label is firefox
+so are you saying the problem is with the PDF or something else like Fedex label generation ?
+It regressed with bug 811002:
+http://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=2f2a45f04e7c&tochange=ef3f5669b53e
+Is this specific to Windows 10?  Also, is there a publicly accessible PDF that shows this problem?
+I tested on Win 7, so no. And AFAIK, bug 811002 was about Windows and Linux too.
+I forwarded you the PDF.
+So after spending a lot of time inspecting the PDF and the printing code, I discovered both the cause and the solution(s).
+
+The PDF in question contains a rotation inside of it around the barcodes, and the Cairo Win32 printing backend we use seems broken in several places.
+
+I have proof of concept fixes I have been working on locally that make the PDF print fine. I will rework them into a more official fix over the next week.
+Great to hear!
+(In reply to Lee Salzman [:eihrul] from comment #13)
+> The PDF in question contains a rotation inside of it around the barcodes,
+> and the Cairo Win32 printing backend we use seems broken in several places.
+
+
+Indeed, when I ran Mozregression, I printed the PDF with the virtual printer PDF Creator and for the 1st bad build (and currently FF41), it was printed in landscape (with the barcodes) instead of portrait like the original PDF.
+With MS Document Writer, the portrait format is honored, but the barcodes are missing ont the print output.
+Created attachment 8667005
+fix rotated strokes and images in Cairo Win32 printing surfaces
+
+This patch fixes issues discovered with Win32 printing surfaces in Cairo if a rotation transform is used.
+
+Firstly, strokes were being double-transformed. Originally a GDI transform was used to transform the stroke, but later in an attempt to better preserve precision, Cairo changed to transform the path before it was supplied to GDI. At the same time, it neglected to fully revert the now unneeded GDI transform for strokes. So, this patch does that.
+
+Second, regarding images not showing up when rotated - after some hunting, I found other reports that StretchDIBits may be buggy on many printing devices (such as even the Microsoft XPS writer) if you supply it with a rotation transform. However, StretchDIBits seems to perform fine with scaling or mirroring, which it supports explicitly via its interface even if no transform is used.
+
+PDF only allows rotations in 90 degree increments. So, I just attack 90 degree and 270 degree rotation transforms, and leave 180 degree transforms alone since those only mirror axes, but don't swap them. To correct for the axis swap, I just swap the X and Y axes of the image itself before rendering it out, so that the only thing that the underlying transform is doing anymore is scaling or mirroring the image. Thus, StretchDIBits becomes happy again because it is only performing operations it is advertised to support.
+
+With these changes, the Microsoft XPS writer and Adobe PDF exporter are happy. We probably want to also check on a couple printers just to be sure, as each printer driver is a unique snowfloke.
+Some confirmation:
+
+Tried printing on an HP Officejet 6812, and it was affected by the image rotation issue, but not the stroke rotation issue. The patch fixed the issue there.
+
+Microsoft XPS writer was affected by both the stroke and image rotation issues, and the patch fixed both.
+
+Adobe PDF writer seemed unaffected by either issue, and the patch did not regress that behavior, so it continued to work.
+Try build: https://treeherder.mozilla.org/#/jobs?repo=try&revision=8e3820bcbe95
+(In reply to Lee Salzman [:eihrul] from comment #18)
+> Try build:
+> https://treeherder.mozilla.org/#/jobs?repo=try&revision=8e3820bcbe95
+
+On my Windows 7 the barcode prints with this try run, both in XPS and on a "random" printer.
+I filed an upstream bug report at freedesktop.org. Here's the link:
+https://bugs.freedesktop.org/show_bug.cgi?id=92202
+Comment on attachment 8667005
+fix rotated strokes and images in Cairo Win32 printing surfaces
+
+Review of attachment 8667005:
+-----------------------------------------------------------------
+
+::: gfx/cairo/cairo/src/cairo-win32-printing-surface.c
+@@ +670,5 @@
+> +    assert (status == CAIRO_STATUS_SUCCESS);
+> +    cairo_matrix_multiply (&m, &m, &surface->ctm);
+> +    cairo_matrix_multiply (&m, &m, &surface->gdi_ctm);
+> +    /* Check if matrix can't be represented as only scaling or mirroring.
+> +     * Some printing devices don't support rotation with StretchDIBits.
+
+Is there a citation for this?
+(In reply to Jeff Muizelaar [:jrmuizel] from comment #21)
+> Comment on attachment 8667005
+> fix rotated strokes and images in Cairo Win32 printing surfaces
+> 
+> Review of attachment 8667005:
+> -----------------------------------------------------------------
+> 
+> ::: gfx/cairo/cairo/src/cairo-win32-printing-surface.c
+> @@ +670,5 @@
+> > +    assert (status == CAIRO_STATUS_SUCCESS);
+> > +    cairo_matrix_multiply (&m, &m, &surface->ctm);
+> > +    cairo_matrix_multiply (&m, &m, &surface->gdi_ctm);
+> > +    /* Check if matrix can't be represented as only scaling or mirroring.
+> > +     * Some printing devices don't support rotation with StretchDIBits.
+> 
+> Is there a citation for this?
+
+The initial hint I got by looking at reduced versions of the test case I made and checking for differences - finding the PDF rotate command. So at least, that was what caused me to search for any known bugs regarding this in the first place.
+
+After searching, I found this forum post where a programmer had contacted Microsoft and verified there were bugs regarding blitting functions and rotation transforms: https://groups.google.com/forum/#!topic/microsoft.public.win32.programmer.gdi/QGwUXTd5sm4
+
+And of course, after sufficient testing, we have also our own evidence to support this conclusion and the the fix.
+Just a quick update, dunno if the fix was rolled out in the release of the new firefox but I tried another label today and it still has the same issue with the barcodes not printing.
+(In reply to blacklotus60 from comment #23)
+> Just a quick update, dunno if the fix was rolled out in the release of the
+> new firefox but I tried another label today and it still has the same issue
+> with the barcodes not printing.
+
+The fix wouldn't be in the release yet. It has to go through the release staging process - first aurora, then beta, then release. So, it can take a couple months in the worst case for it to get to the release. I only just flagged it for checkin, and it hasn't been checked in to the incoming source code tree yet... so this could take a while. So once it finally makes its way into aurora or beta builds, just using those if you find them stable enough may be a solution.
+> PDF only allows rotations in 90 degree increments.
+
+PDF allows any rotation. The cairo drawing model is based on the PDF drawing model. I'll attach a PDF of a 45 degree rotation that you can test with.
+
+> +    rotated = fabs (m.xx) < fabs (m.xy) || fabs (m.yy) < fabs (m.yx);
+
+Which means this will have to be changed to:
+  rotated = fabs (m.xx) == 0 && fabs (m.yy) == 0 && (m.xy * m.yx < 0);
+
+I did some testing with the XPS writer and an image with different rotations. I can reproduce the problem. Your patch (with my correction) fixes this issue for multiples of 90 degrees but not for other rotations. I checked the XPS output when printing from Adobe Reader and they rotate the image before output to the XPS writer. For non 90 degree rotations the image is padded and clipped.
+
+I also checked the printing surface output (without your patch) with both a display DC and with a PostScript printer and it worked correctly. So there is unlikely to be anything wrong with the way cairo is using StretchDIBits. There is nothing in the StretchDIBits documentation that says it won't work with rotations. I mostly used the PostScipt output for testing when I wrote the cairo win printing surface. I don't think I ever tested with the XPS Writer. I didn't think anyone actually used it.
+
+The XPS format allows the same image transformations as cairo. There is an example of rotated images on page 176 of ECMA-388. So this is clearly a bug in the XPS writer.
+
+I also noticed that StretchDIBits is returning an error status for rotated images on the XPS Writer. I plan to implement in cairo a more general version of this workaround for broken printer drivers that will check if StretchDIBits fails, transform the image (including handling non 90 degree rotations), and try again.
+Created attachment 8669414
+image-rotate-45.pdf
+
+Example of 45 degree rotation in PDF.
+(In reply to Lee Salzman [:eihrul] from comment #16)
+> Firstly, strokes were being double-transformed. Originally a GDI transform
+> was used to transform the stroke, but later in an attempt to better preserve
+> precision, Cairo changed to transform the path before it was supplied to
+> GDI. At the same time, it neglected to fully revert the now unneeded GDI
+> transform for strokes. So, this patch does that.
+
+I didn't understand the issue you are having with strokes. Do you have a test case I can try?
+
+The reason for transforming the GDI to user space (stroke_ctm) before stroking is because the stroking parameters (width, dash lengths) are in user space. If the user space transform is anything other than a uniform scale, just scaling the stroke parameters will not produce the correct result. I'll attach an PDF containing an example of stroking in a non uniform scale.
+
+Your patch breaks stroking for non uniform scales.
+Created attachment 8669416
+stroke.pdf
+
+Example of strokes in non uniform space.
+
+The stroke on the left was created in cairo by first scaling user space by (1,2) then creating a circle path and stroking it. The circle has become an ellipse in the no uniform scale. The stroking pen has also be distorted into an ellipse resulting in a non uniform stoke width.
+
+The stroke in the right was created in cairo by first scaling user space by (1,2) then creating a circle path. The scale was restored to identity before stroking it. As a result the circular path has become an ellipse while the circular pen has retained its shape.
+I tested the XPS writer with my stroke example. XPS Writer does not handle the stroke transform correctly. The first stroke always has a constant width. I tried both with your patch and without it. With your patch the stroke width is the same as the widest stroke in the correct output. Without your patch the stroke width is the same as the narrowest stroke in the correct output.
+
+The XPS format can handle non uniform stroke transforms. I discovered this when I opened the XPS output of the stroke example in 7zip, opened the page description, and noticed a matrix called "RenderTransform" with the values 1,0,0,1,x,y. I changed it to 1,0,0,2,x,y, saved it, and opened it in the XPS viewer. A non uniform stroke width was displayed.
+(In reply to Adrian Johnson from comment #25)
+> > PDF only allows rotations in 90 degree increments.
+> 
+> PDF allows any rotation. The cairo drawing model is based on the PDF drawing
+> model. I'll attach a PDF of a 45 degree rotation that you can test with.
+> 
+> > +    rotated = fabs (m.xx) < fabs (m.xy) || fabs (m.yy) < fabs (m.yx);
+> 
+> Which means this will have to be changed to:
+>   rotated = fabs (m.xx) == 0 && fabs (m.yy) == 0 && (m.xy * m.yx < 0);
+> 
+> I did some testing with the XPS writer and an image with different
+> rotations. I can reproduce the problem. Your patch (with my correction)
+> fixes this issue for multiples of 90 degrees but not for other rotations. I
+> checked the XPS output when printing from Adobe Reader and they rotate the
+> image before output to the XPS writer. For non 90 degree rotations the image
+> is padded and clipped.
+> 
+> I also checked the printing surface output (without your patch) with both a
+> display DC and with a PostScript printer and it worked correctly. So there
+> is unlikely to be anything wrong with the way cairo is using StretchDIBits.
+> There is nothing in the StretchDIBits documentation that says it won't work
+> with rotations. I mostly used the PostScipt output for testing when I wrote
+> the cairo win printing surface. I don't think I ever tested with the XPS
+> Writer. I didn't think anyone actually used it.
+> 
+> The XPS format allows the same image transformations as cairo. There is an
+> example of rotated images on page 176 of ECMA-388. So this is clearly a bug
+> in the XPS writer.
+> 
+> I also noticed that StretchDIBits is returning an error status for rotated
+> images on the XPS Writer. I plan to implement in cairo a more general
+> version of this workaround for broken printer drivers that will check if
+> StretchDIBits fails, transform the image (including handling non 90 degree
+> rotations), and try again.
+
+The check suggest above will have problems with some transforms that are nearly-but-not-quite-zero due to slight epsilon errors in the transforms. So comparison against zero is not advised here and why I went with a more general check that will certainly catch those cases, even if it is only going to hit 90 degree cases. Since the 90 degree cases are what is vexing our users, that is what I am concerned with and trying to address.
+
+The other cases are going to be broken on some printer drivers anyway, so not worth worrying about, but are nevertheless passed through in such a way that if the printer driver can handle these non-90 degree transforms if it is able to still produce the correct output we expect. But in the wild, 90 degree transforms are what we are seeing, here for business purposes, so it is important to us that these work, rather than get hung up too much on trying to get a perfect fix for this while users are being affected.
+
+As far as the PDF spec stated when I verified, the Rotate command only works with 90 degree increments. 
+
+As far as StretchDIBits, regardless of what any documentation says, the implementation is variable and clearly buggy on many drivers, and has been independently reported by other people using it in other software, with even an admission from Microsoft they have bugs in their own software.
+
+I will look into addressing the non-uniformity issue, however, the stroke setup as it currently stands still is leading to issues and needs to be fixed, regardless.
+(In reply to Adrian Johnson from comment #27)
+> (In reply to Lee Salzman [:eihrul] from comment #16)
+> > Firstly, strokes were being double-transformed. Originally a GDI transform
+> > was used to transform the stroke, but later in an attempt to better preserve
+> > precision, Cairo changed to transform the path before it was supplied to
+> > GDI. At the same time, it neglected to fully revert the now unneeded GDI
+> > transform for strokes. So, this patch does that.
+> 
+> I didn't understand the issue you are having with strokes. Do you have a
+> test case I can try?
+> 
+> The reason for transforming the GDI to user space (stroke_ctm) before
+> stroking is because the stroking parameters (width, dash lengths) are in
+> user space. If the user space transform is anything other than a uniform
+> scale, just scaling the stroke parameters will not produce the correct
+> result. I'll attach an PDF containing an example of stroking in a non
+> uniform scale.
+> 
+> Your patch breaks stroking for non uniform scales.
+
+The test case here contains private details from the reporter, so I don't think you'd have to consult the bug reporter to get a copy of it.
+
+But because the path was already transformed, the axis swaps/mirrors that are contained in the transform that is left by the time we get to StrokePath needs to be factored out as well, with what we want only being the transformed relative scales, I presume. Either way, XPS writer was choking on it. So the simplest test case to construct here would be to pass in a 90 degree rotation to stroke with a solid pattern. I think that would reproduce the issue. Either way, I'm working on writing up a fix for this.
+Created attachment 8669952
+stroke-fix.diff
+
+I can reproduce the problem with a 90 degree transformed stroke output to XPS. This patch should fix the issue.
+(In reply to Adrian Johnson from comment #32)
+> Created attachment 8669952
+> stroke-fix.diff
+> 
+> I can reproduce the problem with a 90 degree transformed stroke output to
+> XPS. This patch should fix the issue.
+
+This would still leave the problem that if you have a non-uniform scale, and a rotation, that the path is already transformed by CTM on its original inputting to Cairo, and again inside _cairo_win32_printing_surface_emit_path possibly. So, if you leave the rotation active in the matrix you're supplying to GDI to evaluate widths, it is going to evaluate the widths as if the path was not rotated.
+
+So for something like a 90 degree transform with a (2, 1) scale, the widths on each axis would be incorrectly swapped, no?
+
+And then we have the other gremlin in the room that sometimes has_ctm may be false, but has_gdi_ctm may be true... in which case there's still a transform left active that the printer driver might fail to honor.
+
+How to solve those issues?
+(In reply to Lee Salzman [:eihrul] from comment #33)
+> (In reply to Adrian Johnson from comment #32)
+> > Created attachment 8669952
+> > stroke-fix.diff
+> > 
+> > I can reproduce the problem with a 90 degree transformed stroke output to
+> > XPS. This patch should fix the issue.
+> 
+> This would still leave the problem that if you have a non-uniform scale, and
+> a rotation, that the path is already transformed by CTM on its original
+> inputting to Cairo,
+
+cairo does not transform paths supplied to backends. The paths are in (cairo) device space.
+
+> and again inside _cairo_win32_printing_surface_emit_path
+> possibly.
+
+Yes, the win32 print surface transforms paths by ctm since the win32 print surface can keep track of a GDI device space that is different to the cairo device space. ctm is also used for replaying recording groups.
+
+> So, if you leave the rotation active in the matrix you're
+> supplying to GDI to evaluate widths, it is going to evaluate the widths as
+> if the path was not rotated.
+
+I didn't understand this. The path is transformed by ctm into GDI device space. The stroke width is factored out of the stroke transform into a scalar value. So the only purpose left for the ModifyWorldTransform is to change to shape of the stroke pen. The patch checks if the pen shape is not a circle before calling ModifyWorldTransform.
+
+> So for something like a 90 degree transform with a (2, 1) scale, the widths
+> on each axis would be incorrectly swapped, no?
+
+It is not possible to make non uniform scaled strokes work with XPS. I tried moving the emit path to occur inside the transform (after adjusting the path) in case XPS did not like the stroke on a different transform to the path. That did not work. But these transforms are rare. Most documents are using uniform strokes so I optimized away the transform when not required.
+
+> And then we have the other gremlin in the room that sometimes has_ctm may be
+> false, but has_gdi_ctm may be true... in which case there's still a
+> transform left active that the printer driver might fail to honor.
+
+I'll look into that but it won't affect firefox. gdi_ctm is only used for ctms that scale down. The intended use case is creating EMF files where it can be used to create higher precision by scaling down GDI and applying the corresponding inverse in cairo. For printing the ctm always scales up since the GDI space for printers is the printer DPI.
+
+> How to solve those issues?
+
+I need to do more testing. I'm currently doing some major work on the win32 printing surface to fix these issues as well as other bit rot (this backend has been neglected for a few years).
+(In reply to Adrian Johnson from comment #34)
+> (In reply to Lee Salzman [:eihrul] from comment #33)
+> > (In reply to Adrian Johnson from comment #32)
+> > > Created attachment 8669952
+> > > stroke-fix.diff
+> > > 
+> > > I can reproduce the problem with a 90 degree transformed stroke output to
+> > > XPS. This patch should fix the issue.
+> > 
+> > This would still leave the problem that if you have a non-uniform scale, and
+> > a rotation, that the path is already transformed by CTM on its original
+> > inputting to Cairo,
+> 
+> cairo does not transform paths supplied to backends. The paths are in
+> (cairo) device space.
+
+That's the exact problem. You supply path's in user space. By the time they get to the printing backend, they are in device space. stroke_ctm that is passed in to this particular function is the same CTM that was used to transform from user space to device space. And you're applying it again during StrokePath to the pen.
+
+So if the you have a path that was a vertical line in user space, with a 90 degree rotation that transformed it into a horizontal line in device space, what we're getting here is the horizontal line. If the normals from the horizontal line are used as input into the rotation transform to evaluate width, the result will be erroneous. You'll get the relative scaling for the opposite axis of the one you need.
+
+> > and again inside _cairo_win32_printing_surface_emit_path
+> > possibly.
+> 
+> Yes, the win32 print surface transforms paths by ctm since the win32 print
+> surface can keep track of a GDI device space that is different to the cairo
+> device space. ctm is also used for replaying recording groups.
+> 
+> > So, if you leave the rotation active in the matrix you're
+> > supplying to GDI to evaluate widths, it is going to evaluate the widths as
+> > if the path was not rotated.
+> 
+> I didn't understand this. The path is transformed by ctm into GDI device
+> space. The stroke width is factored out of the stroke transform into a
+> scalar value. So the only purpose left for the ModifyWorldTransform is to
+> change to shape of the stroke pen. The patch checks if the pen shape is not
+> a circle before calling ModifyWorldTransform.
+
+Yes, but the transform assumes an input in user space with scale partially factored out. Except the input is actually in device space, because that's what the path we're giving to GDI is in.
+
+> > So for something like a 90 degree transform with a (2, 1) scale, the widths
+> > on each axis would be incorrectly swapped, no?
+> 
+> It is not possible to make non uniform scaled strokes work with XPS. I tried
+> moving the emit path to occur inside the transform (after adjusting the
+> path) in case XPS did not like the stroke on a different transform to the
+> path. That did not work. But these transforms are rare. Most documents are
+> using uniform strokes so I optimized away the transform when not required.
+
+Except now for non-XPS outputs, you will still have the problem I outlined above which was pre-existing, but if we're going to solve it, we should solve it rather than leave that broken.
+
+> > And then we have the other gremlin in the room that sometimes has_ctm may be
+> > false, but has_gdi_ctm may be true... in which case there's still a
+> > transform left active that the printer driver might fail to honor.
+> 
+> I'll look into that but it won't affect firefox. gdi_ctm is only used for
+> ctms that scale down. The intended use case is creating EMF files where it
+> can be used to create higher precision by scaling down GDI and applying the
+> corresponding inverse in cairo. For printing the ctm always scales up since
+> the GDI space for printers is the printer DPI.
+> 
+> > How to solve those issues?
+> 
+> I need to do more testing. I'm currently doing some major work on the win32
+> printing surface to fix these issues as well as other bit rot (this backend
+> has been neglected for a few years).
+Actually, wait, I may just be an idiot here. Is the way the GDI pen orientation independent of the path normal? If so, then the transform there is actually correct, and I was looking at it the wrong way...
+(In reply to Lee Salzman [:eihrul] from comment #36)
+> Actually, wait, I may just be an idiot here. Is the way the GDI pen
+> orientation independent of the path normal? If so, then the transform there
+> is actually correct, and I was looking at it the wrong way...
+
+In cairo the stroking can be performed under a different transformation to the one in which the path was emitted. Once the path has been created it will not change when the transform is changed. But the stroke parameters will be in new transform. This is based on the PostScript model. Windows GDI also works the same way. There is an example here http://www.cairographics.org/tutorial/#L2linewidth
+
+PDF is a little different. The stroking is always in the same transformation as the path. But the same effect can be achieved by pre-transforming the path coordinates by the inverse stroke ctm within the application creating the PDF. The PDF file is created containing the operators for changing the ctm to the stroke space, constructing the path, then the stroke operator. When the stroke is rendered, the stroke pen will be in the stroke space and the path will transformed back to what it was before the pre-transform was applied. This is what we do in the cairo PDF backend. It is also what I tried in win32 printing to see if stroking in the same transform as the path was emitted would make XPS happy. It didn't.
+(In reply to Adrian Johnson from comment #37)
+> (In reply to Lee Salzman [:eihrul] from comment #36)
+> > Actually, wait, I may just be an idiot here. Is the way the GDI pen
+> > orientation independent of the path normal? If so, then the transform there
+> > is actually correct, and I was looking at it the wrong way...
+> 
+> In cairo the stroking can be performed under a different transformation to
+> the one in which the path was emitted. Once the path has been created it
+> will not change when the transform is changed. But the stroke parameters
+> will be in new transform. This is based on the PostScript model. Windows GDI
+> also works the same way. There is an example here
+> http://www.cairographics.org/tutorial/#L2linewidth
+> 
+> PDF is a little different. The stroking is always in the same transformation
+> as the path. But the same effect can be achieved by pre-transforming the
+> path coordinates by the inverse stroke ctm within the application creating
+> the PDF. The PDF file is created containing the operators for changing the
+> ctm to the stroke space, constructing the path, then the stroke operator.
+> When the stroke is rendered, the stroke pen will be in the stroke space and
+> the path will transformed back to what it was before the pre-transform was
+> applied. This is what we do in the cairo PDF backend. It is also what I
+> tried in win32 printing to see if stroking in the same transform as the path
+> was emitted would make XPS happy. It didn't.
+
+Here's a thought... If the pen on input is assumed to be symmetric, then couldn't we actually also just boil down the transform to just the resulting scaling effect, by removing rotation, so that ultimately even non-uniform scaling would be acceptable to the printer driver in these rotated? Presuming it is just some aspect of the rotation part of the matrix that is bugging out the printer driver, and not the scaling...
+Created attachment 8670416
+workaround for Windows printer drivers that can't handle swapped X and Y axes
+
+Okay, how about this here patch?
+
+Upon experimentation, we found the root issue that was vexing the printer driver for both strokes and images was the fact that the X and Y axes were swapped, not the negative scaling or anything else. So presumably it's reading values in the diagonal of the matrix internally, and since these are (nearly-)zero, problems arise.
+
+Also we found the transforms supplied from PDF.js were a combination of both mirroring and rotation, so a pure check for a rotation would not work, as we are supplying final transforms on our end that may look like { 0, 1, 1, 0 }, rather than a simple landscape transform like { 0, 1, -1, 0 }. So, this patch makes the check more specific by checking for nearly zero values in the diagonal, but still does not insist the the xy*yx be negative like with a pure rotation, since otherwise some matrices we are sending it would be overlooked.
+
+Thus, this combines both your suggested fix to check the major/minor values of the SVD and see if the scale was uniform enough to just omit the transform entirely. If despite this the matrix has in part a simple axis-swap like might arise from our landscape transforms, we just undo the axis-swap since the pen is, at least on input, rotationally-invariant... Anything else, we are left to the mercy of the printer driver.
+The _cairo_win32_printing_surface_paint_image_pattern changes are mostly look ok. The only improvement I would suggest is
+
++    axis_swap = fabs(m.xx) < 1e-6 && fabs(m.yy) < 1e-6;
+
+In windows backends where 1 device unit == 1 pixel or printer dpi we can using the check:
+
+ fabs(m.xx * image->width) < 1 && fabs(m.tt * image->height) < 1
+
+to check if the matrix components are too small to shift any part of the image by more than a pixel. This will make the code more tolerant of rounding errors in the matrix than a value like 1e-6.
+
+In cairo I intend to implement a more general solution. I will start with the solution that generates the most optimal output and each time StretchDIBits returns a fail status I try the next fallback solution from the following list:
+ - first try mime data (jpeg or png)
+ - then try image data (flattening transparency if required)
+ - then redraw image to remove rotation/shear from the matrix
+ - then break the above image down to smaller pieces
+
++	/* Check if the matrix swaps the X and Y axes, which
++	 * has been observed to cause problems with XPS export.
++	 */
++	if (fabs(mat.xx) < 1e-6 && fabs(mat.yy) < 1e-6) {
++	    /* swap the X and Y axes to undo the axis swap in the matrix */
++	    cairo_matrix_t swap_xy = { 0, 1, 1, 0, 0, 0 };
++	    cairo_matrix_multiply (&mat, &swap_xy, &mat);
++	}
+
+I don't understand what value this code is adding. Do you have a test case that shows a difference in which case I am missing something?
+
+The "(fabs(scale * (major - minor) > 1))" checks if the pen is not a circle in which case we need the stroke transform to get the elliptical pen shape. But for flips and 90 degree rotations the pen shape will always remain a circle in which case the above code will not be executed.
+(In reply to Adrian Johnson from comment #40) 
+> +	/* Check if the matrix swaps the X and Y axes, which
+> +	 * has been observed to cause problems with XPS export.
+> +	 */
+> +	if (fabs(mat.xx) < 1e-6 && fabs(mat.yy) < 1e-6) {
+> +	    /* swap the X and Y axes to undo the axis swap in the matrix */
+> +	    cairo_matrix_t swap_xy = { 0, 1, 1, 0, 0, 0 };
+> +	    cairo_matrix_multiply (&mat, &swap_xy, &mat);
+> +	}
+> 
+> I don't understand what value this code is adding. Do you have a test case
+> that shows a difference in which case I am missing something?
+> 
+> The "(fabs(scale * (major - minor) > 1))" checks if the pen is not a circle
+> in which case we need the stroke transform to get the elliptical pen shape.
+> But for flips and 90 degree rotations the pen shape will always remain a
+> circle in which case the above code will not be executed.
+
+If we're supplying a transform to GDI that happens to contain an axis swap, then that is going to cause the printer driver to bug out. So if we need the elliptical pen shape, that is the case where such a transform may be accidentally supplied.
+
+But because the pen shape on input is a circle (= symmetric), we can thus tack on some arbitrary unit rotation to the front of the transform without disturbing the final result. By tacking on that X/Y swap matrix, we undo the axis swap in the matrix we're giving to GDI, but the final ellipse will still be what we want on output. GDI is happy, printer's happy, we're happy, everyone's happy. :)
+Created attachment 8671492
+workaround for Windows printer drivers that can't handle swapped X and Y axes
+
+Latest version of printing patch that incorporates Adrian's fixes and feedback.
+Comment on attachment 8671492
+workaround for Windows printer drivers that can't handle swapped X and Y axes
+
+Review of attachment 8671492:
+-----------------------------------------------------------------
+
+::: gfx/cairo/cairo/src/cairo-win32-printing-surface.c
+@@ +1261,5 @@
+> +/* from doc/tutorial/src/singular.c */
+> +static void
+> +get_singular_values (const cairo_matrix_t *matrix,
+> +		     double *major,
+> +		     double *minor)
+
+Couldn't this use _cairo_matrix_compute_basis_scale_factors?
+Created attachment 8673870
+workaround for Windows printer drivers that can't handle swapped X and Y axes
+
+Cleaned up the SVD code based on some suggestions from Jeff to reuse similar code already in Cairo, and also fixed a related bug that snuck into the patch.
+
+Carried r+ from Jeff.
+Created attachment 8676427
+add Cairo patch for bug 1205854
+Try results: https://treeherder.mozilla.org/#/jobs?repo=try&revision=4befedbcb2c8
+lee, do you want both patches landed ?
+https://hg.mozilla.org/integration/mozilla-inbound/rev/cbd0b9619978
+(In reply to Carsten Book [:Tomcat] from comment #47)
+> lee, do you want both patches landed ?
+
+Yep, both. One to modify the sources and the other to have the patch around in case we need to reapply it.
+Created attachment 8676952
+initialize variable in _cairo_matrix_transformed_circle_major_axis
+
+This just initializes variable to quiet warning, but should make no actual difference in semantics of the code.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/aa291bcfb0e8
+These appear to have caused a bunch of reftest failures like https://treeherder.mozilla.org/logviewer.html#?job_id=16044497&repo=mozilla-inbound
+
+Both backed out in https://hg.mozilla.org/integration/mozilla-inbound/rev/26c5929a5a7e
+Created attachment 8677170
+workaround for Windows printer drivers that can't handle swapped X and Y axes
+
+Fixes for reftest failures that arose from an ill-placed pure attribute on a function prototype.
+
+Try results to check that reftest failures were fixed: https://treeherder.mozilla.org/#/jobs?repo=try&revision=05f7155fa201
+https://hg.mozilla.org/integration/mozilla-inbound/rev/a8df1b37b075
+https://hg.mozilla.org/mozilla-central/rev/a8df1b37b075

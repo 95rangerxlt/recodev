@@ -1,0 +1,151 @@
+In following up on bug 1054660 about "unrestored" using too much memory I found that for some pages the |tabData| associated with the the partially restored tab (__SS_data) is using up several MiB of memory.
+
+The problem seems two-fold:
+  1) The data is duplicated.
+  2) We're loading tabData before the tab is fully restored, ideally this
+     would be lazily loaded.
+
+STR:
+1) Open browser
+2) Load http://www.samsung.com/us/
+3) Open an additional blank tab
+4) Close browser
+5) Open browser
+6) Restore session
+7) Measure memory usage w/ about:memory before selecting the samsung tab
+
+You'll find that there are 2 copies of a 1MiB string. By grepping through a gc log I was able to find the offending string and using:
+   |find_roots.py gc.log -sp <addr_of_str> |
+I was able to determine that the data is being held alive by the sessionstore.
+
+Copy 1: 
+
+> via XPCWrappedNative::mFlatJSObject :[ContentFrameMessageManager 7f04c2f08be0] --[gContentRestore]-->
+> [Proxy] --[private]--> [Object] --[resetRestore]--> [Function] --[**UNKNOWN SLOT 0**]--> 
+> [Object] --[_tabData]--> [Proxy] --[private]--> [Object] --[storage]--> [Object] 
+> --[http://www.samsung.com]--> [Object] --[FSR_SAMSUNGCOM_BLOB]--> 
+> [string <length 523973 (truncated)> {"start":141869]
+
+Copy 2:
+
+> via nsXPCWrappedJS::mJSObj :[Object] --[_browserTokenMap]--> [WeakMap 7f04d254c060] 
+> --[WeakMap entry key]--> [XULElement] --[__SS_data]--> [Proxy] --[private]--> [Object]
+> --[storage]--> [Object] --[http://www.samsung.com]--> [Object] --[FSR_SAMSUNGCOM_BLOB]-->
+> [string <length 523973 (truncated)> {"start":141869]
+
+In following up on bug 1054660 about "unrestored" using too much memory I found that for some pages the |tabData| associated with the the partially restored tab (__SS_data) is using up several MiB of memory.
+
+The problem seems two-fold:
+  1) The data is duplicated.
+  2) We're loading tabData before the tab is fully restored, ideally this
+     would be lazily loaded.
+
+STR:
+1) Open browser
+2) Load http://www.samsung.com/us/
+3) Open an additional blank tab
+4) Close browser
+5) Open browser
+6) Restore session
+7) Measure memory usage w/ about:memory before selecting the samsung tab
+
+You'll find that there are 2 copies of a 1MiB string. By grepping through a gc log I was able to find the offending string and using:
+   |find_roots.py gc.log -sp <addr_of_str> |
+I was able to determine that the data is being held alive by the sessionstore.
+
+Copy 1: 
+
+> via XPCWrappedNative::mFlatJSObject :[ContentFrameMessageManager 7f04c2f08be0] --[gContentRestore]-->
+> [Proxy] --[private]--> [Object] --[resetRestore]--> [Function] --[**UNKNOWN SLOT 0**]--> 
+> [Object] --[_tabData]--> [Proxy] --[private]--> [Object] --[storage]--> [Object] 
+> --[http://www.samsung.com]--> [Object] --[FSR_SAMSUNGCOM_BLOB]--> 
+> [string <length 523973 (truncated)> {"start":141869]
+
+Copy 2:
+
+> via nsXPCWrappedJS::mJSObj :[Object] --[_browserTokenMap]--> [WeakMap 7f04d254c060] 
+> --[WeakMap entry key]--> [XULElement] --[__SS_data]--> [Proxy] --[private]--> [Object]
+> --[storage]--> [Object] --[http://www.samsung.com]--> [Object] --[FSR_SAMSUNGCOM_BLOB]-->
+> [string <length 523973 (truncated)> {"start":141869]
+Great investigation, Eric!
+
+(In reply to Eric Rahm [:erahm] from comment #0)
+> The problem seems two-fold:
+>   1) The data is duplicated.
+
+Yes, the first of those two places is the content process (in an e10s world), the DOMStorage data is sent over and restored. I think we could stop holding onto it once that happened by adding:
+
+|delete tabData.storage| to
+http://hg.mozilla.org/mozilla-central/annotate/0e441ff66c5e/browser/components/sessionstore/ContentRestore.jsm#l155
+
+The second place is a tab._SS_data property that we hold onto until the tab has been restored. If it's closed before we take our information from there. We could probably move around that data but not get rid of it completely.
+
+>   2) We're loading tabData before the tab is fully restored, ideally this
+>      would be lazily loaded.
+
+With SessionStore loading a JSON file from disk lazy loading isn't really doable currently. We read the file once at startup and keep everything we read in memory.
+(In reply to Tim Taubert [:ttaubert] (away Dec 19th, back Jan 5th) from comment #1)
+> Great investigation, Eric!
+> 
+> (In reply to Eric Rahm [:erahm] from comment #0)
+> > The problem seems two-fold:
+> >   1) The data is duplicated.
+> 
+> Yes, the first of those two places is the content process (in an e10s
+> world), the DOMStorage data is sent over and restored. I think we could stop
+> holding onto it once that happened by adding:
+> 
+> |delete tabData.storage| to
+> http://hg.mozilla.org/mozilla-central/annotate/0e441ff66c5e/browser/
+> components/sessionstore/ContentRestore.jsm#l155
+
+That seems to have done the trick! about:memory diff, note the reduction of copies:
+> │  │  ├──-1.44 MB (-21.48%) -- strings
+> │  │  │  ├──-1.98 MB (-29.44%) ++ string(length=516298, copies=2, "{"start":1418952269920,"log":[{"x":-1,"e":17,"d": (truncated))
+> │  │  │  ├───0.99 MB (14.72%) ++ string(length=516298, copies=1, "{"start":1418952269920,"log":[{"x":-1,"e":17,"d": (truncated))
+> │  │  │  ├──-0.35 MB (-5.24%) ++ string(length=184184, copies=2, "{"myespn":"  <div class=//"toolbar//">   <h4><a cl (truncated))
+> │  │  │  ├───0.18 MB (02.62%) ++ string(length=184184, copies=1, "{"myespn":"  <div class=//"toolbar//">   <h4><a cl (truncated))
+
+> The second place is a tab._SS_data property that we hold onto until the tab
+> has been restored. If it's closed before we take our information from there.
+> We could probably move around that data but not get rid of it completely.
+
+Okay, it seems like we can't avoid that (unless we do some form of lazy loading).
+
+> >   2) We're loading tabData before the tab is fully restored, ideally this
+> >      would be lazily loaded.
+> 
+> With SessionStore loading a JSON file from disk lazy loading isn't really
+> doable currently. We read the file once at startup and keep everything we
+> read in memory.
+
+I see, so to do lazy loading per tab we'd need to change how we save the data so that we could get meta-data separate from the actual storage, etc. Is that something we'd even consider?
+https://tbpl.mozilla.org/?tree=Try&rev=44dd6d2db695
+Created attachment 8538929
+Clear tabData storage after calling restore
+Comment on attachment 8538929
+Clear tabData storage after calling restore
+
+Review of attachment 8538929:
+-----------------------------------------------------------------
+
+Stealing the review from Tim since it looks like he's out for the holidays.
+Created attachment 8539538
+Clear tabData storage after calling restore
+Comment on attachment 8539538
+Clear tabData storage after calling restore
+
+Review of attachment 8539538:
+-----------------------------------------------------------------
+
+Added r=billm, carrying forward r+
+Hi Eric, can you provide a try link thanks!
+(In reply to Carsten Book [:Tomcat] from comment #8)
+> Hi Eric, can you provide a try link thanks!
+
+Maybe I should have prefixed it w/ "try: "?
+
+(In reply to Eric Rahm [:erahm] from comment #3)
+> https://tbpl.mozilla.org/?tree=Try&rev=44dd6d2db695
+https://hg.mozilla.org/integration/fx-team/rev/1731ab46c546
+https://hg.mozilla.org/mozilla-central/rev/1731ab46c546

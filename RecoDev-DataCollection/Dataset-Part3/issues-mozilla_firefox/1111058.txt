@@ -1,0 +1,384 @@
+This is regression from bug 905700. When a sourcemap fails to parse (which isn't rare in development, if the map doesn't exist and the dev server returns some random 404 HTML or something), we need to gracefully handle it and treat the source as if it never had a sourcemap.
+
+Most of the code is already there for this, but changes to the sourcemap handling introduced a bug: an `onNewSource` notification doesn't get sent to the debugger for sources with an invalid sourcemap. This because `source` in ThreadSources checks if a sourcemap exists for the source to detect if it's a generated source or not, and we don't send notificatons for generated sources. However, the place it checks actually stores a sourcemap *promise*, so that value always exists, even if it holds a rejection.
+
+Should be pretty simply to tweak the code in `source` to resolve the promise and check if it's an actual valid sourcemap, and then do the notification logic.
+
+This is regression from bug 905700. When a sourcemap fails to parse (which isn't rare in development, if the map doesn't exist and the dev server returns some random 404 HTML or something), we need to gracefully handle it and treat the source as if it never had a sourcemap.
+
+Most of the code is already there for this, but changes to the sourcemap handling introduced a bug: an `onNewSource` notification doesn't get sent to the debugger for sources with an invalid sourcemap. This because `source` in ThreadSources checks if a sourcemap exists for the source to detect if it's a generated source or not, and we don't send notificatons for generated sources. However, the place it checks actually stores a sourcemap *promise*, so that value always exists, even if it holds a rejection.
+
+Should be pretty simply to tweak the code in `source` to resolve the promise and check if it's an actual valid sourcemap, and then do the notification logic.
+We should uplift this to Aurora too, as it's a pretty serious regression IMHO. I'm viewing the current 6 week window as a chance to fix as many of these regressions from the D.Source work as possible.
+(In reply to James Long (:jlongster) from comment #1)
+> We should uplift this to Aurora too, as it's a pretty serious regression
+> IMHO. I'm viewing the current 6 week window as a chance to fix as many of
+> these regressions from the D.Source work as possible.
+
++1
+Created attachment 8537477
+1111058.patch
+
+This makes sure that whatever is in `_sourceMaps` has a valid sourcemap. We have a test that tests invalid sourcemaps, but I bet we need to add a check in there that the original file is still listed as a source. I will probably add that to my patch, but should be a small addition.
+Comment on attachment 8537477
+1111058.patch
+
+Review of attachment 8537477:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/test/browser_dbg_pretty-print-07.js
+@@ +34,5 @@
+>    gThreadClient.source(gSource).prettyPrint(4, testPrettyPrinted);
+>  }
+>  
+>  function testPrettyPrinted({ error, source }) {
+> +  ok(!error, "An error occurred while pretty-printing");
+
+Nit: This will result in output like:
+
+  TEST-PASS | An error occurred while pretty-printing
+
+Can you rewrite your assertions like "Should not get an error while pretty-printing", so we get messages like this in the detailed logs:
+
+  TEST-PASS | Should not get an error while pretty-printing
+
+Which I think is more natural to read and conveys the actual intent much better.
+I noticed a few other issues while working on this, so I'm making this bug more generic. This will fix edge cases with the following:
+
+* sourcemap URLs that return invalid sourcemaps
+* calling `getOriginalLocation` from other Debugger instances than the debugger tool (like the tracer)
+* general races with certain kinds of breakpoints
+
+The problem is that it's hard to tell if a source is actually sourcemapped. It can have a sourceMapURL, but the contents of it are invalid so we disregard the sourcemap. Creating the source actors is a special dance to make sure that we create the appropriate sourcemapped and non-sourcemapped ones, but certain points in the code assume that this dance has already happened (and just want to get a source actor for a source).
+
+More specifically, `ThreadSources.prototype.source` is just confusing. My new patch renames `sourcesForScript` and `_sourceForScript` to more general names like `createSourceActor`. The `source` method is basically internal now, and nobody outside should use it. They should either call `getSourceActor` or one of the appropriate `createSourceActor` functions, depending on if they think the source actor should be able to be created at that point.
+
+It's kind of hard to explain, but basically it was too easy to mess up how you created/got a source actor before, and this should help.
+Created attachment 8538817
+1111058.patch
+
+I probably need to add better comments, because this stuff is really tricky. The main problem here is that the initialization order of source actors is important for the `onNewSource` notification. We send an `onNewSource` notification when a source actor is created, and it's either an original "fake" source or it's a real source that doesn't have a valid source map. We don't want to send notifications for internal "generated" sources, but we need to create them to set breakpoints, etc. (simplest solution for handling arbitrary source like evals)
+
+That means that we need to make sure that we've attempted to get the sourcemap for a source first though before creating a SourceActor for it. Also that we need to wait until it's fully downloaded and parsed, because if we can't parse the sourcemap we discard it and treat it like an non-sourcemapped source.
+
+All this to say, as I mentioned in my above comment, I tried to make the `source` function internal, and added better methods on `ThreadSources` for public consumption that handles all this trickery.
+Created attachment 8539028
+1111058.patch
+
+Fixed a small typo that happened while rebasing
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=cbe535943301
+Comment on attachment 8539028
+1111058.patch
+
+Review of attachment 8539028:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/script.js
+@@ -2011,4 @@
+>        }
+> -    }
+> -
+> -    return true;
+
+I removed `return true` because I didn't see anything use the return value of `addScript`, but after reading the function documentation again I can add it back. The only thing is now setting the breakpoints is async, so not sure if it's ok to eagerly return that.
+
+In fact, I wonder if it's ok that this is async now. This is where we restore breakpoints when a page is reloaded (or on attach, though I don't know why we do that since breakpoints don't survive across thread attachments). Seems like a script could execute before we set the breakpoint here. All tests are passsing, so I'm guessing we are missing that edge case?
+
+I guess that means I need a way to get a source actor for a real source, but tell it not to send any `onNewScript` notifications, and also trigger the process for fetching the sourcemap and properly sending `onNewScript` notifications separately.
+Comment on attachment 8539028
+1111058.patch
+
+Review of attachment 8539028:
+-----------------------------------------------------------------
+
+Overall, this looks great, and I love how it cleans up the API and usage.
+
+However, we really can't make restoring breakpoints asynchronous. There will /definitely/ be refresh + breakpoint race conditions. We could use `synchronize` to force it to be synchronous, but that is super gross and I imagine it would also be a pretty big hit to the debugger's initialization performance to enter and leave a nested event loop for every script on the page (potentially tens of thousands).
+
+Instead, can we create the non-source mapped source actor we need for setting BPs, but suppress emitting the `newSource` event unless creating the source mapped source actors fails?
+
+::: toolkit/devtools/server/actors/script.js
+@@ -2011,4 @@
+>        }
+> -    }
+> -
+> -    return true;
+
+If you're going to remove `return true`, then also remove the `return false` and fix the documentation.
+
+@@ +5265,2 @@
+>     */
+> +  createSourceActor: function (aSource) {
+
+Can you spec parameters and return type?
+
+Additionally, can you name this `createNonSourceMappedSourceActor` or something equally descriptive?
+
+@@ +5267,2 @@
+>      // Don't use getSourceURL because we don't want to consider the
+>      // displayURL property if it's an eval source
+
+Existing nit: can you explain *why* we don't want to consider the displayURL property if it's an eval source? The reason is because this is a URL that we potentially use to fetch the source contents, right? We should definitely document this, as it's rather subtle. Sorry for not catching this earlier.
+
+Also, proper punctuation please :) (missing period)
+
+@@ +5303,2 @@
+>     */
+> +  createMappedSourceActors: function (aSource) {
+
+Personally, I'd prefer `createSourceMappedSourceActors` just to be explicit, since we have so many different ways to create source actors.
+
+@@ +5307,1 @@
+>      }
+
+I think part of the reason why the ThreadSources APIs are so frustrating (besides the many potentially overlapping types of sources and inherent complexity) is that all the methods try to do everything. So: can we be more assertive here by *requiring* that we are source mapping and adjusting callers to match that?
+
+  dbg_assert(!this._userSourceMaps || !aSource.sourceMapURL),
+             "createMappedSourceActors: should be source mapping");
+
+Additionally, can we `dbg_assert` that we already created the non-source mapped actor for the given source? If it is important enough to warrant various comments, it is important enough to assert.
+I wanted to fix this on Monday but packing for traveling took longer than I thought, so going to spend a little time on it before Christmas and see if I can finish it.
+
+(In reply to Nick Fitzgerald [:fitzgen] from comment #10)
+> Comment on attachment 8539028
+> 1111058.patch
+> 
+> Review of attachment 8539028:
+> -----------------------------------------------------------------
+> 
+> Overall, this looks great, and I love how it cleans up the API and usage.
+> 
+> However, we really can't make restoring breakpoints asynchronous. There will
+> /definitely/ be refresh + breakpoint race conditions. We could use
+> `synchronize` to force it to be synchronous, but that is super gross and I
+> imagine it would also be a pretty big hit to the debugger's initialization
+> performance to enter and leave a nested event loop for every script on the
+> page (potentially tens of thousands).
+
+Yeah, I realized that as I was explaining my patch.
+
+> Instead, can we create the non-source mapped source actor we need for
+> setting BPs, but suppress emitting the `newSource` event unless creating the
+> source mapped source actors fails?
+
+Let's definitely do this. I'll think about the best way to code that, but separating the `newSource` notification from any call to `source` seems like a good idea anyway.
+
+I agree with the rest of your review, I will fix up appropriately.
+Comment on attachment 8539028
+1111058.patch
+
+Review of attachment 8539028:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/script.js
+@@ +5307,1 @@
+>      }
+
+(disclaimer: I'm trying for the first time to reply to a review comment inline in splinter, but I'm not convinced it's going to paste the right context of your comment. To be clear, I'm replying to your comment "I think part of the reason why the ThreadSources APIs are so frustrating...")
+
+I'm slightly confused by your comment at the end, since it's not required to create the non-source mapped actor first and there are no comments to that effect. There are comments about attempting to create the sourcemapped ones first to figure out if we should send the onNewSource notification or not, but that's a special case somewhere else.
+
+Also, I don't know how different it will be to dbg_assert here instead of just `if`. Really, I think this might actually be an internal function. Now that I've fixed up the (now internal) `source` method to properly send the right notifications, callers don't really care anymore about any of this stuff. `createSourceActors` is really the public API now, which does the Right Thing. We could even make `createSourceActor` and `createSourceMappedSourceActors` just internal things. In that case the latter function could do the dbg_assert, and `createSourceActors` does the check if we are sourcemapping, if you like.
+
+Kind of speaking out loud here, and just taking a few iterations to get this right.
+Created attachment 8541096
+1111058.patch
+
+Updated patch, with a much better fix. This makes the `source` method actually wait for the sourcemap promise, and then checks if the sourcemap is valid or not before firing onNewSource.
+
+`source` still eagerly returns a SourceActor, because it doesn't depend on the above behavior. But it can spawn that promise to figure out the sourcemapping stuff and make sure to do the right notification, which works really well, and I was able to simplify other parts of the code that my patch previous complicated.
+
+No review needed yet; will make one more cleanup pass through it after the holidays, and will ask for another review then.
+Created attachment 8544828
+1111058.patch
+
+I think enough has changed here for a quick re-review. Anything I should change?
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=dc2f1e2c2420
+Comment on attachment 8544828
+1111058.patch
+
+Review of attachment 8544828:
+-----------------------------------------------------------------
+
+Looks good. Just a few cases to think about and maybe make some small changes to accomodate those cases, and some nits to fix up.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +5233,4 @@
+>        try {
+>          this._onNewSource(actor);
+>        } catch (e) {
+>          reportError(e);
+
+Instead of doing this wrapping here, let's do this in the `ThreadSources` constructor:
+
+    this._onNewSource = DevToolsUtils.makeInfallible(
+      aOnNewSource,
+      "ThreadSources.prototype._onNewSource");
+
+@@ +5238,5 @@
+>      }
+>  
+> +    if(!actor.source) {
+> +      // Always notify if we don't have a source because that means
+> +      // it's something that has been sourcemapped.
+
+This is not true: it could be a consolidated HTML source. However, I think the code's logic is still correct. Please re-word the comment.
+
+@@ +5245,5 @@
+> +    else {
+> +      // If we have a real source, check to see if it's sourcemapped
+> +      // and only send notifications for sources that aren't. Source
+> +      // actors are still created for generated sources that are
+> +      // sourcemapped, but we should never send notifications for them.
+
+As someone reading this code, trying to figure out what's going on, this comment leaves me wishing for more context.
+
+How about something like this:
+
+"""
+Although we create `SourceActor` instances for generated sources when
+source mapping is enabled, they are only used internally for X, Y, Z.
+Because they are only used internally, we should not send "new source"
+notifications for these internal sources. We know that a `SourceActor`
+represents one of these generated sources when it has both a
+`Debugger.Source` instance and a source map.
+"""
+
+I believe that "X, Y, Z" is just for use in the `BreakpointStore`. Is there anything else?
+
+@@ +5359,3 @@
+>     *
+> +   * @param Debugger.Source aSource
+> +   *        The source instance to create actors for
+
+Full sentences, please.
+
+@@ +5383,5 @@
+> +   * of `aSource`. If sourcemapped, returns actors for all of the original
+> +   * sources.
+> +   *
+> +   * @param Debugger.Source aSource
+> +   *        The source instance to create actors for
+
+Ditto.
+
+@@ +5391,5 @@
+> +    // It's important to first try to create the sourcemapped actors,
+> +    // and then create the real source. The `onNewSource` notification
+> +    // depends on this order of creation.
+> +    return this._createSourceMappedActors(aSource).then(actors => {
+> +      let actor = this.createNonSourceMappedActor(aSource);
+
+Isn't this no longer necessary now that we fetch the source map before potentially emitting the new source notification?
+
+@@ +5589,5 @@
+>          return {
+> +          sourceActor: (!sourceUrl) ? null : this.source({
+> +            originalUrl: sourceUrl,
+> +            generatedSource: source
+> +          }),
+
+How would the situation arise that we get here and don't have a source actor for the given original URL? Wouldn't it have been created in ThreadSources after we got the source map? Looking at the code, I guess not; shouldn't we change the behavior to create source mapped SourceActor instances greedily once we successfully fetch a source map? It seems like it would clean this up a bit (and other places, as well?)
+
+Also, indentation.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #16)
+> 
+> @@ +5391,5 @@
+> > +    // It's important to first try to create the sourcemapped actors,
+> > +    // and then create the real source. The `onNewSource` notification
+> > +    // depends on this order of creation.
+> > +    return this._createSourceMappedActors(aSource).then(actors => {
+> > +      let actor = this.createNonSourceMappedActor(aSource);
+> 
+> Isn't this no longer necessary now that we fetch the source map before
+> potentially emitting the new source notification?
+
+Yeah, I think you're right. I'll remove the comment. I'll also play with it and run the tests with various ordering and make sure it behaves as expected.
+
+> @@ +5589,5 @@
+> >          return {
+> > +          sourceActor: (!sourceUrl) ? null : this.source({
+> > +            originalUrl: sourceUrl,
+> > +            generatedSource: source
+> > +          }),
+> 
+> How would the situation arise that we get here and don't have a source actor
+> for the given original URL? Wouldn't it have been created in ThreadSources
+> after we got the source map? Looking at the code, I guess not; shouldn't we
+> change the behavior to create source mapped SourceActor instances greedily
+> once we successfully fetch a source map? It seems like it would clean this
+> up a bit (and other places, as well?)
+
+There's one use case which is the reason for a few decisions in this API, this part being one of them: a different actor that uses a different Debugger instance may call this `getOriginalLocation` method. In that case, there's zero guarantee that any of the source discovery setup has been run (_discoverSources, _addScript, etc). So we *have* to assume in this case that we need to rebuild any actors necessary.
+
+That does mean that potentially there is a duplicate notification in the debugger for stuff like unnamed eval sources, though. (things with urls will just return the cached source actors.) But there's certainly far less potential for bugs for cross-Debugger sourcemapped than there was before. We should probably test the cross-Debugger stuff more though.
+Created attachment 8545421
+1111058.patch
+
+with minor fixes from fitzgen's review
+(In reply to James Long (:jlongster) from comment #17)
+> (In reply to Nick Fitzgerald [:fitzgen] from comment #16)
+> > 
+> > @@ +5391,5 @@
+> > > +    // It's important to first try to create the sourcemapped actors,
+> > > +    // and then create the real source. The `onNewSource` notification
+> > > +    // depends on this order of creation.
+> > > +    return this._createSourceMappedActors(aSource).then(actors => {
+> > > +      let actor = this.createNonSourceMappedActor(aSource);
+> > 
+> > Isn't this no longer necessary now that we fetch the source map before
+> > potentially emitting the new source notification?
+> 
+> Yeah, I think you're right. I'll remove the comment. I'll also play with it
+> and run the tests with various ordering and make sure it behaves as expected.
+> 
+> > @@ +5589,5 @@
+> > >          return {
+> > > +          sourceActor: (!sourceUrl) ? null : this.source({
+> > > +            originalUrl: sourceUrl,
+> > > +            generatedSource: source
+> > > +          }),
+> > 
+> > How would the situation arise that we get here and don't have a source actor
+> > for the given original URL? Wouldn't it have been created in ThreadSources
+> > after we got the source map? Looking at the code, I guess not; shouldn't we
+> > change the behavior to create source mapped SourceActor instances greedily
+> > once we successfully fetch a source map? It seems like it would clean this
+> > up a bit (and other places, as well?)
+> 
+> There's one use case which is the reason for a few decisions in this API,
+> this part being one of them: a different actor that uses a different
+> Debugger instance may call this `getOriginalLocation` method. In that case,
+> there's zero guarantee that any of the source discovery setup has been run
+> (_discoverSources, _addScript, etc). So we *have* to assume in this case
+> that we need to rebuild any actors necessary.
+
+This would be _great_ to add as a comment.
+
+> That does mean that potentially there is a duplicate notification in the
+> debugger for stuff like unnamed eval sources, though. (things with urls will
+> just return the cached source actors.) But there's certainly far less
+> potential for bugs for cross-Debugger sourcemapped than there was before. We
+> should probably test the cross-Debugger stuff more though.
+
+Always +1 for more tests for this stuff.
+Created attachment 8545615
+1111058.patch
+
+Done! Added a comment about creating actors within `getOriginalLocation`
+This try push is still valid, the only stuff added since then are comments and slight indentation tweaks: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=dc2f1e2c2420
+https://hg.mozilla.org/integration/fx-team/rev/d68aaa3f8e5c
+https://hg.mozilla.org/mozilla-central/rev/d68aaa3f8e5c
+Comment on attachment 8545615
+1111058.patch
+
+Approval Request Comment
+[Feature/regressing bug #]: 905700
+[User impact if declined]: There are times when a source will not show up in the source listing in the debugger, for example when the source has an invalid sourcemap. There are probably other edge cases where this happens.
+[Describe test coverage new/current, TBPL]: tests updated and passing
+[Risks and why]: no huge risk, it does touch core code in the debugger server though
+[String/UUID change made/needed]:
+
+
+1111771
+https://hg.mozilla.org/releases/mozilla-aurora/rev/6250d427f703

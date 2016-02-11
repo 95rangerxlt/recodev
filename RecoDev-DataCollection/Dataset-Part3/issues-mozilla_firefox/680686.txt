@@ -1,0 +1,160 @@
+[browser/components/sessionstore/test/browser/browser_354894.js]
+  13x [about:blank]
+  12x [chrome://browser/content/browser.xul]
+
+I tried to fix AllTabs.jsm to not leak DOMWindows but wasn't successful. AllTabs was created with multi-windows support in mind which Panorama isn't ready for. In fact it's going to need some time for that. So I'll suggest removing AllTabs.jsm for now and replace it with a per-window solution. Running the test from above doesn't leak anymore with the patch applied.
+
+This leak is very likely responsible for some (if not all) of the leaks introduced with bug 626455 and bug 662812.
+
+[browser/components/sessionstore/test/browser/browser_354894.js]
+  13x [about:blank]
+  12x [chrome://browser/content/browser.xul]
+
+I tried to fix AllTabs.jsm to not leak DOMWindows but wasn't successful. AllTabs was created with multi-windows support in mind which Panorama isn't ready for. In fact it's going to need some time for that. So I'll suggest removing AllTabs.jsm for now and replace it with a per-window solution. Running the test from above doesn't leak anymore with the patch applied.
+
+This leak is very likely responsible for some (if not all) of the leaks introduced with bug 626455 and bug 662812.
+Created attachment 554646
+patch v1
+Comment on attachment 554646
+patch v1
+
+>+  handleEvent: function AllTabs_handleEvent(event) {
+>+    let tab = event.target;
+>+  },
+
+Dead code?
+
+>+  register: function AllTabs_register(eventName, callback) {
+>+    function handleEvent(event) {
+>+      callback(event.target, event);
+>+    }
+>+
+>+    this._callbacks.set(callback, handleEvent);
+>+    gBrowser.tabContainer.addEventListener(this._events[eventName], handleEvent, false);
+>+  },
+>+
+>+  unregister: function AllTabs_unregister(eventName, callback) {
+>+    if (!this._callbacks.has(callback))
+>+      return;
+>+
+>+    let handleEvent = this._callbacks.get(callback);
+>+    this._callbacks.delete(callback);
+>+    gBrowser.tabContainer.removeEventListener(this._events[eventName], handleEvent, false);
+>+  }
+
+What happens when calling register twice with the same callback?
+It really would be interesting to know what AllTabs.jsm is doing wrong. It looks like it shouldn't leak...
+Created attachment 554648
+patch v2
+
+(In reply to Dão Gottwald [:dao] from comment #2)
+> Dead code?
+
+Oops, indeed. Removed.
+
+> What happens when calling register twice with the same callback?
+
+Checking now if the callback is already registered and returning if so.
+(In reply to Dão Gottwald [:dao] from comment #3)
+> It really would be interesting to know what AllTabs.jsm is doing wrong. It
+> looks like it shouldn't leak...
+
+Yeah, I tried lots of different things and made sure that unregisterBrowserWindow() and similar functions are called. I even added a domwindowclosed observer but that didn't help...
+Comment on attachment 554648
+patch v2
+
+>+  register: function AllTabs_register(eventName, callback) {
+>+    if (this._callbacks.has(callback))
+>+      return;
+
+This means that you can't use one function to react to two events...
+Can we just make register/unregister call add/removeEventListener directly and let the callbacks take an event instead of a tab?
+
+Can we also remove the tab.ownerDocument.defaultView != gWindow checks?
+Could the reason for the leaks be that groupitems.js currently does *not* have this check?
+(In reply to Dão Gottwald [:dao] from comment #6)
+> This means that you can't use one function to react to two events...
+> Can we just make register/unregister call add/removeEventListener directly
+> and let the callbacks take an event instead of a tab?
+
+I tried to be minimal invasive but I think we should do that. That's much better than fiddling around with those callbacks.
+
+> Can we also remove the tab.ownerDocument.defaultView != gWindow checks?
+> Could the reason for the leaks be that groupitems.js currently does *not*
+> have this check?
+
+Interesting discovery... let me try that!
+(In reply to Tim Taubert [:ttaubert] from comment #7)
+> > Can we also remove the tab.ownerDocument.defaultView != gWindow checks?
+> > Could the reason for the leaks be that groupitems.js currently does *not*
+> > have this check?
+> 
+> Interesting discovery... let me try that!
+
+Bingo, the leak is gone. Great catch, thanks!
+Created attachment 554654
+patch v3
+I think we should probably still get rid of AllTabs.jsm. It's showing that it's overengineered. There's only a handful of consumers, so we shouldn't be afraid of being invasive.
+Created attachment 554657
+patch v4
+Comment on attachment 554657
+patch v4
+
+>-      AllTabs.tabs.forEach(function(tab) {
+>-        if (tab.ownerDocument.defaultView != gWindow)
+>-          return;
+>-
+>+      Array.forEach(gBrowser.tabs, function (tab) {
+>         self.saveTab(tab, null);
+>       });
+
+This is a behavior change, since AllTabs.tabs filtered closing tabs, right? I wouldn't have minded maintaining AllTabs.tabs, AllTabs.register and AllTabs.unregister as thin wrappers like in your previous patches...
+(In reply to Dão Gottwald [:dao] from comment #12)
+> This is a behavior change, since AllTabs.tabs filtered closing tabs, right?
+> I wouldn't have minded maintaining AllTabs.tabs, AllTabs.register and
+> AllTabs.unregister as thin wrappers like in your previous patches...
+
+Oh! We shouldn't touch closing tabs, good point. Ok... the patch is still there :)
+For patch v2 I'd still like a tab -> event signature change for the callbacks.
+Created attachment 554663
+patch v2b
+
+(In reply to Dão Gottwald [:dao] from comment #14)
+> For patch v2 I'd still like a tab -> event signature change for the
+> callbacks.
+
+Done.
+Created attachment 554675
+patch v2c
+
+Fixed browser_tabview_alltabs.js.
+Comment on attachment 554675
+patch v2c
+
+>--- a/browser/base/content/tabview/tabitems.js
+>+++ b/browser/base/content/tabview/tabitems.js
+
+>-    this._eventListeners["open"] = function(tab) {
+>-      if (tab.ownerDocument.defaultView != gWindow || tab.pinned)
+>-        return;
+>+    this._eventListeners["open"] = function (event) {
+>+      let tab = event.target;
+
+nit: this._eventListeners.open
+
+>-    this._eventListeners["attrModified"] = function(tab) {
+>-      if (tab.ownerDocument.defaultView != gWindow || tab.pinned)
+>-        return;
+>+    this._eventListeners["attrModified"] = function (event) {
+>+      let tab = event.target;
+
+ditto
+
+>--- a/browser/base/content/test/tabview/browser_tabview_alltabs.js
+>+++ b/browser/base/content/test/tabview/browser_tabview_alltabs.js
+
+> Cu.import("resource:///modules/tabview/AllTabs.jsm");
+
+still need to remove this
+http://hg.mozilla.org/integration/fx-team/rev/399aba688a19
+http://hg.mozilla.org/mozilla-central/rev/399aba688a19

@@ -1,0 +1,421 @@
+Test: pointerevent_capture_suppressing_mouse-manual.html
+
+When pointer capturing is set and mouse move from capturing element pointerleave event should be fired on capturing element according to specification.
+
+On normal window work fine, on e10s does not work.
+
+Test: pointerevent_capture_suppressing_mouse-manual.html
+
+When pointer capturing is set and mouse move from capturing element pointerleave event should be fired on capturing element according to specification.
+
+On normal window work fine, on e10s does not work.
+Some investigation:
+Looks like difference is situated in EventStateManager::NotifyMouseOut(..., nsIContent* aMovingInto)
+On normal window aMovingInto = nullptr, otherwise on e10s aMovingInto != nullptr.
+On e10s issue is situated in EventStateManager::NotifyMouseOut()
+> // if the frame is associated with a subdocument,
+> // tell the subdocument that we're moving out of it
+> nsSubDocumentFrame* subdocFrame = do_QueryFrame(wrapper->mLastOverFrame.GetFrame());
+on e10s subdocFrame = nullptr. That's why code
+> // Not moving into any element in this subdocument
+> kidESM->NotifyMouseOut(aMouseEvent, nullptr);
+is not working. As result pointerleave event does not fired on captured element.
+(commented on IRC)
+Some investigation at EventStateManager::NotifyMouseOut():
+wrapper->mLastOverFrame.GetFrame() and ->GetContent() are exists.
+But ESM::IsRemoteTarget(wrapper->mLastOverFrame.GetFrame()->GetContent()) returns false.
+Callstack of dispatching pointerleave message at non-e10s window (capture state enabled)
+> ...
+> EventStateManager::DispatchMouseOrPointerEvent(aMouseEvent=0x006fddb8, aMessage=4425,
+>      aTargetContent=0x05f38d30, aRelatedContent=0x00000000)
+> EnterLeaveDispatcher::~EnterLeaveDispatcher()
+> EventStateManager::NotifyMouseOut(aMouseEvent=0x006fddb8, aMovingInto=0x00000000)
+> EventStateManager::NotifyMouseOut(aMouseEvent=0x006fddb8, aMovingInto=0x0c277ab0)
+> EventStateManager::NotifyMouseOver(aMouseEvent=0x006fddb8, aContent=0x0c277ab0)
+> EventStateManager::NotifyMouseOver(aMouseEvent=0x006fddb8, aContent=0x05f38d30)
+> EventStateManager::GenerateMouseEnterExit(aMouseEvent=0x006fddb8)
+> EventStateManager::PreHandleEvent(aPresContext=0x08e28400, aEvent=0x006fddb8,
+>      aTargetFrame=0x08f32968, aTargetContent=0x05f38d30, aStatus=0x006fe2ac)
+> PresShell::HandleEventInternal(aEvent=0x006fddb8, aStatus=0x006fe2ac)
+> PresShell::HandlePositionedEvent(aTargetFrame=0x08f32968, aEvent=0x006fddb8, aEventStatus=0x006fe2ac)
+> PresShell::HandleEvent(aFrame=0x05110340, aEvent=0x006fddb8, aDontRetargetEvents=false,
+>      aEventStatus=0x006fe2ac, aTargetContent=0x006fe1f0)
+> DispatchPointerFromMouseOrTouch(aShell=0x037e8ca0, aFrame=0x05110340, aEvent=0x006fe304,
+>      aDontRetargetEvents=false, aStatus=0x006fe2ac, aTargetContent=0x006fe1f0)
+> ...
+We can see two calls of NotifyMouseOut. And second call with argument aMovingInto as null.
+Callstack on e10s window (capture state is enabled) at ESM::NotifyMouseOut ()
+> EventStateManager::NotifyMouseOut(aMouseEvent=0x0108c5e4, aMovingInto=0x0556e6a0)
+> EventStateManager::NotifyMouseOver(aMouseEvent=0x0108c5e4, aContent=0x0556e6a0)
+> EventStateManager::GenerateMouseEnterExit(aMouseEvent=0x0108c5e4)
+> EventStateManager::PreHandleEvent(aPresContext=0x05422400, aEvent=0x0108c5e4,
+>      aTargetFrame=0x04f18c18, aTargetContent=0x0556e6a0, aStatus=0x0108cad8)
+> PresShell::HandleEventInternal(aEvent=0x0108c5e4, aStatus=0x0108cad8)
+> PresShell::HandlePositionedEvent(aTargetFrame=0x04f18c18, aEvent=0x0108c5e4,
+>      aEventStatus=0x0108cad8)
+> PresShell::HandleEvent(aFrame=0x0558c2f0, aEvent=0x0108c5e4, aDontRetargetEvents=false,
+>      aEventStatus=0x0108cad8, aTargetContent=0x0108ca1c)
+> DispatchPointerFromMouseOrTouch(aShell=0x04fcf8e0, aFrame=0x0558c2f0, aEvent=0x0108cba8,
+>      aDontRetargetEvents=false, aStatus=0x0108cad8, aTargetContent=0x0108ca1c)
+> ...
+At this point kidESM->NotifyMouseOut(aMouseEvent, nullptr) will not be called, because
+> nsSubDocumentFrame* subdocFrame = do_QueryFrame(lastFrame)
+is null on e10s window. Also
+> ESM::IsRemoteTarget(wrapper->mLastOverFrame.GetFrame()->GetContent())
+is false at that point. And
+> EnterLeaveDispatcher::EnterLeaveDispatcher(aESM=0x05599060, aTarget=0x0556e6a0,
+>      aRelatedTarget=0x0556e6a0, aMouseEvent=0x0108c5e4, aType=4425)
+with aTarget == aRelatedTarget will contain empty mTargets array.
+So pointerleave message will not be sent into content.
+Some investigation: mouseleave event was suppressed as pointerleave event.
+So callstacks of dispatching mousemove and corresponding pointermove are identical.
+But looks like mouseleave event is generated at next mousemove event,
+and for corresponding pointermove event unfortunately pointerleave event is not generated.
+Created attachment 8612232
+captured_pointer_leave_ver1.diff
+
++ Add special case for dispatching POINTER_LEAVE event on captured element
+
+Suggestions and comments and objections are very welcome.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=384e85ae7682
+Comment on attachment 8612232
+captured_pointer_leave_ver1.diff
+
+
+>   if (wrapper->mLastOverFrame) {
+>     // if the frame is associated with a subdocument,
+>     // tell the subdocument that we're moving out of it
+>-    nsSubDocumentFrame* subdocFrame = do_QueryFrame(wrapper->mLastOverFrame.GetFrame());
+>-    if (subdocFrame) {
+>+    nsIFrame* lastFrame = wrapper->mLastOverFrame.GetFrame();
+>+    if (nsSubDocumentFrame* subdocFrame = do_QueryFrame(lastFrame)) {
+There shouldn't be any reason for this change.
+
+
+
+>+  // In case we go out from capturing element (retargetedByPointerCapture is true)
+>+  // we should dispatch NS_POINTER_LEAVE event and only for capturing element.
+>+  nsRefPtr<nsIContent> movingInto = aMouseEvent->retargetedByPointerCapture
+>+                                      && (wrapper->mLastOverElement == aMovingInto)
+put && at the end of the previous line
+
+>+                                    ? aMovingInto->GetParent()
+Why is this right in non-e10s case. Per spec pointerleave should be dispatched only on capturing element, but if
+we actually have aMovingInto null here in non-e10s, don't we end up dispatching pointerleave to all the ancestor elements?
+Do we actually currently have a bug in non-e10s that pointerleave is dispatched to too many elements?
+(but I think this is pretty much the right approach, need to just tweak this to make e10s and non-e10s behave the same way. It is still
+mystery to me, why non-e10s has non-null subdocFrame)
+Created attachment 8612814
+captured_pointer_leave_ver2.diff
+
+- Removed unwanted changes
+
+Suggestions and comments and objections are very welcome.
+(In reply to Olli Pettay [:smaug] from comment #10)
+> Why is this right in non-e10s case.
+Test shows that it works on both cases: non-e10s and e10s.
+> Per spec pointerleave should be dispatched only on capturing element, but if
+> we actually have aMovingInto null here in non-e10s, don't we end up
+> dispatching pointerleave to all the ancestor elements?
+To check such behavior we need to changes test or add new tests into official test suite.
+> Do we actually currently have a bug in non-e10s that pointerleave is
+> dispatched to too many elements?
+I can try to investigate such behavior and create new bug at bad case.
+(In reply to Olli Pettay [:smaug] from comment #10)
+> I think this is pretty much the right approach, need to just tweak this to make e10s and
+> non-e10s behave the same way. It is still mystery to me, why non-e10s has non-null subdocFrame
+Callstacks for non-e10s case and e10s are very different.
+In case non-e10s we go through NotifyMouseOver twice. And we have got docContent as second argument. Then we go through NotifyMouseOut and get [nsXULElement=xul:browser] as argument aMovingInto (which has [nsSubDocumentFrame] and then call second time NotifyMouseOut with aMovingInto as nullptr.
+Callstack for e10s is smaller, we have no nsXULElement, go through NotifyMouseOver and NotifyMouseOut only one time, and check needed case via retargetedByPointerCapture flag.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=11ea9ac6d863
+(In reply to Maksim Lebedev from comment #13)
+> (In reply to Olli Pettay [:smaug] from comment #10)
+> > I think this is pretty much the right approach, need to just tweak this to make e10s and
+> > non-e10s behave the same way. It is still mystery to me, why non-e10s has non-null subdocFrame
+> Callstacks for non-e10s case and e10s are very different.
+> In case non-e10s we go through NotifyMouseOver twice. And we have got
+> docContent as second argument. Then we go through NotifyMouseOut and get
+> [nsXULElement=xul:browser] as argument aMovingInto (which has
+> [nsSubDocumentFrame] and then call second time NotifyMouseOut with
+> aMovingInto as nullptr.
+And I've been asking why we deal with xul:browser here at all in any case?
+That seems wrong.
+(In reply to Olli Pettay [:smaug] from comment #15)
+> And I've been asking why we deal with xul:browser here at all in any case? That seems wrong.
+Not in any case - only at non-e10s case. But I don't know answer for that question.
+So could you debug it? Are we missing to forward the event to the right presshell somewhere in
+PresShell::HandleEvent while capturing is enabled?
+(In reply to Olli Pettay [:smaug] from comment #17)
+> So could you debug it?
+Yes. It is very easy.
+> Are we missing to forward the event to the right presshell somewhere in
+> PresShell::HandleEvent while capturing is enabled?
+Maybe. But how we can check it?
+Comment on attachment 8612814
+captured_pointer_leave_ver2.diff
+
+So waiting for more information here, as discussed on IRC.
+Some investigation on non-e10s:
+PresShell::HandleEvent() is fired where mPresShellId = 3
+then shell was found with mPresShellId = 20 and called shell->HandlePositionedEvent().
+Then EventStateManager::NotifyMouseOver was called, at this point: mDocument = [nsHTMLDocument] and parentDoc = [XULDocument], docContent = [nsXULElement:"xul:browser"], parentShell = [PresShell] with mPresShellId = 3.
+Then parentESM->NotifyMouseOver was called (at PresShell with mPesShellId = 3).
+Then EventStateManager::NotifyMouseOut was called, at this point: subdocFrame = [nsSubDocumentFrame] and we found kidESM which is related with PresShell with mPresShellId = 20.
+Then we call EventStateManager::NotifyMouseOut with aMovingInto as nullptr and at presShell with mPresShellId = 20.
+(In reply to Maksim Lebedev from comment #9)
+> https://treeherder.mozilla.org/#/jobs?repo=try&revision=384e85ae7682
+
+Test is passing for this build.
+Dmitriy, could you check on which elements IE dispatches pointerleave event when some element is capturing the pointer. I mean, does only the capturing element get pointerleave, or also some
+ancestors?
+Created attachment 8614129
+captured_pointer_leave_ver3.diff
+
++ Changed RelatedTarget at NotifyMouseOut
+
+Suggestions and comments and objections are very welcome.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=599c023662b4
+(In reply to Maksim Lebedev from comment #20)
+> Some investigation on non-e10s:
+> PresShell::HandleEvent() is fired where mPresShellId = 3
+> then shell was found with mPresShellId = 20 and called
+> shell->HandlePositionedEvent().
+> Then EventStateManager::NotifyMouseOver was called, at this point: mDocument
+> = [nsHTMLDocument] and parentDoc = [XULDocument], docContent =
+> [nsXULElement:"xul:browser"]
+ahaa, this is the key...
+Comment on attachment 8614129
+captured_pointer_leave_ver3.diff
+
+But please test or get someone to test IE, and we need a test here.
+Created attachment 8614654
+captured_pointer_leave_test_ver1.diff
+
++ Add simple testing sequence for check pointerleave event behavior
+
+Suggestions and comments and objections are very welcome.
+TEST without PATCH: https://treeherder.mozilla.org/#/jobs?repo=try&revision=961385d3f8ee
+TEST with PATCH: https://treeherder.mozilla.org/#/jobs?repo=try&revision=bafe13f7d3d3
+Comment on attachment 8614654
+captured_pointer_leave_test_ver1.diff
+
+>+    function targetGotHandler(event) {
+>+      logger("Target: " + event.type);
+>+      test_TargetGotCapture++;
+>+      event.target.style.background = "magenta";
+>+    }
+>+    function targetLostHandler(event) {
+>+      logger("Target: " + event.type);
+>+      test_TargetLostCapture++;
+>+      event.target.style.background = "cyan";
+>+    }
+>+    function targetLeaveHandler(event) {
+>+      logger("Target: " + event.type);
+>+      test_TargetLeave++;
+>+    }
+So shouldn't we check here that if we're doing pointer capture, only the captured element gets the event.
+this 'target' shouldn't get it, right?
+
+
+>+  <head>
+>+    <meta charset="utf-8">
+>+    <meta name="author" content="Maksim Lebedev" />
+>+    <title>Test for Bug 1162990</title>
+>+    <script type="application/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+>+    <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css"/>
+>+    <script type="text/javascript">
+>+      function prepareTest() {
+>+        SimpleTest.waitForExplicitFinish();
+>+        //SimpleTest.requestFlakyTimeout("untriaged");
+Why this?
+Created attachment 8615257
+pointerleave_bubbling test
+
+(In reply to Olli Pettay [:smaug] from comment #22)
+> Dmitriy, could you check on which elements IE dispatches pointerleave event
+> when some element is capturing the pointer. I mean, does only the capturing
+> element get pointerleave, or also some
+> ancestors?
+
+I've created a test for pointerleave bubbling:
+1. Press and hold left mouse button on "Set capture" button 
+2. Move cross all rectangles in the page.
+3. Release left mouse button  
+4. See the events in the black rectangle.
+
+Expected:
+Pointerleave event should fire two times first for btnCapture right after button down and second when mouse crosses the border (leaves) of black rectangle.
+
+Actual for IE 11.0.9600.17801: 
+Extra pointerleave events fire for parent divs (seems the pointerleave event bubbles in IE)
+
+Actual for m-c with e10s enabled:
+Pointerleave event fires one time for btnCapture right after button down. No pointerleave event when mouse crosses the border (leaves) of black rectangle.
+
+Actual for m-c with e10s disabled: 
+Same as in IE
+
+Actual for Maksims patch (https://treeherder.mozilla.org/#/jobs?repo=try&revision=bafe13f7d3d3) with e10s enabled and disabled:
+As expected
+ Dmitriy, I assume ancestors don't get the same event, but each one gets their own event during
+bubble (well, actually, during target) phase, right?
+jrossi, do you happen to know why IE behaves that way?
+(In reply to Olli Pettay [:smaug] from comment #31)
+> Dmitriy, I assume ancestors don't get the same event, but each one gets
+> their own event during bubble (well, actually, during target) phase, right?
+Looks like events are different at [m-c with e10s disabled] because pointerleave has "NO" as bubbles options according pointer events specification. But in any case pointerleave event should be suppressed for all elements except capturing element according to pointer events specification.
+Comment on attachment 8614654
+captured_pointer_leave_test_ver1.diff
+
++      var rectTg = target.getBoundingClientRect();
++      var rectLr = target.getBoundingClientRect();
+Seems rectLr related to listener not to target
+
++    var container = undefined;
++    var target = undefined;
++    var listener = undefined;
+It's not necessary to initialize variable to 'undefined'
+
++    function on_event(object, event, callback) {
+Seems not used anywhere
+
++      SpecialPowers.pushPrefEnv({
++        "set": [
++          ["dom.w3c_pointer_events.enabled", true]
++        ]
++      }, executeTest);
+Is it needed in bug1162990_inner.html?
+
+I would like to suggest to:
+- move pointer to continer too. 
+- check pointerleave not fired on children an siblings.
+- remove assertion from "target got capture" and etc. to test (assert) only pointerleave event.
+(In reply to Olli Pettay [:smaug] (for generic DOM reviews, you may want to look for other reviewers too ;)) from comment #31)
+>  Dmitriy, I assume ancestors don't get the same event, but each one gets
+> their own event during
+> bubble (well, actually, during target) phase, right?
+
+Yes you are right. Event object is not the same (like in bubble) and targets are different. Also there is no way to stopPropagation. So it is not clean bubble, but something very similar (all 3 pointerleave events fires at the same time / action). Also all events has same relatedTarget.
+(In reply to Olli Pettay [:smaug] from comment #29)
+> So shouldn't we check here that if we're doing pointer capture, only the
+> captured element gets the event. this 'target' shouldn't get it, right?
+'Target' is the target of pointer capturing. So it should get events (I think so).
+(In reply to Dmitriy Barkalov from comment #34)
+> +    var container = undefined;
+> +    var target = undefined;
+> +    var listener = undefined;
+> It's not necessary to initialize variable to 'undefined'
+Explicity is always better than implicity!
+> +      SpecialPowers.pushPrefEnv({
+> +        "set": [
+> +          ["dom.w3c_pointer_events.enabled", true]
+> +        ]
+> +      }, executeTest);
+> Is it needed in bug1162990_inner.html?
+Please, don't forget that pointer events is still disabled by default.
+> I would like to suggest to:
+> - check pointerleave not fired on children an siblings.
+Why it is needed? We don't cross children boundaries.
+And siblings are not situated in tree for targets elements.
+> I would like to suggest to:
+> - remove assertion from "target got capture" and etc. to test (assert) only pointerleave event.
+It is very bad idea, because we cannot get correct information about test behavior in case FireFox did not set pointer capture on target element.
+Created attachment 8621545
+captured_pointer_leave_test_ver2.diff
+
++ Added child element
++ Added some changes
+- Removed unwanted functions
++ Added second test for correct checking
+
+Suggestions and comments and objections are very welcome.
+TEST without PATCH: https://treeherder.mozilla.org/#/jobs?repo=try&revision=1f73d16fc0da
+TEST with PATCH: https://treeherder.mozilla.org/#/jobs?repo=try&revision=4ad6e3998579
+Comment on attachment 8621545
+captured_pointer_leave_test_ver2.diff
+
+s/father/parentElement/ or something like that.
+
+This is a bit hard to parse. I would check the event counts right after
+synthesizePointer calls.
+
+
++      parent.is(test_TargetLeave,       1, "Part2: Target should receive pointerleave event two times");
+Looks like a copy paste error.
+Comment on attachment 8621545
+captured_pointer_leave_test_ver2.diff
+
+Review of attachment 8621545:
+-----------------------------------------------------------------
+
+LGTM.
+
+Just one comment: it is not necessary to initialize variables with "undefined".
+(In reply to Olli Pettay [:smaug] from comment #40)
+> This is a bit hard to parse. I would check the event counts right after synthesizePointer calls.
+Behavior of some events is asyncronius, that's why I would like to check them at the finish of test.
+Created attachment 8622987
+captured_pointer_leave_test_ver3.diff
+
++ Some code style changes and element name changes according with comments.
+
+Suggestions and comments and objections are very welcome.
+(In reply to Dmitriy Barkalov from comment #41)
+> Just one comment: it is not necessary to initialize variables with "undefined".
+I believe that we together can make the world a little bit better.
+TEST with PATCH: https://treeherder.mozilla.org/#/jobs?repo=try&revision=143c09d92730
+Comment on attachment 8622987
+captured_pointer_leave_test_ver3.diff
+
+"basket" is interesting word here. But fine.
+Comment on attachment 8622987
+captured_pointer_leave_test_ver3.diff
+
+Review of attachment 8622987:
+-----------------------------------------------------------------
+
+LGTM
+
+::: layout/base/tests/bug1162990_inner_1.html
+@@ +76,5 @@
+> +    }
+> +  
+> +    function prepareTest() {
+> +      parent.turnOnPointerEvents(executeTest);
+> +    }    
+
+Extra spaces around this function
+
+::: layout/base/tests/bug1162990_inner_2.html
+@@ +76,5 @@
+> +    }
+> +  
+> +    function prepareTest() {
+> +      parent.turnOnPointerEvents(executeTest);
+> +    }    
+
+Extra spaces here
+Created attachment 8623538
+captured_pointer_leave_test_ver4.diff
+
+- Removed unwanted empty spaces
+
+Suggestions and comments and objections are very welcome.
+TEST with PATCH: https://treeherder.mozilla.org/#/jobs?repo=try&revision=44d5aa35388c
+(In reply to Olli Pettay [:smaug] from comment #40)
+> s/father/parentElement/ or something like that.
+(In reply to Olli Pettay [:smaug] from comment #46)
+> "basket" is interesting word here. But fine.
+Word "basket" is less than "parentElement". Word "parent" unfortunately already busy.
+Comment on attachment 8623538
+captured_pointer_leave_test_ver4.diff
+
+Review of attachment 8623538:
+-----------------------------------------------------------------
+
+LGTM
+If there are no objections, I put checkin-needed flag.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f5fbae5bbe34
+https://hg.mozilla.org/integration/mozilla-inbound/rev/bc38e13fab2e
+https://hg.mozilla.org/mozilla-central/rev/f5fbae5bbe34
+https://hg.mozilla.org/mozilla-central/rev/bc38e13fab2e

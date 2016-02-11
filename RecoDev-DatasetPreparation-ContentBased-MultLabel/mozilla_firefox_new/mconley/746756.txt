@@ -1,0 +1,201 @@
+I got reported that someone on first use of the panel got a list with all the downloads in the last months, that shouldn't happen, should likely limit to the last X days or so.
+
+I got reported that someone on first use of the panel got a list with all the downloads in the last months, that shouldn't happen, should likely limit to the last X days or so.
+The list in all conditions should fit in 4-5 downloads and have scrollbars for seeing the remaining.
+This might be as simple as calling the cleanUp method of nsIDownloadManager on
+migration in nsBrowserGlue.js, at the cost of initializing the download manager
+synchronously on startup, or might involve introducing a mechanism that prevents
+loading the downloads history on first run, in DowloadsStartup.js, by tuning the
+flag we pass to ensurePersistentDataLoaded.
+To be more precise, what we want here is to avoid old completed downloads from
+the Downloads Window to leak in the session-specific completed downloads list
+of the panel, when the feature is activated for the first time.
+I think I'm going to try the DownloadsStartup.js route, rather than the nsBrowserGlue.js migration, since we'll likely only want to trigger this if the toolkit UI hasn't been selected...and migrations seem to roll the UI version forward regardless of outcome. Feels slippery.
+Created attachment 672385
+Patch v1
+
+I've added another pref, recording whether or not this is the first time the Downloads Manager has been initted with the panel enabled. If so, we run the clean up.
+
+Let me know if I've missed any corner-cases.
+The patch I've put up is based on the patch I put up in bug 766263, so I'm marking the dependency in case anybody wants to try this patch out.
+
+If this gets r+'d before 766263 lands, I'll just rebase.
+Comment on attachment 672385
+Patch v1
+
+I _think_ we should be able to achieve the same effect by passing true to
+ensurePersistentDataLoaded. In this case, maybe we should reset the preference
+after the usual cleanUp on shutdown, to avoid old downloads actually reppearing
+in case of crashes before the browser shuts down. Can you verify if this works?
+Created attachment 673268
+Patch v2
+
+Paolo:
+
+Is this what you had in mind?  The behaviour is more or less equivalent, except that if the user opens up the old downloads window, they can still see all of the old inactive downloads on the first run.
+
+But other than that, it seems much the same.
+
+-Mike
+Comment on attachment 673268
+Patch v2
+
+(In reply to Mike Conley (:mconley) from comment #8)
+> The behaviour is more or less equivalent,
+> except that if the user opens up the old downloads window, they can still
+> see all of the old inactive downloads on the first run.
+
+That's right. Since this is the same behavior as the current Nightly, and won't
+influence the Library window, I think this solution is better, for the startup
+performance improvements it will give once every piece is in place.
+
++        if (this._panelFirstRun) {
++          this._panelFirstRun = false;
++        }
+
+nit: is this actually faster than just setting the value, without the if?
+Created attachment 673304
+Patch v3
+
+(In reply to Paolo Amadini [:paolo] from comment #9)
+> Comment on attachment 673268
+> Patch v2
+> 
+> (In reply to Mike Conley (:mconley) from comment #8)
+> > The behaviour is more or less equivalent,
+> > except that if the user opens up the old downloads window, they can still
+> > see all of the old inactive downloads on the first run.
+> 
+> That's right. Since this is the same behavior as the current Nightly, and
+> won't
+> influence the Library window, I think this solution is better, for the
+> startup
+> performance improvements it will give once every piece is in place.
+> 
+> +        if (this._panelFirstRun) {
+> +          this._panelFirstRun = false;
+> +        }
+> 
+> nit: is this actually faster than just setting the value, without the if?
+
+I don't actually know. The performance hit of writing a pref isn't something I've studied.
+
+I'll trust your expertise in the matter. I've removed the conditional.
+(In reply to Mike Conley (:mconley) from comment #10)
+> I'll trust your expertise in the matter. I've removed the conditional.
+
+I've no expertise, mine was a real question :-) But without a reason to do
+otherwise, I agree the code is just simpler without the conditional.
+Comment on attachment 673304
+Patch v3
+
+Review of attachment 673304:
+-----------------------------------------------------------------
+
+With bug 766263, we end up having 2 prefs that sound like are doing the same thing, even if they are not.
+We should either:
+- unify the 2
+- clearly rename this to not make it sound like it refers to some first use
+
+To unify we may store a cached session variable to avoid reopening in the session, while on next restart just go and read this firstRun pref.
+Comment on attachment 673304
+Patch v3
+
+Review of attachment 673304:
+-----------------------------------------------------------------
+
+::: browser/components/downloads/src/DownloadsStartup.js
+@@ +234,5 @@
+>          gPrivateBrowsingService.privateBrowsingEnabled) {
+>        return;
+>      }
+>  
+> +    if (!DownloadsCommon.useToolkitUI && this._panelFirstRun) {
+
+if we are using toolkitUI the panel should not have had a first run.
+I know this is correct code-wise but the name is misleading, call it dataFirstLoaded or whatever else, but don't use panel if this may happen regarless it being used.
+Created attachment 674242
+Patch v4
+
+Is this any clearer?
+Comment on attachment 674242
+Patch v4
+
+Review of attachment 674242:
+-----------------------------------------------------------------
+
+yeah better. I still don't like this session restore code as a whole, but I guess it's just session restore itself that is confusing.
+
+::: browser/components/downloads/src/DownloadsStartup.js
+@@ +207,5 @@
+>    /**
+>     * Indicates whether we should load all downloads from the previous session,
+>     * including completed items as well as active downloads.
+>     */
+> +  _restoringSession: false,
+
+The comment needs to be updated, anything you can do to make clear what it mens and causes will be welcome...
+
+@@ +241,5 @@
+> +
+> +  /**
+> +   * True if we've never completed a session with the Downloads Panel enabled.
+> +   */
+> +  get _firstPanelSession() {
+
+So... why not keeping the pref name that is clear enough as _firstSessionCompleted
+you invert the pref here, then you invert again in _recoverallDownloads... so we can just never invert the meaning.
+Created attachment 674291
+Patch v5
+
+(In reply to Marco Bonardo [:mak] from comment #15)
+> Comment on attachment 674242
+> Patch v4
+> 
+> Review of attachment 674242:
+> -----------------------------------------------------------------
+> 
+> 
+> ::: browser/components/downloads/src/DownloadsStartup.js
+> @@ +207,5 @@
+> >    /**
+> >     * Indicates whether we should load all downloads from the previous session,
+> >     * including completed items as well as active downloads.
+> >     */
+> > +  _restoringSession: false,
+> 
+> The comment needs to be updated, anything you can do to make clear what it
+> mens and causes will be welcome...
+
+Ok, done.
+
+> 
+> @@ +241,5 @@
+> > +
+> > +  /**
+> > +   * True if we've never completed a session with the Downloads Panel enabled.
+> > +   */
+> > +  get _firstPanelSession() {
+> 
+> So... why not keeping the pref name that is clear enough as
+> _firstSessionCompleted
+> you invert the pref here, then you invert again in _recoverallDownloads...
+> so we can just never invert the meaning.
+
+Good idea. Done.
+Comment on attachment 674291
+Patch v5
+
+Review of attachment 674291:
+-----------------------------------------------------------------
+
+It looks ok, thanks.
+Landed on inbound: https://hg.mozilla.org/integration/mozilla-inbound/rev/6c68ce017824
+https://hg.mozilla.org/mozilla-central/rev/6c68ce017824
+
+
+On first feature activation the panel should limit reported downloads
+
+
+
+Bug 746756 - On feature activation, Download Panel should limit reported downloads. r=mak. 

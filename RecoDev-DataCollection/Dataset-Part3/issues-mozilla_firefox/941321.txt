@@ -1,0 +1,144 @@
+After the merge to nightly, a *lot* of bugs were filed that boiled down to not being able to enter/exit customize mode. All of them that I've seen were caused by custom themes or add-ons breaking things, or by our code removing buttons that shouldn't be removed (bug 940946 and its dupes).
+
+While we can fix the themes bit by fixing bug 918782, and we can fix bug 940946 once we investigate it more (I should hope), I think we should investigate doing more. Ideas:
+
+- for enter/exit, make the catch clause try to restore to non-customize mode instead of just giving up and going "well, that's terrible" without a user-visible message, or, at a minimum, display the error that broke stuff prominently in both the in-tab document and the pane in which we'd normally show the customize stuff.
+
+- make the toolbarbutton wrap/unwrap more fault-tolerant. It currently does a bunch of unwrapping without checking there's something in the thing it's unwrapping. While it's clearly a problem if stuff inside a wrapper has disappeared, the current 'solution' is to throw JS errors and go sadfaces. We should do better.
+
+- make the transition listener and/or other yield clauses have some kind of timeout so that we don't ever just sit there without completing other steps. No idea how to architecture that, exactly, but it sounds like it might help.
+
+
+These ideas aren't particularly great (well, apart from #2 which I think we should just do ASAP), so I'd love to hear more ideas about how to make this less fragile.
+
+After the merge to nightly, a *lot* of bugs were filed that boiled down to not being able to enter/exit customize mode. All of them that I've seen were caused by custom themes or add-ons breaking things, or by our code removing buttons that shouldn't be removed (bug 940946 and its dupes).
+
+While we can fix the themes bit by fixing bug 918782, and we can fix bug 940946 once we investigate it more (I should hope), I think we should investigate doing more. Ideas:
+
+- for enter/exit, make the catch clause try to restore to non-customize mode instead of just giving up and going "well, that's terrible" without a user-visible message, or, at a minimum, display the error that broke stuff prominently in both the in-tab document and the pane in which we'd normally show the customize stuff.
+
+- make the toolbarbutton wrap/unwrap more fault-tolerant. It currently does a bunch of unwrapping without checking there's something in the thing it's unwrapping. While it's clearly a problem if stuff inside a wrapper has disappeared, the current 'solution' is to throw JS errors and go sadfaces. We should do better.
+
+- make the transition listener and/or other yield clauses have some kind of timeout so that we don't ever just sit there without completing other steps. No idea how to architecture that, exactly, but it sounds like it might help.
+
+
+These ideas aren't particularly great (well, apart from #2 which I think we should just do ASAP), so I'd love to hear more ideas about how to make this less fragile.
+Created attachment 8336007
+don't break on empty wrappers,
+
+Let's start small and at least deal with this.
+Comment on attachment 8336007
+don't break on empty wrappers,
+
+Review of attachment 8336007:
+-----------------------------------------------------------------
+
+LGTM!
+remote:   https://hg.mozilla.org/integration/fx-team/rev/4631552fe3bb
+https://hg.mozilla.org/mozilla-central/rev/4631552fe3bb
+Another thing: we should check that inasmuch as this code uses begin/endBatchUpdate in CustomizableUI, that we ensure we always end what we began, so to speak, even if other code throws exceptions when entering/exiting.
+```
+try {
+  ...
+} catch(ex) {
+  ...
+} finally {
+  // EXIT!
+}
+```
+
+?
+(In reply to Mike de Boer [:mikedeboer] from comment #6)
+> ```
+> try {
+>   ...
+> } catch(ex) {
+>   ...
+> } finally {
+>   // EXIT!
+> }
+> ```
+> 
+> ?
+
+Hah. Yeah. If it were that simple:
+
+[16:35:52]	Gijs	Yoric: in particular, if I do: foo() { throw "bar"; }; try { setTimeout(foo, 1000); } catch (ex) { /* this won't see "bar" */ }, right?
+[16:36:10]	Yoric	Gijs: Indeed.
+[16:36:19]	Gijs	how are promises different, then?
+[16:36:44]	Yoric	Well, the |throw| equivalent [would be to] cause the promise to be rejected.
+[16:36:59]	Yoric	The |yield| converts a rejected promise into an exception.
+[16:37:08]	Yoric	I mean Task.jsm.
+[16:37:16]	Gijs	Hrm.
+[16:38:00]	Gijs	Yoric: but surely if I have an event listener that, at the end of the function, resolves the promise, and that event listener has a JS exception and never resolves the promise, no error would be reported? How would the code know which promise to reject?
+[16:38:14]	Yoric	Right.
+[16:38:20]	Gijs	OK.
+[16:38:32]	Yoric	The event listener needs to _reject_ the promise, otherwise nothing interesting/useful happens.
+[16:38:41]	Gijs	So I guess what I'm trying to get at is, I can't just slap a massive try catch into my task.jsm thing and assume I catch everything
+[16:38:54]	Gijs	because anything that yields could error out "unseen"
+[16:39:03]	Gijs	and Task.jsm would just wait forever for the yield to, um, yield.
+[16:39:38]	Yoric	Indeed.
+Created attachment 8337783
+add more failure-proofing to Australis customize mode enter/exit routines,
+
+This adds a timeout to the transition, and makes sure we can't die on failing to unwrap toolbar palette items.
+Comment on attachment 8337783
+add more failure-proofing to Australis customize mode enter/exit routines,
+
+Review of attachment 8337783:
+-----------------------------------------------------------------
+
+This looks like a good solution to me. Just a naming suggestion.
+
+::: browser/components/customizableui/src/CustomizeMode.jsm
+@@ +14,5 @@
+>  const kAboutURI = "about:customizing";
+>  const kDragDataTypePrefix = "text/toolbarwrapper-id/";
+>  const kPlaceholderClass = "panel-customization-placeholder";
+>  const kSkipSourceNodePref = "browser.uiCustomization.skipSourceNodeCheck";
+> +const kMaxTransitionDuration = 2000;
+
+For durations like this, I think it's good to make it clear what unit we're using - so maybe call this kMaxTransitionDurationMs
+Comment on attachment 8337783
+add more failure-proofing to Australis customize mode enter/exit routines,
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/b6cbed05a206
+https://hg.mozilla.org/mozilla-central/rev/b6cbed05a206
+Created attachment 8339968
+try-finally all of Australis' begin/endBatchUpdate calls,
+
+I think this is the last thing I want to be doing here. Any issues after this should probably get their own bug. If absolutely necessary we could implement something that keeps track of a sequence of tasks and how to reverse them, but the number of reports of this problem has slunk so far, and so many smaller issues have been resolved, that I don't think it's worth the engineering effort to do much more than this patch for now. I'll add a diff -w in a bit.
+Created attachment 8339970
+Diff -w
+
+Diff -w
+Comment on attachment 8339968
+try-finally all of Australis' begin/endBatchUpdate calls,
+
+Review of attachment 8339968:
+-----------------------------------------------------------------
+
+I think this is fine, and rightfully defensive. Just one thing I noticed that's not even from one of your changes.
+
+::: browser/components/customizableui/content/panelUI.js
+@@ +228,3 @@
+>        }
+>        this.panel.hidden = false;
+>      }.bind(this)).then(null, Cu.reportError);
+
+I guess this should be ERROR too?
+Comment on attachment 8339970
+Diff -w
+
+This was helpful in my review. Thanks. :)
+remote:   https://hg.mozilla.org/integration/fx-team/rev/de713c4fc4e1
+
+
+(In reply to Mike Conley (:mconley) from comment #14)
+> ::: browser/components/customizableui/content/panelUI.js
+> >      }.bind(this)).then(null, Cu.reportError);
+> 
+> I guess this should be ERROR too?
+
+I left this as-is because unfortunately panelUI.js doesn't include logging.js (and because it's eval'd in the browser's scope, probably (sh/c)ouldn't).
+https://hg.mozilla.org/mozilla-central/rev/de713c4fc4e1

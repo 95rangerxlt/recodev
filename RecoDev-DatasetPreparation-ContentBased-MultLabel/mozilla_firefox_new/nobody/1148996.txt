@@ -1,0 +1,196 @@
+Creating this after Bug 1148761 surfaced as a result of the final patch in Bug 1094821.  Basically, we need to take advantage of the new builtIn theme functionality in LightweightThemeManager to simplify the DevEdition theme application and have it fit within the addons manager.
+
+Creating this after Bug 1148761 surfaced as a result of the final patch in Bug 1094821.  Basically, we need to take advantage of the new builtIn theme functionality in LightweightThemeManager to simplify the DevEdition theme application and have it fit within the addons manager.
+Created attachment 8585248
+aurora-simulation.patch
+
+A patch to help for testing the problem (that surfaces only in Aurora builds)
+Created attachment 8585612
+lwtheme-devedition-changes.patch
+
+Rebased the original patch on top of the backout in 1148761 (which backed out everything *except* for the string change in browser/locales/en-US/chrome/browser/browser.dtd).
+Here are some failing tests when devedition is set (this can be simulated either by applying the aurora simulation patch or more simply by just removing the #ifdef MOZ_DEV_EDITION condition around the prefs in firefox.js):
+
+browser/base/content/test/general/browser_bug592338.js
+browser/base/content/test/general/browser_devedition.js
+services/sync/tests/unit/test_prefs_store.js
+toolkit/mozapps/extensions/test/browser/browser_select_selection.js
+
+The reason these are failing is that the tests are expecting that the lightweightThemes.selectedThemeID pref is going to be undefined when the test starts.
+Created attachment 8585623
+devedition-test-fixes-WIP.patch
+
+This fixes the xpcshell test by deleting the lightweightThemes.selectedThemeID and browser.devedition.theme.enabled prefs in head.js.  I haven't yet been able to find a way to do the same for mochitests.
+
+After looking into this for some time over the last two days, I believe clearing out the selected lw theme before tests is the most reasonable way to solve this problem, because it would be easy to accidentally regress tests on aurora otherwise.  We have separate tests for the devedition theme + lw theme integration so I don't think this approach makes us miss out on test coverage.
+Created attachment 8585669
+devedition-test-fixes.patch
+
+This fixes the issues locally
+Comment on attachment 8585669
+devedition-test-fixes.patch
+
+Hi Joel, I have some changes to testing/mochitest/browser-test.js and testing/xpcshell/head.js and I need someone to take a look at them.  Basically, I want to remove an applied lightweight theme for xpcshell and mochitests.
+
+The reason we need to do this is that we set the selectedThemeID in firefox.js but only in the dev edition channel, and our tests assume that no theme is applied.  This caused some tests that were fine on m-c but started failing on aurora (1148761).
+
+There are two main ways I thought of for fixing this:
+1) We could fix tests on-by-one to allow a theme to optionally be applied and/or clear out the current lw theme at the start of the test.  I didn't go for this approach since it seemed like a footgun for future test failures to begin after merging to Aurora.
+2) Remove the lightweight theme in the test harnesses before tests start.  This can be done by deleting the lightweightThemes.selectedThemeID pref.  That's what I'm doing in this patch.
+
+Sidenote: I tried defining this pref in user_prefs.js for mochitests, but there was a problem: any changes didn't seem to override the pref defined in firefox.js.  So this is my idea on how to solve the problem.  I'm sensitive to the fact that we have prefs listed all over the place for the test systems [0], so don't want to make this situtation worse if possible.  But I'm not sure what the other options are, so looking for some feedback.
+
+[0]: bug 1023483 and https://developer.mozilla.org/en-US/docs/Mozilla/QA/Automated_testing#Need_to_set_preferences_for_test-suites.3F
+Comment on attachment 8585669
+devedition-test-fixes.patch
+
+Review of attachment 8585669:
+-----------------------------------------------------------------
+
+nice, would we want to do this for mochitest-plain?  browser-test.js is just for browser-chrome and devtools.  Also we have talos which could benefit from this type of change.  Let me know if you think we should extend this and I can help you find the right places to modify.
+(In reply to Brian Grinstead [:bgrins] from comment #6)
+> Sidenote: I tried defining this pref in user_prefs.js for mochitests, but
+> there was a problem: any changes didn't seem to override the pref defined in
+> firefox.js.
+
+Are you sure this was firefox.js rather than the nsBrowserGlue migration code?
+(In reply to Dão Gottwald [:dao] from comment #8)
+> (In reply to Brian Grinstead [:bgrins] from comment #6)
+> > Sidenote: I tried defining this pref in user_prefs.js for mochitests, but
+> > there was a problem: any changes didn't seem to override the pref defined in
+> > firefox.js.
+> 
+> Are you sure this was firefox.js rather than the nsBrowserGlue migration
+> code?
+
+Actually, I just tested and realized that it wasn't taking affect because I wasn't doing a full build after making the change (didn't realize it needed a build).  So, maybe I can get away with changing just user_prefs so we don't have to also make the change for mochitest-plain.
+Created attachment 8586259
+lwtheme-devedition-changes.patch
+
+Same patch that we landed in 1094821, with the following changes:
+
+1) nsBrowserGlue: had to bump up to version 30 instead of 28
+2) Doesn't include string changes in browser/locales/en-US/chrome/browser/browser.properties because those are already landed (I didn't back those out in 1148761 )
+3) In LightweightThemeManager.jsm I call _prefs.deleteBranch("selectedThemeID") instead of _prefs.clearUserPref("selectedThemeID").  This is needed for tests in dev edition builds, because clearing the user pref just sets the current theme to dev edition.  However, when setting currentTheme = null, it should actually null out the current theme (i.e. delete the branch).  It seems like the right behavior even outside of the test environment also.
+We will need to make sure we set the relevant prefs for Talos as well
+Created attachment 8586274
+change talos to a lightweight theme (1.0)
+Comment on attachment 8586274
+change talos to a lightweight theme (1.0)
+
+Review of attachment 8586274:
+-----------------------------------------------------------------
+
+Looks good
+https://hg.mozilla.org/build/talos/rev/a46e0f1e5f17
+Created attachment 8586283
+devedition-test-fixes.patch
+
+Changes prefs_general.js instead of browser-test.js so it will affect all mochitests
+Comment on attachment 8586259
+lwtheme-devedition-changes.patch
+
+Review of attachment 8586259:
+-----------------------------------------------------------------
+
+::: browser/components/nsBrowserGlue.js
+@@ +718,5 @@
+>      DebugUserAgent.init();
+>  #endif
+>  
+> +#ifndef RELEASE_BUILD
+> +    let browserBundle = Services.strings.createBundle("chrome://browser/locale/browser.properties");
+
+I'll replace these bundles with gBrandBundle and gBrowserBundle on top of 1147398
+Comment on attachment 8586259
+lwtheme-devedition-changes.patch
+
+Review of attachment 8586259:
+-----------------------------------------------------------------
+
+I've only reviewed the additional changes here, and assumed nothing changed in the rest of the patch.
+
+r=me assuming a green try push against aurora as well.
+
+::: browser/components/nsBrowserGlue.js
+@@ +721,5 @@
+> +#ifndef RELEASE_BUILD
+> +    let browserBundle = Services.strings.createBundle("chrome://browser/locale/browser.properties");
+> +    let brandBundle = Services.strings.createBundle("chrome://branding/locale/brand.properties");
+> +    let themeName = browserBundle.GetStringFromName("deveditionTheme.name");
+> +    let vendorShortName = brandBundle.GetStringFromName("vendorShortName");
+
+Nit: please use the globals bug 1147398 just added here.
+Created attachment 8586389
+lwtheme-devedition-changes-r=Gijs.patch
+
+Using gBrowserBundle / gBrandBundle
+Try push against fx-team: https://treeherder.mozilla.org/#/jobs?repo=try&revision=3c87ccd66e3e
+Try push on Aurora simulation (has oranges, but they seem unrelated - I saw these when looking at it before the merge): https://treeherder.mozilla.org/#/jobs?repo=try&revision=ef05b1c7f9e1
+Try push  on Aurora repo: https://treeherder.mozilla.org/#/jobs?repo=try&revision=b02652e575a1
+(In reply to :Gijs Kruitbosch from comment #17) 
+> r=me assuming a green try push against aurora as well.
+
+The try push on aurora with no patches looks approximately just as orange as the push with these patches applied, so any remaining oranges seem to not be caused by this.
+
+aurora, no other patches: https://treeherder.mozilla.org/#/jobs?repo=try&revision=a2d28c96150d
+aurora + these two patches: https://treeherder.mozilla.org/#/jobs?repo=try&revision=a2d28c96150d
+
+Given that plus the green push on fx-team, this is ready to land.
+remote:   https://hg.mozilla.org/integration/fx-team/rev/10160e5098c8
+remote:   https://hg.mozilla.org/integration/fx-team/rev/4d9d80b41d62
+Should I update talos.json as well?  
+
+One other question, with the preference changes would there be issues uplifting the code to aurora or beta if needed in the future?
+(In reply to Joel Maher (:jmaher) from comment #22)
+> Should I update talos.json as well?  
+
+Maybe we should wait until this gets merged into m-c, but I don't think it's going to have any issues (it was landed for much of last week with no issues until the Aurora merge).
+
+> One other question, with the preference changes would there be issues
+> uplifting the code to aurora or beta if needed in the future?
+
+lightweightThemes.selectedThemeID will not mean anything on beta and forward, but setting it to an empty string shouldn't hurt.  On Aurora 39 setting it to an empty string won't change anything.
+
+The showCustomizeButton pref if not flipped to false on 39 will cause an extra button to show up in the customize mode (this is Aurora only).  I'm not sure if that would affect talos results, but it would be safest to not include that change if it needs to be uplifted to 39.
+https://hg.mozilla.org/mozilla-central/rev/10160e5098c8
+https://hg.mozilla.org/mozilla-central/rev/4d9d80b41d62
+I had a bug "related" to this one when updated from dev edition 39 to 40 with the "Default theme".
+
+Default Theme was revert to Dark Theme and setting it to "Default Theme" was working TILL I restart Firefox... So every time I restarted Firefox it was with Dark Theme instead of the default theme. 
+
+English is not my native language but here it the fix I've found ---> http://forums.mozillazine.org/viewtopic.php?p=14158607#p14158607
+
+Read my 3 messages especially the second message which include the fix of the bug.
+
+Hoping it will help to fix it !
+
+Regards
+(In reply to infoplus007 from comment #25)
+> I had a bug "related" to this one when updated from dev edition 39 to 40
+> with the "Default theme".
+> 
+> Default Theme was revert to Dark Theme and setting it to "Default Theme" was
+> working TILL I restart Firefox... So every time I restarted Firefox it was
+> with Dark Theme instead of the default theme. 
+> 
+> English is not my native language but here it the fix I've found --->
+> http://forums.mozillazine.org/viewtopic.php?p=14158607#p14158607
+> 
+> Read my 3 messages especially the second message which include the fix of
+> the bug.
+> 
+> Hoping it will help to fix it !
+> 
+> Regards
+
+Thanks for the report - Bug 1164178 has been fixed which should resolve this issue, and we will be uplifting it to Dev Edition ASAP
+
+
+Convert dev edition theme to a lightweight theme
+
+
+
+Bug 1148996 - Install a devedition lightweight theme on startup, then wait for it to be applied before applying devedition styles;r=Gijs 
+
+Bug 1148996 - Remove selected lightweight theme for mochitest and xpcshell tests;r=jmaher

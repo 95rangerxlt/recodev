@@ -1,0 +1,417 @@
+Created attachment 8520755
+iframe.png
+
+- Open URL
+- open dev tools
+- select the iframe
+- Switch to "fonts", you'll see the @font-face-loaded OpenSans.
+- Click on "See all the fonts used in the page"
+
+Only Arial-fonts are shown, openSans is missing.
+
+Created attachment 8520755
+iframe.png
+
+- Open URL
+- open dev tools
+- select the iframe
+- Switch to "fonts", you'll see the @font-face-loaded OpenSans.
+- Click on "See all the fonts used in the page"
+
+Only Arial-fonts are shown, openSans is missing.
+Created attachment 8520756
+page.png
+That's right, when you click on the All Fonts button, the font-inspector only retrieves the fonts from the root frame document.
+What it does is it selects the <body> node of the root frame document, and then creates a range object, then calls |range.selectNodeContents(bodyNode)| and then uses a platform API to retrieve the list of fonts: |DOMUtils.getUsedFontFaces(range)|.
+This should be done for all frames instead.
+
+Also, forcing the selection of the <body> node isn't really nice at all. The user might have selected another node and might want it to remain selected even while looking at all fonts.
+The selection happens because the |FontInspector.update| method uses |this.inspector.selection.node| to create the range. But it could also accept a node as input parameter and use that instead.
+
+Thirdly, the font-inspector isn't remote safe at all right now, which means it won't work when debugging remote devices, and it won't work with e10s (multi-process).
+Bug 886041 will change that and refactors quite a bit of the font-inspector, so we need to wait for that one to land, and then update the code to:
+
+- avoid loosing the selection and selecting <body> when asking to show all fonts
+- loop on all available frames to really retrieve all fonts
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #2)
+> - loop on all available frames to really retrieve all fonts
+This can be done quite easily by using the tabActor's list of windows.
+Hi Patrick,
+
+I'd like to take this up. I was exploring the code and would I be right in assuming that the modification (looping through the windows) would be inside the showAll function in font-inspector.js?
+(In reply to Anurag Chaudhury from comment #4)
+> Hi Patrick,
+> 
+> I'd like to take this up. I was exploring the code and would I be right in
+> assuming that the modification (looping through the windows) would be inside
+> the showAll function in font-inspector.js?
+Cool, thanks for your interest. I'll assign the bug to you.
+So, I think there are 2 bugs in 1 here. First we want the getUsedFontFaces method to return all used font faces even the ones in the iframes that are nested below the provided node.
+This method is defined in the style actor, here: http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/styles.js#234
+So this one isn't a fix that should be done in font-inspector.js.
+
+But the other problem we have I think (and we could perhaps keep that for a separate bug if you prefer) is that when we click on the "show all" button, we select the <body> node, and that's just bad, because we don't want to mess with the current selection the user has made. So, we need to have a way in font-inspector.js to not force the selection (this is where it happens http://mxr.mozilla.org/mozilla-central/source/browser/devtools/fontinspector/font-inspector.js#185).
+
+Overall, I think the right way to fix this bug is:
+
+- add a new method in styles.js, next to getUsedFontFaces, called getAllUsedFontFaces,
+- this method should also accept node and options parameters,
+- this method should call this.getUsedFontFaces with the provided node, and then iterate over all nested windows, and in turn call this.getUsedFontFaces with the body nodes of these nested windows, consolidating all fonts into 1 array and returning this at the end.
+
+This way, we keep getUsedFontFaces as it is now, we just add another method, and we change font-inspector.js to, instead of changing the current selection, make it call that new method.
+
+Does this make sense?
+Let me know if you need more/different explanations. Also, please join IRC #devtools if you want more direct feedback.
+Thanks Patrick. This should be enough info to get me started. I'll start working on the bug and ask questions as they come up. Thanks!
+Created attachment 8539920
+fonts_patch.diff
+
+If this looks good then I can add a test. Also, I wasn't sure why we would call getUsedFontFaces for the node passed in and then call getUsedFontFaces for the window body nodes. Since this is triggered only for show all fonts, shouldn't we just iterate through windows? I tried it with the test website and a couple of other pages, seems like it's working fine. Thanks.
+Comment on attachment 8539920
+fonts_patch.diff
+
+Review of attachment 8539920:
+-----------------------------------------------------------------
+
+The approach looks fine. I agree, no need for this new method to access the node, I don't know why I suggested this in my last comment.
+Please find some code style related review comments below.
+And yes, a test for this would be nice.
+
+::: browser/devtools/fontinspector/font-inspector.js
+@@ +85,2 @@
+>   /**
+>    * Retrieve all the font info for the selected node and display it.
+
+This comment should be updated. Maybe something like:
+
+Retrieve the font(s) information from and display it.
+@param {Boolean} showAllFonts If set to true, retrieve the information for all the fonts on the page.
+
+@@ +104,5 @@
+>        includePreviews: true,
+>        previewFillStyle: fillStyle
+>      }
+> +    let fonts = [];
+> +    if (showAllFonts !== undefined)
+
+Why not just |if (showAllFonts)| ?
+
+@@ +105,5 @@
+>        previewFillStyle: fillStyle
+>      }
+> +    let fonts = [];
+> +    if (showAllFonts !== undefined)
+> +    {
+
+nit: in the devtools codebase, we usually prefer putting the { on the same line as the if (also applies to the else). So please reformat this section to:
+
+if (showAllFonts) {
+  fonts = ....
+} else {
+  fonts = ...
+}
+
+@@ +119,1 @@
+>      if (!fonts) {
+
+I know this was here before, but in fact, fonts can never be falsy here. It will always be an array. Maybe a 0 length array, but an array still.
+So please, change this condition to: |if (!fonts.length)|
+
+@@ +186,1 @@
+>          !this.inspector.selection.isElementNode()) {
+
+The update method already does similar checks, I believe the showAll method could be simplified to:
+
+showAll: function FI_showAll() {
+  this.update(true);
+}
+
+::: toolkit/devtools/server/actors/styles.js
+@@ +221,5 @@
+>  
+> +/**
+> +   * Get all the fonts from a page.
+> +   *
+> +   * @param NodeActor node
+
+Let's remove this param.
+
+@@ +233,5 @@
+> +   *   object with 'fontFaces', a list of fonts that apply to this node.
+> +   */
+> +
+> +getAllUsedFontFaces: method(function(node, options) {
+> +
+
+nit: Why an empty line here?
+
+@@ +235,5 @@
+> +
+> +getAllUsedFontFaces: method(function(node, options) {
+> +
+> +  let windows = this.inspector.tabActor.windows;
+> +  let fonts_list = [];
+
+Please camelcase variables (fontsList)
+
+@@ +238,5 @@
+> +  let windows = this.inspector.tabActor.windows;
+> +  let fonts_list = [];
+> +
+> +  windows.forEach(win => {
+> +    let node_actor = this.inspector.walker._ref(win.document.body);   
+
+Please camelcase node_actor (nodeActor).
+Also, no need for |this.inspector.walker|, instead use |this.walker|.
+Finally, |_ref| is a private method of the walker. You shouldn't be using it. That said, there isn't a good way right now with the walker's API to achieve the same thing, BUT, we don't actually need to pass in a NodeActor since we have the real DOM node, and that's what getUsedFontFaces needs in the end anyway.
+So, 2 solutions:
+- this.getUsedFontFaces({rawNode: win.document.body});
+  basically, pretend to be a NodeActor, since getUsedFontFaces only cares about the |rawNode| property. But this isn't very clean.
+- or, refactor getUsedFontFaces to either accept a NodeActor or a DOMNode. I prefer this solution.
+
+@@ +241,5 @@
+> +  windows.forEach(win => {
+> +    let node_actor = this.inspector.walker._ref(win.document.body);   
+> +    this.getUsedFontFaces(node_actor,options).forEach(
+> +      font_object => { fonts_list.push(font_object); });
+> +  });
+
+I think using a for...of loop to iterate over the windows would be a bit nicer. Also, instead of iterating over the font faces inside the windows loop, you can simply concatenate the list to fontsList:
+
+for (let win of windows) {
+  fontsList = [...fontsList,
+               ...this.getUsedFontFaces(win.document.body, options)];
+}
+
+@@ +248,5 @@
+> +
+> +  },
+> +  {
+> +    request: {
+> +      node: Arg(0, "domnode"),
+
+Get rid of this param.
+Created attachment 8540269
+fonts_patch.diff
+
+I updated the code and modified the existing showAllFonts test case. I didn't know about the ... trick. Nice. Let me know if there's anything else.
+Comment on attachment 8540269
+fonts_patch.diff
+
+Review of attachment 8540269:
+-----------------------------------------------------------------
+
+Great. This looks good. Thanks!
+
+I only have a few very minor comments about the code style (trailing white spaces, indentation, empty lines...).
+Also, some re-wording in the test and you forgot to add test_iframe.html to the patch (you probably forgot to run |hg add browser/devtools/fontinspector/test/test_iframe.html|).
+
+Please provide a new patch with the missing file and I'll R+ it.
+
+::: browser/devtools/fontinspector/font-inspector.js
+@@ +112,5 @@
+> +    else{
+> +      fonts = yield this.pageStyle.getUsedFontFaces(node, options)
+> +                      .then(null, console.error);
+> +    }
+> + 
+
+nit: trailing space here.
+
+::: browser/devtools/fontinspector/test/browser.ini
+@@ +2,4 @@
+>  subsuite = devtools
+>  support-files =
+>    browser_fontinspector.html
+> +  test_iframe.html
+
+You forgot to add this file to source control. It isn't part of the patch.
+
+::: browser/devtools/fontinspector/test/browser_fontinspector.js
+@@ +85,5 @@
+>    viewDoc.querySelector("#showall").click();
+>    yield updated;
+>  
+> +  // shouldn't just click the body node for showAll
+> +  is(inspector.selection.nodeFront.nodeName, "DIV", "Show all fonts selected");
+
+Now that we don't select the body node anymore, this check and the preceding comment is confusing. I think some re-phrasing is needed:
+
+// Check that the current selection isn't changed when all fonts are displayed.
+is(inspector.selector.nodeFront.nodeName, "DIV",
+  "The current selection hasn't changed");
+
+::: toolkit/devtools/server/actors/styles.js
+@@ +221,5 @@
+>  
+> +/**
+> +   * Get all the fonts from a page.
+> +   *
+> +   * 
+
+nit: trailing space here. Also, just one empty line between the description and the @param below is enough.
+
+@@ +230,5 @@
+> +   *
+> +   * @returns object
+> +   *   object with 'fontFaces', a list of fonts that apply to this node.
+> +   */
+> +
+
+nit: no need for an empty line between the jsdoc and the function.
+
+@@ +231,5 @@
+> +   * @returns object
+> +   *   object with 'fontFaces', a list of fonts that apply to this node.
+> +   */
+> +
+> +getAllUsedFontFaces: method(function(options) {
+
+nit: The indentation of this function is incorrect. The function name getAllUsedFontFaces should have 2 leading spaces. The body of the function 4.
+
+@@ +236,5 @@
+> +  let windows = this.inspector.tabActor.windows;
+> +  let fontsList = [];
+> +  for(let win of windows){
+> +    fontsList = [...fontsList,
+> +                 ...this.getUsedFontFaces(win.document.body,options)];
+
+nit: please add 1 space after the ,
+
+@@ +239,5 @@
+> +    fontsList = [...fontsList,
+> +                 ...this.getUsedFontFaces(win.document.body,options)];
+> +  }
+> +  return fontsList;
+> +
+
+nit: no need for an empty line here.
+
+@@ +268,5 @@
+>     *   object with 'fontFaces', a list of fonts that apply to this node.
+>     */
+>    getUsedFontFaces: method(function(node, options) {
+> +    // node.rawNode is defined for NodeActor objects
+> +    let actualNode = (node.rawNode)?node.rawNode:node;
+
+Or just:
+let actualNode = node.rawNode || node;
+The patch also needs to be rebased, it doesn't apply for me after I just pulled.
+Hey Patrick, sorry about the delay. I updated the code according to all the styling stuff you mentioned. I also pulled in the changes. There were quite a few changes to the test file browser_fontinspector.js, but when I run the file it fails. The issue is :
+
+The test is expecting 5 results but gets back 4. This is because it's expecting the results as :
+
+const FONTS = [
+  {name: "Ostrich Sans Medium", remote: true, url: BASE_URI + "ostrich-regular.ttf",
+   format: "truetype", cssName: "bar"},
+  {name: "Ostrich Sans Black", remote: true, url: BASE_URI + "ostrich-black.ttf",
+   format: "", cssName: "bar"},
+  {name: "Ostrich Sans Black", remote: true, url: BASE_URI + "ostrich-black.ttf",
+   format: "", cssName: "bar"},
+  {name: "Ostrich Sans Medium", remote: true, url: BASE_URI + "ostrich-regular.ttf",
+   format: "", cssName: "barnormal"},
+];
+
+However, Ostrich Sans Black only occurs once. This is because the div with the bold text and the div with the 800 px font weight in the test are treated as having the same font, so it only shows up once. This pretty much causes the entire test to fall through since now the order of expected results doesn't match as well. I'm not really sure what to do about this. Could you please let me know if you see the same behaviour on your end? Also, is this expected behaviour? As in should it actually  be 5? If so, then any ideas on how to proceed? Thanks a lot.
+Scratch that. I goofed. I accidentally edited the browser_fontinspector.html file and somehow ended up with 4 fonts instead of 5. Sorry about that. Just attached the updated diff.
+Created attachment 8541837
+fonts_patch.diff
+Created attachment 8541863
+font_inspector.patch
+Created attachment 8541864
+font_inspector.patch
+
+Missed the comment change in browser_inspector.js
+Comment on attachment 8541864
+font_inspector.patch
+
+Review of attachment 8541864:
+-----------------------------------------------------------------
+
+The latest changes look good. 
+
+I just have a couple of final minor comments, and you forgot again to add the test_iframe.html file to the patch.
+
+Also, you need to change the commit message to be formatted like: "Bug 1097150 - <description>; r=pbrosset" where <description> should state what you have changed functionality-wise, so more something like: "Added getAllUsedFontFaces to font-inspector to retrieve fonts from all windows".
+
+::: browser/devtools/fontinspector/font-inspector.js
+@@ +179,3 @@
+>     */
+>    showAll: function FI_showAll() {
+> +    // call getAllUsedFonts through update
+
+This comment isn't very useful, please remove it.
+
+::: browser/devtools/fontinspector/test/browser.ini
+@@ +1,5 @@
+>  [DEFAULT]
+>  subsuite = devtools
+>  support-files =
+>    browser_fontinspector.html
+> +  test_iframe.html
+
+This file is still missing from the patch. As said in my previous review, I think you missed a |hg add browser/devtools/fontinspector/test/test_iframe.html|
+
+::: toolkit/devtools/server/actors/styles.js
+@@ +252,5 @@
+> +  getAllUsedFontFaces: method(function(options) {
+> +    let windows = this.inspector.tabActor.windows;
+> +    let fontsList = [];
+> +    for(let win of windows){
+> +      fontsList = [...fontsList, 
+
+nit: 1 trailing whitespace on this line.
+Created attachment 8541985
+font_inspector.patch
+
+Hmm I had the test_iframe.html in my earlier diff but it's not in the patch now. Sorry about that. updated the patch and commit message.
+Created attachment 8541993
+font_inspector.patch
+Comment on attachment 8541993
+font_inspector.patch
+
+Review of attachment 8541993:
+-----------------------------------------------------------------
+
+Looks good. Thanks!
+I've pushed this patch to our try server to check that all tests still pass on all platforms: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=7edd9ff9bb30
+Let's wait until this turns green and then land your patch.
+Well, that didn't work out :(. I looked at the errors and it seems like mostly TypeError complaints for 
+
+ if (!fonts.length) {
+      return;
+    }
+
+saying fonts is undefined and the test timeout threshold stuff.
+(In reply to Anurag Chaudhury from comment #21)
+> Well, that didn't work out :(. I looked at the errors and it seems like
+> mostly TypeError complaints for 
+> 
+>  if (!fonts.length) {
+>       return;
+>     }
+> 
+> saying fonts is undefined and the test timeout threshold stuff.
+Indeed. I didn't see this coming but it seems the actor methods can return null. So, that condition should instead be |if (!fonts || !fonts.length) {|
+Created attachment 8543150
+font_inspector.patch
+Yup, thought so, just wanted confirmation.Thanks! I updated the patch. Hopefully this goes through.
+Comment on attachment 8543150
+font_inspector.patch
+
+Review of attachment 8543150:
+-----------------------------------------------------------------
+
+Thanks for the change. Sorry for the delay.
+And now the TRY tree is closed so I can't push to it right now.
+Will do as soon as it opens again.
+Pending try build: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=5fb70e22d0c7
+https://hg.mozilla.org/integration/fx-team/rev/010c93a343d2
+https://hg.mozilla.org/mozilla-central/rev/010c93a343d2
+
+
+Font inspector doesn't show fonts of iframes
+
+
+
+Bug 1097150 - Added getAllUsedFontFaces to styles.js retrieve fonts from all windows;r=pbrosset 

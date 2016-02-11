@@ -1,0 +1,210 @@
+Moving the content script at mobile/chrome/content/bindings/browser.js to toolkit/content/browser-content.js.
+
+Listeners for platform features being implemented at toolkit's browser.xml, and firefox UI bits at tabbrowser.xml
+
+Moving the content script at mobile/chrome/content/bindings/browser.js to toolkit/content/browser-content.js.
+
+Listeners for platform features being implemented at toolkit's browser.xml, and firefox UI bits at tabbrowser.xml
+Created attachment 537308
+WIP v1
+
+WIP v1
+
+haven't removed the duplicated listeners from mobile yet.
+
+toolkit and front-end full impl of DOMTitleChanged, keeping event semantics unchanged for single-process mode.
+Created attachment 537692
+Patch
+
+So what I did was:
+
+- moved mobile/chrome/content/bindings/browser.js to toolkit/content/browser-content.js
+- moved contentTitle and contentWindowId to toolkit's browser.xml
+- used the changes to fix content title support in firefox's tabbrowser
+
+everything else left as is.. there are more things I want to reuse in firefox's front end (like the _documentURI) but don't want to hold this patch for that.. will do that in a future one
+
+
+(marking both feedback and review to see if this is the direction you had in mind for this bindings/browser.js file. If it is, it's ready for review; if not let me know what's the correct approach)
+
+sending this to tryserver now..
+ok, everything here is local/remote agnostic, so I don't need to add a new binding for this patch
+Comment on attachment 537692
+Patch
+
+
+>diff --git a/mobile/chrome/content/bindings/browser.xml b/mobile/chrome/content/bindings/browser.xml
+
+>           receiveMessage: function(aMessage) {
+
+>               case "Content:LocationChange":
+
+>-                if (this._browser.updateWindowId(json.contentWindowId)) {
+>+                if (this._browser._documentURI != json.documentURI) {
+>                   this._browser._documentURI = json.documentURI;
+
+Make sure the documentURI is only changed for the top-level window. I think we only send it for the top-level window, but we should be sure.
+
+
+>diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/browser.xml
+
+>+      <field name="_messageListener"><![CDATA[
+
+>+            switch (aMessage.name) {
+>+
+
+Remove extra blank line
+
+>+              case "Content:StateChange":
+>+              case "Content:LocationChange":
+>+              case "Content:SecurityChange":
+>+                this.contentWindowId = json.contentWindowId;
+
+self.contentWindowId = json.contentWindowId;
+
+Overall this looks good. This shouldn't break Fennec or Firefox if we landed it on trunk now
+Created attachment 539986
+Patch v2
+
+(In reply to comment #4)
+> Make sure the documentURI is only changed for the top-level window. I think
+> we only send it for the top-level window, but we should be sure.
+
+verified
+
+> >+      <field name="_messageListener"><![CDATA[
+> >+            switch (aMessage.name) {
+> >+
+> 
+> Remove extra blank line
+done
+
+> 
+> >+              case "Content:StateChange":
+> >+              case "Content:LocationChange":
+> >+              case "Content:SecurityChange":
+> >+                this.contentWindowId = json.contentWindowId;
+> 
+> self.contentWindowId = json.contentWindowId;
+done
+
+Two extra changes from the previous patch:
+
+- removed messageManager getter from mobile's browser as it's already present in toolkit.
+
+There's a difference in that the one in mobile uses a ref to _frameLoader, and the one in toolkit doesn't have this ref, which lead to an error during toolkit's constructor
+
+(I can add a _messageManager cache field in toolkit if you want)
+
+
+- wrapped the messageManager in toolkit's constructor in a "if (this.messageManager)", because chrome <browser>s don't have a message manager (there's one in firefox's sidebar, and some in mochitests). I'll file a bug for this to see if this is something that needs to be changed (I think a browser should always have the message manager)
+Comment on attachment 539986
+Patch v2
+
+
+>diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrowser.xml
+
+>+      <field name="_messageListener"><![CDATA[
+>+        ({
+>+          self: this,
+>+          receiveMessage: function receiveMessage(aMessage) {
+>+            let self = this.self;
+>+            let json = aMessage.json;
+>+            let browser = aMessage.target;
+>+
+>+            switch (aMessage.name) {
+>+              case "DOMTitleChanged":
+>+                let tab = getTabForBrowser(browser);
+
+                  let tab = self.getTabForBrowser(browser);
+
+>diff --git a/mobile/chrome/content/bindings/browser.js b/toolkit/content/browser-content.js
+>       case "DOMTitleChanged":
+>+        if (!aEvent.isTrusted ||
+>+            aEvent.target.defaultView != aEvent.target.defaultView.top)
+>+          return;
+
+"content" should be the top-level window, so you can shorten that to:
+
+          if (!aEvent.isTrusted || aEvent.target.defaultView != content)
+
+r+ with those fixed
+Created attachment 737773
+title change handling
+
+It doesn't seem relevant anymore to share code with Fennec, since Fennec now works in a completely different way. However, I think one big goal of this bug was to handle the DOMTitleChanged event across processes. That's what this patch does.
+
+Ideally, we could use the message manager to handle DOMTitleChanged events the same way no matter whether browser.tabs.remote is true or false. However, that causes some test failures because the following can happen in a single-process firefox:
+
+the DOMTitleChanged event fires and is handled
+  - we send a DOMTitleChanged message via the message manager
+then the DOMContentLoaded event fires and is handled
+  - this caused some jetpack test code to run that tried to assert
+    that the document title was correct, and the assertion failed
+then the message handler for the DOMTitleChanged message that we sent earlier runs
+  - now the title gets changed, but it's too late
+
+This shouldn't be possible in multi-process firefox, as far as I can tell.
+
+Anyway, I just made the title code only use the message manager when browser.tabs.remote is true.
+Can we fix the jetpack test code?
+This patch is patching a browser/base/content/browser.xml that doesn't exist on m-c. Which patch adds that, and what kind of reviews has it gotten?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #9)
+> This patch is patching a browser/base/content/browser.xml that doesn't exist
+> on m-c. Which patch adds that, and what kind of reviews has it gotten?
+
+It's added by one of the patches from bug 666801 but on review I suggested to rename that file to remote-browser.xml
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #8)
+> Can we fix the jetpack test code?
+
+The JetPack code doesn't really seem to be wrong. It expects that, once the load event happens, the title will be correct for the given page. That seems like a pretty reasonable assumption, and it gets broken if we use the message manager to implement the title changes from single-process Firefox.
+Comment on attachment 737773
+title change handling
+
+Review of attachment 737773:
+-----------------------------------------------------------------
+
+Looks good. A note that equally applies to the patch I had previously submitted, but: should we think about making tabbrowser implement nsIMessageListener instead of having the _messageListener obj and having to deal with the |self = this| crap?
+
+::: browser/base/content/tabbrowser.xml
+@@ +293,5 @@
+> +      <method name="_getTabForBrowser">
+> +        <parameter name="aBrowser"/>
+> +        <body>
+> +        <![CDATA[
+> +          for (let i = 0; i < this.browsers.length; i++) {
+
+a better way to implement this function is to iterate through the tabs array and check the .linkedBrowser property of the tab:
+
+if (this.tabs[i].linkedBrowser == aBrowser)
+  return this.tabs[i]
+
+@@ +2750,5 @@
+>                "-moz-default-background-color" :
+>                Services.prefs.getCharPref("browser.display.background_color");
+> +
+> +          if (Services.prefs.getBoolPref("browser.tabs.remote"))
+> +            messageManager.addMessageListener("DOMTitleChanged", this._messageListener);
+
+is gMultiProcessBrowser already available here?
+
+and we need to remove the listener in the destructor
+I forgot to mention that this is fine for now, but the original idea was to have the same handling for both single-process and multi-process. It seems that the Jetpack code had a valid assumption but it's fine that that is changing now, and if the test is the only thing blocking that then it's OK to change the test to reflect the new reality.
+Or, alternatively, if the test reflects a wider existing assumption in other code or other add-ons, we should see if we'll need to send the title together with the DOMContentLoaded notifications to not break more things.
+
+Let's file a bug to follow up on these considerations.
+
+(sorry for the multiple comments, i'm basically writing down my thought stream here)
+> is gMultiProcessBrowser already available here?
+
+No, it hasn't been set by that point.
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/02d966a79f14
+https://hg.mozilla.org/mozilla-central/rev/02d966a79f14
+
+
+Handle document title changes across processes
+
+
+
+Bug 662008 - Handle document title changes across processes (r=felipe) 

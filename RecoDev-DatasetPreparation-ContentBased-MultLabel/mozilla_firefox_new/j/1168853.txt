@@ -1,0 +1,197 @@
+Once bug 1164564 lands, we will be able to connect to a worker from the main thread, and obtain a thread actor for it. From that point on we should be able to use this thread actor as if it were living in the main thread.
+
+The only caveat is that although the debugger server is now running in a worker, certain code paths may not yet work as intended, because the required APIs are either not available, or does not work as expected.
+
+One problem I ran into in particular is that obtaining the source text for a source actor does not work, because its not possible to load URLs from a worker. Indeed, loading URLs is only possible from the main thread. To work around this, we need some form of rpc mechanism to let the main thread do the work on behalf on the worker thread.
+
+Note that this is the last piece of client/server functionality we need before we can start building the UI.
+
+Once bug 1164564 lands, we will be able to connect to a worker from the main thread, and obtain a thread actor for it. From that point on we should be able to use this thread actor as if it were living in the main thread.
+
+The only caveat is that although the debugger server is now running in a worker, certain code paths may not yet work as intended, because the required APIs are either not available, or does not work as expected.
+
+One problem I ran into in particular is that obtaining the source text for a source actor does not work, because its not possible to load URLs from a worker. Indeed, loading URLs is only possible from the main thread. To work around this, we need some form of rpc mechanism to let the main thread do the work on behalf on the worker thread.
+
+Note that this is the last piece of client/server functionality we need before we can start building the UI.
+Created attachment 8612390
+Implement WorkerDebugger.isInitialized
+
+Another small patch. I found myself needing a way to tell whether the worker debugger has been initialized yet.
+Created attachment 8612392
+Implement (Worker)SourceActor.source
+
+This patch extends the worker debugging protocol with a rpc mechanism, and refactors fetch so that it uses this rpc mechanism in a worker thread to hand off the work of fetching the URL to the main thread .
+Comment on attachment 8612392
+Implement (Worker)SourceActor.source
+
+Review of attachment 8612392:
+-----------------------------------------------------------------
+
+Was it a conscious choice to disallow concurrent RPC calls? I feel like it would be pretty easy to support concurrent RPC calls with a unique identifier for call, and it seems like it would be a big win when fetching multiple sources over the network. On the other hand, it might not be worth it since the only time there are multiple sources we need to fetch over the network (as opposed to using Debugger.Source.prototype.text) is when we are source mapping (not currently supported in worker debugging) *and* the sources aren't embedded within the source map. Unfortunately, I don't have any numbers on how often sources are or aren't embedded in the source map. Still, it seems like it should be really easy to support using a unique identifier and concurrency vs the LIFO queue that is implemented now.
+
+Additionally, because this is the introduction of a new protocol, I think it merits some nice overview documentation, explanation of the currently supported methods, etc. I feel like this is kind of difficult when the server half of the implementation is embedded within `connectToWorker` and the client code is spread elsewhere. What I'd personally prefer doing is:
+
+* Create a worker-rpc.js file
+* Adding all this documentation I mentioned to the top of this
+* Export the `rpc` client function from that file, and have WorkerActor import it
+* Export an `initializeWorkerRpcServer` function that could be imported and used in `connectToWorker`.
+
+What do you think of that?
+
+::: toolkit/devtools/DevToolsUtils.js
+@@ +584,5 @@
+> +    // issuing an rpc request, to fetch the URL on our behalf.
+> +    exports.fetch = function (url, options) {
+> +      return rpc("fetch", url, options);
+> +    }
+> +  })();
+
+Why the immediately invoked function here and in the if's consequent branch? They both look superfluous to me: am I missing something?
+
+Also, nit: semicolon missing after defining fetch in both branches.
+
+::: toolkit/devtools/server/worker.js
+@@ +7,5 @@
+> +this.rpc = function (method) {
+> +  postMessage(JSON.stringify({
+> +    type: "rpc",
+> +    method: method,
+> +    params: Array.prototype.slice.call(arguments, 1)
+
+Use `function (methods, ...args) ...` instead of the arguments object.
+Comment on attachment 8612392
+Implement (Worker)SourceActor.source
+
+Review of attachment 8612392:
+-----------------------------------------------------------------
+
+Interestingly, we have some helpers that help run tasks in workers: https://github.com/mozilla/gecko-dev/blob/master/toolkit/devtools/shared/worker.js (also see worker-helper.js)
+
+That basically allows you to message a worker and get a response back. It will automatically tag each message with an id and provide a promise interface for waiting on a response to your request.
+
+Not really applicable here though since you want to do it the other way around, but yeah tagging requests sounds better.
+
+Are there any other code paths that you think will fail?
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #3)
+> Comment on attachment 8612392
+> Implement (Worker)SourceActor.source
+> 
+> Review of attachment 8612392:
+> -----------------------------------------------------------------
+> 
+> Was it a conscious choice to disallow concurrent RPC calls? I feel like it
+> would be pretty easy to support concurrent RPC calls with a unique
+> identifier for call, and it seems like it would be a big win when fetching
+> multiple sources over the network. On the other hand, it might not be worth
+> it since the only time there are multiple sources we need to fetch over the
+> network (as opposed to using Debugger.Source.prototype.text) is when we are
+> source mapping (not currently supported in worker debugging) *and* the
+> sources aren't embedded within the source map. Unfortunately, I don't have
+> any numbers on how often sources are or aren't embedded in the source map.
+> Still, it seems like it should be really easy to support using a unique
+> identifier and concurrency vs the LIFO queue that is implemented now.
+> 
+
+I agree. I will address this before landing the patch.
+
+> Additionally, because this is the introduction of a new protocol, I think it
+> merits some nice overview documentation, explanation of the currently
+> supported methods, etc. I feel like this is kind of difficult when the
+> server half of the implementation is embedded within `connectToWorker` and
+> the client code is spread elsewhere. What I'd personally prefer doing is:
+> 
+> * Create a worker-rpc.js file
+> * Adding all this documentation I mentioned to the top of this
+> * Export the `rpc` client function from that file, and have WorkerActor
+> import it
+> * Export an `initializeWorkerRpcServer` function that could be imported and
+> used in `connectToWorker`.
+> 
+> What do you think of that?
+> 
+
+Well, things are a little bit more complicated than that. The rpc function needs direct access to the  worker debugger's postMessage API, because its protocol operates on a level below that of normal debugger packets. In addition to rpc calls, this worker debugger protocol is used to connect to the worker debugger, and multiplex messages from different connections over a single channel.
+
+We don't want ordinary modules to have unrestricted access to the worker debugger API. For this reason, we do not expose the postMessage API to modules. The only place where it can be accessed directly is in the bootstrap script, which handles all messages for the worker debugger protocol.
+
+This is the main reason I've defined the rpc method in the bootstrap script, and exposed it as a built-in global, instead of a standalone module. I agree that the latter probably would have been cleaner, so if you can think of a way to do this without exposing the postMessage API to every module, let me know!
+
+On the server side, since the worker rpc server is always the WorkerDebuggerServer, I think it makes sense to have the rpc logic there, as we do now. It doesn't actually require any state, so having an initializeWorkerRpcServer function feels like an unnecessary abstraction.
+
+> ::: toolkit/devtools/DevToolsUtils.js
+> @@ +584,5 @@
+> > +    // issuing an rpc request, to fetch the URL on our behalf.
+> > +    exports.fetch = function (url, options) {
+> > +      return rpc("fetch", url, options);
+> > +    }
+> > +  })();
+> 
+> Why the immediately invoked function here and in the if's consequent branch?
+> They both look superfluous to me: am I missing something?
+> 
+
+It doesn't seem actually necessary here, so I could get rid of it if you'd like. It's a pattern I adopted because you can't do function definitions in an if/else branch in strict mode, which caused some problems for me earlier. I actually use this pattern in some other places like worker-loader.js and transport.js as well.
+
+> Also, nit: semicolon missing after defining fetch in both branches.
+> 
+> ::: toolkit/devtools/server/worker.js
+> @@ +7,5 @@
+> > +this.rpc = function (method) {
+> > +  postMessage(JSON.stringify({
+> > +    type: "rpc",
+> > +    method: method,
+> > +    params: Array.prototype.slice.call(arguments, 1)
+> 
+> Use `function (methods, ...args) ...` instead of the arguments object.
+
+Good call. Will do.
+Comment on attachment 8612392
+Implement (Worker)SourceActor.source
+
+Review of attachment 8612392:
+-----------------------------------------------------------------
+
+Nick gave some good feedback already and I'm a bit overloaded, so this looks good to me. I looked it over and can't think of anything to add.
+
+::: toolkit/devtools/DevToolsUtils.js
+@@ +584,5 @@
+> +    // issuing an rpc request, to fetch the URL on our behalf.
+> +    exports.fetch = function (url, options) {
+> +      return rpc("fetch", url, options);
+> +    }
+> +  })();
+
+I agree that this should be taken out, unless it's actually needed (which it is not here).
+Comment on attachment 8612390
+Implement WorkerDebugger.isInitialized
+
+Review of attachment 8612390:
+-----------------------------------------------------------------
+
+::: dom/workers/nsIWorkerDebugger.idl
+@@ +29,5 @@
+>    readonly attribute bool isChrome;
+>  
+>    readonly attribute bool isFrozen;
+>  
+> +  readonly attribute bool isInitialized;
+
+iid change
+Try run for the WorkerDebugger.isInitialized patch:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=2fbb8e4e6897
+https://hg.mozilla.org/integration/fx-team/rev/0bdbb7d472bf
+https://hg.mozilla.org/mozilla-central/rev/0bdbb7d472bf
+Try run for the (Worker)SourceActor.source patch:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=434461a3f808
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=dc98156a21ed
+https://hg.mozilla.org/integration/fx-team/rev/002f738e36f0
+https://hg.mozilla.org/mozilla-central/rev/002f738e36f0
+
+
+Implement (Worker)SourceActor.source
+
+
+
+Bug 1168853 - Implement WorkerDebugger.isInitialized;r=khuey 
+
+Bug 1168853 - Implement (Worker)SourceActor.source;r=jlong 

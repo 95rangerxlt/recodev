@@ -1,0 +1,233 @@
+Created attachment 8596345
+patch
+
+This bug adds a JSM, WebRequest.jsm, that exposes an API similar to Chrome's webRequest API [1]. The idea is to make it easier to offer such an API in Jetpack.
+
+In theory all this code could go in Jetpack, but I'd rather keep it in toolkit since it's generally useful to other consumers.
+
+The API is not exactly the same as Chrome's. For example, it passes a <browser> element instead of a tab ID. It uses outer window IDs instead of frame IDs. Jetpack is free to use the corresponding Jetpack concepts here.
+
+Certain aspects are also incomplete since the platform doesn't provide them. For example, it would be great to have a request ID that carried through the whole series of callbacks, but we don't have a way to support that. I'm planning on adding it, but that shouldn't hold up this bug. I also implemented only a subset of the callbacks.
+
+Despite the holes, I think it's already pretty useful, so I would like to try to get it landed. We can iterate on it from there.
+
+[1] https://developer.chrome.com/extensions/webRequest
+
+Created attachment 8596345
+patch
+
+This bug adds a JSM, WebRequest.jsm, that exposes an API similar to Chrome's webRequest API [1]. The idea is to make it easier to offer such an API in Jetpack.
+
+In theory all this code could go in Jetpack, but I'd rather keep it in toolkit since it's generally useful to other consumers.
+
+The API is not exactly the same as Chrome's. For example, it passes a <browser> element instead of a tab ID. It uses outer window IDs instead of frame IDs. Jetpack is free to use the corresponding Jetpack concepts here.
+
+Certain aspects are also incomplete since the platform doesn't provide them. For example, it would be great to have a request ID that carried through the whole series of callbacks, but we don't have a way to support that. I'm planning on adding it, but that shouldn't hold up this bug. I also implemented only a subset of the callbacks.
+
+Despite the holes, I think it's already pretty useful, so I would like to try to get it landed. We can iterate on it from there.
+
+[1] https://developer.chrome.com/extensions/webRequest
+Comment on attachment 8596345
+patch
+
+Review of attachment 8596345:
+-----------------------------------------------------------------
+
+Haven't looked through the tests yet but there's a few changes I'd like to see before another pass anyway.
+
+::: toolkit/modules/addons/WebRequest.jsm
+@@ +19,5 @@
+> +XPCOMUtils.defineLazyModuleGetter(this, "WebRequestCommon",
+> +                                  "resource://gre/modules/WebRequestCommon.jsm");
+> +
+> +// TODO
+> +// Figure out how to handle requestId. Gecko seems to have no such thing.
+
+I'd suggest a getRequestId function which takes a channel and checks a weak map for an existing ID otherwise generating a new one and starts listening for events that create new channels for the same request.
+
+@@ +56,5 @@
+> +      if (response && response.cancel) {
+> +        return {cancel: true};
+> +      }
+> +
+> +      // FIXME: Need to handle redirection here.
+
+Let's get follow-up bugs filed and referenced for the stuff you haven't implemented.
+
+@@ +123,5 @@
+> +      return;
+> +    }
+> +    this.examineInitialized = true;
+> +    Services.obs.addObserver(this, "http-on-examine-response", false);
+> +    Services.obs.addObserver(this, "http-on-examine-cached-response", false);
+
+You want http-on-examine-merged-response here too.
+
+In all of these cases these notifications are fired after headers are received but before the response is complete so this is really appropriate for the onResponseStarted event. For onCompleted you'd maybe need to use nsITraceableChannel to inject a listener to wait for the onStopRequest of the channel before calling listeners.
+
+@@ +139,5 @@
+> +  addModifyListener(callback, filter) {
+> +    this.initModify();
+> +
+> +    let id = this.nextId++;
+> +    this.modifyListeners.set(callback, {id, filter});
+
+id never seems to be used. Why not do |filter || {}| then later code can just assume filter is non-null.
+
+@@ +153,5 @@
+> +  addCompletedListener(callback, filter) {
+> +    this.initExamine();
+> +
+> +    let id = this.nextId++;
+> +    this.completedListeners.set(callback, {id, filter});
+
+id never seems to be used
+
+@@ +229,5 @@
+> +          method: channel.requestMethod,
+> +          browser: browser,
+> +          type: WebRequestCommon.typeForPolicyType(policyType),
+> +          requestHeaders: requestHeaders,
+> +        });
+
+For safety it might be worth making sure we discard this unless the caller requested blocking.
+
+@@ +238,5 @@
+> +      if (!response) {
+> +        continue;
+> +      }
+> +      if (response.cancel) {
+> +        throw "Unsupported!";
+
+This will block any other listeners from being called. Use Cu.reportError instead.
+
+@@ +283,5 @@
+> +          browser: browser,
+> +          type: WebRequestCommon.typeForPolicyType(policyType),
+> +          statusCode: channel.responseStatus,
+> +          responseHeaders: responseHeaders,
+> +        });
+
+Same for blocking here.
+
+::: toolkit/modules/addons/WebRequestContent.jsm
+@@ +1,3 @@
+> +/* This Source Code Form is subject to the terms of the Mozilla Public
+> + * License, v. 2.0. If a copy of the MPL was not distributed with this
+> + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+This is a process script but named as a jsm which breaks my brain. Just use .js
+
+@@ +19,5 @@
+> +  _classDescription: "WebRequest content policy",
+> +  _classID: Components.ID("938e5d24-9ccc-4b55-883e-c252a41f7ce9"),
+> +  _contractID: "@mozilla.org/webrequest/policy;1",
+> +
+> +  QueryInterface: XPCOMUtils.generateQI([Ci.nsIContentPolicy, Ci.nsIObserver,
+
+I don't see nsIObserver used
+
+@@ +63,5 @@
+> +  },
+> +
+> +  shouldLoad(policyType, contentLocation, requestOrigin,
+> +             node, mimeTypeGuess, extra, requestPrincipal)
+> +  {
+
+Nit: brace on previous line
+
+@@ +122,5 @@
+> +      }
+> +
+> +      let ir = window.QueryInterface(Ci.nsIInterfaceRequestor)
+> +                     .getInterface(Ci.nsIDocShell)
+> +                     .sameTypeRootTreeItem
+
+You don't need sameTypeRootTreeItem here, any docShell.getInterface for nsIContentFrameMessageManager will work
+
+@@ +138,5 @@
+> +
+> +    if (block) {
+> +      let rval = mm.sendSyncMessage("WebRequest:ShouldLoad", data);
+> +      if (rval.length == 1 && rval[0].cancel) {
+> +        return Ci.nsIContentPolicy.REJECT;
+
+I wonder if there is a way to log to the window's console that this was cancelled by a particular extension
+Created attachment 8603145
+patch v2
+
+Here's a new version of the patch. I put off filing bugs for the TODO stuff. I'll do that when this is closer to landing.
+Comment on attachment 8603145
+patch v2
+
+Review of attachment 8603145:
+-----------------------------------------------------------------
+
+This is looking great. I'm on the fence over whether we should try and consistently prefix initialProcessData with something that makes it clear it is app owned, maybe ["toolkit@mozilla.org"] to encourage add-on developers to use their ID as a prefix for their objects. What do you think?
+
+::: toolkit/modules/addons/WebRequest.jsm
+@@ +100,5 @@
+> +    opts.id = id;
+> +    Services.ppmm.broadcastAsyncMessage("WebRequest:AddContentPolicy", opts);
+> +
+> +    this.policyData.set(id, opts);
+> +    Services.ppmm.initialProcessData.webRequestContentPolicies = this.policyData;
+
+You can just do this in init()
+
+@@ +135,5 @@
+> +  },
+> +
+> +  onStopRequest(request, context, statusCode) {
+> +    this.manager.onStopRequest(request);
+> +    return this.orig.onStopRequest(request, context, statusCode);
+
+Not sure it makes much difference but maybe flip these two so we tell Gecko the request is done before we tell the extension.
+
+@@ +291,5 @@
+> +        channel.cancel();
+> +        return false;
+> +      }
+> +      if (result.redirectUrl) {
+> +        channel.redirectTo(BrowserUtils.makeURI(result.redirectUrl));
+
+We should probably note somewhere wherever we document this that redirecting to a data: uri isn't supported due to bug 707624.
+
+::: toolkit/modules/addons/WebRequestContent.js
+@@ +133,5 @@
+> +                     .getInterface(Ci.nsIDocShell)
+> +                     .QueryInterface(Ci.nsIInterfaceRequestor);
+> +      try {
+> +        mm = ir.getInterface(Ci.nsIContentFrameMessageManager);
+> +      } catch (e if e.result == Cr.NS_NOINTERFACE) {}
+
+Does this ever throw? Just interested to know when we have a window but no content frame message manager.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/e6565b1773b8
+> Does this ever throw? Just interested to know when we have a window but no content frame
+> message manager.
+
+Apparently it can throw in non-e10s. I added a comment.
+https://hg.mozilla.org/mozilla-central/rev/e6565b1773b8
+I've written a page on this: https://developer.mozilla.org/en-US/docs/Mozilla/JavaScript_code_modules/WebRequest.jsm.
+
+A couple of things:
+* I wasn't sure what all the properties passed to the listener are, especially windowId and parentWindowId.
+* I could not get onSendHeaders to fire at all. Is this a bug, or am I doing something wrong? Code: https://gist.github.com/wbamberg/0ed8cfa6d3bc4fc2235f.
+(In reply to Will Bamberg [:wbamberg] from comment #7)
+> A couple of things:
+> * I wasn't sure what all the properties passed to the listener are,
+> especially windowId and parentWindowId.
+
+These are the window IDs of the window that initiated the request and its parent window if it was a sub-frame. They correspond to the frameId and parentFrameId properties in Chrome. The only difference is that frameId is 0 for the main frame of any tab in Chrome. In Firefox the main frame doesn't have any special ID.
+
+> * I could not get onSendHeaders to fire at all. Is this a bug, or am I doing
+> something wrong? Code: https://gist.github.com/wbamberg/0ed8cfa6d3bc4fc2235f.
+
+I filed bug 1185795 for that.
+
+
+Add webRequest-like API to Firefox
+
+dev-doc-complete
+
+Bug 1157561 - Add webRequest-like API to Firefox (r=Mossop) 

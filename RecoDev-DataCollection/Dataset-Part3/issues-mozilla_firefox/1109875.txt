@@ -1,0 +1,408 @@
+This is probably the most important piece of bug 1109869. We need to stop using CPOWs here:
+http://hg.mozilla.org/mozilla-central/annotate/be1f49e80d2d/browser/components/sessionstore/TabState.jsm#l90
+
+I expect we'll have to keep this code for tests, but we should fix the calls from browser.js and SessionStore.jsm.
+
+I'm kinda hoping we can use an "unload" event handler in a frame script to broadcast the final state of the tab. Bug 1103036 will make this easier. There's probably a lot more work to do beyond that though.
+
+This is probably the most important piece of bug 1109869. We need to stop using CPOWs here:
+http://hg.mozilla.org/mozilla-central/annotate/be1f49e80d2d/browser/components/sessionstore/TabState.jsm#l90
+
+I expect we'll have to keep this code for tests, but we should fix the calls from browser.js and SessionStore.jsm.
+
+I'm kinda hoping we can use an "unload" event handler in a frame script to broadcast the final state of the tab. Bug 1103036 will make this easier. There's probably a lot more work to do beyond that though.
+Tim, is there any chance you could find someone to work on this?
+Sounds like a perfect fit for Steven!
+
+I know we've tried using the "unload" event to save data before losing the tab itself but that didn't work. Guess we need bug 1103036 before we can start here? But even then we would see the TabClose event before the actual data - and it might only solve the case for gBrowser.removeTab(). Searching for |TabState.flush| reveals a lot more call sites where synchronization is needed, getting rid of all of those will be super hard.
+
+The easiest way to achieve that might be to file separate bugs and try to get rid of each of them step by step. This would surely take a long time so I would be interested in seeing some perf number, how much are those CPOWs hurting us? Which of those calls is the worst? Which of those should we try getting rid of first?
+I'm pretty confident that the onTabClose callsite is the worst. The only non-test callers are in SessionStore.jsm and browser.js. The browser.js callers are used when we switch to a non-remote tab, which is pretty rare. The SessionStore.jsm callers are for window close, application quit, tab close, and duplicateTab. Of those, tab close clearly seems like the most common.
+
+I've retitled the bug to focus on tab closing. If we want to address other issues, we can do that in later bugs.
+
+The reason I filed this bug is that we're trying to deprecate CPOWs that are sent when the content process is not blocked (bug 1097998). Session store is one of the most common users of these types of CPOWs. We don't have measurements for jank, but the jank you get is pretty noticeable when closing a tab for a slow content process.
+
+I'm also unsure whether the "unload" event will help us here. The <browser> element will already have been removed from the DOM, so I don't think we can use the browser message manager to communicate. The process message manager will still be available, but then we'll have no way to distinguish tabs.
+
+One thing I remember we talked about is moving the <browser> to some hidden part of the DOM when the tab is closed. Once we got the data we need, we could remove it. That might be the best way to proceed.
+(In reply to Bill McCloskey (:billm) from comment #3)
+> One thing I remember we talked about is moving the <browser> to some hidden
+> part of the DOM when the tab is closed. Once we got the data we need, we
+> could remove it. That might be the best way to proceed.
+
+That does sound indeed possible. Last week I landed bug 1077652 which adds a <browser> to the deck that contains all browsers, the preloaded browser however isn't linked to any tab (yet). The same would hold for the browser whose tab was just removed.
+Created attachment 8554587
+wip.patch
+
+I played around with that on the weekend.
+
+I made it so that TabClose wouldn't cause a sync flush anymore. Shortly before the browser is really gone, after the tab animation has ended, the unload event will fire in the content script and we can use the @mozilla.org/childprocessmessagemanager;1 to send a sync message with the last data that may still be pending.
+
+Now, if for example the only shistory entry hasn't made it to the parent yet, we will not append the tab to the list of closed tabs for the window, because we regard it as empty and not worth saving. Thus we have to change the code to always append non-private tabs and maybe remove them from _closedTabs[] again later when the <browser> is destroyed. My solution in the patch is a little messy but we could surely improve that rather easily.
+
+We will have to make the same changes for closing/closed windows, which would require the information sent with the last sync message to not go into _closedTabs[] but rather into the state of the closed window. We might have a few - or maybe many - tests fail because they're checking state too early. I assume that by properly waiting for the "domwindowclosed" notification all messages should have arrived and updated tab states accordingly.
+Thanks Tim! It looks like we may want to avoid tearing down the browser message manager in the chrome process until after the frame script unload event has finished running and has sent some sort of "I'm done" message. That way you don't have to send the browser using msg.data.objects, which won't work in e10s anyway. I'll try to figure out how hard that would be.
+I filed bug 1126089 about this.
+(In reply to Bill McCloskey (:billm) from comment #7)
+> I filed bug 1126089 about this.
+
+Thx!
+
+(In reply to Bill McCloskey (:billm) from comment #6)
+> That way you don't have to send the browser using msg.data.objects, which
+> won't work in e10s anyway.
+
+That's interesting as we use it for bug 1070096. Doesn't seem to be a huge problem currently because about:tabcrashed is a non-remote page but we'd probably want to fix that for the future.
+*** Bug 1134308 has been marked as a duplicate of this bug. ***
+Bug 1126089 should probably prioritized, can't do much without that here.
+Requesting triage again: this is an M8 which is blocked by an M5 (bug 1126089) and blocks an M5 (bug 1105891).
+Tim, we've decided to move blocking up on this since it blocks at least one serious perf bug related to tab closing. This is currently in milestone 6, which the team is currently working on.
+
+Is this a bug you think you'll have time for in the near future?
+I don't have a lot of time currently but I was planning to give it another shot when bug 1126089 is fixed. So if I can't finish it there will at least be something to continue from :)
+*** Bug 1144228 has been marked as a duplicate of this bug. ***
+Experimented some more now that we can send async messages from the "unload" event. It all seems to work well with some changes in non-e10s mode. In real e10s however, the browser remoteness switching code is a pain. Whenever we switch a browser's remoteness it will unload its frame scripts and we have no real way to distinguish that from when a tab is closed. We could of course check whether the tab was closed when receiving a message that indicates it was sent after unload, but that doesn't work when for example a remote tab is created, turned into a non-remote one, and then quickly closed. The remote frame scripts run after the non-remote ones and an unload event will be fired too. So both frame scripts report to the same browser at the same time and create all kinds of funny failures.
+
+In bug 1145942 I was able to work around that by passing listenWhenClosed=true only for the "SessionStore:crashedTabRevived" messages. We thus ignore the "setupSyncHandler" message from closed message managers as in the above example. It's not as easy to do the same for "update" messages.
+I'm probably being dense, but I don't see exactly where the problem is. Say a tab is created, converted to non-remote, and then closed. I would assume that the unload event in the frame script would just send the latest update messages. When we see the TabClose event, could we mark the <browser> as closed somehow and then wait until message-manager-disconnect fires on the <browser>? When that happens, we would have all the latest messages from the <browser> and we would know it was closed. We might have to count message-manager-close and message-manager-disconnect events just like in [1] to make sure we don't miss any.
+
+Also, sorry for assigning this to you without permission. We try to have assignees for every e10s bug regardless of whether it's being worked on.
+
+[1] http://mxr.mozilla.org/mozilla-central/source/testing/mochitest/browser-test.js#51
+This is a really annoying source of logspam in automation. Can we please bump the priority on this?
+(In reply to Bill McCloskey (:billm) from comment #16)
+> I'm probably being dense, but I don't see exactly where the problem is. Say
+> a tab is created, converted to non-remote, and then closed. I would assume
+> that the unload event in the frame script would just send the latest update
+> messages. When we see the TabClose event, could we mark the <browser> as
+> closed somehow and then wait until message-manager-disconnect fires on the
+> <browser>? When that happens, we would have all the latest messages from the
+> <browser> and we would know it was closed. We might have to count
+> message-manager-close and message-manager-disconnect events just like in [1]
+> to make sure we don't miss any.
+
+Trying to remember what was happening...
+
+1) call tab=gBrowser.addTab() - this will create a remote browser loading "about:blank"
+2) call tab.linkedBrowser.loadURI("about:robots") - this will switch the browser to a non-remote one.
+
+The frame script will immediately load in the non-remote docShell, see the unload event and send a final "update" message. When the "loadFrameScript" message arrives in the former remote browser it does the same, unload and send a message.
+
+SessionStore.receiveMessage() in the parent has no way of telling whether a message was sent by the old or new docShell, |message.target| points to |tab.linkedBrowser| in both cases. This yields the aforementioned test failures when running mochitest-e10s tests.
+OK, thanks, I understand now. What if we add a new property, "targetFrameLoader", to each message? It would be a pointer to the nsIFrameLoader that the message came from. When we switch remoteness, we get the same <browser> element but a different frameloader. So you could put code at the top of receiveMessage like this:
+
+if (msg.target.frameLoader && msg.target.frameLoader != msg.targetFrameLoader) {
+  return;
+}
+
+msg.target.frameLoader would be null if the tab has been closed, so we want to handle the message in that case. But if msg.target.frameLoader is non-null and doesn't match msg.targetFrameLoader, then the message came from an older frameloader before the remoteness switch. I think ignoring it should be fine since we already save history when switching remoteness.
+
+Let me know if this seems like it should work. If it does, I'll file a bug to add targetFrameLoader. It should be pretty easy.
+(In reply to Bill McCloskey (:billm) from comment #19)
+> Let me know if this seems like it should work. If it does, I'll file a bug
+> to add targetFrameLoader. It should be pretty easy.
+
+Yeah, that seems like it should work. Let's do it.
+OK, filed bug 1155224.
+Do you think you'll have time to work on this soon Tim? We're hoping to get it done by the next merge.
+Yeah, was rebasing my old patches yesterday. Will take a deeper look today and hopefully post something.
+Thanks! Let me know if there's more I can do to help.
+Created attachment 8599338
+0001-Bug-1109875-Make-browser.permanentKey-a-property-of-.patch
+
+Alright, let's start small. browser.permanentKey being a property of the XUL binding bit us once as it is removed and recreated when unbinding a <browser> from the DOM (when switching remoteness). Now when gBrowser.removeTab() is called the <browser> gets destroyed and sessionstore receives a message with a proper target that unfortunately doesn't have a .permanentKey anymore.
+
+Having .permanentKey being maintained by the tabbrowser and just tacking it onto the <browser> seems a lot easier and just works as before. And sessionstore has access to it as long as something keeps a reference to the <browser>.
+Created attachment 8599339
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch
+
+This makes use of what bug 1155224 introduced and lets sessionstore discard "SessionStore:update" messages not targeted at the current/latest frameLoader. This patch by itself doesn't change any behavior yet as "listenWhenClosed" is still false for update messages.
+Created attachment 8599342
+0003-Bug-1109875-When-unloading-a-frameLoader-flush-all-p.patch
+
+This patch makes us flush all pending updates from the frame script's unload handler. The isFinal=true flag tells the parent to perform all final steps after the tab has been closed and to not expect any further messages/updates from it.
+Comment on attachment 8599339
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch
+
+Review of attachment 8599339:
+-----------------------------------------------------------------
+
+Waiting to see what you say about the comment...
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +612,5 @@
+>      }
+>  
+>      switch (aMessage.name) {
+>        case "SessionStore:setupSyncHandler":
+> +        this._lastKnownFrameLoader.set(browser.permanentKey, browser.frameLoader);
+
+This doesn't seem right to me. Say we have a situation like in comment 18. Won't the setupSyncHandler message for the remote frame arrive after the setupSyncHandler message for the non-remote frame? It seems like we would have the same problem as before.
+
+I was thinking maybe we could fire an event or something when we create a new <browser>. Then the session store code could listen for that event and add an entry to the weakmap.
+Comment on attachment 8599342
+0003-Bug-1109875-When-unloading-a-frameLoader-flush-all-p.patch
+
+Review of attachment 8599342:
+-----------------------------------------------------------------
+
+Not sure if this patch is missing some changes or if those will come later. But this looks fine.
+(In reply to Bill McCloskey (:billm) from comment #29)
+> Not sure if this patch is missing some changes or if those will come later.
+> But this looks fine.
+
+Sorry, should have been clear that there is more to come.
+(In reply to Bill McCloskey (:billm) from comment #28)
+> >      switch (aMessage.name) {
+> >        case "SessionStore:setupSyncHandler":
+> > +        this._lastKnownFrameLoader.set(browser.permanentKey, browser.frameLoader);
+> 
+> This doesn't seem right to me. Say we have a situation like in comment 18.
+> Won't the setupSyncHandler message for the remote frame arrive after the
+> setupSyncHandler message for the non-remote frame? It seems like we would
+> have the same problem as before.
+
+Good catch. Had to think a while about why this worked for me and all tests were passing. I think this is due to the frame script loading when the frameLoader is already being destroyed. In that case the sync message doesn't make it at all and we don't have a problem.
+
+> I was thinking maybe we could fire an event or something when we create a
+> new <browser>. Then the session store code could listen for that event and
+> add an entry to the weakmap.
+
+That approach seems better.
+Created attachment 8599825
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch
+
+Not sure if you can review the nsFrameLoader changes, if not we can just ask Olli as well.
+(In reply to Tim Taubert [:ttaubert] from comment #32)
+> Not sure if you can review the nsFrameLoader changes, if not we can just ask
+> Olli as well.
+
+Meant the nsXULElement changes, but that's still DOM stuff.
+Created attachment 8599859
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch, v3
+
+Small fix.
+Comment on attachment 8599859
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch, v3
+
+Review of attachment 8599859:
+-----------------------------------------------------------------
+
+The session store changes look fine. Olli should review the next version of the nsXULElement changes though. I don't know that code very well.
+
+::: dom/xul/nsXULElement.cpp
+@@ +1601,5 @@
+>          slots->mFrameLoader = nsFrameLoader::Create(this, false);
+>          NS_ENSURE_TRUE(slots->mFrameLoader, NS_OK);
+>  
+> +        if (slots->mFrameLoader) {
+> +          nsContentUtils::DispatchTrustedEvent(OwnerDoc(),
+
+This won't work because we might not be allowed to run script yet (if we're adding a <xul:browser> during layout, for example). You'll need to use AddScriptRunner I think.
+Created attachment 8599932
+0004-Bug-1109875-Don-t-flush-state-when-closing-tabs.patch
+
+This is the main patch. I'm working on a set of tests for edge cases and just need to write a few more. So I'm fairly convinced this patch works as intended, all tests are running (with a few fixes here and there of course).
+Created attachment 8599940
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch, v4
+
+r=billm for the sessionstore changes.
+
+Olli, can you please review the nsXULElement changes?
+Comment on attachment 8599940
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch, v4
+
+I wouldn't call it "FrameLoaderCreated" because it is for XUL elements only.
+Perhaps XULFrameLoaderCreated.
+
+And just use AsyncEventDispatcher, and its RunDOMEventWhenSafe.
+Created attachment 8599964
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch, v5
+
+(In reply to Olli Pettay [:smaug] from comment #38)
+> I wouldn't call it "FrameLoaderCreated" because it is for XUL elements only.
+> Perhaps XULFrameLoaderCreated.
+
+Done.
+
+> And just use AsyncEventDispatcher, and its RunDOMEventWhenSafe.
+
+That's better, a lot less boilerplate code :) Thanks!
+Comment on attachment 8599964
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch, v5
+
+(new AsyncEventDispatcher(this, NS_LITERAL_STRING("XULFrameLoaderCreated"), /* aBubbles */ true))->
+  RunDOMEventWhenSafe();
+
+would work too. But either way.
+
+I think you don't need the static_cast<nsIContent*>()
+
+And drop if (slots->mFrameLoader) {.
+There is the null check just above.
+
+
+r+ for the nsXULElement.cpp
+Created attachment 8599983
+0002-Bug-1109875-Ignore-SessionStore-update-messages-that.patch, v6
+
+r=billm,smaug
+Comment on attachment 8599932
+0004-Bug-1109875-Don-t-flush-state-when-closing-tabs.patch
+
+Review of attachment 8599932:
+-----------------------------------------------------------------
+
+Thanks. Looks good.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +661,5 @@
+> +          if (aMessage.data.isFinal) {
+> +            // We expect no further updates.
+> +            this._closedTabs.delete(browser.permanentKey);
+> +
+> +            // Determine whether the tab state is worth saving.
+
+I feel like this code could be split out into a function and shared with the onTabClose, which is really just a less general version of it.
+
+@@ +679,5 @@
+> +              });
+> +
+> +              // If we found a tab closed before our tab or there are
+> +              // no tabs in the list at all, insert our tabData.
+> +              if (index > -1 || closedTabs.length == 0) {
+
+This condition seems a little strange. If index == -1, why don't we just put tabData at the end of the array?
+Created attachment 8600404
+0004-Bug-1109875-Don-t-flush-state-when-closing-tabs-r-bi.patch, v2
+
+Addressed your review comments but have to ask again. Turns out that adding tabData to the list of closed tabs when receiving the final message isn't the right thing to do if it was deliberately removed from the list, e.g. by calling undoCloseTab() or forgetClosedTab(). This will probably not happen if you simply use a default Firefox, but tests and add-ons might hit that.
+Created attachment 8600938
+0005-Bug-1109875-Add-tests-for-async-tab-removal.patch
+
+These tests were useful already and uncovered a few issues.
+Created attachment 8600939
+0006-Bug-1109875-Fix-sessionstore-tests-to-properly-wait-.patch
+
+Had to touch quite a few tests to make them wait until we received the tab's final state after removing it.
+Pushed to try:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=3a5ee8345828
+
+sessionstore tests (e10s & non-e10s) are fine on my machine. I expect a few other browser tests to break though, let's see.
+Created attachment 8600975
+0001-Bug-1109875-Make-browser.permanentKey-a-property-of-.patch, v2
+
+Small update to fix try failures. CustomizationTabPreloader.jsm needs to set the permanentKey when creating its own browser with all the usual frame scripts. browser_RemotePageManager.js must swap permanentKey properties when swapping docShells without the help of the tabbrowser.
+Created attachment 8601000
+0007-Bug-1109875-Fix-various-other-tests-to-properly-wait.patch
+
+This fixes the few other tests that were failing on try.
+Next try:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=ec503453750c
+Comment on attachment 8600939
+0006-Bug-1109875-Fix-sessionstore-tests-to-properly-wait-.patch
+
+Review of attachment 8600939:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_367052.js
+@@ +10,5 @@
+>    gPrefService.setIntPref("browser.sessionstore.max_tabs_undo", max_tabs_undo + 1);
+> +  registerCleanupFunction(() => gPrefService.clearUserPref("browser.sessionstore.max_tabs_undo"));
+> +
+> +  // Empty the list of closed tabs.
+> +  while (ss.getClosedTabCount(window)) {
+
+I don't really see why you're adding this, but I guess it's fine.
+
+::: browser/components/sessionstore/test/browser_394759_perwindowpb.js
+@@ +6,5 @@
+>  
+>  const TESTS = [
+>    { url: "about:config",
+>      key: "bug 394759 Non-PB",
+> +    value: "uniq" + r() },
+
+This function could have a better name :-).
+Comment on attachment 8600938
+0005-Bug-1109875-Add-tests-for-async-tab-removal.patch
+
+Review of attachment 8600938:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_async_remove_tab.js
+@@ +9,5 @@
+> +  let r = `rand-${Math.random()}`;
+> +  ss.setTabValue(tab, "foobar", r);
+> +
+> +  // Flush to ensure there are no scheduled messages.
+> +  TabState.flush(browser);
+
+I'm looking forward to the day when we say "yield TabState.flush(browser);" :-).
+(In reply to Bill McCloskey (:billm) from comment #50)
+> >  const TESTS = [
+> >    { url: "about:config",
+> >      key: "bug 394759 Non-PB",
+> > +    value: "uniq" + r() },
+> 
+> This function could have a better name :-).
+
+Yeah... it's a legacy function used in sessionstore tests. Should probably get rid of it some time.
+
+(In reply to Bill McCloskey (:billm) from comment #51)
+> > +  // Flush to ensure there are no scheduled messages.
+> > +  TabState.flush(browser);
+> 
+> I'm looking forward to the day when we say "yield TabState.flush(browser);"
+> :-).
+
+Me too! We could indeed probably introduce an async variant of this that doesn't use the SyncHandler and use it in a few or most of the tests. Getting rid of those calls in SessionStore itself is of course a tad more difficult.
+Last push to try before landing:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=a31ca4453c17
+https://hg.mozilla.org/integration/fx-team/rev/5dd3334019f5
+https://hg.mozilla.org/integration/fx-team/rev/3168f0bf439e
+https://hg.mozilla.org/integration/fx-team/rev/7d540d97dfe4
+https://hg.mozilla.org/integration/fx-team/rev/98edf81629bd
+https://hg.mozilla.org/integration/fx-team/rev/e2ba32edadf3
+https://hg.mozilla.org/integration/fx-team/rev/40f06e925ae2
+https://hg.mozilla.org/integration/fx-team/rev/5d06e3e4609a
+Created attachment 8601502
+0008-Bug-1109875-Fix-test-failures-by-making-xul-iframe-a.patch
+
+XBL is fun.
+Created attachment 8601507
+0008-Bug-1109875-Fix-test-failures-by-making-xul-iframe-a.patch, v2
+
+With null check.
+Comment on attachment 8601507
+0008-Bug-1109875-Fix-test-failures-by-making-xul-iframe-a.patch, v2
+
+I would write
+return frameLoader ? frameLoader.docShell : null;
+(IMO, that is easier to read), but either way.
+(In reply to Olli Pettay [:smaug] from comment #57)
+> I would write
+> return frameLoader ? frameLoader.docShell : null;
+> (IMO, that is easier to read), but either way.
+
+Thanks, will do.
+https://hg.mozilla.org/integration/fx-team/rev/e2cb353f68b7
+https://hg.mozilla.org/mozilla-central/rev/5dd3334019f5
+https://hg.mozilla.org/mozilla-central/rev/3168f0bf439e
+https://hg.mozilla.org/mozilla-central/rev/7d540d97dfe4
+https://hg.mozilla.org/mozilla-central/rev/98edf81629bd
+https://hg.mozilla.org/mozilla-central/rev/e2ba32edadf3
+https://hg.mozilla.org/mozilla-central/rev/40f06e925ae2
+https://hg.mozilla.org/mozilla-central/rev/5d06e3e4609a
+https://hg.mozilla.org/mozilla-central/rev/e2cb353f68b7
+*** Bug 939761 has been marked as a duplicate of this bug. ***
+https://hg.mozilla.org/integration/fx-team/rev/2391dcb4d95a
+(In reply to Pulsebot from comment #62)
+> https://hg.mozilla.org/integration/fx-team/rev/2391dcb4d95a
+
+Looks like I accidentally added an empty file, which was spotted by Enn.
+https://hg.mozilla.org/mozilla-central/rev/2391dcb4d95a

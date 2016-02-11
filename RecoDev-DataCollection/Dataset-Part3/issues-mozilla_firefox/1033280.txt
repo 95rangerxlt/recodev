@@ -1,0 +1,314 @@
+Today, if we want to use promise in client code, we have to keep adding everywhere some glue code around client.request() to return a promise, like:
+
+  let deferred = promise.defer();
+  let req = {
+   to: actorID,
+   type: "myRequest"
+  };
+  client.request(req, res => {
+    if (res.error) {
+      deferred.reject(res.error);
+    } else {
+      deferred.resolve(res);
+    }
+  });
+  return deferred.promise;
+
+It would be handy to introduce an helper on DebuggerClient to not have to do that everywhere. Something similar to requester but promisified.
+
+Today, if we want to use promise in client code, we have to keep adding everywhere some glue code around client.request() to return a promise, like:
+
+  let deferred = promise.defer();
+  let req = {
+   to: actorID,
+   type: "myRequest"
+  };
+  client.request(req, res => {
+    if (res.error) {
+      deferred.reject(res.error);
+    } else {
+      deferred.resolve(res);
+    }
+  });
+  return deferred.promise;
+
+It would be handy to introduce an helper on DebuggerClient to not have to do that everywhere. Something similar to requester but promisified.
+Created attachment 8449352
+Ensure that DebuggerClient.request returns a promise-like object
+
+Instead of coming up with a new method, here, I just make it so that
+DebuggerClient.request returns a "promise-like" object that has EventEmitter+Promise API.
+Created attachment 8449354
+Ensure that DebuggerClient.request returns a promise
+
+I'm wondering if DebuggerClient.request really needs to return an EventEmitter object.
+At first sight, it looks like the only usage of listening to something other than json-reply is in tests:
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/transport/tests/unit/test_client_server_bulk.js#208
+
+If that's really the only usage, I'm wondering if DebuggerClient.request shouldn't just return a promise that is resolved on json-reply and only use DebuggerClient.startBulkRequest if you except to receive a bulk-reply event?
+
+Here is a patch to do that. (I would need to update this test)
+Panos, I talked to you about that on irc, if you have any feedback on this story, you are welcome to contribute to the discussion ;)
+Created attachment 8449358
+Possible simplification thanks to this helper.
+
+To give you an idea of what kind of simplication we can make thanks to such helper...
+
+A 3rd possible way to go would be to introduce a brand new helper method on DebuggerClient,
+that would allow to do more, like `requester`...
+The 3rd possible patch would be to introduce a new method on DebuggerClient.
+I like the 2nd approach the most: just return a promise instead of a callback, unless Ryan can think of any downsides. I would also use request.once for the traditional JSON requests, as we don't get multiple replies for them.
+We currently support any of the following:
+
+1. JSON request, JSON reply (99% of communications today)
+2. Bulk request, JSON reply (bulk app install)
+3. JSON request, Bulk reply (only in tests so far)
+4. Bulk request, Bulk reply (only in tests so far)
+
+Calling |client.request()| and then waiting on the "bulk-reply" event is mode 3 above.  So, Alex is correct that currently this only happens in a test.  This is not the same as |startBulkRequest|, which is about modes 2 and 4.
+
+It seems likely we'll make use of these currently unused modes soon, so we should keep them supported here.  For example, if we convert the profiler to use bulk data, there will likely be a JSON "stream-me-data" request, and then a bulk reply with the data (so that's mode 3) or maybe a JSON reply if there was some kind of error (mode 1).  This is also why |request| supports both events:  It's possible that a JSON reply would be sent to mean "error", but you are also expecting a bulk reply when successful.
+
+For any one request, you'll only ever get *either* a JSON reply *or* a bulk reply.  So, there are few ways to go to get a promise-style API:
+
+A. Add a promise-like then, as in Alex's approach 1, but it should also watch "bulk-reply"
+B. Stop exposing both "json-reply" and "bulk-reply" outside |request|, but watch both and resolve / reject, as in Alex's approach 2
+
+If we get rid of the separate events, then it's up to the caller to figure out what happened in the case where you might get either a JSON or bulk reply (like the hypothetical profiler example above), which is a little unfortunate I think, as it's back to making the caller do more work (which you're trying to avoid).  It seems a little nicer to be able to depend on the events if you want them.
+
+So, my proposal is approach A.  I'll review Alex's approach 1 with that in mind.
+Comment on attachment 8449352
+Ensure that DebuggerClient.request returns a promise-like object
+
+Review of attachment 8449352:
+-----------------------------------------------------------------
+
+Overall, I like this route more as I say in comment 7.
+
+::: toolkit/devtools/client/dbg-client.jsm
+@@ +691,5 @@
+>  
+> +    // Implement a Promise like API on the returned object
+> +    // that resolves/rejects on request response
+> +    let deferred = promise.defer();
+> +    request.on("json-reply", function listener(resp) {
+
+Use |once| here, and drop the |off|.
+
+@@ +700,5 @@
+> +        deferred.resolve(resp);
+> +      }
+> +    });
+> +    request.then = deferred.promise.then.bind(deferred.promise);
+> +
+
+You should also |request.once("bulk-reply")| and resolve the promise with the object you get from that.  There's no standard way to say "error" via bulk data, so you can't reject from that event.
+Comment on attachment 8449354
+Ensure that DebuggerClient.request returns a promise
+
+Review of attachment 8449354:
+-----------------------------------------------------------------
+
+I believe we still want to emit the events, as I suggest in comment 7.
+(In reply to J. Ryan Stinnett [:jryans] from comment #8)
+> Comment on attachment 8449352
+> @@ +700,5 @@
+> > +        deferred.resolve(resp);
+> > +      }
+> > +    });
+> > +    request.then = deferred.promise.then.bind(deferred.promise);
+> > +
+> 
+> You should also |request.once("bulk-reply")| and resolve the promise with
+> the object you get from that.  There's no standard way to say "error" via
+> bulk data, so you can't reject from that event.
+
+The issue with that is that I can't use two once() without leaking :(
+
+Otherwise regarding the big picture, this beast with two heads (EventEmitter+Promise) is disturbing.
+My concern outside of just programming taste is that we might introduce an overhead to a low level code that is used a lot, on each request.
+That, to take care of special cases. May be everything would be easier if we only support a meaningful subset of these cases and use explicit method for each of them.
+ * request: JSON->JSON
+ * startBulkRequest: Bulk->JSON
+ * requestBulk: JSON->Bulk
+(Is bulk-bulk a useful scenario?)
+
+You can also see this proposal from another angle:
+Keep 'request' simple for most cases using JSON->JSON, and expose something else for anything involving bulk:
+ * request: JSON->JSON (returns only a promise)
+ * startBulkRequest: Bulk->JSON
+ * requestBulk: JSON->Bulk or JSON (i.e. request as it is today, no promise)
+Why can't we just return a promise, and if a callback is also supplied, automatically do:
+
+  p.then(callback);
+  return p;
+
+?
+
+Taking a look at the patch...
+Comment on attachment 8449354
+Ensure that DebuggerClient.request returns a promise
+
+Review of attachment 8449354:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/client/dbg-client.jsm
+@@ +694,5 @@
+> +    let deferred = promise.defer();
+> +    request.on("json-reply", function listener(resp) {
+> +      request.off("json-reply", listener);
+> +      if (resp.error) {
+> +        deferred.reject(resp.error);
+
+Errors always should always be of the form { error, message }, so you are losing the human-readable message here.
+We talked about promisifying the DebuggerClient before, but decided it was easier to just convert them to protocol.js: https://bugzilla.mozilla.org/show_bug.cgi?id=906202
+(I guess that discussion happened on IRC)
+(In reply to Nick Fitzgerald [:fitzgen] from comment #13)
+> We talked about promisifying the DebuggerClient before, but decided it was
+> easier to just convert them to protocol.js:
+> https://bugzilla.mozilla.org/show_bug.cgi?id=906202
+
+I think Alex's current interest here is driven by several factors:
+
+* the Webapps actor does not currently use protocol.js, and that's what he's refactoring
+* protocol.js currently has a higher than desirable memory overhead
+
+(Of course, you could say "let's fix protocol.js".  I'm just not sure how hard that is.)
+(In reply to Alexandre Poirot (:ochameau) from comment #10)
+> (In reply to J. Ryan Stinnett [:jryans] from comment #8)
+> > Comment on attachment 8449352
+> > @@ +700,5 @@
+> > > +        deferred.resolve(resp);
+> > > +      }
+> > > +    });
+> > > +    request.then = deferred.promise.then.bind(deferred.promise);
+> > > +
+> > 
+> > You should also |request.once("bulk-reply")| and resolve the promise with
+> > the object you get from that.  There's no standard way to say "error" via
+> > bulk data, so you can't reject from that event.
+> 
+> The issue with that is that I can't use two once() without leaking :(
+
+Fair enough, I suppose each listener would have to |off| both itself and the other one.
+
+As an aside, I really think event-emitter should support |off()| with no args, like it does from add-on SDK, so you could easily clear all listeners.
+
+> Otherwise regarding the big picture, this beast with two heads
+> (EventEmitter+Promise) is disturbing.
+
+What's not to like?! :D It is a bit odd, but I am okay with it myself.  If I'm the minority opinion, a different route is obviously fine too.
+
+> My concern outside of just programming taste is that we might introduce an
+> overhead to a low level code that is used a lot, on each request.
+> That, to take care of special cases. 
+
+I guess I am not really convinced there's "a lot" of overhead here until I see some numbers.
+
+Since the usage of events and the usage of promises (that you want to add) is basically zero at the moment, I guess they are both "overhead" until there is more usage...  But still I am not convinced it's that high.
+
+> You can also see this proposal from another angle:
+> Keep 'request' simple for most cases using JSON->JSON, and expose something
+> else for anything involving bulk:
+>  * request: JSON->JSON (returns only a promise)
+>  * startBulkRequest: Bulk->JSON
+>  * requestBulk: JSON->Bulk or JSON (i.e. request as it is today, no promise)
+
+If we really think there is too much overhead, this seems okay, but I'd like to find better names... |startBulkRequest| vs. |requestBulk| is pretty confusing.  Maybe |requestBulkReply| in place of |requestBulk| (even though you might still get JSON)?  Names are hard.
+
+|startBulkRequest| is really "Bulk -> JSON or Bulk", and I think it can stay that way under this proposal.  I agree the use cases for Bulk -> Bulk are less clear, but I don't see a reason yet to disregard it.
+Another strategy to keep the overhead minimal here would be to only setup the |.then| property on |request()|'s return value if no callback is passed in, since surely no one would pass a callback, but then also use the promise... right? :)
+
+Then the setup of |then| only happens if you're likely to use it, so existing callers (who pass callbacks today) aren't paying anything extra for a promise they don't need.
+Created attachment 8451687
+patch, with test
+
+Ok, you are right, It may just be some preemptive optimization.
+We would need to benchmark to know what is the real impact of the whole codebase.
+I intend to look at this after my quest to shrink memory usage down.
+
+In the meantime, exposing just a promise or an EventEmitter+Promise 
+doesn't make a big difference for the future as there won't be much callsites using the EventEmitter API.
+So if my "YAGNI comments" appear to apply over time, we can easily tweak that afterward.
+
+Here is the f+ patch with comments addressed and a test.
+
+try: https://tbpl.mozilla.org/?tree=Try&rev=a5f833a78ff1
+
+Panos, I don't know if there is the same rule in devtools for "api changes",
+but I'm flagging you as the master of keys for the API change of this patch ;)
+Comment on attachment 8451687
+patch, with test
+
+Review of attachment 8451687:
+-----------------------------------------------------------------
+
+This seems good to me.
+
+For the test, you should also check that the error case rejects as expected.
+Comment on attachment 8451687
+patch, with test
+
+Also, you should update the |request| method comment to note that the return value is a promise.
+Created attachment 8451975
+patch, with more tests
+
+Added comment and rejection test.
+
+While writing this test, I realized that when an exception happens
+during a call to a request method on an actor, it replies with
+an {error, message} object but without any `from` field,
+so that the promise never resolves nor rejects;
+nor the request()'s callback gets ever called.
+
+I tend to think we should address that, to prevent some stalled listeners...
+
+https://tbpl.mozilla.org/?tree=Try&rev=9c99aaad482b
+(In reply to Alexandre Poirot (:ochameau) from comment #21)
+> While writing this test, I realized that when an exception happens
+> during a call to a request method on an actor, it replies with
+> an {error, message} object but without any `from` field,
+> so that the promise never resolves nor rejects;
+> nor the request()'s callback gets ever called.
+> 
+> I tend to think we should address that, to prevent some stalled listeners...
+
+Yeah, that's been a long-standing problem with the client, even before these events appeared with bulk data.  A request that gets back a general failure like this (when the actor or actor's type / method do not exist, and thus currently has no |from|) is left in the client's set of |_activeRequests| indefinitely.  This also prevents the client from ever sending future requests to that actor, so basically it blows up pretty fast.  Of course, once there is an error, who knows if you can even proceed at all with whatever you were doing...
+
+Anyway, something to think about reworking!  Also, I am guessing protocol.js behaves differently in this case.
+(In reply to J. Ryan Stinnett [:jryans] from comment #22)
+> (In reply to Alexandre Poirot (:ochameau) from comment #21)
+> > While writing this test, I realized that when an exception happens
+> > during a call to a request method on an actor, it replies with
+> > an {error, message} object but without any `from` field,
+> > so that the promise never resolves nor rejects;
+> > nor the request()'s callback gets ever called.
+> > 
+> > I tend to think we should address that, to prevent some stalled listeners...
+> Anyway, something to think about reworking!  Also, I am guessing protocol.js
+> behaves differently in this case.
+
+...reworking in a different bug, I mean, since it's been around for quite some time. (Hopefully that was clear.)
+Comment on attachment 8451975
+patch, with more tests
+
+Review of attachment 8451975:
+-----------------------------------------------------------------
+
+And there was much rejoicing!
+
+::: toolkit/devtools/server/tests/unit/test_client_request.js
+@@ +1,4 @@
+> +/* Any copyright is dedicated to the Public Domain.
+> +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> +
+> +// Test DebuggerClient API
+
+"Test the DebuggerClient.request API."
+Created attachment 8452388
+patch
+
+Tuned test comment.
+(to apply after bug 797621's patch, there is a minor conflict on xpcshell.ini as both are adding a new test file, and this one is on top)
+https://hg.mozilla.org/integration/fx-team/rev/b71aad2fe73c
+https://hg.mozilla.org/mozilla-central/rev/b71aad2fe73c

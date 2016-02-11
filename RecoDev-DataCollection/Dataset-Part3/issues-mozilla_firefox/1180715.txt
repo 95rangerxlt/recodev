@@ -1,0 +1,536 @@
+This will allow the imgLoader to re-use the cached imgRequest when loading the thumbnail for the same page in separate about:newtab pages.
+
+(In reply to Seth Fowler [:seth] from bug #1162953 comment #16)
+> (In reply to Oliver Henshaw from bug #1162953 comment #9)
+> > I'm not sure why the cached image request needs validating in the first
+> > place. Seems like another bg to me, or is this expected?
+> > ShouldRevalidateEntry() returns true because the expiration time is 0 so the
+> > moz-page-thumb will always be popping in and out of the cache. Then the
+> > onStartRequest decides not to re-use the original imgRequest because
+> > cacheChan = null: does this look correct?
+> 
+> This much is more-or-less as designed, though we could have designed it
+> better. =)
+> 
+> IIRC moz-page-thumb:// is a layer on top of file://, and thus it's not a
+> caching channel. That leads us to conclude that we have no information about
+> whether the channel contents will be different or not, and to reload the
+> image from scratch. We could potentially check the mtime of the file -
+> that's not totally sound, but it's probably good enough in practice. That
+> sounds like something Necko probably already supports; I'll ask around.
+
+The image loader does check the mtime of the file, but first it has to know the the url is backed by a file (i.e. "url instanceof Ci.nsIFileURL" must be true)
+
+This can be done by inheriting from nsStandardURL.h, as e.g. resource:// URLs do. But the mapping from moz-page-thumb:// urls to the underlying file:// urls should probably continue to live with all the other page thumbnailing logic, i.e. in javascript. Fortunately it seems to be possible to inherit from an xpcom "standard-url" instance.
+
+This will allow the imgLoader to re-use the cached imgRequest when loading the thumbnail for the same page in separate about:newtab pages.
+
+(In reply to Seth Fowler [:seth] from bug #1162953 comment #16)
+> (In reply to Oliver Henshaw from bug #1162953 comment #9)
+> > I'm not sure why the cached image request needs validating in the first
+> > place. Seems like another bg to me, or is this expected?
+> > ShouldRevalidateEntry() returns true because the expiration time is 0 so the
+> > moz-page-thumb will always be popping in and out of the cache. Then the
+> > onStartRequest decides not to re-use the original imgRequest because
+> > cacheChan = null: does this look correct?
+> 
+> This much is more-or-less as designed, though we could have designed it
+> better. =)
+> 
+> IIRC moz-page-thumb:// is a layer on top of file://, and thus it's not a
+> caching channel. That leads us to conclude that we have no information about
+> whether the channel contents will be different or not, and to reload the
+> image from scratch. We could potentially check the mtime of the file -
+> that's not totally sound, but it's probably good enough in practice. That
+> sounds like something Necko probably already supports; I'll ask around.
+
+The image loader does check the mtime of the file, but first it has to know the the url is backed by a file (i.e. "url instanceof Ci.nsIFileURL" must be true)
+
+This can be done by inheriting from nsStandardURL.h, as e.g. resource:// URLs do. But the mapping from moz-page-thumb:// urls to the underlying file:// urls should probably continue to live with all the other page thumbnailing logic, i.e. in javascript. Fortunately it seems to be possible to inherit from an xpcom "standard-url" instance.
+Created attachment 8629971
+Implement a thumb-uri interface that supports nsIFileURL
+
+Here's an implementation of thumb-uri to replace the simple-uri in the moz-page-thumb:// protocol handler. All the xpcom machinery is present and tested, though I haven't run the unit tests or checked whether there's any fallout from changing the  URL structure from "moz-page-thumb://thumbnail?url=http%3A%2F%2Fwww.mozilla.org%2F
+" to "moz-page-thumb://thumbnail/?url=http%3A%2F%2Fwww.mozilla.org%2F". Also the patch needs more work to integrate it with the rest of the js code.
+Comment on attachment 8629971
+Implement a thumb-uri interface that supports nsIFileURL
+
+Review of attachment 8629971:
+-----------------------------------------------------------------
+
+This looks good to me! Thanks for doing this, Oliver.
+
+You'll certainly want to get review from someone familiar with both JavaScript and XPCOM, though. I'm not an expert in either of those areas.
+
+::: toolkit/components/thumbnails/PageThumbsProtocol.js
+@@ +30,5 @@
+>  XPCOMUtils.defineLazyModuleGetter(this, "FileUtils",
+>    "resource://gre/modules/FileUtils.jsm");
+>  
+> +function ThumbUri() {
+> +  // should not be used - create with Object.create() in a factory
+
+Should you be asserting that this isn't used, then? Or should you just remove it, since it's not clear to me where this is referenced?
+
+@@ +52,5 @@
+> +    let file = PageThumbsStorage.getFilePathForURL(url);
+> +    return new FileUtils.File(file);
+> +  },
+> +  set file(value) {
+> +    dump( "ThumbURL set file(f) not supported.\n" );
+
+Does dump() assert? If not, you should use an assert, so if someone calls this it turns the tests orange.
+
+@@ +83,5 @@
+> +
+> +};
+> +
+> +// don't need the "standard-url" methods in the prototype until object creation
+> +ThumbUri.prototype = Object.create(Object.prototype, ThumbUriProperties)
+
+I don't understand your comment here.
+Seth, any idea on the memory savings here?
+(In reply to Eric Rahm [:erahm] from comment #3)
+> Seth, any idea on the memory savings here?
+
+Bug 1162953 suggests that we're potentially leaking a gigabyte of image memory here in some cases. It'd be even worse except that's the cap on image memory usage on desktop.
+Actually, "leaking" is not the quite right term here. We're accumulating lots of unused entries in the image cache, which will eventually be freed. But we shouldn't be accumulating those entries.
+I've been struggling with the tests whenever I look at this, so have delayed answering your comments. I'd planned to answer with an updated patch but words will have to do for now.
+
+(In reply to Seth Fowler [:seth] from comment #2)
+> Comment on attachment 8629971
+> Implement a thumb-uri interface that supports nsIFileURL
+> 
+> Review of attachment 8629971:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/components/thumbnails/PageThumbsProtocol.js
+> @@ +30,5 @@
+> >  XPCOMUtils.defineLazyModuleGetter(this, "FileUtils",
+> >    "resource://gre/modules/FileUtils.jsm");
+> >  
+> > +function ThumbUri() {
+> > +  // should not be used - create with Object.create() in a factory
+> 
+> Should you be asserting that this isn't used, then? Or should you just
+> remove it, since it's not clear to me where this is referenced?
+
+Yep, an assert of some kind seems wise. I think I need it because I need something to attach the prototype to, just it shouldn't be called.
+
+> 
+> @@ +52,5 @@
+> > +    let file = PageThumbsStorage.getFilePathForURL(url);
+> > +    return new FileUtils.File(file);
+> > +  },
+> > +  set file(value) {
+> > +    dump( "ThumbURL set file(f) not supported.\n" );
+> 
+> Does dump() assert? If not, you should use an assert, so if someone calls
+> this it turns the tests orange.
+OK. Or I could implement the setter, but I wondered whether that would have security implications (only privileged code can access the nsIFile methods of these objects, right?)
+
+> 
+> @@ +83,5 @@
+> > +
+> > +};
+> > +
+> > +// don't need the "standard-url" methods in the prototype until object creation
+> > +ThumbUri.prototype = Object.create(Object.prototype, ThumbUriProperties)
+> 
+> I don't understand your comment here.
+Right, I should make that clearer. At this point I only need the methods XPCOMUtils expects in the prototype, I can wait until createInstance() time to attach the other methods to the prototype.
+Sounds legit - cc Tim and Mak as regular touchers of this
+Created attachment 8636683
+xpcshell test for "thumb-url" implementation
+
+I'd better add this test I've written that affirms that inheriting xpcom interfaces in js continues to work as I expect it to.
+Created attachment 8639317
+(1/3) - Track image LoadTime to compare with file mtime.
+Created attachment 8639318
+(2/3) - Implement a nsIFileURL interface for thumbnails
+
+Changes from v0
+---------------
+
+* Rename ThumbUri (and "thumb-uri") to ThumbUrl (and "thumb-url")
+* Change PageThumbs::getThumbnailURL() to match thumbnail URL signature
+* Add xpcshell test for "thumb-url" implementation to affirm that
+inheriting an xpcom interface from an xpcom instance works
+* Address the initial review:
+  - Document the tricky parts of the xpcom implementation better
+  - Assert if "new ThumbUrl()" is called
+  - throw if nsIFile setter is called
+  - Add test to make sure the setter throws as expected
+  - Fix declaration of the setter to actually work
+* Wait 1 second between first and last parts of each mochitest test, as
+image cache entries only track times with resolution of 1 second.
+Created attachment 8639319
+(3/3) - De-duplicate parsing of thumbnail URL
+Comment on attachment 8639319
+(3/3) - De-duplicate parsing of thumbnail URL
+
+Review of attachment 8639319:
+-----------------------------------------------------------------
+
+r=me with the 'instanceof' replaced.
+
+::: toolkit/components/thumbnails/PageThumbsProtocol.js
+@@ +136,5 @@
+>     * @param aLoadInfo The Loadinfo which to use on the channel.
+>     * @return The newly created channel.
+>     */
+>    newChannel2: function Proto_newChannel2(aURI, aLoadInfo) {
+> +    aURI instanceof Ci.nsIFileURL;
+
+Why not:
+
+let {file} = aURI.QueryInterface(Ci.nsIFileURL);
+let fileuri = Services.io.newFileURI(file);
+Comment on attachment 8639318
+(2/3) - Implement a nsIFileURL interface for thumbnails
+
+Review of attachment 8639318:
+-----------------------------------------------------------------
+
+::: toolkit/components/thumbnails/PageThumbsProtocol.js
+@@ +129,2 @@
+>      uri.spec = aSpec;
+>      return uri;
+
+Why don't we just do:
+
+let {url} = parseURI(aSpec);
+let file = PageThumbsStorage.getFilePathForURL(url);
+return Services.io.newFileURI(new FileUtils.File(file));
+
+here? |newChannel2| could then just use nsIFileURL.file to construct an appropriate channel.
+
+Seems like that would fulfill the criteria "url instanceof Ci.nsIFileURL", no?
+(In reply to Tim Taubert [:ttaubert] from comment #13)
+> Comment on attachment 8639318
+>
+> here? |newChannel2| could then just use nsIFileURL.file to construct an
+> appropriate channel.
+> 
+> Seems like that would fulfill the criteria "url instanceof Ci.nsIFileURL",
+> no?
+
+It would. But then the return URI object is a file:// so the file:// protocol handler will be used subsequently. Probably there's no harm from using the 'wrong' ::newChannel2 but it would also use the wrong ::getProtocolFlags(), which I assume we don't want.
+
+I wonder if I can do something like netwerk/protocol/res/SubstitutingProtocolHandler.cpp. Just need to load the SubstitutingURL with its CID and implement ResolveURI in the js protocol handler - would that work?
+Created attachment 8643036
+Provide a nsIFileURL interface for thumbnails
+
+Changes from v1
+---------------
+
+* Use SubstitutingURL to provide the nsIFileURL interface.
+* Implement nsISubstitutingProtocolHandler methods to support this.
+* Adjust the xpcshell-test accordingly.
+Created attachment 8643038
+Drop parseURI from newChannel2
+
+Probably the review+ should carry over, not sure whether I can make that 
+happen from git-bz.
+
+Changes from v1
+---------------
+
+* Use the approach suggested in the review.
+* Don't remove parseURI() entirely as it still has a caller.
+Created attachment 8643039
+Use nsIURL methods instead of RegExp
+Comment on attachment 8643036
+Provide a nsIFileURL interface for thumbnails
+
+Review of attachment 8643036:
+-----------------------------------------------------------------
+
+::: toolkit/components/thumbnails/PageThumbsProtocol.js
+@@ +104,5 @@
+> +   * So declare no-op implementations for (get|set|has)Substitution methods and
+> +   * do all the work in resolveURI.
+> +   */
+> +
+> +  setSubstitution: function Proto_setSubstitution(root, baseURI) {},
+
+Please use the new function definitions:
+
+setSubstitution(root, baseURI) {},
+
+@@ +106,5 @@
+> +   */
+> +
+> +  setSubstitution: function Proto_setSubstitution(root, baseURI) {},
+> +
+> +  getSubstitution: function Proto_getSubstitution(root) {
+
+getSubstitution(root) {
+
+@@ +110,5 @@
+> +  getSubstitution: function Proto_getSubstitution(root) {
+> +    throw Cr.NS_ERROR_NOT_AVAILABLE;
+> +  },
+> +
+> +  hasSubstitution: function Proto_hasSubstitution(root) {
+
+hasSubstitution(root) {
+
+@@ +114,5 @@
+> +  hasSubstitution: function Proto_hasSubstitution(root) {
+> +    return false;
+> +  },
+> +
+> +  resolveURI: function Proto_resolveURI(resURI) {
+
+resolveURI(resURI) {
+
+@@ +116,5 @@
+> +  },
+> +
+> +  resolveURI: function Proto_resolveURI(resURI) {
+> +    if (resURI.host != PageThumbs.staticHost)
+> +      throw Cr.NS_ERROR_NOT_AVAILABLE;
+
+Nit: let's add a newline after here
+
+@@ +127,3 @@
+>    classID: Components.ID("{5a4ae9b5-f475-48ae-9dce-0b4c1d347884}"),
+> +  QueryInterface: XPCOMUtils.generateQI([Ci.nsIProtocolHandler,
+> +                                        Ci.nsISubstitutingProtocolHandler])
+
+Nit: indentation.
+
+::: toolkit/components/thumbnails/test/browser_thumbnails_update.js
+@@ +90,5 @@
+>    yield captureAndCheckColor(0, 255, 0, "we have a green thumbnail");
+> +
+> +  // image cache entry timestamps have second resolution
+> +  // so make sure the second part of this test takes part in a different second.
+> +  yield wait(1000);
+
+This should probably work, I just hope we're not introducing another intermittent failure here.
+
+::: toolkit/components/thumbnails/test/test_thumbnails_interfaces.js
+@@ +20,5 @@
+> +  // then check that the file URL resolution works
+> +  let uri = Services.io.newURI("moz-page-thumb://thumbnail/?url=http%3A%2F%2Fwww.mozilla.org%2F",
+> +                               null, null);
+> +  ok(uri instanceof Ci.nsIURL, "moz-page-thumb:// is an URL");
+> +  ok(uri instanceof Ci.nsIFileURL, "This moz-page-thumb:// object is a FileURL");
+
+Nit: As nsIFileURL implements nsIURL we don't need the first check but it doesn't hurt either.
+
+@@ +27,5 @@
+> +  // and check that the error case works as expected
+> +  let bad = Services.io.newURI("moz-page-thumb://wronghost/?url=http%3A%2F%2Fwww.mozilla.org%2F",
+> +                               null, null);
+> +  bad instanceof Ci.nsIFileURL;
+> +  Assert.throws(() => bad.file, /NS_ERROR_NOT_AVAILABLE/i,
+
+You probably want bad.QueryInterface(Ci.nsIFileURL).file. A lone instanceof expression stmt looks weird.
+Created attachment 8645029
+Track image LoadTime to compare with file mtime.
+
+Changes from attachment #8639317
+--------------------------------
+
+Renumber commit subject and add note about ext4 to the commit message.
+Created attachment 8645030
+Provide a nsIFileURL interface for thumbnails. review=ttaubert
+
+toolkit/components/thumbnails/test/browser_thumbnails_update.js passes
+with --run-until-failure so I think there's little risk of intermittent
+failures.
+
+Changes from attachment #8643036
+--------------------------------
+
+* Address review comments
+* Test nsISubstitutingProtocolHandler::resolveURI() error behaviour
+directly, as that's what is specified.
+Created attachment 8645031
+(3/4) - Drop parseURI from newChannel2. review=ttaubert
+Created attachment 8645032
+(4/4) - Use nsIURL methods instead of RegExp. review=ttaubert
+
+Changes from attachment #8643039
+--------------------------------
+
+* Re-apply changes from review of attachment #8643036.
+(In reply to Tim Taubert [:ttaubert] from comment #18)
+> > +  // image cache entry timestamps have second resolution
+> > +  // so make sure the second part of this test takes part in a different second.
+> > +  yield wait(1000);
+> 
+> This should probably work, I just hope we're not introducing another
+> intermittent failure here.
+
+Strange things happen in VMs. At a minimum, I'd recommend not waiting for *exactly* one second, as you're asking for hard-to-reproduce issues if there are slight discrepancies between different notions of time in the system. Maybe wait for two seconds instead?
+Comment on attachment 8645029
+Track image LoadTime to compare with file mtime.
+
+Review of attachment 8645029:
+-----------------------------------------------------------------
+
+Seems like this isn't quite ready for review - could you explain what's happening in imgRequest::SetCacheEntry? (See below.)
+
+::: image/imgLoader.h
+@@ +90,5 @@
+>      mTouchedTime = time;
+>      Touch(/* updateTime = */ false);
+>    }
+>  
+> +  int32_t GetLoadTime() const
+
+Since SecondsFromPRTime() returns a uint32_t, shouldn't this method also return a uint32_t?
+
+@@ +170,5 @@
+>    imgLoader* mLoader;
+>    nsRefPtr<imgRequest> mRequest;
+>    uint32_t mDataSize;
+>    int32_t mTouchedTime;
+> +  int32_t mLoadTime;
+
+And shouldn't this be a uint32_t field?
+
+::: image/imgRequest.cpp
+@@ +196,5 @@
+>  
+>  void imgRequest::SetCacheEntry(imgCacheEntry* entry)
+>  {
+>    mCacheEntry = entry;
+> +  //mCacheEntry->UpdateLoadTime(); // FIXME?
+
+What's the story here?
+Created attachment 8647006
+Track image LoadTime to compare with file mtime.
+
+(In reply to Seth Fowler [:seth] [:s2h] from comment #24)
+> 
+> Since SecondsFromPRTime() returns a uint32_t, shouldn't this method also
+> return a uint32_t?
+Done. I followed mExpiryTime and mTouchedTime which are both int32_t but
+from looking at other code I see that's probably a mistake.
+> And shouldn't this be a uint32_t field?
+And done.
+
+> 
+> ::: image/imgRequest.cpp
+> @@ +196,5 @@
+> >  
+> >  void imgRequest::SetCacheEntry(imgCacheEntry* entry)
+> >  {
+> >    mCacheEntry = entry;
+> > +  //mCacheEntry->UpdateLoadTime(); // FIXME?
+> 
+> What's the story here?
+I wasn't sure whether this would be needed. But I think since all
+imgLoader::NewRequestAndEntry are matched by an imgRequest::Init (at least for
+all requests that make it into the cache) then I don't need UpdateLoadTime
+anywhere else.
+
+So, dropped this line.
+
+But now I'm wondering whether imgCacheEntry::UpdateCache() is a better place to
+update mLoadTime (if diff != 0).
+(In reply to Seth Fowler [:seth] [:s2h] from comment #23)
+> > > +  // image cache entry timestamps have second resolution
+> > > +  // so make sure the second part of this test takes part in a different second.
+> > > +  yield wait(1000);
+> 
+> Strange things happen in VMs. At a minimum, I'd recommend not waiting for
+> *exactly* one second, as you're asking for hard-to-reproduce issues if there
+> are slight discrepancies between different notions of time in the system.
+> Maybe wait for two seconds instead?
+
+Or the test/browser_thumbnails_update.js change can be dropped if bug #1192394 goes in first.
+Comment on attachment 8647006
+Track image LoadTime to compare with file mtime.
+
+(In reply to Oliver Henshaw from comment #25)
+> But now I'm wondering whether imgCacheEntry::UpdateCache() is a better place
+> to
+> update mLoadTime (if diff != 0).
+Actually, I thought it over and think it makes sense to set the load time at the start of the load, not when it's finished. So this approach is good, I hope.
+Comment on attachment 8647006
+Track image LoadTime to compare with file mtime.
+
+Review of attachment 8647006:
+-----------------------------------------------------------------
+
+Looks good!
+Can we get an AWSY run of this against a baseline? It would be nice to verify the improvements haven't caused any regressions before landing.
+Created attachment 8650410
+(1/4) - Track image LoadTime to compare with file mtime. review=seth
+
+Changes:
+
+Be more specific in commit comment about how even ext4 won't guarantee
+millisecond timestamps.
+Created attachment 8650412
+(2/4) - Provide a nsIFileURL interface for thumbnails. review=ttaubert
+
+Changes
+-------
+
+Wait for two seconds in the browser_thumbnails_update.js test.
+Pushed to Try as https://treeherder.mozilla.org/#/jobs?repo=try&revision=410dad73086c
+Added the xpcshell tests, canceled the old Try push. This is the new one: https://treeherder.mozilla.org/#/jobs?repo=try&revision=86fed5e3fcf9
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=314004cc86f4
+Since AWSY is currently busted, erahm agreed that landing doesn't need to wait for the AWSY comparison. I don't expect it to be particularly significant in any case.
+(In reply to Oliver Henshaw from comment #35)
+> Since AWSY is currently busted, erahm agreed that landing doesn't need to
+> wait for the AWSY comparison. I don't expect it to be particularly
+> significant in any case.
+
+The AWSY results are back, it's pretty clear there's no regression [1] and possibly a 5MiB improvement (we'll need more runs to confirm that).
+
+[1] https://areweslimyet.com/?series=henshaw_1180715&evenspacing
+The Android xpcshell failures in that last Try push look real to me.
+Created attachment 8653524
+(2/4) - Provide a nsIFileURL interface for thumbnails. review=ttaubert
+
+Added blank "head=/tail=" lines to xpcshell.ini. Hopefully this should be
+enough.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=7c7b28ea5009
+^ Just pushed a try job with the newest patches. If this looks good on try I'll land it later today.
+Oliver, it looks like the tests aren't passing on Android and B2G still, due to this failure:
+
+TEST-UNEXPECTED-FAIL | toolkit/components/thumbnails/test/test_thumbnails_interfaces.js | xpcshell return code: 0
+
+TEST-UNEXPECTED-FAIL | toolkit/components/thumbnails/test/test_thumbnails_interfaces.js | run_test - [run_test : 17] moz-page-thumb handler provides substituting interface - false == true 
+
+Can you please investigate this so that we can land this change? It's pretty important; we'd really like to get this into Gecko 44.
+Created attachment 8673685
+(2/4) - Provide a nsIFileURL interface for thumbnails. review=ttaubert
+
+Don't run the xpcshell-test on android or b2g, the xpcom interface isn't
+packaged there.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=134273ac08fe
+No related failures that I can see, though maybe some tests failed to run?
+These patches need refreshing. The first one didn't apply for me.
+Created attachment 8675616
+(1/4) - Track image LoadTime to compare with file mtime. review=seth
+
+Refreshed patch (minor conflict in unrelated context line)
+https://hg.mozilla.org/integration/mozilla-inbound/rev/38558bb6671b53b51716c9a8d897b9eb1f3668a8
+Bug 1180715 (1/4) - Track image LoadTime to compare with file mtime. review=seth
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/7b4f0495cf6d5f40298755b6d8d15434f449fa0c
+Bug 1180715 (2/4) - Provide a nsIFileURL interface for thumbnails. review=ttaubert
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/0c42cb5532d79c78803208c0c25f0aa00ec27ad5
+Bug 1180715 (4/4) - Use nsIURL methods instead of RegExp. review=ttaubert
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/048e4bbd0fdd564a08496f34c282b60e1c05649b
+Bug 1180715 (3/4) - Drop parseURI from newChannel2. review=ttaubert
+https://hg.mozilla.org/mozilla-central/rev/38558bb6671b
+https://hg.mozilla.org/mozilla-central/rev/7b4f0495cf6d
+https://hg.mozilla.org/mozilla-central/rev/0c42cb5532d7
+https://hg.mozilla.org/mozilla-central/rev/048e4bbd0fdd
+https://hg.mozilla.org/mozilla-central/rev/38558bb6671b
+https://hg.mozilla.org/mozilla-central/rev/7b4f0495cf6d
+https://hg.mozilla.org/mozilla-central/rev/0c42cb5532d7
+https://hg.mozilla.org/mozilla-central/rev/048e4bbd0fdd
+Thanks Oliver for pushing through and getting this fixed! I know it's been a long road.

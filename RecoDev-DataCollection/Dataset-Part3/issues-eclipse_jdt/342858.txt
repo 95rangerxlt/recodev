@@ -1,0 +1,141 @@
+Build Identifier: M20110210-1200
+
+Not always, but often, selecting a method and inlining "All invocations" of it does not work.  If you have "Delete method declaration" selected, that does take affect, leaving all the callers referring to a now deleted method, and thus compilation breaks.
+
+There are no errors from the refactoring itself, it just fails silently.
+
+I'm marking this Major, I think of this as being a critical refactoring.  It's necessary whenever a change to a method is more than just a signature change.
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. Inline CouponChoice.getFrequency().
+2. See the caller not change.
+
+Build Identifier: M20110210-1200
+
+Not always, but often, selecting a method and inlining "All invocations" of it does not work.  If you have "Delete method declaration" selected, that does take affect, leaving all the callers referring to a now deleted method, and thus compilation breaks.
+
+There are no errors from the refactoring itself, it just fails silently.
+
+I'm marking this Major, I think of this as being a critical refactoring.  It's necessary whenever a change to a method is more than just a signature change.
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. Inline CouponChoice.getFrequency().
+2. See the caller not change.
+Created attachment 193266
+A code file where the refactoring does break
+
+If you inline all invocations of getFrequency() in this file, it does not happen.
+Created attachment 193268
+A smaller example
+
+If you inline callee() in this file, it will not work.  If the return value is something OTHER than CashflowFrequency (like, say, int), it works.
+Created attachment 193269
+Updated smaller example
+
+Interestingly, it does NOT break if the enum is an inner class of A as in the prior attachment.  But does if it's an external one, as in this one.
+None of the attached examples compiles as they are not self-contained.
+
+Is there anything in the .log? Could you provide a self-contained example?
+(In reply to comment #4)
+> None of the attached examples compiles as they are not self-contained.
+> 
+> Is there anything in the .log? Could you provide a self-contained example?
+
+Unfortunately my efforts to create a self-contained example all ended up producing a chunk of code for which the refactoring actually worked! The .log doesn't contain anything, it fails silently.
+
+I'll see if I can get something that breaks more self-contained.
+Created attachment 193366
+Isolated case that breaks
+
+I tore out references to other classes as much as I could and still get the break.  In this example, you should be able to attempt "Inline all invocations" of callee() and the invocation in caller() will NOT get inlined.
+(In reply to comment #6)
+> Created attachment 193366 [details]
+> Isolated case that breaks
+Can reproduce using N20110417-2000.
+I thought I would say that I am looking at this bug. It is proving to be quite tricky. Here is what I have so far:
+
+Something goes wrong in jdt core when parsing which causes it to create two instance of the callee methodBinding with "different" return types. One has the return type (enum) with a final modifier and the other doesn't.  The final modifier is assigned in ClassScope.checkAndSetModifiers() line 603 because it processes a half parsed file which hasn't yet parsed the enum field initializer.
+
+What is even more annoying is that when I created a test case it worked as expected and inlined the method. I am only able to reproduce it by running eclipse itself.
+
+I will continue to try and get to the bottom of the problem but I am as yet quite unfamiliar with the jdt core code so may take me some time.
+
+Simple test case (needs to be separate compilation units):
+public class TestAnonymousEnum2 {
+	private final AnonymousEnum2 freq = AnonymousEnum2.TestValue;
+    
+	public AnonymousEnum2 /*]*/callee()/*[*/ {
+        return freq;
+    }
+    
+    public void caller() {
+		callee().toString();
+    }
+}
+
+public enum AnonymousEnum2 {
+	TestValue() {
+	};
+}
+(In reply to Nikolay Metchev from comment #8)
+> What is even more annoying is that when I created a test case it worked as
+> expected and inlined the method. I am only able to reproduce it by running
+> eclipse itself.
+
+In Eclipse also, it inlines correctly in a certain situation:
+1. Try inlining in TestAnonymousEnum2 - It will result in compilation error. Press Ctrl+z to undo.
+2. Open any other java editor.
+3. Click on TestAnonymousEnum2 java editor now.
+4. Try inlining in TestAnonymousEnum2 - it will inline correctly.
+(In reply to Nikolay Metchev from comment #8)
+Thanks for these investigations. The type binding for AnonymousEnum2 should indeed not have a "final" modifier. I've filed bug 419266 for the underlying problem.
+
+The problem shows up here because we're dealing with 2 different ASTs:
+
+1. The one that initializes MemberTypeTargetProvider#fMethodBinding is coming from InlineMethodAction#run(int, int, ITypeRoot), which gets it from the SharedASTProvider. This AST is usually coming from the reconciler, but right after editor switching, the AST is actually created via ASTProvider#createAST(..). That explains comment 9.
+
+2. The InvocationFinder visits another AST, which is always created in MemberTypeTargetProvider#getAffectedBodyDeclarations(..).
+
+In InvocationFinder#visit(MethodInvocation), we compare bindings from the two ASTs via matches > MethodBinding#isEqualTo > BindingComparator#isEqual(..) > and eventually an isEqual(..) that compares the two methodBinding.returnType.
+
+
+This bug will disappear when bug 419266 is fixed (since the bindings will then correctly be identified to be equal).
+
+There's a simple solution to make comment 8 work already now: Just get rid of the second AST creation and also use the SharedASTProvider there. Then, we only compare bindings from the same AST and even save an AST creation.
+Done that with http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=17cf94f18d9db074d03b412bc5c8d422f8dcfe31
+
+However, there are still cases that are broken after that:
+
+public class Test {
+	public AnonymousEnum2 /*]*/callee()/*[*/ {
+		return null;
+	}
+	public void caller() {
+		callee();
+	}
+}
+public enum AnonymousEnum2 {
+	TestValue() {
+	};
+	
+	void foo(Test t) {
+		t.callee(); // broken if AST for Test comes from reconciler
+	}
+}
+
+Writing a test case for this is a more work, since you have to open an editor and make sure you get an AST from the reconciler. Not worth the hassle, since bug 419266 will add a regression test anyway.
+
+If bug 419266 doesn't get fixed for 4.4, then we should change the isEqualTo(..) in InvocationFinder#matches(IBinding) to compare binding keys.
+Thank you Markus,
+It would have taken me quite a while to work all that out.
+(In reply to Markus Keller from comment #10)
+> If bug 419266 doesn't get fixed for 4.4, then we should change the
+> isEqualTo(..) in InvocationFinder#matches(IBinding) to compare binding keys.
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=72578ba43287462a0c91a7de026e07610ac80a95 has changed org.eclipse.jdt.core.dom.BindingComparator#isEqual(TypeBinding, TypeBinding, HashSet) to use TypeBinding.equalsEquals(..) instead of ==, which effectively works around this bug in the same manner as proposed.
+
+Nothing more to do on our side.

@@ -1,0 +1,182 @@
+Created attachment 611966
+patch v1
+
+In preparation for bug 669603 I thought it might be beneficial to split this big patch into multiple steps. This patch moves all the sessionStorage functionality out of the session store service into its own JSM. It's still the same synchronous behavior, but cleaned up a bit.
+
+Created attachment 611966
+patch v1
+
+In preparation for bug 669603 I thought it might be beneficial to split this big patch into multiple steps. This patch moves all the sessionStorage functionality out of the session store service into its own JSM. It's still the same synchronous behavior, but cleaned up a bit.
+Created attachment 613589
+patch v2
+
+Fixed a little typo.
+Comment on attachment 611966
+patch v1
+
+(splinter trashed my in progress review when the attachment became obsolete, so hoping un-obsoleting it bring it back)
+Comment on attachment 611966
+patch v1
+
+Review of attachment 611966:
+-----------------------------------------------------------------
+
+Looking at this patch because I had already started on it...
+
+I think it's a good start but I have some concerns. These aren't "do what I say concerns" so let me know what you think!
+
+::: browser/components/sessionstore/src/SessionStorage.jsm
+@@ +7,5 @@
+> +let EXPORTED_SYMBOLS = ["SessionStorage"];
+> +
+> +const Cu = Components.utils;
+> +const Cc = Components.classes;
+> +const Ci = Components.interfaces;
+
+You don't use Cc or Ci, so no need.
+
+@@ +17,5 @@
+> +const PRIVACY_ENCRYPTED = 1;
+> +const PRIVACY_FULL = 2;
+> +
+> +XPCOMUtils.defineLazyServiceGetter(this, "gScriptSecurityManager",
+> +  "@mozilla.org/scriptsecuritymanager;1", "nsIScriptSecurityManager");
+
+Can we keep this SecuritySvc to match what's in nsSessionStore?
+
+@@ +32,5 @@
+> +   * @param aPrivacyLevel
+> +   *        The session store privacy level to use
+> +   */
+> +  serialize: function SessionStorage_serialize(aTabData, aHistory, aDocShell,
+> +                                               aPrivacyLevel) {
+
+We could take this opportunity to clean this up and bring it closer to mirroring deserialize.
+
+serialize shouldn't know anything about aTabData, it should just return an object and then in sessionstore we decide what to do with it. If it always returns an object then we can just set & be done with it.
+
+I think we can get away with not passing in history too - it should be available on docshell.sessionHistory (quick test in error console seems to work). Or we could pass the browser into each method here and get history/docshell from it. A little bit of duplication with what's happening in sessionstore, but as we pull more of that out into modules that's ok. We should try to design the most robust API instead of pigeonholing into what sessionstore is currently doing.
+
+@@ +63,5 @@
+> +   */
+> +  read: function DomStorage_read(aHistory, aDocShell, aPrivacyLevel) {
+> +    let data = {};
+> +
+> +    History.getEntries(aHistory).forEach(function (aEntry) {
+
+I know structurally this is cleaner, but we're now iterating over every entry twice (for every tab... often). I don't have scientific data to back this up, but I'm guessing that isn't good.
+
+@@ +70,5 @@
+> +        return;
+> +
+> +      // Check if we're allowed to store sessionStorage data.
+> +      if (aPrivacyLevel == PRIVACY_NONE ||
+> +          (aEntry.uri.schemeIs("https") && aPrivacyLevels == PRIVACY_ENCRYPTED))
+
+I don't really like moving the privacy level checks around like this :/
+It works though, but moves the logic around - if we change the rules for _checkPrivacyLevel, we need to make sure that is updated too.
+Can you put a nice big XXX comment here and at _checkPrivacyLevel making it clear how it's used outside of there. The other option would be passing SSS in to here so we could duplicate _checkPrivacyLevel, but that's not great either
+
+Also, aPrivacyLevel (no s!) if we do this (I'm guessing this was the typo fix)
+
+::: browser/components/sessionstore/src/nsSessionStore.js
+@@ +160,5 @@
+>    "@mozilla.org/scriptsecuritymanager;1", "nsIScriptSecurityManager");
+>  
+> +XPCOMUtils.defineLazyModuleGetter(this, "SessionStorage",
+> +  "resource:///modules/sessionstore/SessionStorage.jsm");
+> +
+
+Nit: move this up with the other lazy module imports.
+
+@@ +1872,5 @@
+> +        if (!this._checkPrivacyLevel(true, aTab.pinned))
+> +          privacyLevel = PRIVACY_ENCRYPTED;
+> +        else if (!this._checkPrivacyLevel(false, aTab.pinned))
+> +          privacyLevel = PRIVACY_NONE;
+> +      }
+
+Uhh, so this... privacy level should be determined for each entry, not a once & done thing.
+
+(oh I see...)
+Created attachment 617033
+patch v3
+
+Added Paul suggestions. 
+
+Also, I changed it to use a callback to check privacy. When Bug 745040 is ready, we can update it to call the module directly.
+Created attachment 622562
+Updated patch
+Created attachment 624239
+Updated patch
+Created attachment 627209
+Part 1 - create SessionStorage.jsm and migrate existing code
+
+[Taking over while Andres is out for a couple of weeks.]
+
+We should put bug 708488 on hold for a moment because it's really hard to refactor all the TabState code if it's all over the place.
+
+As a first step we should just create a SessionStorage.jsm, move _serializeSessionStorage() and _deserializeSessionStorage() to their new place and make those internal methods accessible that we need.
+
+The second step, a follow-up bug, should be refactoring the whole code and the API to prepare making all this async.
+Comment on attachment 627209
+Part 1 - create SessionStorage.jsm and migrate existing code
+
+Review of attachment 627209:
+-----------------------------------------------------------------
+
+(In reply to Tim Taubert [:ttaubert] from comment #7)
+> As a first step we should just create a SessionStorage.jsm, move
+> _serializeSessionStorage() and _deserializeSessionStorage() to their new
+> place and make those internal methods accessible that we need.
+> 
+> The second step, a follow-up bug, should be refactoring the whole code and
+> the API to prepare making all this async.
+
+Ok, so you're thinking we just move wholesale & have an unadvertised SessionStorage API that we'll change later? If possible, I'd prefer to have all of that happen within a single version (much like the format changes) so we don't churn too much. SessionStorage.jsm would hopefully only be used by us, but there aren't any guarantees...
+
+That's fine by me if you'll coordinate to make that happen sooner rather than later (and keep my comments & Andres's changes in mind).
+(In reply to Paul O'Shannessy [:zpao] from comment #8)
+> Ok, so you're thinking we just move wholesale & have an unadvertised
+> SessionStorage API that we'll change later? If possible, I'd prefer to have
+> all of that happen within a single version (much like the format changes) so
+> we don't churn too much. SessionStorage.jsm would hopefully only be used by
+> us, but there aren't any guarantees...
+
+I agree, let's make it all happen in this bug.
+Created attachment 628298
+Part 2 - Refactor SessionStorage.jsm and its API
+
+This patch basically contains all the changes from attachment 624239. I simplified the API even more and did a little cleanup.
+Created attachment 628346
+Part 2 - Refactor SessionStorage.jsm and its API
+
+Small cleanup.
+Looks good on try, btw.
+
+https://tbpl.mozilla.org/?tree=Try&rev=af5bde28b750
+Comment on attachment 628346
+Part 2 - Refactor SessionStorage.jsm and its API
+
+Review of attachment 628346:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStorage.jsm
+@@ +143,5 @@
+> +   *        That tab's session history
+> +   * @param aIndex
+> +   *        The history entry's index
+> +   */
+> +  getUriForEntry: function History_getUriForEntry(aHistory, aIndex) {
+
+super nit: I like URI all caps in there but I'm fine either way.
+(In reply to Paul O'Shannessy [:zpao] from comment #13)
+> > +  getUriForEntry: function History_getUriForEntry(aHistory, aIndex) {
+> 
+> super nit: I like URI all caps in there but I'm fine either way.
+
+I do, too. Will fix.
+https://hg.mozilla.org/integration/fx-team/rev/ebd52606c461
+https://hg.mozilla.org/integration/fx-team/rev/329aa567fec9
+https://hg.mozilla.org/mozilla-central/rev/ebd52606c461
+https://hg.mozilla.org/mozilla-central/rev/329aa567fec9

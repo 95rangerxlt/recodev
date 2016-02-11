@@ -1,0 +1,123 @@
+Created attachment 282301
+optimize string serialization
+
+Seems that JSON.jsm is still quite slow (see bug 384370 comment #29). What considerably speeds things up in my tests (by about factor 3) is
+* treating the common case (String) before all other cases while serializing;
+* dropping the look-up table for special character serializations (\n, etc.) in favor of a switch statement;
+* and using arguments.callee for the recursive call (instead of the function's name).
+
+Created attachment 282301
+optimize string serialization
+
+Seems that JSON.jsm is still quite slow (see bug 384370 comment #29). What considerably speeds things up in my tests (by about factor 3) is
+* treating the common case (String) before all other cases while serializing;
+* dropping the look-up table for special character serializations (\n, etc.) in favor of a switch statement;
+* and using arguments.callee for the recursive call (instead of the function's name).
+a factor of 3, nice!
+
+r=sspitzer
+
+it would be interesting to know how much each change impacted the performance.
+
+specifically, how much does arguments.callee save?  That's a new trick to me (http://developer.mozilla.org/en/docs/Core_JavaScript_1.5_Reference:Objects:Function:arguments:callee), but if that makes a big difference, I know of a few recursive calls in the places code where I'd like to use it.
+
+also, dietrich has some numbers in bug #384370.  dietrich, do you want to see how much this patch from Simon will buy us?
+
+
+
+Comment on attachment 282301
+optimize string serialization
+
+simon, would we gain anything by checking if the first char of $0 was \ or ", and then going into the switch?  it seems like the common case is that we'll fall through the switch anyways.  (two compares vs seven)
+Does this need sr (by e.g. Brendan)? If not, would you mind checking this in for me?
+
+(In reply to comment #1)
+> specifically, how much does arguments.callee save?
+
+After having applied the first two optimizations, this lead to another 15% speed improvement in my ad-hoc tests. My guess is that this gain comes from not having to look up the function's name from arbitrarily many stack levels deep. Maybe Brendan can explain this better, though.
+
+(In reply to comment #2)
+> would we gain anything by checking if the first char of $0 was \ or "
+
+No, $0 is really just one char long...
+> Does this need sr (by e.g. Brendan)? If not, would you mind checking this in
+for me?
+
+Yes, I think it needs sr.  
+
+Also, I think checkins to mozilla/js are restricted, and I don't think I have CVS access.  we may need help from gavin (who landed JSON.jsm the first time).
+
+> No, $0 is really just one char long...
+
+oops, I see that now, thanks Simon.
+
+dietrich, can you try this out and see what it does perf-wise to your json-as-on-disk-format work?
+@Simon: What did you use for your test case(s)? I see some ways that significant speed improvements could be made, on top of your changes, and I'd like to do some verification.
+(In reply to comment #4)
+> Also, I think checkins to mozilla/js are restricted
+
+Note to self: check-in requires a1.9+ first.
+
+(In reply to comment #5)
+> @Simon: What did you use for your test case(s)?
+
+I used snapshots from sessionstore.js which I serialized several dozen times in a row per iteration.
+
+BTW: With these optimizations, JSON.toString still was about 10 times slower than plain .toSource(), so further improvements should still be realistic.
+Comment on attachment 282301
+optimize string serialization
+
+Any named function expression is costlier to evaluate than an anonymous function expression because of the Object created to scope the function and bind its name (so it can call itself).
+
+Yes, this means it is faster to use anonymous functions always, and use arguments.callee if you need to call the function or otherwise refer to it from its body.
+
+But it would be silly to over-optimize if the savings is in the noise. I see two named function expressions in the patch, so it would be good to have data for changing each to an anonymous function expression.
+
+/be
+(In reply to comment #4)
+> 
+> dietrich, can you try this out and see what it does perf-wise to your
+> json-as-on-disk-format work?
+> 
+
+venkman #s before patch:
+JSON_toString: 74-143, 130 call(s), 214.11ms total, 0.97ms min, 4.45ms max, 1.65ms avg
+
+after patch:
+JSON_toString: 74-147, 130 call(s), 97.29ms total, 0.42ms min, 2.83ms max, 0.75ms avg
+
+The JSON Places export tests ran about 20% faster w/ this patch. However, as Simon notes, it's still far slower than toSource(), and is about 80% slower than our HTML export.
+Created attachment 282445
+JSON.jsm Optimizations
+
+I've done some additional work, on top of Simon's patch, that improves the performance. After testing, the times that I have are: 320ms (original code), 130ms (Simon's patch), 80ms (my patch).
+
+The biggest gains that I was able to make were to "unroll" the recursion of primitive values in arrays, object keys, and object values. This increased the size and redundancy of the code - but it provided a definite speed boost.
+
+Additionally, removing the temporary function and the array joining provided the rest of the speed benefits.
+
+I'd like to get some feedback as to the complexity, and worth, of the changes before I consider opening this up for review.
+Two more suggestions:
+
+|"" + foo| is faster than foo.toString()
+
+|($0.charCodeAt(0) + 0x10000).toString(16).slice(1)| is faster than
+|("0000" + $0.charCodeAt(0).toString(16)).slice(-4)|
+Comment on attachment 282301
+optimize string serialization
+
+let's get this in, and consider resig's changes as a second pass
+Checking in js/src/xpconnect/loader/JSON.jsm;
+/cvsroot/mozilla/js/src/xpconnect/loader/JSON.jsm,v  <--  JSON.jsm
+new revision: 1.2; previous revision: 1.1
+done
+
+Leaving open for the second patch, though it may be a good idea just to resolve this bug and open a new one for it.
+(In reply to comment #12)
+> Leaving open for the second patch, though it may be a good idea just to resolve
+> this bug and open a new one for it.
+
+Always -- whenever I've failed to split bugs for followup patches I and others have regretted it. Just file it and cite it here. Thanks,
+
+/be
+

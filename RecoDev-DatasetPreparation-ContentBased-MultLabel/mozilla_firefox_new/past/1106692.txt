@@ -1,0 +1,116 @@
+STR:
+
+1. Enable e10s
+2. Go to https://duckduckgo.com/?q=test&t=ffsb
+3. Open Debugger
+4. Show Event Listener pane
+5. It loads correctly
+6. Reload page
+7. Event listeners load, but browser console has error
+
+_getDefinitionSite threw an exception: Error getting function definition site: conn6.child1/pausedobj1104 has no Debugger.Script
+
+Handler function DebuggerClient.requester request callback threw an exception: TypeError: aResponse.source is undefined
+Stack: EventListeners.prototype._getDefinitionSite/<@chrome://browser/content/devtools/debugger-controller.js:1784:7
+DebuggerClient.requester/</<@resource://gre/modules/devtools/dbg-client.jsm:348:9
+makeInfallible/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/DevToolsUtils.js:83:14
+emit@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/commonjs/sdk/event/core.js:97:9
+Request.prototype.emit@resource://gre/modules/devtools/dbg-client.jsm:1099:29
+DebuggerClient.prototype.onPacket@resource://gre/modules/devtools/dbg-client.jsm:939:7
+LocalDebuggerTransport.prototype.send/<@resource://gre/modules/devtools/dbg-client.jsm -> resource://gre/modules/devtools/transport/transport.js:545:11
+makeInfallible/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/DevToolsUtils.js:83:14
+makeInfallible/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/DevToolsUtils.js:83:14
+Line: 1784, column: 6
+
+STR:
+
+1. Enable e10s
+2. Go to https://duckduckgo.com/?q=test&t=ffsb
+3. Open Debugger
+4. Show Event Listener pane
+5. It loads correctly
+6. Reload page
+7. Event listeners load, but browser console has error
+
+_getDefinitionSite threw an exception: Error getting function definition site: conn6.child1/pausedobj1104 has no Debugger.Script
+
+Handler function DebuggerClient.requester request callback threw an exception: TypeError: aResponse.source is undefined
+Stack: EventListeners.prototype._getDefinitionSite/<@chrome://browser/content/devtools/debugger-controller.js:1784:7
+DebuggerClient.requester/</<@resource://gre/modules/devtools/dbg-client.jsm:348:9
+makeInfallible/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/DevToolsUtils.js:83:14
+emit@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/commonjs/sdk/event/core.js:97:9
+Request.prototype.emit@resource://gre/modules/devtools/dbg-client.jsm:1099:29
+DebuggerClient.prototype.onPacket@resource://gre/modules/devtools/dbg-client.jsm:939:7
+LocalDebuggerTransport.prototype.send/<@resource://gre/modules/devtools/dbg-client.jsm -> resource://gre/modules/devtools/transport/transport.js:545:11
+makeInfallible/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/DevToolsUtils.js:83:14
+makeInfallible/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/DevToolsUtils.js:83:14
+Line: 1784, column: 6
+Likely related to the recent Debugger.Source work.
+I don't think is this related; the problem is that we don't return on error when getting the definition site: https://github.com/mozilla/gecko-dev/blob/master/browser/devtools/debugger/debugger-controller.js#L1782
+
+It was like that before Debugger.Source. As for why that pause object doesn't have a Script, I don't know, I don't know much about the event listener pane.
+This is really bizarre. I change code I linked to above to:
+
+    gThreadClient.pauseGrip(aFunction).getDefinitionSite(aResponse => {
+      if (aResponse.error) {
+        // Don't make this error fatal, because it would break the entire events pane.
+        const msg = "Error getting function definition site: " + aResponse.message;
+        DevToolsUtils.reportException("_getDefinitionSite", msg);
+      }
+      deferred.resolve(aResponse.error ? null : aResponse.source.url);
+    });
+
+But now, instead of seeing the 3 or 4 "no script available" errors (and no `source is null` errors), I see a huge dump of "no script available" errors. They come in like 1/sec. It keeps trying to get the definition site from who knows what (the pause objects ids keep incrementing, like it's stuck in some sort of loop).
+Created attachment 8576139
+Never interleave requests to get the page event listeners and avoid redundant requests for definition sites
+
+The problem was that we sometimes make multiple requests to get the event listeners on the page and some times the race ends up with two requests interleaved. This patch fixes this race and also displays the event listeners faster.
+
+There are two main cases that trigger an eventListsners request: displaying the "Events" tab and newSource events. The first case is straightforward, but the latter can occur multiple times in close succession, e.g. if many scripts are being loaded. That is exactly what happens when a page is reloaded, which triggers this bug.
+
+Now, the debugger frontend already has a method to avoid triggering multiple requests from events, which is the setNamedTimeout helper function. Because of that function, the dozens of newSource events that occur on page reload in this case end up only triggering a handful of eventListener requests, because every time we schedule a request it clobbers the previous one.
+
+Unfortunately, setNamedTimeout doesn't work very well for _getListeners, because the latter takes a long time to complete in pages with many events and on top of that it yields to the event loop while sending individual definitionSite requests. What ends up happening is that the first _getListeners call finishes and resumes the debuggee, while the second one is still making definitionSite requests, hence the "No such actor" errors that I've been seeing.
+
+To fix that, I have added a semaphore that blocks _getListeners callers and a flag that indicates whether another _getListeners call needs to be scheduled ASAP due to newSource packets being received.
+
+In addition to that, it turns out that we were going through the eventListeners response and fetching the definition site for each one, even if we had already received the information (it's quite common to have shared event handlers for e.g. click, mousedown, touchstart, etc.). Keeping track of which definition sites were already received reduced the number of definitionSite requests for the DuckDuckGo page from ~500 to ~250. That's a significant and user perceptible speedup in the display of the Events pane.
+
+I thought about writing a test, but given the timing-sensitive nature of this bug, I haven't come up with anything yet. I'll give it some more thought tomorrow though.
+Forgot to mention that all tests pass locally with this patch.
+Comment on attachment 8576139
+Never interleave requests to get the page event listeners and avoid redundant requests for definition sites
+
+Review of attachment 8576139:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +1738,5 @@
+> +  /**
+> +   * A flag the indicates whether a new request to fetch updated event listeners
+> +   * has arrived, while another one was in progress.
+> +   */
+> +  _eventListsnersUpdateNeeded: false,
+
+Nit: _eventListsners -> _eventListeners
+Comment on attachment 8576139
+Never interleave requests to get the page event listeners and avoid redundant requests for definition sites
+
+Review of attachment 8576139:
+-----------------------------------------------------------------
+
+This code looks sane, though it's a little hard to fully understand since I haven't touched the event listener stuff yet. Looks fine though, w/jryans nit
+Your explanation was very good though, so I get the idea behind these changes!
+Created attachment 8576505
+Never interleave requests to get the page event listeners and avoid redundant requests for definition sites v2
+
+Corrected typo.
+https://hg.mozilla.org/integration/fx-team/rev/b49604b2a843
+https://hg.mozilla.org/mozilla-central/rev/b49604b2a843
+
+
+[e10s] Error showing event listener pane for DuckDuckGo
+
+
+
+Never interleave requests to get the page event listeners and avoid redundant requests for definition sites (bug 1106692). r=jlongster 

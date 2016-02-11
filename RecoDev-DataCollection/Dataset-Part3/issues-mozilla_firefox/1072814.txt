@@ -1,0 +1,199 @@
+We should rather use ES6 Promises and the new API if possible.
+
+We should rather use ES6 Promises and the new API if possible.
+Created attachment 8495099
+0001-Bug-1072814-Convert-trivial-Promise.defer-usages-to-.patch
+
+This converts Promise.defer() to new Promise() wherever it was trivial to do.
+Created attachment 8495100
+0002-Bug-1072814-Fix-SessionFile.jsm-to-use-new-Promise-A.patch
+
+Converting SessionFile to use new Promise() was a tad more difficult but worth it I think. Got rid of a try/catch that is handled a little more elegantly by the new API. I also removed the Task.spawn() call - I really like tasks but not if all they do is yield a single promise.
+Created attachment 8495101
+0003-Bug-1072814-Emulate-old-Promise.defer-API-for-non-tr.patch
+
+For these two cases I didn't see any other possibility than emulating the old Promise.defer() API. I can live with that but maybe you have a better idea?
+Comment on attachment 8495099
+0001-Bug-1072814-Convert-trivial-Promise.defer-usages-to-.patch
+
+Review of attachment 8495099:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/head.js
+@@ +29,5 @@
+>  Cu.import("resource:///modules/sessionstore/SessionStore.jsm", tmp);
+>  Cu.import("resource:///modules/sessionstore/SessionSaver.jsm", tmp);
+>  Cu.import("resource:///modules/sessionstore/SessionFile.jsm", tmp);
+>  Cu.import("resource:///modules/sessionstore/TabState.jsm", tmp);
+> +let {Task, SessionStore, SessionSaver, SessionFile, TabState} = tmp;
+
+For the time being, we want to keep importing Promise.jsm, as it has better error-reporting. Hopefully, DOM Promise will catch up in October.
+
+(same thing for other files)
+
+@@ +304,5 @@
+>      }
+>    });
+>  }
+>  function promiseBrowserLoaded(aBrowser, ignoreSubFrames = true) {
+> +  return new Promise(resolve => {
+
+Nit: the brackets are not really necessary (also in other one-liners below).
+Comment on attachment 8495100
+0002-Bug-1072814-Fix-SessionFile.jsm-to-use-new-Promise-A.patch
+
+Review of attachment 8495100:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/SessionFile.jsm
+@@ -32,5 @@
+>  
+>  Cu.import("resource://gre/modules/Services.jsm");
+>  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+>  Cu.import("resource://gre/modules/osfile.jsm");
+> -Cu.import("resource://gre/modules/Promise.jsm");
+
+As above, I'd rather we keep Promise.jsm for the time being.
+
+@@ +272,5 @@
+>        isFinalWrite = this._isClosed = true;
+>      }
+>  
+> +    let refObj = {};
+> +    let histogram = "FX_SESSION_RESTORE_WRITE_FILE_LONGEST_OP_MS";
+
+Nit: it's the name, not the histogram itself.
+
+@@ +288,5 @@
+> +      // Record how long we stopped the main thread.
+> +      TelemetryStopwatch.finish(histogram, refObj);
+> +
+> +      // Forward the promise.
+> +      resolve(writePromise);
+
+Why not 
+
+try {
+  return SessionWorker.post("write", [aData, options]);
+} finally {
+  TelemetryStopwatch.finish(histogram, refObj);
+}
+
+?
+
+@@ +292,5 @@
+> +      resolve(writePromise);
+> +    });
+> +
+> +    // Wait until the write is done.
+> +    promise = promise.then(msg => {
+
+I take it making this work with Task.spawn was too awkward?
+
+@@ +306,5 @@
+> +    }, err => {
+> +      // Catch and report any errors.
+> +      TelemetryStopwatch.cancel(histogram, refObj);
+> +      console.error("Could not write session state file ", err, err.stack);
+> +    });
+
+Can you add somewhere a comment that at this stage, `promise` cannot reject?
+
+@@ +314,5 @@
+> +    AsyncShutdown.profileBeforeChange.addBlocker(
+> +      "SessionFile: Finish writing Session Restore data", promise);
+> +
+> +    return promise.then(() => {
+> +      // Remove the blocker, no matter if the task fails or not.
+
+Nit: It's a promise, not a task anymore.
+Comment on attachment 8495101
+0003-Bug-1072814-Emulate-old-Promise.defer-API-for-non-tr.patch
+
+Review of attachment 8495101:
+-----------------------------------------------------------------
+
+It's sad that we need to emulate non-standard Promise with standard Promise, but I can't see a better way.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ -92,5 @@
+>  Cu.import("resource://gre/modules/TelemetryTimestamps.jsm", this);
+>  Cu.import("resource://gre/modules/TelemetryStopwatch.jsm", this);
+>  Cu.import("resource://gre/modules/osfile.jsm", this);
+>  Cu.import("resource://gre/modules/PrivateBrowsingUtils.jsm", this);
+> -Cu.import("resource://gre/modules/Promise.jsm", this);
+
+As previously.
+
+::: browser/components/sessionstore/nsSessionStartup.js
+@@ -38,5 @@
+>  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+>  Cu.import("resource://gre/modules/Services.jsm");
+>  Cu.import("resource://gre/modules/TelemetryStopwatch.jsm");
+>  Cu.import("resource://gre/modules/PrivateBrowsingUtils.jsm");
+> -Cu.import("resource://gre/modules/Promise.jsm");
+
+As previously.
+(In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment #4)
+> For the time being, we want to keep importing Promise.jsm, as it has better
+> error-reporting. Hopefully, DOM Promise will catch up in October.
+
+I heard about that before... What exactly is Promise.jsm doing better? Are there any bugs tracking the shortcoming of DOM Promises that could block this bug?
+
+(In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment #5)
+> @@ +288,5 @@
+> > +      // Record how long we stopped the main thread.
+> > +      TelemetryStopwatch.finish(histogram, refObj);
+> > +
+> > +      // Forward the promise.
+> > +      resolve(writePromise);
+> 
+> Why not 
+> 
+> try {
+>   return SessionWorker.post("write", [aData, options]);
+> } finally {
+>   TelemetryStopwatch.finish(histogram, refObj);
+> }
+
+Nice idea. I'll do |try { resolve(SW.post) } finally { ...}| though because returning a promise from the Promise constructor doesn't work.
+
+> @@ +292,5 @@
+> > +      resolve(writePromise);
+> > +    });
+> > +
+> > +    // Wait until the write is done.
+> > +    promise = promise.then(msg => {
+> 
+> I take it making this work with Task.spawn was too awkward?
+
+Yeah. I don't like using Tasks for operations that only yield a single Promise... Also I would have had to add an extra try/catch clause whereas the Promise constructor just resolves in case we throw inside it.
+
+> @@ +306,5 @@
+> > +    }, err => {
+> > +      // Catch and report any errors.
+> > +      TelemetryStopwatch.cancel(histogram, refObj);
+> > +      console.error("Could not write session state file ", err, err.stack);
+> > +    });
+> 
+> Can you add somewhere a comment that at this stage, `promise` cannot reject?
+
+Done.
+https://hg.mozilla.org/integration/fx-team/rev/c4c40e8e2691
+https://hg.mozilla.org/integration/fx-team/rev/fbcaa7a5505c
+https://hg.mozilla.org/integration/fx-team/rev/04ae87ed4a41
+https://hg.mozilla.org/mozilla-central/rev/c4c40e8e2691
+https://hg.mozilla.org/mozilla-central/rev/fbcaa7a5505c
+https://hg.mozilla.org/mozilla-central/rev/04ae87ed4a41
+(In reply to Tim Taubert [:ttaubert] from comment #7)
+> (In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment
+> #4)
+> > For the time being, we want to keep importing Promise.jsm, as it has better
+> > error-reporting. Hopefully, DOM Promise will catch up in October.
+> 
+> I heard about that before... What exactly is Promise.jsm doing better? Are
+> there any bugs tracking the shortcoming of DOM Promises that could block
+> this bug?
+
+Bug 939636.
+These days, the main difference is that uncaught Promise.jsm errors causes test errors.

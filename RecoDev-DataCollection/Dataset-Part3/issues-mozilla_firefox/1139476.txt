@@ -1,0 +1,297 @@
+Right now the census code is in js/src/vm/DebuggerMemory.cpp and we can't run it on anything but the live heap nor ubi::Nodes that happen to be outside of SpiderMonkey (like heap snapshots).
+
+Let's do this:
+
+* Move the census code to js/public/UbiCensus.h
+
+* Make sure we aren't using is<T> and as<T> for getting underlying objects (this isn't available on non-live ubi::Nodes)
+
+* Finally, add HeapSnapshot.prototype.takeCensus (involves some webidl and some glue)
+
+Right now the census code is in js/src/vm/DebuggerMemory.cpp and we can't run it on anything but the live heap nor ubi::Nodes that happen to be outside of SpiderMonkey (like heap snapshots).
+
+Let's do this:
+
+* Move the census code to js/public/UbiCensus.h
+
+* Make sure we aren't using is<T> and as<T> for getting underlying objects (this isn't available on non-live ubi::Nodes)
+
+* Finally, add HeapSnapshot.prototype.takeCensus (involves some webidl and some glue)
+(In reply to Nick Fitzgerald [:fitzgen] from comment #0)
+> * Make sure we aren't using is<T> and as<T> for getting underlying objects
+> (this isn't available on non-live ubi::Nodes)
+
+And this will probably involve adding new JS::ubi::Node methods for accessing whatever bits of data we are using as<T> casts for.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #1)
+> (In reply to Nick Fitzgerald [:fitzgen] from comment #0)
+> > * Make sure we aren't using is<T> and as<T> for getting underlying objects
+> > (this isn't available on non-live ubi::Nodes)
+> 
+> And this will probably involve adding new JS::ubi::Node methods for
+> accessing whatever bits of data we are using as<T> casts for.
+
+Split this part off into bug 1142338.
+Created attachment 8647687
+Use only JS::ubi::* interfaces in census analyses
+
+In order to run a census analysis on anything other than the live heap graph
+(the notable example being offline heap snapshots) then the census analysis
+cannot unwrap |ubi::Node|s into their live heap thing referents.
+Comment on attachment 8647687
+Use only JS::ubi::* interfaces in census analyses
+
+Wrong bug! Sorry!
+Created attachment 8650757
+Part 0: Add a takeCensus method to HeapSnapshot instances
+Created attachment 8650758
+Part 1: Port live heap census tests to offline heap snapshots
+Created attachment 8650782
+Part 1: Port live heap census tests to offline heap snapshots
+Created attachment 8650783
+Part 2: Add test comparing live and offline census results
+Comment on attachment 8650757
+Part 0: Add a takeCensus method to HeapSnapshot instances
+
+Review of attachment 8650757:
+-----------------------------------------------------------------
+
+Gross, but not too awful to live.
+
+::: js/src/vm/UbiNode.cpp
+@@ +167,5 @@
+> +    // compile/link time. This is not the world we live in. We observe that
+> +    // while the set of concrete JS::ubi::Node specializations is open ended,
+> +    // there is a finite set of Ts passed to is<T>() in our various
+> +    // JS::ubi::Node analyses and we only really need is<T>() to work for
+> +    // them. That set is hard coded here.
+
+I think I should punish you with an uglier function name for this weirdness. getCanonicalTypeNameForCensusTypes, perhaps? The return-nullptr-if-we-don't-care behavior is pretty funky.
+
+What nastiness would be required to make it a compile-time error if you miss something here? For example, the analyses and this code could share a header with things like
+
+template<typename T>
+struct CanonicalTypeName {
+};
+
+template<>
+struct CanonicalTypeName<JSObject> {
+    typedef bool SomethingThatTheAnalysisUses;
+
+    bool nameMatches(const char16_t* dupe) {
+        return dupe[0] == 'J' && ...
+    }
+};
+
+...or perhaps a function that the analyses would use, so that the analysis would be forced to do CanonicalTypeName<BaseShape> or whatever and trigger a compile error because no such method or typedef would exist.
+
+Anyway, it's not strictly necessary, just a thought. What would happen if you missed something? Would you have any chance with a runtime assert, or just obviously ridiculous numbers output?
+
+::: js/src/vm/UbiNodeCensus.cpp
+@@ +488,5 @@
+>      Count& count = static_cast<Count&>(countBase);
+>      count.total_++;
+>  
+>      const char16_t* key = node.typeName();
+> +    MOZ_ASSERT(key);
+
+Would that catch missing types?
+(In reply to Steve Fink [:sfink, :s:] from comment #9)
+> Comment on attachment 8650757
+> Part 0: Add a takeCensus method to HeapSnapshot instances
+> 
+> Review of attachment 8650757:
+> -----------------------------------------------------------------
+> 
+> Gross, but not too awful to live.
+> 
+> ::: js/src/vm/UbiNode.cpp
+> @@ +167,5 @@
+> > +    // compile/link time. This is not the world we live in. We observe that
+> > +    // while the set of concrete JS::ubi::Node specializations is open ended,
+> > +    // there is a finite set of Ts passed to is<T>() in our various
+> > +    // JS::ubi::Node analyses and we only really need is<T>() to work for
+> > +    // them. That set is hard coded here.
+> 
+> I think I should punish you with an uglier function name for this weirdness.
+> getCanonicalTypeNameForCensusTypes, perhaps? The
+> return-nullptr-if-we-don't-care behavior is pretty funky.
+> 
+> What nastiness would be required to make it a compile-time error if you miss
+> something here? For example, the analyses and this code could share a header
+> with things like
+> 
+> template<typename T>
+> struct CanonicalTypeName {
+> };
+> 
+> template<>
+> struct CanonicalTypeName<JSObject> {
+>     typedef bool SomethingThatTheAnalysisUses;
+> 
+>     bool nameMatches(const char16_t* dupe) {
+>         return dupe[0] == 'J' && ...
+>     }
+> };
+> 
+> ...or perhaps a function that the analyses would use, so that the analysis
+> would be forced to do CanonicalTypeName<BaseShape> or whatever and trigger a
+> compile error because no such method or typedef would exist.
+> 
+> Anyway, it's not strictly necessary, just a thought. What would happen if
+> you missed something? Would you have any chance with a runtime assert, or
+> just obviously ridiculous numbers output?
+
+Unfortunately, the T passed to is<T> can be private to spidermonkey and so we get link errors if the embedder tries to specialize templates with those Ts.
+
+I have bug 1196634 for the (hashtag) Real Fix (tm): to stop using is<T> completely for answering "what coarse-grained type of thing are you?" and instead use an enum.
+
+If you don't want to wait, I can do that here instead of as a follow up.
+
+> 
+> ::: js/src/vm/UbiNodeCensus.cpp
+> @@ +488,5 @@
+> >      Count& count = static_cast<Count&>(countBase);
+> >      count.total_++;
+> >  
+> >      const char16_t* key = node.typeName();
+> > +    MOZ_ASSERT(key);
+> 
+> Would that catch missing types?
+
+It helped me when I was debugging issues with JS::ubi::Concrete<DeserilizedNode>() so I figured it was worth keeping in there. FWIW, there is a matching assert in the report phase of this counter.
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #10)
+> (In reply to Steve Fink [:sfink, :s:] from comment #9)
+> > Anyway, it's not strictly necessary, just a thought. What would happen if
+> > you missed something? Would you have any chance with a runtime assert, or
+> > just obviously ridiculous numbers output?
+> 
+> Unfortunately, the T passed to is<T> can be private to spidermonkey and so
+> we get link errors if the embedder tries to specialize templates with those
+> Ts.
+> 
+> I have bug 1196634 for the (hashtag) Real Fix (tm): to stop using is<T>
+> completely for answering "what coarse-grained type of thing are you?" and
+> instead use an enum.
+> 
+> If you don't want to wait, I can do that here instead of as a follow up.
+
+Cool, the other bug is plenty good enough for me.
+Comment on attachment 8650782
+Part 1: Port live heap census tests to offline heap snapshots
+
+Review of attachment 8650782:
+-----------------------------------------------------------------
+
+Really nice set of tests!
+
+::: toolkit/devtools/server/tests/unit/test_HeapSnapshot_takeCensus_02.js
+@@ +26,5 @@
+> +var a=[];
+> +for (var i = 0; i<n; i++)
+> +a.push(fn());
+> +return a;
+> +}`);
+
+Why no indentation?
+
+::: toolkit/devtools/server/tests/unit/test_HeapSnapshot_takeCensus_05.js
+@@ +10,5 @@
+> +  var g = newGlobal();
+> +  var dbg = new Debugger(g);
+> +
+> +  equal("AllocationMarker" in saveHeapSnapshotAndTakeCensus(dbg).objects, false,
+> +        "There shouldn't exist any allocation markers in the census.");
+
+The detection of the using of the passive voice is what I am experiencing. "No allocation markers should exist in the census"? "Unexpected allocation marker found in the census"?
+
+::: toolkit/devtools/server/tests/unit/test_HeapSnapshot_takeCensus_08.js
+@@ +33,5 @@
+> +         // - a fresh ScriptSourceObject
+> +         // - a new JSScripts, not an eval cache hits
+> +         // - a fresh prototype object
+> +         // - a fresh Call object, since the eval makes 'ev' heavyweight
+> +         // - the new function itself
+
+Wow, this uses a lot of details of the guts. I could imagine not all of these will hold forever, but I guess the test failures from some such optimization would be obvious. I guess this is testing something that is interesting to the end user.
+Comment on attachment 8650783
+Part 2: Add test comparing live and offline census results
+
+Review of attachment 8650783:
+-----------------------------------------------------------------
+
+Awesome test, thanks!
+Created attachment 8652410
+Part 1: Port live heap census tests to offline heap snapshots
+Comment on attachment 8652410
+Part 1: Port live heap census tests to offline heap snapshots
+
+Fixed indentation and assertion message's wording.
+
+Carrying forward r+.
+Try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=b998547bb123
+Comment on attachment 8650757
+Part 0: Add a takeCensus method to HeapSnapshot instances
+
+Gah...
+
+remote: ************************** ERROR ****************************
+remote: 
+remote: WebIDL file dom/webidl/HeapSnapshot.webidl altered in changeset 8fc898fd14da without DOM peer review
+remote: 
+remote: 
+remote: Changes to WebIDL files in this repo require review from a DOM peer in the form of r=...
+remote: This is to ensure that we behave responsibly with exposing new Web APIs. We appreciate your understanding..
+remote: 
+remote: *************************************************************
+
+r? bholley for the webidl changes
+Comment on attachment 8650757
+Part 0: Add a takeCensus method to HeapSnapshot instances
+
+Review of attachment 8650757:
+-----------------------------------------------------------------
+
+::: dom/webidl/HeapSnapshot.webidl
+@@ +19,5 @@
+> +   *
+> +   * See js/src/doc/Debugger/Debugger.Memory.md for detailed documentation.
+> +   */
+> +  [Throws]
+> +  any takeCensus(object? options);
+
+The loosely-typed undocumentedness here makes me cringe. Why can't we take a dictionary, which would let callers know what kinds of options to pass without digging in the documentation? Also, why does it need to return |any|, and what does the return value signify?
+
+Given that this is ChromeOnly plumbing I won't block it, but please fix it if there are ways to do so.
+(In reply to Bobby Holley (:bholley) from comment #18)
+> ::: dom/webidl/HeapSnapshot.webidl
+> @@ +19,5 @@
+> > +   *
+> > +   * See js/src/doc/Debugger/Debugger.Memory.md for detailed documentation.
+> > +   */
+> > +  [Throws]
+> > +  any takeCensus(object? options);
+> 
+> The loosely-typed undocumentedness here makes me cringe. Why can't we take a
+> dictionary, which would let callers know what kinds of options to pass
+> without digging in the documentation? Also, why does it need to return
+> |any|, and what does the return value signify?
+> 
+> Given that this is ChromeOnly plumbing I won't block it, but please fix it
+> if there are ways to do so.
+
+I would normally agree with you, but we already have a takeCensus function that works on the live heap graph rather than offline heap snapshots, and it is implemented inside the engine where we don't dictionaries or anything. As such, we already have very well tested arguments parsing functions. This patch is more of porting that existing functionality to offline heap snapshots than anything else. In this case, it doesn't make sense to use dictionaries because it would mean duplicating much of that existing code's logic and creating two unshared copies. Additionally, the existing documentation is very thorough and has examples: https://dxr.mozilla.org/mozilla-central/source/js/src/doc/Debugger/Debugger.Memory.md
+Can you at least add explicit documentation in the webidl file about what the return value represents, and where in that README to find documentation about |options|?
+(In reply to Bobby Holley (PTO through Sept 8) from comment #20)
+> Can you at least add explicit documentation in the webidl file about what
+> the return value represents, and where in that README to find documentation
+> about |options|?
+
+Yes, I can do that.
+
+https://dxr.mozilla.org/mozilla-central/rev/f61c3cc0eb8b7533818e7379ccc063b611015d9d/js/src/doc/Debugger/Debugger.Memory.md#311-505
+https://hg.mozilla.org/integration/mozilla-inbound/rev/a329a372a16d
+https://hg.mozilla.org/integration/mozilla-inbound/rev/abf9e89b6cf8
+https://hg.mozilla.org/integration/mozilla-inbound/rev/60db955839a5
+https://hg.mozilla.org/mozilla-central/rev/a329a372a16d
+https://hg.mozilla.org/mozilla-central/rev/abf9e89b6cf8
+https://hg.mozilla.org/mozilla-central/rev/60db955839a5

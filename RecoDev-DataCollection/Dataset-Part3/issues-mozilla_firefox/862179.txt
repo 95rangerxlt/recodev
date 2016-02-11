@@ -1,0 +1,946 @@
+_syncLoadEngines needs to be reimplemented asynchronously (converted to OS.File), and nsIBrowserSearchService converted to using it when possible.
+
+_syncLoadEngines needs to be reimplemented asynchronously (converted to OS.File), and nsIBrowserSearchService converted to using it when possible.
+I have a question about converting file.isWritable() and file.createUnique() to use OS.File API.  Any suggestions how I can do that?
+Hmm, OS.File looks to not yet have a built-in createUnique equivalent. The implementation would be relatively easy to port over, I think:
+
+http://mxr.mozilla.org/mozilla-central/source/xpcom/io/nsLocalFileCommon.cpp#52
+
+we should probably do that in a new bug.
+
+For isWritable, I don't think there's an exact equivalent (and IIRC the implementation varies across platforms for what it factors into the decision). It may be best to change the search code such that it doesn't try to pre-judge write-ability, and instead have it handle failures to write correctly.
+
+Yoric may have other thoughts!
+- Should be easy to implement createUnique.
+- Yes, generally, with OS.File, we prefer the approach "try to write, handle failures", which is both simpler to implement and quite more I/O-efficient.
+Created attachment 743007
+WIP Patch
+
+Still need to do the following:
+1) update all callers of _ensureInitialized as it becomes asynchronous.
+2) update nsIBrowserSearchService interface
+3) fix all tests which are affected.
+(In reply to Raymond Lee [:raymondlee] from comment #4)
+> Created attachment 743007
+> WIP Patch
+> 
+> Still need to do the following:
+> 1) update all callers of _ensureInitialized as it becomes asynchronous.
+
+Hmm, I don't think this is right. We want to keep the two paths (asynchronous+synchronous fallback) for the moment, but make the asynchronous loading one actually do asynchronous loading (as opposed to just calling syncInit as it does right now). Then, eventually we can get rid of the synchronous fallback path.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #5)
+> (In reply to Raymond Lee [:raymondlee] from comment #4)
+> > Created attachment 743007
+> > WIP Patch
+> > 
+> > Still need to do the following:
+> > 1) update all callers of _ensureInitialized as it becomes asynchronous.
+> 
+> Hmm, I don't think this is right. We want to keep the two paths
+> (asynchronous+synchronous fallback) for the moment, but make the
+> asynchronous loading one actually do asynchronous loading (as opposed to
+> just calling syncInit as it does right now). Then, eventually we can get rid
+> of the synchronous fallback path.
+
+Sure, I will create the asynchronous path and keep the synchronous one.
+Created attachment 743568
+v1
+
+Will create tests in another patch.
+Comment on attachment 743568
+v1
+
+Hmm, sorry, I guess I should have been clearer about what this bug is about (and I should have looked at this much sooner than now). Fixing this bug doesn't require any changes to the nsIBrowserSearchService interface, because the async initialization ("init" method) already exists.
+
+This bug is really just about re-implementing an async version of SRCH_SVC__syncInit (a.k.a. SearchService._syncInit), and having that be called in SRCH_SVC_init (a.k.a. SearchService.init) instead of _syncInit. Similar to how for the engineMetaDataService, there is both epsSyncInit (engineMetadataService.syncInit) and epsInit (engineMetadataService.init).
+
+Similarly as with the meta data, the async loading path needs to be able to be "interrupted" by the synchronous engine loading path, which is probably the biggest source of complication. Mirroring the model of the meta data service is probably the best approach, though there may be some additional complexity involved.
+Created attachment 746902
+v2
+
+I have updated the patch and fixed the xpcshell tests. Hope this fits the requirements of this bug. :-)
+Comment on attachment 746902
+v2
+
+Looks good from a quick skim, Yoric may be able to submit feedback here before I can.
+Comment on attachment 746902
+v2
+
+Review of attachment 746902:
+-----------------------------------------------------------------
+
+Good work.
+
+::: toolkit/components/search/nsSearchService.js
+@@ +2724,5 @@
+> +  _asyncInit: function SRCH_SVC__asyncInit() {
+> +    return TaskUtils.spawn(function() {
+> +      try {
+> +        yield this._asyncLoadEngines();
+> +        if (gInitialized) {
+
+There are too many of these |if (gInitialized)| tests for my taste. I suggest you wrap them all in a single function |contextSwitch| (or whichever name you prefer) such that the following call does everything you need:
+
+ |yield contextSwitch(this._asyncLoadEngines());|
+
+You will need to create a custom exception to interrupt your code once |gInitialized| is |true|.
+
+Note: We have a library that does this and more in bug 838577, but it's not ready to land yet.
+
+@@ +2926,5 @@
+> +      while (locations.hasMoreElements()) {
+> +        let dir = locations.getNext().QueryInterface(Ci.nsIFile);
+> +        let iterator = new OS.File.DirectoryIterator(dir.path);
+> +        try {
+> +          yield iterator.next();
+
+I know that this algorithm is not your fault, but whoever wrote that certainly made things difficult. Could you document that you are adding to |loadDirs| all the non-empty directories of |NS_APP_SEARCH_DIR_LIST|?
+
+(side-note: there's a context switch here, too)
+
+@@ +2928,5 @@
+> +        let iterator = new OS.File.DirectoryIterator(dir.path);
+> +        try {
+> +          yield iterator.next();
+> +          loadDirs.push(dir);
+> +        } catch(e) {}
+
+Please document why you catch all errors.
+
+@@ +2948,5 @@
+> +      let toLoad = chromeFiles.concat(loadDirs);
+> +
+> +      function modifiedDir(aDir) {
+> +        return (!cache.directories || !cache.directories[aDir.path] ||
+> +                cache.directories[aDir.path].lastModifiedTime != aDir.lastModifiedTime);
+
+I have two issues with this version of |modifiedDir|:
+- it could be replaced by a loop that would be easier to read;
+- this call to |aDir.lastModifiedTime| performs main thread I/O and could be replaced by OMT I/O.
+
+@@ +3016,5 @@
+> +    return TaskUtils.spawn(function() {
+> +      let json;
+> +      try {
+> +        let bytes = yield OS.File.read(aPath);
+> +        json = JSON.parse(new TextDecoder().decode(bytes));
+
+You could share an instance of |TextDecoder|, but that's not a big deal.
+
+@@ +3205,5 @@
+> +    // Check whether aDir is the user profile dir
+> +    let isInProfile = aDir.equals(getDir(NS_APP_USER_SEARCH_DIR));
+> +    let iterator = new OS.File.DirectoryIterator(aDir.path);
+> +    let entries = [];
+> +    return iterator.forEach(function(aFile) {
+
+It would be more efficient to call |iterator.nextBatch()|, to obtain all the directory entries at once. This would save O(n) synchronizations between threads.
+
+@@ +3217,5 @@
+> +
+> +        let file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+> +        file.initWithPath(aFile.path);
+> +        let fileURL = NetUtil.ioService.newFileURI(file).QueryInterface(Ci.nsIURL);
+> +        let fileExtension = fileURL.fileExtension.toLowerCase();
+
+It seems to me that the code would be simpler without all this nsIFile/nsIFileURL stuff.
+
+@@ +3280,5 @@
+> +      }.bind(this));
+> +    }.bind(this)).then(function() {
+> +      iterator.close();
+> +    }, function() {
+> +      iterator.close();
+
+A |finally| would be just as good.
+
+@@ +3309,5 @@
+> +          LOG("_asyncLoadFromChromeURLs: loading engine from chrome url: " + url);
+> +
+> +          let engine = new Engine(makeURI(url), SEARCH_DATA_XML, true);
+> +
+> +          yield engine._asyncInitFromURISync();
+
+|asyncInitFromURISync|? That name certainly sounds surprising.
+
+@@ +3403,5 @@
+> +      let rootURIs = rootURIPref.split(",");
+> +      let uris = [];
+> +      let chromeFiles = [];
+> +
+> +      for (let i = 0; i < rootURIs.length; i++) {
+
+|for (let root of rootURIs)|, maybe?
+
+@@ +3444,5 @@
+> +          request.open("GET", makeURI(listURL).spec, true);
+> +          request.send();
+> +
+> +          return deferred.promise;
+> +        }.apply();
+
+I think you can get rid of that closure.
+
+@@ +3568,5 @@
+>  
+>    /**
+>     * Converts a Sherlock file and its icon into the custom XML format used by
+> +   * the Search Service asynchronously. Saves the engine's icon (if present) 
+> +   * into the XML as a data: URI and changes the extension of the source file 
+
+Nit: whitespaces.
+
+@@ +3603,5 @@
+> +        FAIL("_asyncConvertSherlockFile: Couldn't back up " + oldSherlockFile.path +
+> +             ":\n" + ex, Cr.NS_ERROR_FAILURE);
+> +      }
+> +
+> +      // TODO: this should be converted to us OS.File when Bug 866571 is fixed
+
+Even without that bug, you could do something along the lines of:
+ aBaseName + "-" + timestamp + "-" + (++counter) + XML_FILE_EXT
+
+@@ +3629,5 @@
+> +        let icon = yield this._asyncFindSherlockIcon(aEngine._file, aBaseName);
+> +
+> +        if (icon) {
+> +           let info = yield OS.File.stat(icon.path);
+> +           if (info.Size < MAX_ICON_SIZE) {
+
+Uppercase |Size| looks weird.
+
+@@ +3633,5 @@
+> +           if (info.Size < MAX_ICON_SIZE) {
+> +            // Use this as the engine's icon
+> +            let bytes = yield OS.File.read(icon.path);
+> +            // Convert the byte array to a base64-encoded string
+> +            let str = btoa(String.fromCharCode.apply(null, bytes));
+
+Ouch. That looks evil.
+
+You should probably use either
+ new FileReader().readAsDataURL(bytes)
+or
+ https://developer.mozilla.org/en-US/docs/DOM/window.URL.createObjectURL
+
+@@ +3634,5 @@
+> +            // Use this as the engine's icon
+> +            let bytes = yield OS.File.read(icon.path);
+> +            // Convert the byte array to a base64-encoded string
+> +            let str = btoa(String.fromCharCode.apply(null, bytes));
+> +            aEngine._iconURI = makeURI(ICON_DATAURL_PREFIX + str);
+
+Function |makeURI| looks pretty useless. You should probably call directly NetUtil.newURI.
+
+@@ +3819,5 @@
+>            yield engineMetadataService.init();
+>            if (gInitialized) {
+>              // No need to pursue asynchronous initialization,
+>              // synchronous fallback had to be called and has finished.
+>              return;
+
+This one will need to be replaced, too.
+Created attachment 752301
+v3
+
+Added the contextSwitch and fixed other issues.
+*** Bug 880307 has been marked as a duplicate of this bug. ***
+Comment on attachment 752301
+v3
+
+It would be nice if we fixed bug 854478 and bug 862143 before this one, since it removes a bunch of the code that you're porting. I will try to find someone to review those patches.
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>+  _asyncInitFromURI: function SRCH_ENG__asyncInitFromURI() {
+
+>+  _retrieveSearchXMLData: function SRCH_ENG__retrieveSearchXMLData(aURL) {
+
+Hmm, could you use the existing _initFromURI instead of adding this function? That would also remove the need to add _asyncInitFromURI (the existing initFromURI is already async). You could convert the existing _initFromURI to return a promise, and port its existing caller to deal with that.
+
+>+function contextSwitch(aPromise) {
+
+I would prefer calling this "checkForSyncCompletion", or something like that. "contextSwitch" isn't very descriptive.
+
+>+  // Asynchronous implementation of the initializer.
+>+  _asyncInit: function SRCH_SVC__asyncInit() {
+>+    return TaskUtils.spawn(function() {
+>+      LOG("_asyncInit start");
+>+      try {
+>+        yield contextSwitch(this._asyncLoadEngines());
+>+      } catch(ex if ex.result != Cr.NS_ERROR_ALREADY_INITIALIZED) {
+
+nit: space before ( (applies to a bunch of other places in this patch)
+
+>+  _asyncLoadEngines: function SRCH_SVC__asyncLoadEngines() {
+>+    return TaskUtils.spawn(function() {
+>+      LOG("_asyncLoadEngines: start");
+>+      // See if we have a cache file so we don't have to parse a bunch of XML.
+>+      let cache = {};
+>+      let cacheEnabled = getBoolPref(BROWSER_SEARCH_PREF + "cache.enabled", true);
+>+      if (cacheEnabled) {
+>+        let cacheFilePath = OS.Path.join(OS.Constants.Path.profileDir, "search.json");
+>+        cache = yield contextSwitch(this._asyncReadCacheFile(cacheFilePath));
+>+      }
+
+>+        let iterator = new OS.File.DirectoryIterator(dir.path);
+>+        try {
+>+          yield contextSwitch(iterator.next());
+>+          loadDirs.push(dir);
+
+This needs a comment ("add dir to loadDirs if it contains any files").
+
+Seems like we could additionally use DirectoryIterator's "winPattern" argument to restrict the iteration to *.xml. Maybe in a followup, if we don't fix the Sherlock bugs first.
+
+>+      function hasModifiedDir(aList) {
+
+>+            let info = yield OS.File.stat(dir.path);
+>+            if (cache.directories[dir.path].lastModifiedTime !=
+>+                info.lastModificationDate.getTime()) {
+
+Is this time in the same format as nsIFile.lastModifiedTime? We should make sure that switching between sync/async init processes doesn't invalidate the cache, if possible.
+
+>+  _asyncLoadEnginesFromDir: function SRCH_SVC__asyncLoadEnginesFromDir(aDir) {
+
+>+    return TaskUtils.spawn(function() {
+>+      let osfiles = yield iterator.nextBatch();
+>+      yield iterator.close();
+
+Is there any benefit to yielding here?
+
+>+        let file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+>+        file.initWithPath(osfile.path);
+>+        let fileURL = NetUtil.ioService.newFileURI(file).QueryInterface(Ci.nsIURL);
+>+        let fileExtension = fileURL.fileExtension.toLowerCase();
+
+Hmm, it would be nice to avoid the creation of an nsIFile and nsIURL just to get the filename. Perhaps OS.File.DirectoryIterator.Entry should get a .fileExtension attribute? Maybe worth a followup bug.
+
+>+        this._addEngineToStore(addedEngine);
+
+Hmm, I wonder if this is a problem - if synchronous initialization is triggered after we've added the first engine to the store, then we're going to potentially re-load the engine and then just fail to add it. I'm not sure how we should handle this, but I see a couple of options:
+
+- don't add any asynchronously loaded engines to the store until we've completed all of the asynchronous initialization (if sync init is triggered and disrupts, we'll just discard all of the work done by the async init process)
+- just leave things as is and rely on _addEngineToStore refusing to add duplicate engines (potentially mixes and matches engines loaded synchronously and asynchronously, and seems potentially risky). We could even have the synchronous loading process avoid loading engines that were already loaded asynchronously, though that might be difficult because we can't de-dupe until we load the engine anyways.
+
+>   syncInit: function epsSyncInit() {
+>     LOG("metadata syncInit start");
+>+    if (this._initState == engineMetadataService._InitStates.FINISHED_SUCCESS) {
+>+      return;
+>+    }
+
+Why is this change needed?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #14)
+> >   syncInit: function epsSyncInit() {
+> >     LOG("metadata syncInit start");
+> >+    if (this._initState == engineMetadataService._InitStates.FINISHED_SUCCESS) {
+> >+      return;
+> >+    }
+> 
+> Why is this change needed?
+
+Nevermind, I figured this out, just forgot to remove the comment :)
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #14)
+> >+  _retrieveSearchXMLData: function SRCH_ENG__retrieveSearchXMLData(aURL) {
+> 
+> Hmm, could you use the existing _initFromURI instead of adding this
+> function?
+
+Looking at this again, while I think it would be a good idea to consolidate these code paths, the current code in initFromURI seems to make a bunch of assumption about it handling additions of search engines (rather than just loading existing engines), so maybe this is not worth it for the moment. Followup bug would be good, though.
+Comment on attachment 752301
+v3
+
+I just landed the patches for bug 854478 and bug 862143. Can you rebase this on top of those? Sorry I didn't think of this earlier :(
+Created attachment 760795
+v4
+
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #14)
+> Comment on attachment 752301
+> v3
+> 
+> It would be nice if we fixed bug 854478 and bug 862143 before this one,
+> since it removes a bunch of the code that you're porting. I will try to find
+> someone to review those patches.
+> 
+> >diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+> 
+> >+function contextSwitch(aPromise) {
+> 
+> I would prefer calling this "checkForSyncCompletion", or something like
+> that. "contextSwitch" isn't very descriptive.
+
+Changed to "checkForSyncCompletion"
+> 
+> >+  // Asynchronous implementation of the initializer.
+> >+  _asyncInit: function SRCH_SVC__asyncInit() {
+> >+    return TaskUtils.spawn(function() {
+> >+      LOG("_asyncInit start");
+> >+      try {
+> >+        yield contextSwitch(this._asyncLoadEngines());
+> >+      } catch(ex if ex.result != Cr.NS_ERROR_ALREADY_INITIALIZED) {
+> 
+> nit: space before ( (applies to a bunch of other places in this patch)
+
+done.
+
+> 
+> >+  _asyncLoadEngines: function SRCH_SVC__asyncLoadEngines() {
+> >+    return TaskUtils.spawn(function() {
+> >+      LOG("_asyncLoadEngines: start");
+> >+      // See if we have a cache file so we don't have to parse a bunch of XML.
+> >+      let cache = {};
+> >+      let cacheEnabled = getBoolPref(BROWSER_SEARCH_PREF + "cache.enabled", true);
+> >+      if (cacheEnabled) {
+> >+        let cacheFilePath = OS.Path.join(OS.Constants.Path.profileDir, "search.json");
+> >+        cache = yield contextSwitch(this._asyncReadCacheFile(cacheFilePath));
+> >+      }
+> 
+> >+        let iterator = new OS.File.DirectoryIterator(dir.path);
+> >+        try {
+> >+          yield contextSwitch(iterator.next());
+> >+          loadDirs.push(dir);
+> 
+> This needs a comment ("add dir to loadDirs if it contains any files").
+> 
+
+Added
+
+> Seems like we could additionally use DirectoryIterator's "winPattern"
+> argument to restrict the iteration to *.xml. Maybe in a followup, if we
+> don't fix the Sherlock bugs first.
+> 
+> >+      function hasModifiedDir(aList) {
+> 
+> >+            let info = yield OS.File.stat(dir.path);
+> >+            if (cache.directories[dir.path].lastModifiedTime !=
+> >+                info.lastModificationDate.getTime()) {
+> 
+> Is this time in the same format as nsIFile.lastModifiedTime? We should make
+> sure that switching between sync/async init processes doesn't invalidate the
+> cache, if possible.
+> 
+> >+  _asyncLoadEnginesFromDir: function SRCH_SVC__asyncLoadEnginesFromDir(aDir) {
+> 
+> >+    return TaskUtils.spawn(function() {
+> >+      let osfiles = yield iterator.nextBatch();
+> >+      yield iterator.close();
+> 
+> Is there any benefit to yielding here?
+
+No, I have removed the yield bit.
+
+> 
+> >+        let file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+> >+        file.initWithPath(osfile.path);
+> >+        let fileURL = NetUtil.ioService.newFileURI(file).QueryInterface(Ci.nsIURL);
+> >+        let fileExtension = fileURL.fileExtension.toLowerCase();
+> 
+> Hmm, it would be nice to avoid the creation of an nsIFile and nsIURL just to
+> get the filename. Perhaps OS.File.DirectoryIterator.Entry should get a
+> .fileExtension attribute? Maybe worth a followup bug.
+> 
+
+I have simplified this part of code.
+
+> >+        this._addEngineToStore(addedEngine);
+> 
+> Hmm, I wonder if this is a problem - if synchronous initialization is
+> triggered after we've added the first engine to the store, then we're going
+> to potentially re-load the engine and then just fail to add it. I'm not sure
+> how we should handle this, but I see a couple of options:
+> 
+> - don't add any asynchronously loaded engines to the store until we've
+> completed all of the asynchronous initialization (if sync init is triggered
+> and disrupts, we'll just discard all of the work done by the async init
+> process)
+
+I've collected all async loaded engines first and then add them to the store.
+
+
+> (In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment
+> #14)
+> > >+  _retrieveSearchXMLData: function SRCH_ENG__retrieveSearchXMLData(aURL) {
+> > 
+> > Hmm, could you use the existing _initFromURI instead of adding this
+> > function?
+> 
+> Looking at this again, while I think it would be a good idea to consolidate
+> these code paths, the current code in initFromURI seems to make a bunch of
+> assumption about it handling additions of search engines (rather than just
+> loading existing engines), so maybe this is not worth it for the moment.
+> Followup bug would be good, though.
+
+I have renamed _initFromURI to _initFromURIAndLoad to distinguish it from _asyncInitFromURI and _initFromURISync.  Will file a followup bug when this bug lands.
+Comment on attachment 760795
+v4
+
+Steven, could you give this a feedback pass?
+Comment on attachment 760795
+v4
+
+Review of attachment 760795:
+-----------------------------------------------------------------
+
+Looks good to me. Just a few nits, nothing big.
+
+::: toolkit/components/search/nsSearchService.js
+@@ +1219,5 @@
+> +      }
+> +
+> +      // Now that the data is loaded, initialize the engine object
+> +      this._initFromData();
+> +    }.bind(this));
+
+You define a number of anonymous functions throughout the patch, and call bind(this) upon them. You can avoid calling bind here by defining these with an "Arrow function":
+
+return TaskUtils.spawn(() => {
+  ...
+});
+
+See https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/arrow_functions
+
+@@ +2675,4 @@
+>    // If initialization has not been completed yet, perform synchronous
+>    // initialization.
+>    // Throws in case of initialization error.
+> +  _ensureInitialized: function SRCH_SVC__ensureInitialized() {
+
+I'm not sure how the others feel about cleanup like this mixed with the patch, but one downside is it can make future blames more cumbersome.
+
+@@ +3516,5 @@
+> +          // Complete initialization by calling asynchronous initializer.
+> +          yield self._asyncInit();
+> +          TelemetryStopwatch.finish("SEARCH_SERVICE_INIT_MS");
+> +        } catch (ex if ex.result == Cr.NS_ERROR_ALREADY_INITIALIZED) {
+> +          // No need to pursue asynchronous because synchronous fallback was 
+
+Trailing whitespace here
+Created attachment 795928
+v5
+
+(In reply to Steven MacLeod [:smacleod] from comment #20)
+> Comment on attachment 760795
+> v4
+> 
+> Review of attachment 760795:
+> -----------------------------------------------------------------
+> 
+> Looks good to me. Just a few nits, nothing big.
+> 
+> ::: toolkit/components/search/nsSearchService.js
+> @@ +1219,5 @@
+> > +      }
+> > +
+> > +      // Now that the data is loaded, initialize the engine object
+> > +      this._initFromData();
+> > +    }.bind(this));
+> 
+> You define a number of anonymous functions throughout the patch, and call
+> bind(this) upon them. You can avoid calling bind here by defining these with
+> an "Arrow function":
+> 
+> return TaskUtils.spawn(() => {
+>   ...
+> });
+> 
+> See
+> https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/
+> arrow_functions
+
+I have tried it but Task.spawn doesn't work with arrow function. I have updated one of the methods to use that.
+
+> 
+> @@ +2675,4 @@
+> >    // If initialization has not been completed yet, perform synchronous
+> >    // initialization.
+> >    // Throws in case of initialization error.
+> > +  _ensureInitialized: function SRCH_SVC__ensureInitialized() {
+> 
+> I'm not sure how the others feel about cleanup like this mixed with the
+> patch, but one downside is it can make future blames more cumbersome.
+> 
+I have reverted this cleanup.
+
+> @@ +3516,5 @@
+> > +          // Complete initialization by calling asynchronous initializer.
+> > +          yield self._asyncInit();
+> > +          TelemetryStopwatch.finish("SEARCH_SERVICE_INIT_MS");
+> > +        } catch (ex if ex.result == Cr.NS_ERROR_ALREADY_INITIALIZED) {
+> > +          // No need to pursue asynchronous because synchronous fallback was 
+> 
+> Trailing whitespace here
+
+Done.
+
+
+I have also made some other minor changes
+The try results look ok
+https://tbpl.mozilla.org/?tree=Try&rev=0871976a6c7e
+Comment on attachment 795928
+v5
+
+Review of attachment 795928:
+-----------------------------------------------------------------
+
+::: toolkit/components/search/nsSearchService.js
+@@ +1204,5 @@
+>    },
+>  
+> +  /*
+> +   * Retrieves the data from the engine's file asynchronously. If the engine's
+> +   * dataType is XML, the document element is placed in the engine's data field.
+
+Please document the return value of this method.
+In particular, it is important to know whether this method can return rejected promises that will need to be handled by callers.
+(the remark is also true for other methods in this file).
+
+@@ +1260,5 @@
+> +      this._initFromData();
+> +    }.bind(this));
+> +  },
+> +
+> +  _retrieveSearchXMLData: function SRCH_ENG__retrieveSearchXMLData(aURL) {
+
+Side-note: we don't need to give weird name to methods anymore.
+
+@@ +2661,5 @@
+>  function executeSoon(func) {
+>    Services.tm.mainThread.dispatch(func, Ci.nsIThread.DISPATCH_NORMAL);
+>  }
+>  
+> +function checkForSyncCompletion(aPromise) {
+
+Nit: This function requires some documentation.
+
+@@ +2667,5 @@
+> +    if (gInitialized) {
+> +      throw Components.Exception("Synchronous fallback was called and has " +
+> +                                 "finished so no need to pursue asynchronous " +
+> +                                 "initialization",
+> +                                 Cr.NS_ERROR_ALREADY_INITIALIZED);
+
+I'll bow to whatever Gavin decides here, but I'm not a big fan of throwing an XPCOM error to bail out of race conditions. Throwing an error is an acceptable technique, but I would make sure that this is a singleton error private to this module.
+
+@@ +2690,5 @@
+>    // initialization is complete, only if an error has been encountered so far.
+>    _initRV: Cr.NS_OK,
+>  
+> +  /**
+> +   * The initialization has started or not.
+
+Please document the type of the field.
+Also, I believe that this file uses // comments for documenting private stuff.
+Created attachment 797112
+v6
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #23)
+> Comment on attachment 795928
+> v5
+> 
+> Review of attachment 795928:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/components/search/nsSearchService.js
+> @@ +1204,5 @@
+> >    },
+> >  
+> > +  /*
+> > +   * Retrieves the data from the engine's file asynchronously. If the engine's
+> > +   * dataType is XML, the document element is placed in the engine's data field.
+> 
+> Please document the return value of this method.
+> In particular, it is important to know whether this method can return
+> rejected promises that will need to be handled by callers.
+> (the remark is also true for other methods in this file).
+
+Updated
+
+> 
+> @@ +1260,5 @@
+> > +      this._initFromData();
+> > +    }.bind(this));
+> > +  },
+> > +
+> > +  _retrieveSearchXMLData: function SRCH_ENG__retrieveSearchXMLData(aURL) {
+> 
+> Side-note: we don't need to give weird name to methods anymore.
+
+Thanks for the note.  I will leave that for now as many methods use the format in this file.
+
+> 
+> @@ +2661,5 @@
+> >  function executeSoon(func) {
+> >    Services.tm.mainThread.dispatch(func, Ci.nsIThread.DISPATCH_NORMAL);
+> >  }
+> >  
+> > +function checkForSyncCompletion(aPromise) {
+> 
+> Nit: This function requires some documentation.
+
+Updated.
+
+> 
+> @@ +2667,5 @@
+> > +    if (gInitialized) {
+> > +      throw Components.Exception("Synchronous fallback was called and has " +
+> > +                                 "finished so no need to pursue asynchronous " +
+> > +                                 "initialization",
+> > +                                 Cr.NS_ERROR_ALREADY_INITIALIZED);
+> 
+> I'll bow to whatever Gavin decides here, but I'm not a big fan of throwing
+> an XPCOM error to bail out of race conditions. Throwing an error is an
+> acceptable technique, but I would make sure that this is a singleton error
+> private to this module.
+
+Please let me know what's the best approach.
+
+> 
+> @@ +2690,5 @@
+> >    // initialization is complete, only if an error has been encountered so far.
+> >    _initRV: Cr.NS_OK,
+> >  
+> > +  /**
+> > +   * The initialization has started or not.
+> 
+> Please document the type of the field.
+> Also, I believe that this file uses // comments for documenting private
+> stuff.
+
+Updated
+As I understand it, we should have good test coverage of most of this already by virtue of the new async init being the "default path" for most client code already (and it being well covered in the test suite). I'm not sure whether the coverage is extensive for edge-casey things like loading from JARs, system locations, etc. IIRC we also have some coverage of the synchronous initialization path in the test suite, but I'm not sure that we have much coverage of interaction between the two.
+
+Steven/Raymond, can you guys work together to evaluate the amount of test coverage these changes have, and address any discovered gaps?
+Comment on attachment 797112
+v6
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>+  _asyncInitFromFile: function SRCH_ENG__asyncInitFromFile() {
+
+>+      switch (this._dataType) {
+>+        case SEARCH_DATA_XML:
+
+>+        default:
+>+          ERROR("Unsuppored engine _dataType in _initFromFile: \"" +
+>+                this._dataType + "\"",
+>+                Cr.NS_ERROR_UNEXPECTED);
+
+Hmm, this should just be simplified to:
+if (this._dataType != SEARCH_DATA_XML)
+  ERROR(...)
+...
+
+Bug 862143's patch introduced the same issue in _initFromFile, though, so maybe we should just fix them both in a followup (in the interests of not expanding scope here too much!)
+(In reply to :Gavin Sharp (mostly away until Sep 13; use gavin@gavinsharp.com for email) from comment #25)
+> As I understand it, we should have good test coverage of most of this
+> already by virtue of the new async init being the "default path" for most
+> client code already (and it being well covered in the test suite). I'm not
+> sure whether the coverage is extensive for edge-casey things like loading
+> from JARs, system locations, etc. IIRC we also have some coverage of the
+> synchronous initialization path in the test suite, but I'm not sure that we
+> have much coverage of interaction between the two.
+> 
+> Steven/Raymond, can you guys work together to evaluate the amount of test
+> coverage these changes have, and address any discovered gaps?
+
+Steven: I have looked at the tests.  
+
+* readCacheFile is covered by test_json_cache.js (async) and test_init_async_multiple_then_sync.js (sync)
+* findJAREgnines is covered by test_identifiers.js (async) and test_645970 (sync)
+* loadEnginesFromDir is covered by test_nocache.js (async)
+* loadFromChromeURLs is also covered by test_identifiers.js (async)
+
+test_init_async_multiple_then_sync.js has the asynchronous path which is interrupted and switched back to synchronous initialization path.
+
+Not sure if missed anything.  Could you suggest what tests we should add?
+Sorry for the delay in response.
+
+(In reply to Raymond Lee [:raymondlee] from comment #27)
+> Steven: I have looked at the tests.  
+> 
+> * readCacheFile is covered by test_json_cache.js (async) and
+> test_init_async_multiple_then_sync.js (sync)
+> * findJAREgnines is covered by test_identifiers.js (async) and test_645970
+> (sync)
+> * loadEnginesFromDir is covered by test_nocache.js (async)
+> * loadFromChromeURLs is also covered by test_identifiers.js (async)
+> 
+> test_init_async_multiple_then_sync.js has the asynchronous path which is
+> interrupted and switched back to synchronous initialization path.
+> 
+> Not sure if missed anything.  Could you suggest what tests we should add?
+
+Yeah, I'm seeing the same thing. It would be good if we had tests explicitly named covering the sync vs async paths. Would you be able to write some tests explicitly naming the path being tested, to make sure we have explicit tests for things like the sync LoadEnginesFromDir and sync findJarEngines fallbacks?
+Created attachment 815307
+v8
+
+(In reply to Steven MacLeod [:smacleod] from comment #28)
+> Sorry for the delay in response.
+> 
+> (In reply to Raymond Lee [:raymondlee] from comment #27)
+> > Steven: I have looked at the tests.  
+> > 
+> > * readCacheFile is covered by test_json_cache.js (async) and
+> > test_init_async_multiple_then_sync.js (sync)
+> > * findJAREgnines is covered by test_identifiers.js (async) and test_645970
+> > (sync)
+> > * loadEnginesFromDir is covered by test_nocache.js (async)
+> > * loadFromChromeURLs is also covered by test_identifiers.js (async)
+> > 
+> > test_init_async_multiple_then_sync.js has the asynchronous path which is
+> > interrupted and switched back to synchronous initialization path.
+> > 
+> > Not sure if missed anything.  Could you suggest what tests we should add?
+> 
+> Yeah, I'm seeing the same thing. It would be good if we had tests explicitly
+> named covering the sync vs async paths. Would you be able to write some
+> tests explicitly naming the path being tested, to make sure we have explicit
+> tests for things like the sync LoadEnginesFromDir and sync findJarEngines
+> fallbacks?
+
+Steven: Please have a look at the test test_sync.js and test_async.js
+Created attachment 819103
+Additional test of fallback to synchronous initialization
+
+This patch contains an additional test I quickly made which combines the code from Raymond's test_async.js and test_sync.js, to test falling back to synchronous initialization during async initialization.
+
+This test only really tests a single point of fallback inside the asynchronous initialization and I'm a little unsure of how to reliably test specific points. Maybe we could have a test which fuzzes a bit by waiting a certain number of ticks or something, not sure if it's worth it though.
+Comment on attachment 815307
+v8
+
+Review of attachment 815307:
+-----------------------------------------------------------------
+
+These tests look good to me, but I thought it would be good to have some tests that actually exercise the fallback path. I've attached a patch which introduces one such test. (Nit: There appears to be a few places in the new code with trailing whitespace, it would be great to clear those out).
+Created attachment 820196
+v9
+
+Steven: I have merged your test into the patch.  I have also added another test which listens an observer topic and then run the sync fallback code.
+Comment on attachment 820196
+v9
+
+Review of attachment 820196:
+-----------------------------------------------------------------
+
+The test looks good to me. Though, I'm not sure we should introduce that notification. Gavin, thoughts?
+
+::: toolkit/components/search/nsSearchService.js
+@@ +2993,5 @@
+> +      let loadFromJARs = getBoolPref(BROWSER_SEARCH_PREF + "loadFromJars", false);
+> +      let chromeURIs = [];
+> +      let chromeFiles = [];
+> +      if (loadFromJARs) {
+> +        Services.obs.notifyObservers(null, SEARCH_SERVICE_TOPIC, "find-jar-engines");
+
+I'm not sure we should introduce a notification just for the sake of testing the fallback here.
+Comment on attachment 820196
+v9
+
+Adding the notification for the sync fallback seems fine (though it might be nice to add a comment describing what that test is testing exactly).
+
+nit: don't use arguments.callee, give the function a name instead and refer to it that way.
+Created attachment 827957
+Patch for check-in
+
+(In reply to :Gavin Sharp (email gavin@gavinsharp.com) from comment #34)
+> Comment on attachment 820196
+> v9
+> 
+> Adding the notification for the sync fallback seems fine (though it might be
+> nice to add a comment describing what that test is testing exactly).
+> 
+> nit: don't use arguments.callee, give the function a name instead and refer
+> to it that way.
+
+Updated.
+
+Pushed to try and waiting for results.
+https://tbpl.mozilla.org/?tree=Try&rev=49dfb3c414b4
+https://hg.mozilla.org/integration/fx-team/rev/4c0f044453a3
+https://hg.mozilla.org/mozilla-central/rev/4c0f044453a3
+This breaks nightlies for me (search engines, the location bar, and the right click menu).
+This is due to a broken error path, and possibly needs a custom search engine to trigger.
+Here's the traceback:
+
+A coding exception was thrown and uncaught in a Task.
+
+Full message: ReferenceError: file is not defined
+Full stack: @resource://gre/components/nsSearchService.js:3293
+TaskImpl_run@resource://gre/modules/Task.jsm:234
+reject@resource://gre/modules/commonjs/sdk/core/promise.js:133
+then@resource://gre/modules/commonjs/sdk/core/promise.js:52
+resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+reject@resource://gre/modules/commonjs/sdk/core/promise.js:134
+then@resource://gre/modules/commonjs/sdk/core/promise.js:52
+resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+reject@resource://gre/modules/commonjs/sdk/core/promise.js:139
+then@resource://gre/modules/commonjs/sdk/core/promise.js:52
+resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+reject@resource://gre/modules/commonjs/sdk/core/promise.js:208
+TaskImpl_handleException@resource://gre/modules/Task.jsm:301
+TaskImpl_run@resource://gre/modules/Task.jsm:245
+resolve@resource://gre/modules/commonjs/sdk/core/promise.js:118
+then@resource://gre/modules/commonjs/sdk/core/promise.js:43
+resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+@resource://gre/components/nsSearchService.js:1295
+(In reply to Gummi from comment #38)
+> This breaks nightlies for me (search engines, the location bar, and the
+> right click menu).
+> This is due to a broken error path, and possibly needs a custom search
+> engine to trigger.
+> Here's the traceback:
+> 
+> A coding exception was thrown and uncaught in a Task.
+> 
+> Full message: ReferenceError: file is not defined
+> Full stack: @resource://gre/components/nsSearchService.js:3293
+> TaskImpl_run@resource://gre/modules/Task.jsm:234
+> reject@resource://gre/modules/commonjs/sdk/core/promise.js:133
+> then@resource://gre/modules/commonjs/sdk/core/promise.js:52
+> resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+> reject@resource://gre/modules/commonjs/sdk/core/promise.js:134
+> then@resource://gre/modules/commonjs/sdk/core/promise.js:52
+> resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+> reject@resource://gre/modules/commonjs/sdk/core/promise.js:139
+> then@resource://gre/modules/commonjs/sdk/core/promise.js:52
+> resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+> reject@resource://gre/modules/commonjs/sdk/core/promise.js:208
+> TaskImpl_handleException@resource://gre/modules/Task.jsm:301
+> TaskImpl_run@resource://gre/modules/Task.jsm:245
+> resolve@resource://gre/modules/commonjs/sdk/core/promise.js:118
+> then@resource://gre/modules/commonjs/sdk/core/promise.js:43
+> resolve@resource://gre/modules/commonjs/sdk/core/promise.js:185
+> @resource://gre/components/nsSearchService.js:1295
+
+Could you provide some steps how to reproduce this bug please?
+
+I have tried to add some engines via http://mycroftproject.com/ but can't get the error.
+
+Tested on Firefox 28.0a1 (2013-11-08)
+(In reply to Raymond Lee [:raymondlee] from comment #39)
+
+> 
+> Could you provide some steps how to reproduce this bug please?
+> 
+> I have tried to add some engines via http://mycroftproject.com/ but can't
+> get the error.
+> 
+> Tested on Firefox 28.0a1 (2013-11-08)
+
+STR in my case, I was facing exactly same problem:
+
+1. Create new profile and install Nightly from: http://ftp.mozilla.org/pub/mozilla.org/firefox/nightly/2013-11-06-03-02-00-mozilla-central/
+2. Instal (for example) this search engine: https://addons.mozilla.org/PL/firefox/addon/google-pl/?src=search
+2. Set it as first one (default)
+3. Update Nightly to (manual): http://ftp.mozilla.org/pub/mozilla.org/firefox/nightly/2013-11-07-03-02-00-mozilla-central/
+4. Search Engines are death, not possible to type in URLbar. 
+
+To solve problem: close Nightly, open profile folder, delete this Google PL, Nightly will start normal, install this engine one more time-> no problems.
+Here's the plugin that broke things for me: 
+curl http://ix.io/917 > $MOZPROFILE/searchplugins/google-ssl.xml
+Gummi, Semtex: could you file a new bug covering that issue, and mark it as "blocking" this one? Seems worth looking into further.
+(In reply to :Gavin Sharp (email gavin@gavinsharp.com) from comment #42)
+> Gummi, Semtex: could you file a new bug covering that issue, and mark it as
+> "blocking" this one? Seems worth looking into further.
+
+https://bugzilla.mozilla.org/show_bug.cgi?id=940446
+Ready, but I'm not sure if I've set everything in right way.

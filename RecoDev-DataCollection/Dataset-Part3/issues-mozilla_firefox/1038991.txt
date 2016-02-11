@@ -1,0 +1,495 @@
+Need to generate self-signed certs for client and server with WiFi debugging.
+
+Probably simplest to have a purpose-built interface specific to DevTools.  Can't see a JS accessible general API at the moment.
+
+Need to generate self-signed certs for client and server with WiFi debugging.
+
+Probably simplest to have a purpose-built interface specific to DevTools.  Can't see a JS accessible general API at the moment.
+This is test-only at the moment, but might prove useful/interesting: http://hg.mozilla.org/mozilla-central/file/7883d8e9f210/security/pkix/test/lib/pkixtestutil.h#l95
+(In reply to David Keeler (:keeler) [use needinfo?] from comment #1)
+> This is test-only at the moment, but might prove useful/interesting:
+> http://hg.mozilla.org/mozilla-central/file/7883d8e9f210/security/pkix/test/
+> lib/pkixtestutil.h#l95
+
+Thanks, that's one example I've been looking at. :)
+
+Also noticed the DTLS code for media[1] seems to do something similar as well.
+
+[1]: http://dxr.mozilla.org/mozilla-central/source/media/mtransport/dtlsidentity.cpp#32
+Created attachment 8462886
+DevTools security cert generator
+
+David, can you review the C++ code here?
+
+Panos, since I'm adding a new "security" directory to toolkit/devtools, I wanted at least on DevTools peer to be aware. :) Also, I will add JS security bits in future bugs to this new directory that both the client and server will make use of to implement authentication and encryption, and I will likely have you review those as well.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=560e7fb406f8
+Comment on attachment 8462886
+DevTools security cert generator
+
+Review of attachment 8462886:
+-----------------------------------------------------------------
+
+Nice! You will need a review from a build peer, too.
+
+::: toolkit/devtools/security/nsIDevToolsCertService.idl
+@@ +7,5 @@
+> +interface nsIX509Cert;
+> +interface nsIDevToolsGetCertCallback;
+> +
+> +[scriptable, uuid(9702fdd4-4c2c-439c-ba2e-19cda018eb99)]
+> +interface nsIDevToolsCertService : nsISupports
+
+Since this component does not appear to be necessarily devtools-specific, I wonder if it would be better to use a more generic name so that other uses could be encouraged. A somewhat similar debugger component is called nsIJSInspector, which although not an ideal name for unrelated reasons, sounds more suitable for other uses. Just a thought.
+
+@@ +16,5 @@
+> +   * with TLS.
+> +   *
+> +   * The cert is stored permanently in the profile's key store after first use,
+> +   * and is valid for 2 years.  If an expired or otherwise invalid cert with the
+> +   * is found with the nickname expected here, it is removed and a new one is
+
+Typo: the first "with the" is redundant.
+
+Don't we want to support some method of removing old certificates after a security compromise for example? "Hey, my laptop was stolen and now my phone is vulnerable". Perhaps a forceCreate argument or a new method.
+
+::: toolkit/devtools/security/tests/moz.build
+@@ +3,5 @@
+>  # This Source Code Form is subject to the terms of the Mozilla Public
+>  # License, v. 2.0. If a copy of the MPL was not distributed with this
+>  # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+>  
+> +XPCSHELL_TESTS_MANIFESTS += ['unit/xpcshell.ini']
+
+I think you can add this line to the parent moz.build (adjusting the path of course) and get rid of this file.
+Comment on attachment 8462886
+DevTools security cert generator
+
+Review of attachment 8462886:
+-----------------------------------------------------------------
+
+This looks good. Just a few nits.
+
+::: toolkit/devtools/security/DevToolsCertService.cpp
+@@ +61,5 @@
+> +
+> +    // Ensure key database will allow generation
+> +    ScopedPK11SlotInfo slot(PK11_GetInternalKeySlot());
+> +    if (!slot) {
+> +      return NS_ERROR_FAILURE;
+
+For any NSS library function failures, you might consider:
+
+return GetXPCOMFromNSSError(PR_GetError());
+
+or, if you have a SECStatus:
+
+return MapSECStatus(srv);
+
+@@ +64,5 @@
+> +    if (!slot) {
+> +      return NS_ERROR_FAILURE;
+> +    }
+> +    if (PK11_NeedUserInit(slot)) {
+> +      srv = PK11_InitPin(slot, "", "");
+
+This might not work if the user has a master password set (just something to think about - I don't really have a solution other than popping up a message that says, "hey, you should authenticate against the password manager" and trying again)
+
+@@ +99,5 @@
+> +    // Generate cert key pair
+> +    ScopedSECKEYPrivateKey privateKey;
+> +    ScopedSECKEYPublicKey publicKey;
+> +    SECKEYPublicKey* tempPublicKey;
+> +    privateKey = PK11_GenerateKeyPair(slot, CKM_EC_KEY_PAIR_GEN, &keyParams,
+
+If I recall correctly, it's sometimes possible for key generation functions to fail if there isn't enough entropy on the system. Basically the solution is to try again. If you get lots of intermittent failures, this is probably why.
+
+@@ +101,5 @@
+> +    ScopedSECKEYPublicKey publicKey;
+> +    SECKEYPublicKey* tempPublicKey;
+> +    privateKey = PK11_GenerateKeyPair(slot, CKM_EC_KEY_PAIR_GEN, &keyParams,
+> +                                      &tempPublicKey, PR_TRUE /* token */,
+> +                                      PR_TRUE /* sensitive */, nullptr);
+
+use true/false instead of PR_TRUE/PR_FALSE
+
+@@ +119,5 @@
+> +    if (!certRequest) {
+> +      return NS_ERROR_FAILURE;
+> +    }
+> +
+> +    // Valid from one day before to 2 years after
+
+How about 1 year?
+
+@@ +151,5 @@
+> +      return NS_ERROR_FAILURE;
+> +    }
+> +
+> +    // Update the cert version to X509v3
+> +    *(cert->version.data) = SEC_CERTIFICATE_VERSION_3;
+
+null-check cert->version.data
+
+@@ +155,5 @@
+> +    *(cert->version.data) = SEC_CERTIFICATE_VERSION_3;
+> +    cert->version.len = 1;
+> +
+> +    // Set cert signature algorithm
+> +    PLArenaPool* arena = cert->arena;
+
+It would be good to null-check arena (it probably can't be null, but still, NSS functions will often create a new arena to allocate memory from if they get passed a null arena, which could result in memory leaks. Best to just make sure we're actually using an arena that's tracked and will release its resources).
+
+@@ +178,5 @@
+> +
+> +    // Create a CERTCertificate from the signed data
+> +    ScopedCERTCertificate certFromDER(
+> +      CERT_NewTempCertificate(CERT_GetDefaultCertDB(), &cert->derCert, nullptr,
+> +                              PR_TRUE /* perm */, PR_TRUE /* copyDER */));
+
+s/PR_TRUE/true/g
+
+@@ +186,5 @@
+> +
+> +    // Save the cert in the DB
+> +    NS_NAMED_LITERAL_CSTRING(certName, "devtools");
+> +    srv = PK11_ImportCert(slot, certFromDER, CK_INVALID_HANDLE,
+> +                          certName.get(), PR_FALSE /* unused */);
+
+s/PR_FALSE/false/
+
+@@ +215,5 @@
+> +    mCert = certFromDB;
+> +    return NS_OK;
+> +  }
+> +
+> +  nsresult Validate()
+
+Maybe also see if it's self-signed and that the subject/issuer are "CN=devtools"?
+
+@@ +230,5 @@
+> +                               * PRTime(60)  // sec
+> +                               * PRTime(60)  // min
+> +                               * PRTime(24); // hours
+> +    if (notBefore > PR_Now() ||
+> +        notAfter < (PR_Now() - oneDay)) {
+
+nit: factor out PR_Now() to a local variable
+
+@@ +245,5 @@
+> +    SECStatus srv;
+> +
+> +    for (;;) {
+> +      ScopedCERTCertificate cert(
+> +        PK11_FindCertFromNickname(certName.get(), nullptr));
+
+On the off-chance that there's another cert nicknamed "devtools" that wasn't generated by this functionality, shouldn't we also check some properties that we're expecting? (e.g. it's self-signed and subject/issuer are "CN=devtools"?)
+
+::: toolkit/devtools/security/moz.build
+@@ -3,5 @@
+>  # This Source Code Form is subject to the terms of the Mozilla Public
+>  # License, v. 2.0. If a copy of the MPL was not distributed with this
+>  # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+>  
+> -PARALLEL_DIRS += [
+
+I think something strange happened here - this is supposed to be a new file, right?
+
+::: toolkit/devtools/security/tests/moz.build
+@@ -3,5 @@
+>  # This Source Code Form is subject to the terms of the Mozilla Public
+>  # License, v. 2.0. If a copy of the MPL was not distributed with this
+>  # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+>  
+> -PARALLEL_DIRS += [
+
+Again, this is supposed to be a new file, right?
+
+::: toolkit/devtools/security/tests/unit/test_cert.js
+@@ +44,5 @@
+> +  ok(certA.equals(certB));
+> +
+> +  // Check a few expected attributes
+> +  ok(certA.isSelfSigned);
+> +  equal(certA.certType, Ci.nsIX509Cert.USER_CERT);
+
+I would also check that, after going out of scope and being garbage-collected, calling getOrCreateCert again returns the same certificate (check, for example, the serial number).
+(In reply to Panos Astithas [:past] from comment #4)
+> Comment on attachment 8462886
+> DevTools security cert generator
+> 
+> Review of attachment 8462886:
+> -----------------------------------------------------------------
+> 
+> Nice! You will need a review from a build peer, too.
+> 
+> ::: toolkit/devtools/security/nsIDevToolsCertService.idl
+> @@ +7,5 @@
+> > +interface nsIX509Cert;
+> > +interface nsIDevToolsGetCertCallback;
+> > +
+> > +[scriptable, uuid(9702fdd4-4c2c-439c-ba2e-19cda018eb99)]
+> > +interface nsIDevToolsCertService : nsISupports
+> 
+> Since this component does not appear to be necessarily devtools-specific, I
+> wonder if it would be better to use a more generic name so that other uses
+> could be encouraged. A somewhat similar debugger component is called
+> nsIJSInspector, which although not an ideal name for unrelated reasons,
+> sounds more suitable for other uses. Just a thought.
+
+It's a good idea.  I've changed the name to nsILocalCertService, and the methods now have a cert nickname parameter.
+
+> @@ +16,5 @@
+> > +   * with TLS.
+> > +   *
+> > +   * The cert is stored permanently in the profile's key store after first use,
+> > +   * and is valid for 2 years.  If an expired or otherwise invalid cert with the
+> > +   * is found with the nickname expected here, it is removed and a new one is
+> 
+> Typo: the first "with the" is redundant.
+
+Fixed.
+
+> Don't we want to support some method of removing old certificates after a
+> security compromise for example? "Hey, my laptop was stolen and now my phone
+> is vulnerable". Perhaps a forceCreate argument or a new method.
+
+Yep, that's a good thing to have!  I've added a removeCert method.
+ 
+> ::: toolkit/devtools/security/tests/moz.build
+> @@ +3,5 @@
+> >  # This Source Code Form is subject to the terms of the Mozilla Public
+> >  # License, v. 2.0. If a copy of the MPL was not distributed with this
+> >  # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+> >  
+> > +XPCSHELL_TESTS_MANIFESTS += ['unit/xpcshell.ini']
+> 
+> I think you can add this line to the parent moz.build (adjusting the path of
+> course) and get rid of this file.
+
+Thanks, rolled up into the parent file.
+(In reply to David Keeler (:keeler) [use needinfo?] from comment #5)
+> ::: toolkit/devtools/security/DevToolsCertService.cpp
+> @@ +61,5 @@
+> > +
+> > +    // Ensure key database will allow generation
+> > +    ScopedPK11SlotInfo slot(PK11_GetInternalKeySlot());
+> > +    if (!slot) {
+> > +      return NS_ERROR_FAILURE;
+> 
+> For any NSS library function failures, you might consider:
+> 
+> return GetXPCOMFromNSSError(PR_GetError());
+> 
+> or, if you have a SECStatus:
+> 
+> return MapSECStatus(srv);
+
+Thanks for the tip, I'm using these now.
+
+> @@ +64,5 @@
+> > +    if (!slot) {
+> > +      return NS_ERROR_FAILURE;
+> > +    }
+> > +    if (PK11_NeedUserInit(slot)) {
+> > +      srv = PK11_InitPin(slot, "", "");
+> 
+> This might not work if the user has a master password set (just something to
+> think about - I don't really have a solution other than popping up a message
+> that says, "hey, you should authenticate against the password manager" and
+> trying again)
+
+It does indeed fail if there's a master password.  I think it's important to support this case, so I am now triggering PSM to prompt for the password if needed.  Also, I added an attribute on the service that can be checked to see if a prompt would appear.
+
+> @@ +101,5 @@
+> > +    ScopedSECKEYPublicKey publicKey;
+> > +    SECKEYPublicKey* tempPublicKey;
+> > +    privateKey = PK11_GenerateKeyPair(slot, CKM_EC_KEY_PAIR_GEN, &keyParams,
+> > +                                      &tempPublicKey, PR_TRUE /* token */,
+> > +                                      PR_TRUE /* sensitive */, nullptr);
+> 
+> use true/false instead of PR_TRUE/PR_FALSE
+
+Fixed all of these.
+
+> @@ +119,5 @@
+> > +    if (!certRequest) {
+> > +      return NS_ERROR_FAILURE;
+> > +    }
+> > +
+> > +    // Valid from one day before to 2 years after
+> 
+> How about 1 year?
+
+Sure, sounds fine to me.
+
+> @@ +151,5 @@
+> > +      return NS_ERROR_FAILURE;
+> > +    }
+> > +
+> > +    // Update the cert version to X509v3
+> > +    *(cert->version.data) = SEC_CERTIFICATE_VERSION_3;
+> 
+> null-check cert->version.data
+
+Added.
+
+> @@ +155,5 @@
+> > +    *(cert->version.data) = SEC_CERTIFICATE_VERSION_3;
+> > +    cert->version.len = 1;
+> > +
+> > +    // Set cert signature algorithm
+> > +    PLArenaPool* arena = cert->arena;
+> 
+> It would be good to null-check arena (it probably can't be null, but still,
+> NSS functions will often create a new arena to allocate memory from if they
+> get passed a null arena, which could result in memory leaks. Best to just
+> make sure we're actually using an arena that's tracked and will release its
+> resources).
+
+Added.
+
+> @@ +215,5 @@
+> > +    mCert = certFromDB;
+> > +    return NS_OK;
+> > +  }
+> > +
+> > +  nsresult Validate()
+> 
+> Maybe also see if it's self-signed and that the subject/issuer are
+> "CN=devtools"?
+
+Added these checks.
+
+> @@ +230,5 @@
+> > +                               * PRTime(60)  // sec
+> > +                               * PRTime(60)  // min
+> > +                               * PRTime(24); // hours
+> > +    if (notBefore > PR_Now() ||
+> > +        notAfter < (PR_Now() - oneDay)) {
+> 
+> nit: factor out PR_Now() to a local variable
+
+Done.
+
+> @@ +245,5 @@
+> > +    SECStatus srv;
+> > +
+> > +    for (;;) {
+> > +      ScopedCERTCertificate cert(
+> > +        PK11_FindCertFromNickname(certName.get(), nullptr));
+> 
+> On the off-chance that there's another cert nicknamed "devtools" that wasn't
+> generated by this functionality, shouldn't we also check some properties
+> that we're expecting? (e.g. it's self-signed and subject/issuer are
+> "CN=devtools"?)
+
+Sounds reasonable, now aborting the remove process if these checks fail.
+
+> ::: toolkit/devtools/security/moz.build
+> @@ -3,5 @@
+> >  # This Source Code Form is subject to the terms of the Mozilla Public
+> >  # License, v. 2.0. If a copy of the MPL was not distributed with this
+> >  # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+> >  
+> > -PARALLEL_DIRS += [
+> 
+> I think something strange happened here - this is supposed to be a new file,
+> right?
+
+Yep, these are new files.  Should be fixed in the next version, was an issue with exporting from Git.
+
+> ::: toolkit/devtools/security/tests/unit/test_cert.js
+> @@ +44,5 @@
+> > +  ok(certA.equals(certB));
+> > +
+> > +  // Check a few expected attributes
+> > +  ok(certA.isSelfSigned);
+> > +  equal(certA.certType, Ci.nsIX509Cert.USER_CERT);
+> 
+> I would also check that, after going out of scope and being
+> garbage-collected, calling getOrCreateCert again returns the same
+> certificate (check, for example, the serial number).
+
+I've added this check to the test.
+Created attachment 8465849
+DevTools security cert generator (v2, past: r+, dkeeler: r+)
+
+gps, can review the build bits here?
+
+The rest of the patch already has r+ from previous reviews.
+(In reply to J. Ryan Stinnett [:jryans] from comment #8)
+> Created attachment 8465849
+> DevTools security cert generator (v2, past: r+, dkeeler: r+)
+> 
+> gps, can review the build bits here?
+
+The moz-git-tools export still insists on saying the moz.build was copied from another similar file... anyway, it's definitely a new file.
+Try: https://tbpl.mozilla.org/?tree=Try&rev=89935bf87399
+Comment on attachment 8465849
+DevTools security cert generator (v2, past: r+, dkeeler: r+)
+
+Review of attachment 8465849:
+-----------------------------------------------------------------
+
+r+ covers build bits only. Please verify new test manifest is accounted for before landing.
+
+::: toolkit/devtools/moz.build
+@@ +18,5 @@
+>      'qrcode',
+>      'transport',
+>      'tern',
+> +    'discovery',
+> +    'security'
+
+Bonus points if you sort this list while you are here. I'm pretty sure there aren't any order dependencies in toolkit/devtools.
+
+::: toolkit/devtools/security/tests/unit/xpcshell.ini
+@@ +1,5 @@
+> +[DEFAULT]
+> +head =
+> +tail =
+> +
+> +[test_cert.js]
+
+I don't see a moz.build entry for XPCSHELL_TESTS_MANIFESTS for this new file. Try running the test with mach. It will abort if this .ini is not part of the build config.
+Created attachment 8467874
+DevTools security cert generator (v3, past: r+, dkeeler: r+, gps: r+)
+
+(In reply to Gregory Szorc [:gps] from comment #11)
+> ::: toolkit/devtools/moz.build
+> @@ +18,5 @@
+> >      'qrcode',
+> >      'transport',
+> >      'tern',
+> > +    'discovery',
+> > +    'security'
+> 
+> Bonus points if you sort this list while you are here. I'm pretty sure there
+> aren't any order dependencies in toolkit/devtools.
+
+Okay, I've sorted them, as I think it should be fine too.  Hopefully no issues will show up on the new Try run.
+
+> ::: toolkit/devtools/security/tests/unit/xpcshell.ini
+> @@ +1,5 @@
+> > +[DEFAULT]
+> > +head =
+> > +tail =
+> > +
+> > +[test_cert.js]
+> 
+> I don't see a moz.build entry for XPCSHELL_TESTS_MANIFESTS for this new
+> file. Try running the test with mach. It will abort if this .ini is not part
+> of the build config.
+
+It's there, the diff just shows up terribly on Bugzilla (surprise!).  I've verified the new test is run on TBPL and locally with mach.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=4c2634dc5c38
+Created attachment 8467886
+DevTools security cert generator (v4, past: r+, dkeeler: r+, gps: r+)
+
+Sigh, missing comma.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=4dff46213dd7
+https://hg.mozilla.org/integration/fx-team/rev/ae5172562a4c
+https://hg.mozilla.org/mozilla-central/rev/ae5172562a4c

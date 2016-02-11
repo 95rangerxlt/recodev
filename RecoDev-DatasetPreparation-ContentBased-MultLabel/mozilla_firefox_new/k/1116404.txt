@@ -1,0 +1,288 @@
+Created attachment 8542454
+0001-Bug-XXXXXXX-better-timeout-semantics-for-search-serv.patch
+
+Currently the geoip lookups done by the search service use a relatively short XHR timeout in an effort to balance getting data from the service with the jank that would be caused if the search service ends up doing a sync initialization while waiting for the XHR to complete.
+
+There are 2 problems with this that can be solved by changing the timeout strategy:
+
+* We can get telemetry on how long requests that don't timeout take, but can't get insights into how long the actual response time would be for users that see a timeout.
+
+* We lose the opportunity to save the country-code even if the request does take longer than our timeout.
+
+A strategy that would fix these issues is to use a timer and stop waiting for the value when this timer fires - but still let the request complete.  This allows us to report the actual time the request took, and still set the pref with the country code so it can be used next startup.
+
+This attachment works, but outstanding questions are:
+
+* In the case where a success response comes in after the timeout, should we report *both* SEARCH_SERVICE_COUNTRY_FETCH_TIMEOUT and SEARCH_SERVICE_COUNTRY_SUCCESS?  The patch doesn't (ie, the telemetry semantics should be unchanged) but it's fairly easy to make a case that we should report both (as we did manage to see a success response and wrote the pref).
+
+* Can we tweak the existing probe to change the n_buckets and high attributes?
+
+(Note this patch also has a comment fix for one of the other location tests - doesn't seem worth a new bug just for that)
+
+Created attachment 8542454
+0001-Bug-XXXXXXX-better-timeout-semantics-for-search-serv.patch
+
+Currently the geoip lookups done by the search service use a relatively short XHR timeout in an effort to balance getting data from the service with the jank that would be caused if the search service ends up doing a sync initialization while waiting for the XHR to complete.
+
+There are 2 problems with this that can be solved by changing the timeout strategy:
+
+* We can get telemetry on how long requests that don't timeout take, but can't get insights into how long the actual response time would be for users that see a timeout.
+
+* We lose the opportunity to save the country-code even if the request does take longer than our timeout.
+
+A strategy that would fix these issues is to use a timer and stop waiting for the value when this timer fires - but still let the request complete.  This allows us to report the actual time the request took, and still set the pref with the country code so it can be used next startup.
+
+This attachment works, but outstanding questions are:
+
+* In the case where a success response comes in after the timeout, should we report *both* SEARCH_SERVICE_COUNTRY_FETCH_TIMEOUT and SEARCH_SERVICE_COUNTRY_SUCCESS?  The patch doesn't (ie, the telemetry semantics should be unchanged) but it's fairly easy to make a case that we should report both (as we did manage to see a success response and wrote the pref).
+
+* Can we tweak the existing probe to change the n_buckets and high attributes?
+
+(Note this patch also has a comment fix for one of the other location tests - doesn't seem worth a new bug just for that)
+Could the XHR get stuck forever in the background without a timeout? Or is there something on the lower levels of our network stack that will timeout and kill a XHR after some time even with timeout=0 set?
+
+In my experience captive portals, enterprise proxies, network connections switching in the middle of an open request, etc. can cause all kinds of weirdness and I'd generally always set a timeout of some kind on any request. On the service end we have the typical Amazon ELB timeout of 60 seconds of inactivity set.
+(In reply to Mark Hammond [:markh] from comment #0)
+> * In the case where a success response comes in after the timeout, should we
+> report *both* SEARCH_SERVICE_COUNTRY_FETCH_TIMEOUT and
+> SEARCH_SERVICE_COUNTRY_SUCCESS?  The patch doesn't (ie, the telemetry
+> semantics should be unchanged) but it's fairly easy to make a case that we
+> should report both (as we did manage to see a success response and wrote the
+> pref).
+
+I think we want to be able to answer:
+- what percentage of requests succeed "eventually" (i.e. end up getting a country code)
+- what percentage of requests succeed before init is complete
+- what percentage of requests timeout (in the "we stop blocking init on them" sense)?
+
+That last one is just the difference between the first two. It might also be useful to have telemetry for sync init triggered while waiting for the XHR (i.e. set a boolean flag if http://hg.mozilla.org/mozilla-central/annotate/67872ce17918/toolkit/components/search/nsSearchService.js#l3097 throws Cr.NS_ERROR_ALREADY_INITIALIZED).
+
+> * Can we tweak the existing probe to change the n_buckets and high
+> attributes?
+
+I think this should be fine.
+Created attachment 8542847
+t.patch
+
+In IRC, Unfocused suggested an "enumerator" flag would make more sense here and I'm inclined to agree.  It removes alot of ambiguity around "boolean vs flag" and "success vs failure"
+
+So we have a single SEARCH_SERVICE_COUNTRY_FETCH_RESULT probe that can take one of the following values:
+
+  const TELEMETRY_RESULT_ENUM = {
+    SUCCESS: 0,
+    SUCCESS_WITHOUT_DATA: 1,
+    ERROR: 2,
+    XHRTIMEOUT: 3
+  };
+
+We still need to keep a separate one for our pseudo-timeout, so SEARCH_SERVICE_COUNTRY_TIMEOUT exists - it's been renamed as it is now a bool rather than a flag.  We should find there are exactly the same number of submissions (regardless of values) for this probe as there are for _FETCH_RESULT.
+
+> It might also be
+> useful to have telemetry for sync init triggered while waiting for the XHR
+
+Good idea - but that's not in this patch.
+Created attachment 8543197
+t.patch
+
+This patch is just a "finished" version of the previous one.
+
+> > It might also be
+> > useful to have telemetry for sync init triggered while waiting for the XHR
+> 
+> Good idea - but that's not in this patch.
+
+But it is in this one!
+(In reply to Mark Hammond [:markh] from comment #4)
+> This patch is just a "finished" version of the previous one.
+
+Ack - please ignore the change to testing/xpcshell/head.js - that's for bug 1116708 and I forgot to remove it.
+Telemetry as an enum is a great idea. If we continue to see high error rates, we might want to distinguish between different error scenarios. For example:
+
+- ERROR_CONNECTION: DNS, SSL or HTTP connection to the service failed
+- ERROR_RESPONSE: HTTP status code not 200
+- ERROR_DATA: HTTP status code 200, but either a JSON decoding error, or not getting the expected JSON structure
+
+As an aside: I haven't gotten any answer on what might be causing the high Google Compute Engine based requests to our service and if those could be related to the telemetry stats we've seen. The only thing someone suggested was an external service doing either screen captures of browser sessions or something like Selenium/WebDriver tests. Maybe there's a service doing this for Firefox Nightly builds where Telemetry might be on by default.
+(In reply to Hanno Schlichting [:hannosch] from comment #6)
+> - ERROR_CONNECTION: DNS, SSL or HTTP connection to the service failed
+
+hmm - maybe we could add an ERROR_FORBIDDEN now, and...
+
+> As an aside: I haven't gotten any answer on what might be causing the high
+> Google Compute Engine based requests to our service and if those could be
+> related to the telemetry stats we've seen.
+
+... and configure the servers such that GCE gets a 403?  Basically a lever the server can pull to help telemetry make sense of this noise.
+(In reply to Mark Hammond [:markh] from comment #7)
+> (In reply to Hanno Schlichting [:hannosch] from comment #6)
+> > - ERROR_CONNECTION: DNS, SSL or HTTP connection to the service failed
+> 
+> hmm - maybe we could add an ERROR_FORBIDDEN now, and...
+> 
+> ... and configure the servers such that GCE gets a 403?  Basically a lever
+> the server can pull to help telemetry make sense of this noise.
+
+Yes, that would be one approach.
+
+In general the service can return a 200, 400, 403, 404 or 5xx. 200/404 are for normal operation of "found" / "not found". We return a 400 for invalid API keys or malformed client requests and 403 for rate limitation purposes. Variants of 500-codes can happen if part of the service is down hard (load balancer still works, but backend Nginx or Web app tier are down).
+
+The best docs for the error responses are the original Google docs our API's are based on at https://developers.google.com/maps/documentation/business/geolocation/#errors 
+
+The API keys are one way to get a bit more insight into where requests are coming from. Official Mozilla builds should soon have a key configured. This will let us distinguish them from other build sources.
+
+For telemetry we could distinguish between 200 (ok), 404 (not found) and any other response or just any other 4xx response. But my guess is that we already have failures in the connection phase (DNS/SSL) and might not even get HTTP responses. But if would be interesting to check.
+
+As another note: I see about 15-20k telemetry submissions per day for the SEARCH_SERVICE_COUNTRY_SUCCESS stat. But we have about 600k API requests per day coming from GCE, so the two might not be related at all.
+(In reply to Hanno Schlichting [:hannosch] from comment #8)
+
+> As another note: I see about 15-20k telemetry submissions per day for the
+> SEARCH_SERVICE_COUNTRY_SUCCESS stat. But we have about 600k API requests per
+> day coming from GCE, so the two might not be related at all.
+
+Yeah - it's almost impossible to conclude otherwise.
+
+The fact 403 is already used for rate limiting blows my idea, but the intent was a http response code (or header etc) that means only "you are blacklisted" with the sole aim being to try and correlate the client telemetry with a lever on the server - in this case, something like "if we blacklist GCE, does telemetry reflect a surge in ERROR_BLACKLISTED in client reports?"
+
+But as above, it's hard to conclude it would.
+
+> For telemetry we could distinguish between 200 (ok), 404 (not found) and any
+> other response or just any other 4xx response. But my guess is that we
+> already have failures in the connection phase (DNS/SSL) and might not even
+> get HTTP responses. But if would be interesting to check.
+
+Bug 1116383 exists to work out how to break these errors down, but I'm having trouble getting my head around ~70 of attempting failing, so I guess I'm grasping at straws :/
+Comment on attachment 8542454
+0001-Bug-XXXXXXX-better-timeout-semantics-for-search-serv.patch
+
+Gavin suggested you would be a good reviewer for this.  Not particularly urgent, but this week would be awesome - it would be ideal for us to land this on Central and Aurora before the merge.
+There's still the XXX comment for changing the existing telemetry probe in the patch - I thought we had cleared that and the comment can be removed, no?
+Comment on attachment 8543197
+t.patch
+
+Mark: Did you mean to request review on this patch instead?
+Comment on attachment 8542454
+0001-Bug-XXXXXXX-better-timeout-semantics-for-search-serv.patch
+
+oops - yeah, wrong patch.
+Comment on attachment 8543197
+t.patch
+
+This is the correct patch, but please ignore the change to head.js.
+Comment on attachment 8543197
+t.patch
+
+Review of attachment 8543197:
+-----------------------------------------------------------------
+
+I'm not sure if you can change the type of a histogram (without changing its name) or if that will mess up the data collection. Please verify this with froydnj or vladan.
+
+::: toolkit/components/search/nsSearchService.js
+@@ -467,4 @@
+>    let cc = yield fetchCountryCode();
+>    if (cc) {
+> -    // we got one - stash it away
+> -    Services.prefs.setCharPref("browser.search.countryCode", cc);
+
+it's not entirely clear to me why you take this away from here but not the setting of the isUS part right below.
+
+I'll wait on clarification for that. Everything else looks good, pending that question about changing telemetry types.
+
+@@ +486,5 @@
+>      }
+>    }
+> +  // If gInitialized is true then the search service was forced to perform
+> +  // a sync initialization during our XHR - capture this via telemetry.
+> +  Services.telemetry.getHistogramById("SEARCH_SERVICE_COUNTRY_FETCH_CAUSED_SYNC_INIT").add(gInitialized);
+
+nit: wrong indent
+Created attachment 8546310
+0002-Bug-1116404-better-timeout-semantics-for-search-serv.patch
+
+(In reply to :Felipe Gomes from comment #15)
+
+Thanks!
+
+> I'm not sure if you can change the type of a histogram (without changing its
+> name) or if that will mess up the data collection. Please verify this with
+> froydnj or vladan.
+
+Yes, good point.  I'd heard anecdotally that this change would be OK, but it's worth checking.  The change in question is:
+
+   "SEARCH_SERVICE_COUNTRY_FETCH_MS": {
+     "alert_emails": ["mhammond@mozilla.com", "gavin@mozilla.com"],
+     "expires_in_version": "never",
+-    "kind": "linear",
+-    "n_buckets": 20,
+-    "high": 2000,
++    "kind": "exponential",
++    "n_buckets": 30,
++    "high": 100000,
+     "description": "Time (ms) it takes to fetch the country code"
+   },
+
+froydnj or vladan, can you please verify if this is OK, or if I should rename the probe?  (All other Histograms.json changes have renamed probes as the changes were more significant)
+ 
+> it's not entirely clear to me why you take this away from here but not the
+> setting of the isUS part right below.
+
+It's not clear to you because it was wrong!  Thanks, fixed here, and the test was changed to ensure the isUS pref is updated as expected.  This change meant creating a new function storeCountryCode() and changing fetchCountryCode() so it never resolves with a value (it now calls storeCountryCode() when it has the value, which may be after the promise has resolved)
+
+I made a couple of other changes too:
+
+* n_buckets in the histogram above now has 30 buckets - I felt that 15 might be too small given the high value of 100s and after looking at some of the other "exponential" histograms.
+
+* SEARCH_SERVICE_COUNTRY_FETCH_RESULT now has n_values of 8, as it seems likely in the future we will add some more specific ERROR_* values, and updated the comments accordingly.
+
+I figure I might as well re-request review even while the histogram type issue remains unanswered - the outcome of that will either be to make no change, or a relatively trivial rename of that histogram.
+(In reply to Mark Hammond [:markh] from comment #16)
+> > I'm not sure if you can change the type of a histogram (without changing its
+> > name) or if that will mess up the data collection. Please verify this with
+> > froydnj or vladan.
+> 
+> Yes, good point.  I'd heard anecdotally that this change would be OK, but
+> it's worth checking.  The change in question is:
+> 
+>    "SEARCH_SERVICE_COUNTRY_FETCH_MS": {
+>      "alert_emails": ["mhammond@mozilla.com", "gavin@mozilla.com"],
+>      "expires_in_version": "never",
+> -    "kind": "linear",
+> -    "n_buckets": 20,
+> -    "high": 2000,
+> +    "kind": "exponential",
+> +    "n_buckets": 30,
+> +    "high": 100000,
+>      "description": "Time (ms) it takes to fetch the country code"
+>    },
+> 
+> froydnj or vladan, can you please verify if this is OK, or if I should
+> rename the probe?  (All other Histograms.json changes have renamed probes as
+> the changes were more significant)
+
+Thanks for checking!  Any changes you make to the parameters of a histogram require renaming the histogram, *especially* changing the type (since, at a minimum, you're changing the algorithm to determine the "size" of the histogram's buckets).  Kind of inconvenient, I admit. =/
+Created attachment 8546317
+0002-Bug-1116404-better-timeout-semantics-for-search-serv.patch
+
+Thanks for the reply!  This patch renames SEARCH_SERVICE_COUNTRY_FETCH_MS to SEARCH_SERVICE_COUNTRY_FETCH_TIME_MS.
+thanks!
+
+https://hg.mozilla.org/integration/fx-team/rev/862529bd3b1f
+https://hg.mozilla.org/mozilla-central/rev/862529bd3b1f
+Comment on attachment 8546317
+0002-Bug-1116404-better-timeout-semantics-for-search-serv.patch
+
+Approval Request Comment
+[Feature/regressing bug #]: Country-specific search defaults
+[User impact if declined]: Users may not have the correct country defaults, we will not have good telemetry on how many users are so affected.
+[Describe test coverage new/current, TBPL]: Landed with tests
+[Risks and why]:  Low risk
+[String/UUID change made/needed]: None
+
+Note this is a request to uplift to 36, which after the merge today will be beta.
+https://hg.mozilla.org/releases/mozilla-beta/rev/06bb4d89e2bf
+
+
+Implement more useful timeout semantics for geoip lookups in the search service
+
+
+
+Bug 1116404 - better timeout semantics for search service geoip lookups. r=felipe 

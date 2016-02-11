@@ -1,0 +1,232 @@
+I'm assuming this started after Bug 862341, because I just recently noticed this, but it's possible it was caused by Bug 764958.
+
+STR:
+Open https://bgrins.github.io/devtools-demos/
+Open the nemonitor (or any panel)
+Reload the page
+
+Expected:
+To see three requests - /, styles.css, styles.js
+
+Actual:
+Seeing 4 requests - /, styles.css, styles.js, and styles.css (cached)
+
+I'm assuming this started after Bug 862341, because I just recently noticed this, but it's possible it was caused by Bug 764958.
+
+STR:
+Open https://bgrins.github.io/devtools-demos/
+Open the nemonitor (or any panel)
+Reload the page
+
+Expected:
+To see three requests - /, styles.css, styles.js
+
+Actual:
+Seeing 4 requests - /, styles.css, styles.js, and styles.css (cached)
+Created attachment 8603395
+duplicate-request.png
+Panos and/or James, can you take a look when you get a chance and see if this is related to Bug 862341 / Bug 764958?  The other weird thing I just noticed is the requests are showing up as '200' instead of '304' as they do in Nightly (not sure which is correct, but we should definitely make sure it's showing the correct data before sending it out to dev edition).
+So they show up as 200's even after refreshing the page (without a hard refresh)? Yeah, that sounds wrong.
+
+I also don't see where the second request would come from, so I don't think it's bug 764958. If the CSS were actually requested again but came from browser cache, it would show up, but I don't see the cached request in Chrome.
+
+That leads me to believe that it is bug 862341 but I haven't followed that closely enough to give any insight for hwy.
+I can't reproduce this in either Mac or Linux. Since the weird request appears only after a reload when the tool is already open, I can't see how it can be related to bug 862341. That patch only affects requests that occur before the console or netmonitor are open.
+
+I'm happy to dig further however, if you can give me some way to reproduce this.
+I can't reproduce this either. bgrins are you on nightly?
+Also, showing up as cached 200's is right I think. If the resource was hard-cached locally, that's how it will show up. It will only show up as a 304 if it's not loading from the browser cache, and the server responding with the 304 "not modified" response. When loading from the browser cache, it will be a "cached" 200. (cached redirects will properly show up as 301/302)
+It would be neat if we could figure out what actually triggered the request so we could point to the actual JS that fired it off.
+(In reply to James Long (:jlongster) from comment #5)
+> I can't reproduce this either. bgrins are you on nightly?
+
+I see it on both Nightly and fx-team, but I now think it might be tied to a profile.  Can't reproduce on a clean profile so going to resolve
+Panos, I think I've come up with STR.  The difference is on the profile I was testing with I had selected 'disable cache' from the toolbox options.
+
+Open toolbox options and select 'disable cache'
+Open http://localhost/devtools-demos/index.html
+Close toolbox
+Open just Inspector tab (or any non netmonitor tab)
+Reload page
+Switch to netmonitor
+
+I see 5 requests - including styles.css showing up 3 times, twice as cached
+Created attachment 8604800
+duplicate-request-2.png
+
+Screenshot.   Can you confirm the STR in comment 9?
+(In reply to Brian Grinstead [:bgrins] from comment #9)
+> Open http://localhost/devtools-demos/index.html
+
+The URL should be https://bgrins.github.io/devtools-demos/
+I can reproduce this if you make sure to also not click the console, which seems to activate the network monitoring also (since it shows requests there). This does seem related to bug 862341 since it happens when the network monitor isn't explicitly enabled.
+(In reply to James Long (:jlongster) from comment #12)
+> I can reproduce this if you make sure to also not click the console, which
+> seems to activate the network monitoring also (since it shows requests
+> there). This does seem related to bug 862341 since it happens when the
+> network monitor isn't explicitly enabled.
+
+To be clear, I *also* sometimes see this when reloading the page with the netmonitor opened (except for one duplicate request instead of 2).  It's intermittent though - and it seems more common if I reload the page with the netmonitor opened immediately after following the STR in comment 9
+OK, I can reproduce this with the STR from comment 9. I'll take a look tomorrow.
+The 2 cached requests are actually caused by the inspector as it tries to fetch the original stylesheets. I haven't looked closely into how source maps work in the style inspector / style editor, but in this case the requests are probably redundant. To verify this go to the options panel and uncheck "Style Editor -> Show original sources" and then try the STR from comment 9 again.
+
+The debugger doesn't cause cached requests to appear in this page, presumably because it only asks for the source maps when the pragma is encountered in the JS source. I think we should change the style tools to work the same way.
+
+It would also be preferable not to display network requests not generated by content in the content tools, but only in the browser toolbox and the browser content toolbox. That would require an API to annotate requests from chrome code and being able to detect these annotations in the HTTP activity observer. Lacking such an API, we could set an HTTP header like "X-Devtools: 1" which the web server would hopefully ignore. I'll look into this, but I'd appreciate some pointers for fixing the stylesheet source maps or even someone picking that up.
+Created attachment 8605776
+Part 1: Stylesheet actors should use the common DevToolsUtils.fetch()
+
+OK, I found my way around the stylesheet actor code. Before looking for the solution I found that stylesheets and styleeditor actors provide their own implementations of fetch() instead of reusing the one in DevToolsUtils. This patch fixes that and passes all tests locally.
+Created attachment 8605833
+Part 2: Ignore network requests from chrome code in a content toolbox
+
+We can avoid recording network requests made by chrome and add-on code with this simple fix. I'll see if I can come up with a test for this.
+Nice!! I like this fix much better than annotating every request.
+Comment on attachment 8605776
+Part 1: Stylesheet actors should use the common DevToolsUtils.fetch()
+
+Review of attachment 8605776:
+-----------------------------------------------------------------
+
+nice
+Created attachment 8606295
+Part 2: Ignore network requests from chrome code in a content toolbox
+
+Here is a test to make sure we won't regress this. It actually helped me realize the check wasn't entirely correct in the previous version.
+
+Alex, can you think of anything that can go wrong with this change on b2g?
+Comment on attachment 8606295
+Part 2: Ignore network requests from chrome code in a content toolbox
+
+Review of attachment 8606295:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/webconsole/network-monitor.js
+@@ +738,5 @@
+> +    // Ignore requests from chrome or add-on code when we are monitoring
+> +    // content.
+> +    if (aChannel.loadInfo &&
+> +        aChannel.loadInfo.loadingDocument === null &&
+> +        aChannel.loadInfo.loadingPrincipal === Services.scriptSecurityManager.getSystemPrincipal()) {
+
+Does this hide requests from the Browser Toolbox's netmonitor, which I would expect to show chrome requests?
+No, because the browser toolbox has _logEverything set to true and returns early, before this check.
+Comment on attachment 8606295
+Part 2: Ignore network requests from chrome code in a content toolbox
+
+Review of attachment 8606295:
+-----------------------------------------------------------------
+
+I wish I could test on a device, but don't have mine next to me.
+I'll give it a try tomorrow, but the patch looks good.
+
+::: toolkit/devtools/webconsole/network-monitor.js
+@@ +738,5 @@
+> +    // Ignore requests from chrome or add-on code when we are monitoring
+> +    // content.
+> +    if (aChannel.loadInfo &&
+> +        aChannel.loadInfo.loadingDocument === null &&
+> +        aChannel.loadInfo.loadingPrincipal === Services.scriptSecurityManager.getSystemPrincipal()) {
+
+The test against loadingPrincipal looks obvious, but why are you also filtering loadingDocument === null?
+
+Do we have system principal requests with document that we want to show?
+If yes, could you document it here?
+Note that e10s uses almost the same codepaths than b2g, so having something to work on e10s is already a good hint!
+(In reply to Alexandre Poirot [:ochameau] from comment #23)
+> The test against loadingPrincipal looks obvious, but why are you also
+> filtering loadingDocument === null?
+> 
+> Do we have system principal requests with document that we want to show?
+> If yes, could you document it here?
+
+That's a good point, I don't know of any such requests, but I doubt we would want to show them if they exist. Add-ons may be able to create such requests and the content toolbox shouldn't be displaying those.
+Panos, I'm worried that this will hide request for sourcemaps, which I definitely think need to show up in the net monitor. Can you think of a way around that?
+I don't understand, the requests for source maps are not made by the content page, but by the tools. Why would the developer want to see them in the network panel?
+(In reply to Alexandre Poirot [:ochameau] from comment #23)
+> I'll give it a try tomorrow, but the patch looks good.
+
+Works fine also on b2g!
+(In reply to Panos Astithas [:past] from comment #27)
+> I don't understand, the requests for source maps are not made by the content
+> page, but by the tools. Why would the developer want to see them in the
+> network panel?
+
+It helps a lot when working with sourcemaps to see if they are actually fetched or not. Removing this is a regression imho, makes it harder for people to understand if their tools are working.
+I imagine we would only retrieve ressources from cache when our tools retrieve ressources? (except sourcemap and caching issues [which we should fix])
+Shouldn't we only hide chrome cached requests?
+Or do you think that's also misleading? Will sourcemaps sometimes be fetched from cache?
+Isn't it obvious if the source map was fetched by the content appearing in front of the user? That doesn't sound like a question the user should have to deal with. Requests for source maps will always be shown in the browser toolbox, which is what can be used to debug the tools anyway.
+When I say "tools" I mean compilers like babel, sweet.js, coffeescript, etc. I personally have watched developers look for .map requests in the network panel to debug why something isn't sourcemapped. "Oh, the sourcemap is 404ing, weird", etc. This is crucial information for when the sourcemap isn't downloaded correctly.
+(In reply to Panos Astithas [:past] from comment #31)
+> Isn't it obvious if the source map was fetched by the content appearing in
+> front of the user? That doesn't sound like a question the user should have
+> to deal with. Requests for source maps will always be shown in the browser
+> toolbox, which is what can be used to debug the tools anyway.
+
+The sourcemap could be downloaded from cache, yes, but I'd be fine if our solution didn't show that.
+Just to follow up, we talked about this IRC and I've been convinced that it's useful to hide everything not related to the page. I also asked on twitter and people seemed to confirm this: https://twitter.com/jlongster/status/600681362941747203
+
+This is with the caveat that we still provide some way to see when a sourcemaps fails to load or parse. The network monitor is an ideal place to show this because the UI is already structured for showing status code, headers, response text, etc. Maybe we could show an error in the debugger with a link that, when clicked, adds the request to the net monitor.
+
+Or we could just make the filter implemented in this bug configurable, turned off by default but users can turn it on to see any network request. That's definitely the easiest thing to do, and seems to be a popular opinion in the replies. I know prefs are an easy way out, but I think it's a good compromise.
+
+The downside to showing errors in the debugger UI is that it would be a hard UI problem to solve. Eventually we're going to have a tree view of the sources, and probably even show unsourcemapped and sourcemapped sources at the same time. Wondering why the sourcemapped sources didn't come up, but it's because a sourcemap failed loaded by a script deep in the tree *which isn't expanded yet* would be a hard thing to communicate. Feels like we're making it too complex.
+After the discussion we had yesterday what I want to do here is land these reviewed patches and file a followup to provide an alternative for inspecting source map fetches for those who don't like to use the Browser Console or the Browser Toolbox for this.
+
+My preferred solution would be to add a sourcemap-specific policy type that we would use throughout our devtools so that the backend filter these requests separately from other types of requests (like those in comment 0). Then the options panel could provide a checkbox for showing or hiding them. 
+
+My least preferred solution would be to just add a pref that short-circuits this check for every request, for two reasons: (a) it would be too coarse-grained, since it would include non-sourcemap requests from devtools, (b) the perf hit we would take from consulting the pref on every network request and response.
+
+I agree that displaying sourcemap fetching errors in the debugger or other tools is valuable, but I don't think it's that hard a problem. On the contrary, I think that we could even be very loud about it (e.g. a notification box in the tool panel), since not getting the sourcemap will severely affect the debugging experience the tool is about to offer. In that case it should be the top priority for the user to fix.
+(In reply to Panos Astithas [:past] from comment #35)
+> 
+> My preferred solution would be to add a sourcemap-specific policy type that
+> we would use throughout our devtools so that the backend filter these
+> requests separately from other types of requests (like those in comment 0).
+> Then the options panel could provide a checkbox for showing or hiding them. 
+
+This sounds like a good option, hopefully it's not too complicated. I hope we can implement it sooner rather than later so we don't go too long without any way to debug sourcemaps. Let me know if I can help with it.
+(In reply to Alexandre Poirot [:ochameau] from comment #23)
+> ::: toolkit/devtools/webconsole/network-monitor.js
+> @@ +738,5 @@
+> > +    // Ignore requests from chrome or add-on code when we are monitoring
+> > +    // content.
+> > +    if (aChannel.loadInfo &&
+> > +        aChannel.loadInfo.loadingDocument === null &&
+> > +        aChannel.loadInfo.loadingPrincipal === Services.scriptSecurityManager.getSystemPrincipal()) {
+> 
+> The test against loadingPrincipal looks obvious, but why are you also
+> filtering loadingDocument === null?
+> 
+> Do we have system principal requests with document that we want to show?
+> If yes, could you document it here?
+
+Turns out there is a very common case of that pattern, which is mochitests. I suppose I could jump in and change every test, but I'd rather avoid that until including system principal requests with a document becomes a problem in practice. I'll add a comment.
+Created attachment 8608786
+Part 2: Ignore network requests from chrome code in a content toolbox
+
+As luck would have it there was a style editor test that was expecting the existing behavior, namely that cached requests for sources appear in the network monitor. I considered just removing the test since the new test in this bug covers the same domain, but it concerns a style editor feature that has been error prone in the past, so I decided to leave it in. I used gDevTools.testing to cater for that particular case, but bug 1167188 will let us use something better.
+
+Alex can you take another quick look?
+Comment on attachment 8608786
+Part 2: Ignore network requests from chrome code in a content toolbox
+
+Try run: https://treeherder.mozilla.org/#/jobs?repo=try&revision=45e084161d50
+Created attachment 8608789
+Interdiff
+
+This is what changed.
+Comment on attachment 8608786
+Part 2: Ignore network requests from chrome code in a content toolbox
+
+Review of attachment 8608786:
+-----------------------------------------------------------------
+
+Could you also open a followup to get rid of this gDevtools.testing check in network-monitor?
+By updating tests to do content requests. In its current state, this check is a gun aiming at our feet!
+Bug 1167188 will remove the gDevTools.testing check from network-monitor and provide a different mechanism for use by the style editor test. I hope to work on that in a couple of weeks.
+https://hg.mozilla.org/integration/fx-team/rev/d41ab0aed79e
+https://hg.mozilla.org/integration/fx-team/rev/1442cb35801f
+https://hg.mozilla.org/mozilla-central/rev/d41ab0aed79e
+https://hg.mozilla.org/mozilla-central/rev/1442cb35801f

@@ -1,0 +1,243 @@
+Created attachment 430714
+history.pushState test page
+
+The attached page calls history.pushState in the DOMContentLoaded event.  Before the pushState call, I see the favicon I'm pointing to with a <link> tag.  After pushState, the page falls back to /favicon.ico.  For sites that don't have /favicon.ico, you see the blank document icon.
+
+Created attachment 430714
+history.pushState test page
+
+The attached page calls history.pushState in the DOMContentLoaded event.  Before the pushState call, I see the favicon I'm pointing to with a <link> tag.  After pushState, the page falls back to /favicon.ico.  For sites that don't have /favicon.ico, you see the blank document icon.
+about:buildconfig says http://hg.mozilla.org/mozilla-central/rev/ab85a037d0a6
+
+history.pushState was introduced in Gecko 1.9.3.
+
+Sadly, I don't see the problem when clicking on the attachment, but I do see it at http://z.jbalogh.me/history.html.
+Nice bug!  I'll have a look...
+The attached test case probably doesn't work because it's trying to pushState to a different origin.
+Okay, I've figured out what's going on.  After the pushState, tabbrowser calls nsIFaviconService::SetAndLoadFaviconForPage(browser.currentURI, ...)
+
+But the browser's current URI is "changed", not history.html, and the favicon service doesn't have a favicon for that new URI.
+Created attachment 430796
+Fix that probably breaks other things
+
+Comment 4 isn't right.  The issue is that tabbrowser's onLocationChange method clears the favicon if the document is loading.  The assumption is that we'll never call onLocationChange twice for a given load, but that's of course not true if we call pushState during a load and pushState triggers onLocationChange.
+
+(pushState needs to call onLocationChange in order to update the location bar and enable the back button if necessary.)
+
+The attached patch uses the fact that pushState always triggers onLocationChange with a null aRequest parameter.  But a cursory glance through the docshell shows plenty of other places where we pass a null request to onLocationChange, so I have about zero confidence that this doesn't break something.
+
+We could fix this by adding an extra argument to onLocationChange indicating whether we should keep the current favicon, but that seems to break abstraction unnecessarily.  I wonder if there's a better way to accomplish the same thing.
+Created attachment 431027
+Patch for review v1
+
+Aha, this is a much better patch than my last one.  I'm not sure who to ask for a review here.
+
+The only necessary code change is in tabbrowser.xml, but I included some cleanup of the pushstate code in the docshell.  I'd be happy to move that to a separate patch if desired.
+Comment on attachment 431027
+Patch for review v1
+
+Smaug, I'm not sure if you're the right person to review this.  If not, can you suggest a better reviewer?
+Comment on attachment 431027
+Patch for review v1
+
+>diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrowser.xml
+...
+>+              // Don't clear the favicon if this onLocationChange was triggered
+>+              // by a pushState or a replaceState.  See bug 550565.
+>               if (aWebProgress.DOMWindow == this.mBrowser.contentWindow &&
+>-                  aWebProgress.isLoadingDocument)
+>+                  aWebProgress.isLoadingDocument &&
+>+                  (this.mTabBrowser.docShell.loadType & Ci.nsIDocShell.LOAD_CMD_PUSHSTATE) == 0) {
+I'd use !(foobar & someflag)
+
+But this is a change which some toolkit reviewer should review. dao or gavin perhaps?
+
+
+>diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+>--- a/docshell/base/nsDocShell.cpp
+>+++ b/docshell/base/nsDocShell.cpp
+>@@ -1033,16 +1033,19 @@ ConvertDocShellLoadInfoToLoadType(nsDocS
+>         loadType = LOAD_BYPASS_HISTORY;
+>         break;
+>     case nsIDocShellLoadInfo::loadStopContent:
+>         loadType = LOAD_STOP_CONTENT;
+>         break;
+>     case nsIDocShellLoadInfo::loadStopContentAndReplace:
+>         loadType = LOAD_STOP_CONTENT_AND_REPLACE;
+>         break;
+>+    case nsIDocShellLoadInfo::loadPushState:
+>+        loadType = LOAD_PUSHSTATE;
+>+        break;
+>     default:
+>         NS_NOTREACHED("Unexpected nsDocShellInfoLoadType value");
+>     }
+> 
+>     return loadType;
+> }
+> 
+> 
+>@@ -1098,16 +1101,19 @@ nsDocShell::ConvertLoadTypeToDocShellLoa
+>         docShellLoadType = nsIDocShellLoadInfo::loadBypassHistory;
+>         break;
+>     case LOAD_STOP_CONTENT:
+>         docShellLoadType = nsIDocShellLoadInfo::loadStopContent;
+>         break;
+>     case LOAD_STOP_CONTENT_AND_REPLACE:
+>         docShellLoadType = nsIDocShellLoadInfo::loadStopContentAndReplace;
+>         break;
+>+    case LOAD_PUSHSTATE:
+>+        docShellLoadType = nsIDocShellLoadInfo::loadPushState;
+>+        break;
+>     default:
+>         NS_NOTREACHED("Unexpected load type value");
+>     }
+> 
+>     return docShellLoadType;
+> }                                                                               
+You say all this is not needed, so could you explain the reason for all this. 
+
+
+>     // Step 6: If the document's URI changed, update document's URI and update
+>-    // global history
+>+    // global history.
+>+    //
+>+    // We need to call FireOnLocationChange so that the browser's address bar
+>+    // gets updated and the back button is enabled, but we only need to
+>+    // explicitly call FireOnLocationChange if we're not calling SetCurrentURI,
+>+    // since SetCurrentURI will call FireOnLocationChange for us.
+>     if (!equalURIs) {
+>         SetCurrentURI(newURI, nsnull, PR_TRUE);
+>         document->SetDocumentURI(newURI);
+> 
+>         AddToGlobalHistory(newURI, PR_FALSE, oldURI);
+>     }
+>+    else {
+>+        FireOnLocationChange(this, nsnull, mCurrentURI);
+>+    }
+This change certainly needs test. I assume you could check that
+location change fires only once.
+
+
+>diff --git a/docshell/test/test_bug550565.html b/docshell/test/test_bug550565.html
+>new file mode 100644
+>--- /dev/null
+>+++ b/docshell/test/test_bug550565.html
+>@@ -0,0 +1,56 @@
+>+<!DOCTYPE HTML>
+>+<html>
+>+<!--
+>+https://bugzilla.mozilla.org/show_bug.cgi?id=550565
+>+-->
+>+<head>
+>+  <title>Test for bug 550565</title>
+>+  <script type="application/javascript" src="/MochiKit/packed.js"></script>
+>+  <script type="application/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
+>+  <script type="application/javascript" src="/tests/SimpleTest/EventUtils.js"></script>
+>+  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css"/>
+>+</head>
+>+<body>
+>+<a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=550565">Mozilla Bug 550565</a>
+>+<div id="content">
+>+Test for bug 550565.
+>+</div>
+>+<pre id="test">
+>+<script type="application/javascript;version=1.7">
+>+
+>+SimpleTest.waitForExplicitFinish();
+>+
+>+netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
+>+
+>+var popup = window.open("file_bug550565.html");
+>+var popupWin = popup.window.QueryInterface(Components.interfaces.nsIInterfaceRequestor)
+>+                           .getInterface(Components.interfaces.nsIWebNavigation)
+>+                           .QueryInterface(Components.interfaces.nsIDocShellTreeItem)
+>+                           .rootTreeItem
+>+                           .QueryInterface(Components.interfaces.nsIInterfaceRequestor)
+>+                           .getInterface(Components.interfaces.nsIDOMWindow);
+>+
+>+hasRun = false;
+>+
+>+popupWin.document.addEventListener('DOMContentLoaded', function() {
+>+  // The first DOMContentLoaded
+The first DOMcontentLoaded? Do you mean the event for about:blank or what?
+(In reply to comment #8)
+> You say all this is not needed, so could you explain the reason for all this. 
+
+I added it for parity with existing docshell code.  The original pushstate patch added LOAD_PUSHSTATE to nsDocShellLoadTypes.h, but didn't create a corresponding docshell load info entry.  That's not necessary for this patch, because we just check the docshell load flags.  But I think someone might reasonably expect there to be a loadInfo element corresponding to LOAD_PUSHSTATE, since everything else has a loadInfo.
+
+> The first DOMcontentLoaded? Do you mean the event for about:blank or what?
+
+Must be.  I'll fix the comment.
+As I should have done from the beginning, I'm splitting the issue of duplicate OnLocationChanges into a separate bug.  I've filed as bug 554155.  I'll post a smaller patch in this bug focused on only the problem at hand.
+Created attachment 434048
+Smaller patch for review
+
+This patch contains only the fix for this bug.
+Comment on attachment 434048
+Smaller patch for review
+
+Seems like you want this.mBrowser.docShell instead of this.mTabBrowser.docShell. Maybe you could also change this.mTabBrowser.getBrowserForTab(this.mTab) to this.mBrowser while you're at it.
+
+The test should be a browser chrome test: https://developer.mozilla.org/en/Browser_chrome_tests
+Created attachment 434108
+Patch v3
+Comment on attachment 434108
+Patch v3
+
+Looks good, thanks.
+Created attachment 434270
+Patch for checkin
+http://hg.mozilla.org/mozilla-central/rev/348011c0b4b6
+Why the XXX is this patching browser/ but having a test in DOCSHELL? You're testing every user of global code for a Firefox-specific fix? WTF?
+The fix is Firefox specific, the test isn't necessarily. It's mostly Firefox-specific in that it uses browser APIs, but that's part of the nature of browser chrome tests.
+
+The test could as well be in browser/, but I don't think it's really misplaced in docshell/.
+In that case it should surely have a docshell peer reviewing it, no?
+(In reply to comment #18)
+> The fix is Firefox specific, the test isn't necessarily. It's mostly
+> Firefox-specific in that it uses browser APIs, but that's part of the nature of
+> browser chrome tests.
+Tests for tabbrowser's onLocationChange (which this is) belong in browser.
+(In reply to comment #18)
+> The fix is Firefox specific, the test isn't necessarily. It's mostly
+> Firefox-specific in that it uses browser APIs, but that's part of the nature of
+> browser chrome tests.
+> 
+> The test could as well be in browser/, but I don't think it's really misplaced
+> in docshell/.
+
+Well, the tabbrowser API is firefox-specific... other browsers might not have a getIcon() function on gBrowser. So yes, the test is firefox-specific. So as a docshell peer, I don't think this should be in docshell :-)
+(In reply to comment #21)
+> (In reply to comment #18)
+> > The fix is Firefox specific, the test isn't necessarily. It's mostly
+> > Firefox-specific in that it uses browser APIs, but that's part of the nature of
+> > browser chrome tests.
+> > 
+> > The test could as well be in browser/, but I don't think it's really misplaced
+> > in docshell/.
+> 
+> Well, the tabbrowser API is firefox-specific... other browsers might not have a
+> getIcon() function on gBrowser. So yes, the test is firefox-specific. So as a
+> docshell peer, I don't think this should be in docshell :-)
+
+Again, this applies to pretty much all browser chrome tests. This isn't the first browser chrome test in docshell/ either.
+(In reply to comment #22)
+> Again, this applies to pretty much all browser chrome tests. This isn't the
+> first browser chrome test in docshell/ either.
+But they're not testing tabbrowser API, and they're only using tabbrowser API because they were too lazy to open a new window/create their own <browser>.
+(In reply to comment #23)
+> But they're not testing tabbrowser API, and they're only using tabbrowser API
+> because they were too lazy to open a new window/create their own <browser>.
+In my defense, I've been r-'ed on browser chrome tests I've written because I was too lazy to open a new tab and opened a new window instead.
+(In reply to comment #23)
+> (In reply to comment #22)
+> > Again, this applies to pretty much all browser chrome tests. This isn't the
+> > first browser chrome test in docshell/ either.
+> But they're not testing tabbrowser API
+
+In my book this uses tabbrowser API to test if the right favicon is associated with the document after history.pushState. Since this depends on nsIDocShell, it seems docshell relevant. Of course, this could expose a browser bug just like it could expose a docshell bug, but this applies to other browser chrome tests outside of /browser/ as well.
+(In reply to comment #25)
+> In my book this uses tabbrowser API to test if the right favicon is associated
+> with the document after history.pushState. Since this depends on nsIDocShell,
+Almost everything you do with a <browser> element depends on nsIDocShell. This does not mean that tests for browser UI belong there.
+Favicons as well as history.pushState are web features. Saying this is a test for browser UI seems overly simplified. As I've said elsewhere, as soon as a browser implements the used API (which it should when running browser chrome tests), there's no legitimate way to fail this test as is usually the case with UI tests.

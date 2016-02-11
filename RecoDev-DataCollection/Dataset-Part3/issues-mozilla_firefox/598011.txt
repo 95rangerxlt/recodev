@@ -1,0 +1,86 @@
+The new cascading load functionality does not handle the condition where an API call is made to change the session either through the setBrowserState or setWindowState SessionStore API call.  Doing so puts SessionStore in a weird state which causes it to throw the following exception:
+
+Error: (void 0) is undefined
+Source file: jar:file:///C:/Program%20Files/Minefield/omni.jar!/components/nsSessionStore.js
+Line: 2484
+
+There might be other API calls that won't work correctly during cascading loads, but this is the one that stands out.
+
+This is easiest to reproduce using my Session Manager addon to load a session while another is already loading, but it can be done manually by hand as well (though harder to do).
+
+The new cascading load functionality does not handle the condition where an API call is made to change the session either through the setBrowserState or setWindowState SessionStore API call.  Doing so puts SessionStore in a weird state which causes it to throw the following exception:
+
+Error: (void 0) is undefined
+Source file: jar:file:///C:/Program%20Files/Minefield/omni.jar!/components/nsSessionStore.js
+Line: 2484
+
+There might be other API calls that won't work correctly during cascading loads, but this is the one that stands out.
+
+This is easiest to reproduce using my Session Manager addon to load a session while another is already loading, but it can be done manually by hand as well (though harder to do).
+I mentioned in bug 597933 that I'm hoping these issues are in fact the same.
+
+Would you be willing to test my theory and differentiate between a session with a single window and multiple windows? My theory is that multiple window sessions are actually the issue while single window ones are ok (at least when there's already a window open).
+
+Multiple window sessions end up calling _openWindowWithState, which I think is the problem.
+I can trigger the error when above loading only one window while a cascade load is in progress.  It can take a few tries though.  It doesn't seem to halt the cascade load though in that case.
+
+Multiple windows don't throw that error, but frequently they do halt the cascade load such that tabs need to be selected to be loaded.
+
+I've found that loading a single window's session sometimes will only work once.  Subsequent calls to the API load 3 tabs and stop.  Though this seems to have to do something with observing the SSTabLoading notification to handle processing before loading a session.
+Okay I found that the reason the tabs weren't loading sometimes in my SSTabLoading handler is that an exception was being thrown, but the exception makes absolutely no sense.
+
+I have code that basically says:
+
+ss = Cc["@mozilla.org/browser/sessionstore;1"].getService(Ci.nsISessionStore);
+let value = ss.getTabValue(aEvent.originalTarget, "value_name");
+if (value) ss.deleteTabValue(aEvent.originalTarget, "value_name");
+
+The delete is throwing an 'Illegal value' exception which should only happen if the "value_name" tab value doesn't exist, but since it was just read and it exists, that shouldn't be.  I even did a dump(value + "\n") and saw that the item was read.  I have no idea why this is failing.
+Okay ignore disregard comment #3, I forgot I forced value to be something to test if it would do something.  So single windows are working.
+So a single window works fine and it's only cases where setBrowserState is given a multi-window state? (sorry for asking, it's just a bit hard to follow exactly what you're saying in the last couple comments).
+
+And just to be clear, STR go like this?
+!. Load session (via setBrowserState or just by restoring state?)
+2. Load second session (via setBrowserState)
+3. See error
+
+If there are specific cases where these work and fail, that would be super helpful
+
+If you have a dev build of session manager I can get my hands on, that might help too (or can I just use the release on AMO>). I was just going to build a button on the toolbar to call setSessionState with a hardcoded state. It should work, but might not accurately reflect your case.
+
+Thanks Michael!
+I'm not actually seeing errors when loading multiple windows via setBrowserState, it's just that the cascade stops if I load another session while the first one is still loading.  The second session loads, but the tabs simply stop loading at some point until I manually select them.
+
+Note I can also sometimes trigger cascading loads to stop working when loading a single window (also via setBrowserState).
+
+I don't see the error all the time, but I'm beginning to think it might not be 100% related since that error is being thrown in the "content" context not the "chrome" context.  It also sometimes occurs simply loading a session.
+
+
+I have a beta version of session manager available at Addons which should work with Minefield.  It's not as up to date as my development version, but it should be good enough.  I think there are still a few glitches with SessionStore related to closing and restoring windows, since work on bug 588217 was halted and left things in a kind of unfinished state, but basic saving and loading should work as long as you don't set Session Manager to reload tabs for loaded sessions (the cascading change is causing issues with that).  Actually that might be better handled by SessionStore itself, but that would be a different bug (feature request).
+
+https://addons.mozilla.org/en-us/firefox/downloads/file/97662/session_manager-0.6.9pre20100828-fx+sm.xpi?src=addondetail&confirmed=1
+
+
+Also I don't know why, but cascading loads seem to have a tendency to bring the browser to a halt using very high CPU when loading large. It's not really any better than non-cascading loads.  Not sure why that would be though.
+Paul - are we expecting a different patch here, or are we now confident that bug 597933 is likely to fix this, too?
+I'm not confident yet. Hopeful, but the symptoms sound a bit different. I'll know later today.
+So I'm saying with much more confidence that my fix in bug 597933 will fix this. I have a couple tests that calls setWindowState in the middle of another setWindowState and that passes. I'm going to try make another that calls setBrowserState in the middle of setBrowserState just to be sure though.
+So even if this isn't 100% fixed by bug 597933, this should get a lot better.
+
+There might be another edge case hiding here, but I don't think it's bad enough that we need to block. It would be a bug with a specific API, but it could be fixed internally and the API doesn't have to change. So what I'm trying to say... we probably don't need to block beta 7 on this if it remains an issue.
+I think this problem blocks beta7 as described - but I'm happy to have it resolved by bug 597933. If you're right that we fix it substantially but there's a (potentially non-blocking) edge case left over, we can treat that as a separate bug.
+Ok, so I managed to hit the error while calling setSessionState. I tracked it down, and while I'm not all of the issues here are independent from the bug 597933, the error is most certainly related to my typo here:
+http://hg.mozilla.org/mozilla-central/file/dca6eff8d8a0/browser/components/sessionstore/src/nsSessionStore.js#l3502
+
+> this._tasToRestore = { visible: [], hidden: [] };
+
+The tests I have for bug 597933 hit that error, so how about this: the fix for the typo above goes in this bug (since it's quite directly the cause of the error), this bug blocks 597933, and the rest of the fix I have there stays there. 
+
+The rest of the patch in 597933 also fixes the other issues Michael mentioned that aren't directly caused by the error - that sessions get in a state where they forget to load some tabs.
+Created attachment 477839
+Patch v0.1
+
+1 line typo fix :/
+Pushed http://hg.mozilla.org/mozilla-central/rev/54f97b0763cd
+
+in-testsuite+ because it's get's coverage with the tests in bug 597933.

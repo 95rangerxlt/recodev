@@ -1,0 +1,338 @@
+Bug 1201597 let us save heap snapshots in sandboxed child processes that don't have access to the file system, but the MemoryActor (in the child process) is still trying to access the file system in the case that the client requests the heap snapshot file be sent over the RDP.
+
+We need to split this file shuffling out from the MemoryActor to a new global actor in the parent process, which does have access to the file system.
+
+Bug 1201597 let us save heap snapshots in sandboxed child processes that don't have access to the file system, but the MemoryActor (in the child process) is still trying to access the file system in the case that the client requests the heap snapshot file be sent over the RDP.
+
+We need to split this file shuffling out from the MemoryActor to a new global actor in the parent process, which does have access to the file system.
+Created attachment 8665145
+Create HeapSnapshotFileActor
+
+This commit creates the HeapSnapshotFileActor and moves the transferHeapSnapshot
+method from MemoryActor to HeapSnapshotFileActor. This is necessary because
+child processes in e10s are sandboxed and do not have access to the file system,
+and because MemoryActor is in the sandboxed child process it cannot open the
+file and send it over the RDP.
+
+This complexity is hidden at the MemoryFront layer. Users of MemoryFront will
+still simply call its saveHeapSnapshot method, and do not need to worry about
+the inner workings of how heap snapshot files are transferred over the RDP. This
+required adding a third parameter to MemoryFront's initialize method: the
+listTabs response.
+Try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=822f16e1273e
+Comment on attachment 8665145
+Create HeapSnapshotFileActor
+
+Review of attachment 8665145:
+-----------------------------------------------------------------
+
+Add a comment to memory actor's use of `saveHeapSnapshot` about this being safe in the child even though it doesn't have file system access due to the special work you've done in bug 1201597.
+
+::: devtools/client/memory/panel.js
+@@ +65,5 @@
+>  };
+>  
+>  exports.MemoryPanel = MemoryPanel;
+> +
+> +function listTabs(client) {
+
+Let's make `target` do this work for us!  You're not the only person to ask for this ability before.  I suppose it can't easily go in `get root()` since it's async, but let's do it somehow.  Maybe it changes to `function* getRoot()`?  Or the getter is just a promise...  Whatever you like.
+
+::: devtools/client/memory/test/browser/head.js
+@@ +2,5 @@
+> +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> +
+> +"use strict";
+> +
+> +function scopedCuImport(path) {
+
+I was pretty sad after Shu's email to learn we've all been using Cu.import wrong all this time...  Is something like this available as a shared utility?  I think we'd want it even for production code.
+
+@@ +22,5 @@
+> +
+> +/**
+> + * Add a tab and have it load the given url.
+> + */
+> +function addTab(url, win = window) {
+
+Many of these functions exist in the `shared-head` file[1].  You should include that here (example[2]) and de-duplicate the rest of this file.
+
+[1]: https://dxr.mozilla.org/mozilla-central/source/devtools/client/framework/test/shared-head.js
+[2]: https://dxr.mozilla.org/mozilla-central/source/devtools/client/eyedropper/test/head.js#5
+
+::: devtools/server/tests/unit/head_dbg.js
+@@ +51,5 @@
+>  
+>    return function run_test() {
+>      do_test_pending();
+>      startTestDebuggerServer(TEST_GLOBAL_NAME).then(client => {
+> +      DebuggerServer.registerModule("devtools/server/actors/heap-snapshot-file", {
+
+Hmm, it doesn't seem like we should have to do this...  Can't we call `addBrowserActors` in `startTestDebuggerServer`?
+
+On that topic `startTestDebuggerServer` seems to have some errors, it takes a `server` param, but then just uses `DebuggerServer` in some lines.
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #3)
+> ::: devtools/client/memory/test/browser/head.js
+> @@ +2,5 @@
+> > +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> > +
+> > +"use strict";
+> > +
+> > +function scopedCuImport(path) {
+> 
+> I was pretty sad after Shu's email to learn we've all been using Cu.import
+> wrong all this time...  Is something like this available as a shared
+> utility?  I think we'd want it even for production code.
+
+But then, how do you import this helper? :-/
+
+> 
+> @@ +22,5 @@
+> > +
+> > +/**
+> > + * Add a tab and have it load the given url.
+> > + */
+> > +function addTab(url, win = window) {
+> 
+> Many of these functions exist in the `shared-head` file[1].  You should
+> include that here (example[2]) and de-duplicate the rest of this file.
+> 
+> [1]:
+> https://dxr.mozilla.org/mozilla-central/source/devtools/client/framework/
+> test/shared-head.js
+> [2]:
+> https://dxr.mozilla.org/mozilla-central/source/devtools/client/eyedropper/
+> test/head.js#5
+
+Good call, this was me being a lazy programmer.
+
+> ::: devtools/server/tests/unit/head_dbg.js
+> @@ +51,5 @@
+> >  
+> >    return function run_test() {
+> >      do_test_pending();
+> >      startTestDebuggerServer(TEST_GLOBAL_NAME).then(client => {
+> > +      DebuggerServer.registerModule("devtools/server/actors/heap-snapshot-file", {
+> 
+> Hmm, it doesn't seem like we should have to do this...  Can't we call
+> `addBrowserActors` in `startTestDebuggerServer`?
+
+I tried that, and no matter what combination of addBrowserActors and addTabActors I did I couldn't avoid either errors about registering actors twice, missing certain actors, or getting mysterious errors where listTabs requests would always return an empty list of tabs. I spent probably the most time out of the whole patch on this issue, and ended up with this as the best solution that actually worked.
+
+> On that topic `startTestDebuggerServer` seems to have some errors, it takes
+> a `server` param, but then just uses `DebuggerServer` in some lines.
+
+Not surprised, I can fix them all to reference the param while I'm here.
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #4)
+> (In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #3)
+> > ::: devtools/client/memory/test/browser/head.js
+> > @@ +2,5 @@
+> > > +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> > > +
+> > > +"use strict";
+> > > +
+> > > +function scopedCuImport(path) {
+> > 
+> > I was pretty sad after Shu's email to learn we've all been using Cu.import
+> > wrong all this time...  Is something like this available as a shared
+> > utility?  I think we'd want it even for production code.
+> 
+> But then, how do you import this helper? :-/
+
+Hmm, I guess. :P Let's make Cu.importSanely! :)
+
+> > ::: devtools/server/tests/unit/head_dbg.js
+> > @@ +51,5 @@
+> > >  
+> > >    return function run_test() {
+> > >      do_test_pending();
+> > >      startTestDebuggerServer(TEST_GLOBAL_NAME).then(client => {
+> > > +      DebuggerServer.registerModule("devtools/server/actors/heap-snapshot-file", {
+> > 
+> > Hmm, it doesn't seem like we should have to do this...  Can't we call
+> > `addBrowserActors` in `startTestDebuggerServer`?
+> 
+> I tried that, and no matter what combination of addBrowserActors and
+> addTabActors I did I couldn't avoid either errors about registering actors
+> twice, missing certain actors, or getting mysterious errors where listTabs
+> requests would always return an empty list of tabs. I spent probably the
+> most time out of the whole patch on this issue, and ended up with this as
+> the best solution that actually worked.
+
+The "normal" init the server snippet is:
+
+  if (!DebuggerServer.initialized) {
+    DebuggerServer.init();
+    DebuggerServer.addBrowserActors();
+  }
+
+but maybe this does not work in the debugger test's special setup. `addBrowserActors` calls `addTabActors` itself, so maybe changing to the above snippet and removing `addTabActors` from `startTestDebuggerServer` will do it?
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #5)
+> > > ::: devtools/server/tests/unit/head_dbg.js
+> > > @@ +51,5 @@
+> > > >  
+> > > >    return function run_test() {
+> > > >      do_test_pending();
+> > > >      startTestDebuggerServer(TEST_GLOBAL_NAME).then(client => {
+> > > > +      DebuggerServer.registerModule("devtools/server/actors/heap-snapshot-file", {
+> > > 
+> > > Hmm, it doesn't seem like we should have to do this...  Can't we call
+> > > `addBrowserActors` in `startTestDebuggerServer`?
+> > 
+> > I tried that, and no matter what combination of addBrowserActors and
+> > addTabActors I did I couldn't avoid either errors about registering actors
+> > twice, missing certain actors, or getting mysterious errors where listTabs
+> > requests would always return an empty list of tabs. I spent probably the
+> > most time out of the whole patch on this issue, and ended up with this as
+> > the best solution that actually worked.
+> 
+> The "normal" init the server snippet is:
+> 
+>   if (!DebuggerServer.initialized) {
+>     DebuggerServer.init();
+>     DebuggerServer.addBrowserActors();
+>   }
+> 
+> but maybe this does not work in the debugger test's special setup.
+> `addBrowserActors` calls `addTabActors` itself, so maybe changing to the
+> above snippet and removing `addTabActors` from `startTestDebuggerServer`
+> will do it?
+
+I tried this, and this and it didn't work. I believe this is what led to the mysteriously empty listTabs responses.
+Created attachment 8665665
+Create HeapSnapshotFileActor
+
+This commit creates the HeapSnapshotFileActor and moves the transferHeapSnapshot
+method from MemoryActor to HeapSnapshotFileActor. This is necessary because
+child processes in e10s are sandboxed and do not have access to the file system,
+and because MemoryActor is in the sandboxed child process it cannot open the
+file and send it over the RDP.
+
+This complexity is hidden at the MemoryFront layer. Users of MemoryFront will
+still simply call its saveHeapSnapshot method, and do not need to worry about
+the inner workings of how heap snapshot files are transferred over the RDP. This
+required adding a third parameter to MemoryFront's initialize method: the
+listTabs response.
+Created attachment 8665666
+interdiff from last version
+https://hg.mozilla.org/integration/fx-team/rev/a23053342d5b
+https://hg.mozilla.org/mozilla-central/rev/a23053342d5b
+sorry had to back this out for test failures like https://treeherder.mozilla.org/logviewer.html#?job_id=14708536&repo=mozilla-inbound
+Backout:
+https://hg.mozilla.org/mozilla-central/rev/5abe3c4deab9
+gaia? mocha? node_modules?? what looks to be v8 format stack traces?? I am pretty sure I got caught in some cross fire here, as my patch doesn't touch any of that and is completely unrelated.
+
+New try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=c76785790080
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #13)
+> gaia? mocha? node_modules?? what looks to be v8 format stack traces?? I am
+> pretty sure I got caught in some cross fire here, as my patch doesn't touch
+> any of that and is completely unrelated.
+
+Possibly, though Gij21 does use some devtools APIs I believe to track the number of reflows happening. Not sure if your patch would touch those APIs.
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #13)
+> gaia? mocha? node_modules?? what looks to be v8 format stack traces?? I am
+> pretty sure I got caught in some cross fire here, as my patch doesn't touch
+> any of that and is completely unrelated.
+> 
+> New try push:
+> https://treeherder.mozilla.org/#/jobs?repo=try&revision=c76785790080
+
+The try run would be more convincing if it included the test suites that failed last time.
+
+Adding "-u gaia-js-integration" to your syntax should do it, I think.
+Doesn't touch reflow stuff.
+
+Woops re try push.
+Here is a push for gaia-js-integration: https://treeherder.mozilla.org/#/jobs?repo=try&revision=3f2a2bc02632
+Ugh, it looks like there are two failures in Gij:
+
+First failure. Not sure what this is testing or why it is failing yet.
+
+> AssertionError: 0 == 3
+>     at Context.<anonymous> (/home/worker/gaia/apps/communications/dialer/test/marionette/keypad_test.js:105:12)
+>     at callFn (/home/worker/gaia/node_modules/mocha/lib/runnable.js:223:21)
+>     at Test.Runnable.run (/home/worker/gaia/node_modules/mocha/lib/runnable.js:216:7)
+>     at Test.MarionetteTest.run (/home/worker/gaia/node_modules/marionette-js-runner/lib/ui.js:25:31)
+>     at Runner.runTest (/home/worker/gaia/node_modules/mocha/lib/runner.js:373:10)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:451:12
+>     at next (/home/worker/gaia/node_modules/mocha/lib/runner.js:298:14)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:308:7
+>     at next (/home/worker/gaia/node_modules/mocha/lib/runner.js:246:23)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:270:7
+>     at done (/home/worker/gaia/node_modules/mocha/lib/runnable.js:185:5)
+>     at callFn (/home/worker/gaia/node_modules/mocha/lib/runnable.js:228:7)
+>     at Hook.Runnable.run (/home/worker/gaia/node_modules/mocha/lib/runnable.js:216:7)
+>     at next (/home/worker/gaia/node_modules/mocha/lib/runner.js:258:10)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:270:7
+>     at done (/home/worker/gaia/node_modules/mocha/lib/runnable.js:185:5)
+>     at /home/worker/gaia/node_modules/mocha/lib/runnable.js:226:31
+>     at /home/worker/gaia/node_modules/marionette-js-runner/node_modules/promise/lib/core.js:33:15
+>     at flush (/home/worker/gaia/node_modules/marionette-js-runner/node_modules/promise/node_modules/asap/asap.js:27:13)
+>     at process._tickCallback (node.js:442:13)
+
+Second failure. I'm not touching any of the reflows stuff, so I have no idea why this would fail...
+
+> AssertionError: we got 0 reflows instead of 2
+>     at Context.<anonymous> (/home/worker/gaia/apps/system/test/marionette/homescreen_navigation_test.js:75:12)
+>     at callFn (/home/worker/gaia/node_modules/mocha/lib/runnable.js:223:21)
+>     at Test.Runnable.run (/home/worker/gaia/node_modules/mocha/lib/runnable.js:216:7)
+>     at Test.MarionetteTest.run (/home/worker/gaia/node_modules/marionette-js-runner/lib/ui.js:25:31)
+>     at Runner.runTest (/home/worker/gaia/node_modules/mocha/lib/runner.js:373:10)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:451:12
+>     at next (/home/worker/gaia/node_modules/mocha/lib/runner.js:298:14)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:308:7
+>     at next (/home/worker/gaia/node_modules/mocha/lib/runner.js:246:23)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:270:7
+>     at done (/home/worker/gaia/node_modules/mocha/lib/runnable.js:185:5)
+>     at callFn (/home/worker/gaia/node_modules/mocha/lib/runnable.js:228:7)
+>     at Hook.Runnable.run (/home/worker/gaia/node_modules/mocha/lib/runnable.js:216:7)
+>     at next (/home/worker/gaia/node_modules/mocha/lib/runner.js:258:10)
+>     at /home/worker/gaia/node_modules/mocha/lib/runner.js:270:7
+>     at done (/home/worker/gaia/node_modules/mocha/lib/runnable.js:185:5)
+>     at /home/worker/gaia/node_modules/mocha/lib/runnable.js:226:31
+>     at /home/worker/gaia/node_modules/marionette-js-runner/node_modules/promise/lib/core.js:33:15
+>     at flush (/home/worker/gaia/node_modules/marionette-js-runner/node_modules/promise/node_modules/asap/asap.js:27:13)
+>     at process._tickCallback (node.js:442:13)
+Ok, I rebased on m-c and all is well with the cosmos: https://treeherder.mozilla.org/#/jobs?repo=try&revision=a553502d5417
+Nevermind, I've jumped the gun again. I need to stop being so optimistic...
+Are any devtools metric payloads are changing, I haven't tracked it down, but I believe the reflow count comes from: http://mxr.mozilla.org/mozilla-central/source/b2g/chrome/content/devtools/hud.js#258
+Is that the little developer hud thing? This doesn't touch that at all.
+No, but perhaps it could be influencing the metrics collection and breaking the thing that reads devtools metrics? You may want to check in with :janx, he should be familiar with this code.
+jryans pointed out that the hud initializes a MemoryFront which I missed when updating callers because I assumed all uses were under devtools/.
+Created attachment 8666221
+Create HeapSnapshotFileActor; r=jryans
+
+This commit creates the HeapSnapshotFileActor and moves the transferHeapSnapshot
+method from MemoryActor to HeapSnapshotFileActor. This is necessary because
+child processes in e10s are sandboxed and do not have access to the file system,
+and because MemoryActor is in the sandboxed child process it cannot open the
+file and send it over the RDP.
+
+This complexity is hidden at the MemoryFront layer. Users of MemoryFront will
+still simply call its saveHeapSnapshot method, and do not need to worry about
+the inner workings of how heap snapshot files are transferred over the RDP. This
+required adding a third parameter to MemoryFront's initialize method: the
+listTabs response.
+Comment on attachment 8666221
+Create HeapSnapshotFileActor; r=jryans
+
+This version just makes the rootForm optional and if you try to do anything that requires it, it throws an error.
+
+Carrying over r+.
+
+Try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=e9d137e46a15
+https://hg.mozilla.org/integration/fx-team/rev/5be7cb87827d
+https://hg.mozilla.org/mozilla-central/rev/5be7cb87827d
+
+
+Define a global actor on the root process to shuffle heap snapshot files
+
+
+
+Bug 1207645 - Create HeapSnapshotFileActor; r=jryans
+
+Backed out 1 changesets (bug 1207645) for Mulet Gaia JS Integration Test Gij 21 and 4 perma test failures
+
+Backed out changeset a23053342d5b (bug 1207645) 
+
+Bug 1207645 - Create HeapSnapshotFileActor; r=jryans

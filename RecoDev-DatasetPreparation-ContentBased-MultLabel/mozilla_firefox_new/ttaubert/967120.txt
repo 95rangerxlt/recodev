@@ -1,0 +1,136 @@
+The current public and internal API implementation of FxAccounts.jsm has become a little messy. We have two different prototypes, the public one calls a global called "internal" to access the internal one. This all makes it a little hard to follow the flow and I think a good first step to cleaning up FxA would be to address this.
+
+The current public and internal API implementation of FxAccounts.jsm has become a little messy. We have two different prototypes, the public one calls a global called "internal" to access the internal one. This all makes it a little hard to follow the flow and I think a good first step to cleaning up FxA would be to address this.
+Created attachment 8369567
+0001-Bug-967120-Clean-up-FxAccounts-public-internal-API-i.patch
+
+This patch doesn't change how the code works. All it does is clean up as described and move some code around.
+Comment on attachment 8369567
+0001-Bug-967120-Clean-up-FxAccounts-public-internal-API-i.patch
+
+Review of attachment 8369567:
+-----------------------------------------------------------------
+
+Looks fine to me (although I'm not sure it's a priority)
+
+::: services/fxaccounts/FxAccounts.jsm
+@@ +94,5 @@
+>    this.generationCount = 0;
+>  
+>    this.fxAccountsClient = new FxAccountsClient();
+>  
+> +  // Normal (i.e., non-testing) initialization.
+
+I think this line can be removed now (it was really just indicating that signedInUserStorage will only be set if the mock didn't provide it, but that's now handled differently, so I don't think this line adds value)
+
+@@ +178,5 @@
+> +      return data;
+> +    });
+> +  },
+> +
+> +  // set() makes sure that polling is happening, if necessary.
+
+this comment is somewhat messy, and ideally should just be incorporated into the documentation for the getSignedInUser and setSignedInUser comments - but without that, it's probably better moved above both functions (like it was before this refactor)
+
+::: services/fxaccounts/tests/xpcshell/test_accounts.js
+@@ +112,5 @@
+>        return this._now_is;
+>      },
+> +    getCertificateSigned: function (sessionToken, serializedPublicKey) {
+> +      _("mock getCertificateSigned\n");
+> +      _(Object.keys(this) + "\n");
+
+this looks like left-over debugging?
+(In reply to Mark Hammond [:markh] from comment #2)
+> > +    getCertificateSigned: function (sessionToken, serializedPublicKey) {
+> > +      _("mock getCertificateSigned\n");
+> > +      _(Object.keys(this) + "\n");
+> 
+> this looks like left-over debugging?
+
+Yeah... thanks for catching!
+(In reply to Mark Hammond [:markh] from comment #2)
+> Looks fine to me (although I'm not sure it's a priority)
+
+Not the same priority as a bug fixing the FxA workflow but I do think it's important to clean up what we wrote in the last weeks here and there as it does really help to maintain the code. I don't believe that anyone is totally confident discussing the call graph in FxAccounts.jsm currently and removing indirection helps a lot with that.
+
+Should I request uplifting to Aurora before landing the patch? It would certainly make uplifting changes to this file harder if it's not on Aurora. How would we handle this for future "clean ups"? I would really like to further improve maintainability/stability even if that's of course not a top priority...
+
+Gavin, any opinion about this?
+I think we should land this now and uplift it.
+Ok, landed:
+
+https://hg.mozilla.org/integration/fx-team/rev/2865fd5e5458
+Backed out in https://hg.mozilla.org/integration/fx-team/rev/6fa2dd192173 for xpcshell (https://tbpl.mozilla.org/php/getParsedLog.php?id=34041085&tree=Fx-Team, looks like all platforms) and browser-chrome (https://tbpl.mozilla.org/php/getParsedLog.php?id=34041180&tree=Fx-Team, might be opt-only) bustage.
+One thing I found out is that "internal" is a global variable in FxAccounts.jsm. When creating multiple FxAcounts instances that means that all of these share the latest internal object that was assigned to "internal". This is quite bad and one of the reasons I was rewriting this module but the tests seem to somehow expect this behavior implicitly and I need to find out how to fix that.
+Created attachment 8372035
+0002-Bug-967120-Follow-up-to-fix-broken-xpcshell-and-moch.patch
+
+All good locally, will push to try. All these fixes are necessary because those tests just worked by accident as all of the FxAccounts instances shared the latest internal object.
+https://tbpl.mozilla.org/?tree=Try&rev=d669b5dad934
+Comment on attachment 8372035
+0002-Bug-967120-Follow-up-to-fix-broken-xpcshell-and-moch.patch
+
+Review of attachment 8372035:
+-----------------------------------------------------------------
+
+discussed briefly on IRC - my version of the same patch adds a comment at the top of the ctor:
+
+// NOTE: _fxaService and _tokenServerClient are replaced with mocks by
+// the test suite.
+
+which seems worthwhile.
+
+Also, there's one use in the cluster manager that should change too, like:
+
+@@ -551,18 +554,19 @@ this.BrowserIDManager.prototype = {
+ function BrowserIDClusterManager(service) {
+   ClusterManager.call(this, service);
+ }
+ 
+ BrowserIDClusterManager.prototype = {
+   __proto__: ClusterManager.prototype,
+ 
+   _findCluster: function() {
++    let fxa = this.identity._fxaService; // will be mocked for tests.
+     let promiseClusterURL = function() {
+-      return fxAccounts.getSignedInUser().then(userData => {
++      return fxa.getSignedInUser().then(userData => {
+
+::: services/sync/modules/browserid_identity.js
+@@ +410,5 @@
+>    _fetchTokenForUser: function(userData) {
+>      let tokenServerURI = Svc.Prefs.get("tokenServerURI");
+>      let log = this._log;
+>      let client = this._tokenServerClient;
+> +    let fxa = this._fxaService;
+
+there's one more existing use of this._fxaService in this function that might as well change to use this new local
+Thanks! Will incorporate all suggested changes.
+https://hg.mozilla.org/integration/fx-team/rev/b36de5eeda6f
+https://hg.mozilla.org/integration/fx-team/rev/8b84620e4901
+https://hg.mozilla.org/mozilla-central/rev/b36de5eeda6f
+https://hg.mozilla.org/mozilla-central/rev/8b84620e4901
+Comment on attachment 8369567
+0001-Bug-967120-Clean-up-FxAccounts-public-internal-API-i.patch
+
+[Approval Request Comment]
+Risk to taking this patch (and alternatives if risky): Low risk, only cleanup.
+String or IDL/UUID changes made by this patch: None.
+
+We should take this on Aurora because it contains a few important fixes and would make writing patches harder otherwise.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/5280e3c4b237
+https://hg.mozilla.org/releases/mozilla-aurora/rev/9ca38361b57a
+
+
+Clean up FxAccounts' public/internal API implementation
+
+
+
+Bug 967120 - Clean up FxAccounts' public/internal API implementation r=markh 
+
+Back out 2865fd5e5458 (bug 967120) for xpcshell and browser-chrome bustage 
+
+Bug 967120 - Clean up FxAccounts' public/internal API implementation r=markh 
+
+Bug 967120 - Follow-up to fix broken xpcshell and mochitests r=markh 

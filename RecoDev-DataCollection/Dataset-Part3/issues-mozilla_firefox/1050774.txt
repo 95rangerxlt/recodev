@@ -1,0 +1,619 @@
+When script execution is triggered, we want to record the time it takes to complete the execution.
+
+When script execution is triggered, we want to record the time it takes to complete the execution.
+Kannan, the timeline has now landed. Can you start looking at this? If you don't have time, who else can I talk to?
+
+See how we add markers to the timeline: http://mxr.mozilla.org/mozilla-central/search?string=AddProfileTimelineMarker
+Jim, do you know if there is a way to access the docshell from a JSContext / JSRuntime?, such as we can instrument js::RunScript [1] or the SPSEntryMarker to push this markers for the timeline.
+
+I guess the best would be to store callbacks on the  compartment / runtime, do you know where we can do that?
+
+[1] http://dxr.mozilla.org/mozilla-central/source/js/src/vm/Interpreter.cpp#398
+Paul: Thanks for the ping.  I spoke with Victor last week about it and he back then he indicated that timeline was still undergoing review and to hold off.  I'm still in the middle of removing the profiler PseudoStack, and was tentatively planning on having that landed by end of October, and then implementing this.  I asked around generally about getting at a DocShell from a JS global object that is a window (and how to discover if this is the case), and it seems like it's not too difficult.
+
+That said, if someone else gets to this bug before then, all the better.
+
+Nicolas: We don't want SPSEntryMarker to be used for this.  It's going away as soon as I can make it go away.
+I think you want to build this on what bholley and I have been discussing in bug 971673. However, that makes things pretty obscure. Let's talk on IRC.
+Once this is done, you need to add an entry here to see the script markers in the timeline: http://mxr.mozilla.org/mozilla-central/source/browser/devtools/timeline/widgets/global.js#28
+Created attachment 8491838
+timeline-javascript.patch
+
+Tentative javascript + timeline integration patch.  These are the major architectural changes:
+
+1. A new callback |runToCompletionCallback| is added to JSRuntime
+2. This callback is invoked on entry and exit from js::RunScript
+3. The callback is registered by XPCJSRuntime, and is bound to a method that takes the JSContext* at the callback time, retrieves its global, gets a DocShell for that global, and calls |notifyJSRunToCompletionStart| or |notifyJSRunToCompletionStop|.  Note that these are IDL methods on DocShell, because XPCJSRuntime has no knowledge of DocShell internals, and needs a public method to call.
+
+4. DocShell is modified to keep a jsRunToCompletionDepth counter. Whenever |notifyJSRunToCompletionStart| is called, this counter is incremented, and when the Stop method is called it's decremented.
+5. When the counter is first incremented from 0 => 1, it emits a timeline event starting a JS execution interval.
+6. When the counter is finally decremented from 1 => 0, it emits a timeline event ending the previously started JS execution interval.
+
+
+This patch works, but I think I can put callback invokes from within the JS engine in a better place than js::RunScript.  RunScript gets used internally pretty heavily, and will cause many spurious invokes that get swallowed in the depth counter.  I think the best place to do the callback invokes is in the handful of jsapi JS_* methods that can invoke code.  I'll be looking at that tomorrow.
+
+Try run here: https://tbpl.mozilla.org/?tree=Try&rev=407bd879ef40
+
+Will give for review once this is done.
+Yeah! Screenshot: http://i.imgur.com/1a3u277.png
+Comment on attachment 8491838
+timeline-javascript.patch
+
+Looks good to me. Thanks a lot for taking care of that.
+
+JS should move to group:0 (and others markers should all be incremented).
+
+Can you confirm that we only cover scripts that run in the main thread? (we don't want workers).
+As long as xpc::GetWindowOrNull() for a worker globals returns null, we will ignore workers.
+
+I'll confirm this, but for now I'm putting it up for review jut to see if bholley is okay with the general implementation approach.  Any fixes to exclude workers should be minor.
+Just a note: jimb told me about AutoEntryScript.  That seems like the perfect place to do the callback invocations, rather than js::RunScript, which is a bit of an overfit.  I'm going to try that out now, just to see if it works.
+Comment on attachment 8491838
+timeline-javascript.patch
+
+Review of attachment 8491838:
+-----------------------------------------------------------------
+
+Cancelling this review and changing it to feedback.  Looking more at AutoEntryScript, I really want to move these callback invocations there.  The js-engine doesn't need to know about this at all.. way cleaner and more performant than registering a callback via XPCJSRuntime.
+(I cleared the needinfo because it seems like djvj has taken this over, and is making progress.)
+Comment on attachment 8491838
+timeline-javascript.patch
+
+Review of attachment 8491838:
+-----------------------------------------------------------------
+
+From comment 11, it sounds like this isn't the patch I should be looking at.
+
+::: docshell/base/nsIDocShell.idl
+@@ +1021,5 @@
+> +  /**
+> +   * Notify DocShell that a JS RunToCompletion event is being registered.
+> +   */
+> +  [noscript,notxpcom,nostdcall] void notifyJSRunToCompletionStart();
+> +  [noscript,notxpcom,nostdcall] void notifyJSRunToCompletionStop();
+
+you need to rev the IID of nsIDocShell.
+(In reply to Bobby Holley (:bholley) from comment #13)
+> Comment on attachment 8491838
+> timeline-javascript.patch
+> 
+> Review of attachment 8491838:
+> -----------------------------------------------------------------
+> 
+> From comment 11, it sounds like this isn't the patch I should be looking at.
+> 
+> ::: docshell/base/nsIDocShell.idl
+> @@ +1021,5 @@
+> > +  /**
+> > +   * Notify DocShell that a JS RunToCompletion event is being registered.
+> > +   */
+> > +  [noscript,notxpcom,nostdcall] void notifyJSRunToCompletionStart();
+> > +  [noscript,notxpcom,nostdcall] void notifyJSRunToCompletionStop();
+> 
+> you need to rev the IID of nsIDocShell.
+
+Well, the parts that would change after this are simply the locations where I'd invoke the callback.  I wanted to get feedback on the bulk of the existing patch: adding the callbacks, where they are threaded through, etc.
+
+If there are any problems with that (e.g. above comment about IID change), I'd like to fix that along with making these other changes.
+
+So I'm guessing the patch otherwise looks good outside of the IID issue?
+(In reply to Kannan Vijayan [:djvj] from comment #14)
+> So I'm guessing the patch otherwise looks good outside of the IID issue?
+
+I didn't really look at it. Paging a patch in for review has a cost, and I'd rather avoid doing it if 70% of it (the parts in js/src and js/xpconnect) are going to change.
+I'm vacillating on that change now.  Paul indicated that they're working on mechanisms for emitting script info, and if that's the case, we may end up pushing this back down into js::RunScript again so that we can get at that.
+
+Let's land this implementation as-is.
+
+How do I rev the IID of nsIDocShell?
+(I'll re-request review after fixing that)
+(In reply to Kannan Vijayan [:djvj] from comment #16)
+> I'm vacillating on that change now.  Paul indicated that they're working on
+> mechanisms for emitting script info
+
+Can you describe what this means exactly?
+
+> How do I rev the IID of nsIDocShell?
+
+It's declared at the top of the file. Use uuidgen to generate a new one.
+Created attachment 8494781
+timeline-javascript.patch
+
+Decided to stick with the old way for now, since that accommodates the expected situation later on where we want to pass up the script being called.
+(In reply to Bobby Holley (:bholley) from comment #18)
+> (In reply to Kannan Vijayan [:djvj] from comment #16)
+> > I'm vacillating on that change now.  Paul indicated that they're working on
+> > mechanisms for emitting script info
+> 
+> Can you describe what this means exactly?
+
+In this patch, when we create the marker, you'll note that don't attach the name of the function to be executed. That's because it's not possible yet to attach meta-data to a marker. It's a thing we are working on the side. We will eventually be able to attach a function name or even a JS stack.
+Comment on attachment 8494781
+timeline-javascript.patch
+
+Review of attachment 8494781:
+-----------------------------------------------------------------
+
+Patch mechanics look fine modulo the things discussed below. r- on account of the triggers not being well-defined (the solution may just be better documentation).
+
+What happens if the script spins the event loop (i.e. showModalDialog). Do we handle it?
+
+::: docshell/base/nsDocShell.cpp
+@@ +13502,5 @@
+> +void
+> +nsDocShell::NotifyJSRunToCompletionStart()
+> +{
+> +    bool timelineOn;
+> +    GetRecordProfileTimelineMarkers(&timelineOn);
+
+This XPIDL getter is marked [infallible], so you can do:
+
+bool timelineOn = GetRecordProfileTImelineMarkers();
+
+@@ +13512,5 @@
+> +}
+> +
+> +void
+> +nsDocShell::NotifyJSRunToCompletionStop()
+> +{
+
+MOZ_ASSERT(mRunToCompletionDepth > 0);
+
+::: js/src/jsfriendapi.h
+@@ +2581,5 @@
+> +(* RunToCompletionCallback)(JSContext *cx, bool startStop);
+> +
+> +/*
+> + * Sets a callback that is run whenever javascript execution is entered
+> + * or exited.  Calls to the callback by the engine will be properly
+
+This is way too vague. What does it mean for "javascript execution [to be] entered"? Is the granularity per-JSScript? What happens with nested evals, and cross-script calls? What happens when execution leaves the JS engine (say, invoking a DOM method), and then re-enters it again? We need a very crisp definition of what the 'start' triggers are (since presumably the stop triggers are just stack-scoped with the start).
+
+This is why piggybacking onto AutoEntryScript is nice, because it's a very well-defined concept. It may be that we still want to piggyback on that and find some way to access the script details. In particular, past and jimb were working on a mechanism to attach "Execution Reasons" to AutoEntryScript invocations. Would that (combined with knowing the global for which we're executing script) be enough?
+
+::: js/xpconnect/src/XPCJSRuntime.cpp
+@@ +1405,5 @@
+>  }
+>  
+> +// static
+> +void
+> +XPCJSRuntime::RunToCompletionCallback(JSContext *cx, bool startStop)
+
+Seems like this should be called "bool start"
+
+@@ +3274,5 @@
+>      js::SetDefaultJSContextCallback(runtime, DefaultJSContextCallback);
+>      js::SetActivityCallback(runtime, ActivityCallback, this);
+>      js::SetCTypesActivityCallback(runtime, CTypesActivityCallback);
+>      JS_SetInterruptCallback(runtime, InterruptCallback);
+> +    js::SetRunToCompletionCallback(runtime, RunToCompletionCallback);
+
+Please also null this callback out in ~XPCJSRuntime.
+(In reply to Bobby Holley (:bholley) from comment #21)
+> This is way too vague. What does it mean for "javascript execution [to be]
+> entered"? Is the granularity per-JSScript? What happens with nested evals,
+> and cross-script calls? What happens when execution leaves the JS engine
+> (say, invoking a DOM method), and then re-enters it again? We need a very
+> crisp definition of what the 'start' triggers are (since presumably the stop
+> triggers are just stack-scoped with the start).
+
+If I wanted to be precise, I would say: "this callback is invoked whenever js::RunScript is invoked".  Anything less than that will be imprecise and vague.
+
+Really we only care about the top-level entry into the script.  The callback itself does the job of depth-tracking to throw away any nested start/stop calls.  I don't _like_ this approach, it's kind of ugly and horrible.  But I do want to be able to pass up some info regarding WHAT is being executed, and js::RunScript, to accomodate the future developments Paul mentioned.. and js::RunScript is the best place I know of where that info is available.
+
+> This is why piggybacking onto AutoEntryScript is nice, because it's a very
+> well-defined concept. It may be that we still want to piggyback on that and
+> find some way to access the script details. In particular, past and jimb
+> were working on a mechanism to attach "Execution Reasons" to AutoEntryScript
+> invocations. Would that (combined with knowing the global for which we're
+> executing script) be enough?
+
+If the execution reasons included the target JSScript that was about to be invoked, then it should be more than enough.  Is that feasible?
+
+I really do prefer going the AutoEntryScript route over the js::RunScript implementation.  If we can guarantee that the above is possible in the future, then I'm all for it.
+Created attachment 8496127
+timeline-javascript-v2.patch
+
+V2 of the patch that puts the logic into AutoEntryScript instead of calling out from within js::RunScript.  This is much smaller and simpler than before.
+(In reply to Kannan Vijayan [:djvj] from comment #22)
+> (In reply to Bobby Holley (:bholley) from comment #21)
+> > This is way too vague. What does it mean for "javascript execution [to be]
+> > entered"? Is the granularity per-JSScript? What happens with nested evals,
+> > and cross-script calls? What happens when execution leaves the JS engine
+> > (say, invoking a DOM method), and then re-enters it again? We need a very
+> > crisp definition of what the 'start' triggers are (since presumably the stop
+> > triggers are just stack-scoped with the start).
+> 
+> If I wanted to be precise, I would say: "this callback is invoked whenever
+> js::RunScript is invoked".  Anything less than that will be imprecise and
+> vague.
+
+That's not good enough, because it would give rise to a new script-observable concept which is easy to implement given how the code is structured _now_, but might be a big PITA to deal with when we refactor the JS engine at some later point and the Firefox team isn't working on devtools anymore. AutoEntryScript is actually the implementation of a similar mistake from 15 years ago (granted on the much larger scale of "web-exposed"), and boy have we paid for it.
+ 
+> Really we only care about the top-level entry into the script.
+
+Which top-level entry? Which script? Some tricky cases:
+* Synchronous event dispatch
+* Nested event loops
+* One script calling another script.
+* Non-scripted invocations with no script on the stack (i.e. postMessage(someNativeFun.bind(...), 0).
+
+There are really two concepts I can think of to use here:
+(A) Every time we create an AutoEntryScript.
+(B) Every time the JS engine either (a) executes a script or (b) executes a scripted function. js::RunScript might have those properties, but that's not totally clear to me yet.
+
+(A) Is very straightforward to do, but gives you per-global granularity, rather than per-script.
+
+(B) Is more involved and heavyweight, and seems like something that should be part of the Debugger API. Is the problem that doing it that way would be too slow?
+
+> > This is why piggybacking onto AutoEntryScript is nice, because it's a very
+> > well-defined concept. It may be that we still want to piggyback on that and
+> > find some way to access the script details. In particular, past and jimb
+> > were working on a mechanism to attach "Execution Reasons" to AutoEntryScript
+> > invocations. Would that (combined with knowing the global for which we're
+> > executing script) be enough?
+> 
+> If the execution reasons included the target JSScript that was about to be
+> invoked, then it should be more than enough.  Is that feasible?
+
+From a conceptual standpoint not really, but it depends what you're trying to get at.
+
+Supposed we create an AutoEntryScript for global G and then invoke script A which invokes script B - do you need to know about B? If so, then AutoEntryScript won't help you. If not, then it seems kind of wrong to say anything about A in the abstract. The interesting bits would be the global (G), the execution reason (firing an event) and potentially the (filename, line) tuple of where we began executing.
+
+(The last part could perhaps be retrieved by having the AutoEntryScript set up a one-shot OnEnterFrame callback.)
+(In reply to Bobby Holley (:bholley) from comment #24)
+> That's not good enough, because it would give rise to a new
+> script-observable concept which is easy to implement given how the code is
+> structured _now_, but might be a big PITA to deal with when we refactor the
+> JS engine at some later point and the Firefox team isn't working on devtools
+> anymore. AutoEntryScript is actually the implementation of a similar mistake
+> from 15 years ago (granted on the much larger scale of "web-exposed"), and
+> boy have we paid for it.
+
+Fair enough.  Then we really shouldn't go the ::RunScript route.
+
+> Which top-level entry? Which script? Some tricky cases:
+> * Synchronous event dispatch
+> * Nested event loops
+> * One script calling another script.
+> * Non-scripted invocations with no script on the stack (i.e.
+> postMessage(someNativeFun.bind(...), 0).
+
+Anywhere where browser proper enters the JS engine as part of executing JS on behalf of some browser event.  So event dispatch would count.  Script=>script would not count.  Nested event loops should probably count (in the case of alert()s or other dialogs that spin events).
+
+PostMessage can probably go either way.
+
+> There are really two concepts I can think of to use here:
+> (A) Every time we create an AutoEntryScript.
+> (B) Every time the JS engine either (a) executes a script or (b) executes a
+> scripted function. js::RunScript might have those properties, but that's not
+> totally clear to me yet.
+> 
+> (A) Is very straightforward to do, but gives you per-global granularity,
+> rather than per-script.
+> 
+> (B) Is more involved and heavyweight, and seems like something that should
+> be part of the Debugger API. Is the problem that doing it that way would be
+> too slow?
+
+Yeah, B is not an option.  Even invoking this callback at "RunScript" doesn't get us B, since it doesn't handle Script=>Script calls within jitcode.  And even if we instrumented JitCode to cover that case (which is a bad idea in and of itself), it still wouldn't cover Ion jitcode with inlined functions.  So "B" is just a no-go.  "A" is sufficient.
+
+> From a conceptual standpoint not really, but it depends what you're trying
+> to get at.
+> 
+> Supposed we create an AutoEntryScript for global G and then invoke script A
+> which invokes script B - do you need to know about B? If so, then
+> AutoEntryScript won't help you. If not, then it seems kind of wrong to say
+> anything about A in the abstract. The interesting bits would be the global
+> (G), the execution reason (firing an event) and potentially the (filename,
+> line) tuple of where we began executing.
+
+I think knowing about A is fine.  E.g. if it's an onClick event handler, just knowing that it's "onClick handler at foo.html line 3" should be good.  Tracing below that is just a quagmire and not worth it.  We want to give the developer a quick idea of why some JS got executed, and a way to find that JS.  For more detail than that, the profiler is the place to look.
+
+Using debugger infrastructure for this is not feasible.  It needs to be roughly at the same performance level as plain execution.  The entire point of the tool is performance data.  The debugger overhead would pollute any inferences that could be made from the results.
+Comment on attachment 8496127
+timeline-javascript-v2.patch
+
+Review of attachment 8496127:
+-----------------------------------------------------------------
+
+The stuff in nsDocShell still needs to address comment 21.
+
+In general, AutoEntryScript has the potential to be pretty hot (especially in event dispatch). Nothing we're doing here is really all that expensive, but if we add this and 10 other things it can be a real slowdown (this was a big problem with JSContext pushing). So I think we should stick a counter on the ScriptSettingStack called mProfilingConsumers. Callers can invoke UseProfiling and DoneProfiling when this is turned on. If UseProfiling is true when an AutoEntryScript is constructed, we do .emplace() on a Maybe<RunToCompletionNotifier>, passing it the globalObject. This class QIs the global to nsPIDOMWindow, and notifies the docshell as appropriate.
+
+In general, the AutoEntryScript stuff is kind of in flux because jimb was supposedly refactoring it. Can you check in with him to see where he's at on that?
+
+::: dom/base/ScriptSettings.cpp
+@@ +360,5 @@
+> +  if (!global)
+> +    return nullptr;
+> +
+> +  // If global is has an associated window, get it.
+> +  nsGlobalWindow *window = xpc::WindowOrNull(global);
+
+I don't think this is safe to do on a worker thread. And anyway, the correct way to get the window here is to QI original nsIGlobalObject to nsPIDOMWindow.
+(In reply to Kannan Vijayan [:djvj] from comment #25)
+> I think knowing about A is fine.  E.g. if it's an onClick event handler,
+> just knowing that it's "onClick handler at foo.html line 3" should be good. 
+
+Ok. We don't presently have a way to know about A. We could potentially add an optional way to pass this information to the AutoEntryScript when it's constructed.
+(In reply to Bobby Holley (PTO 10/3-10/12) from comment #26)
+> In general, AutoEntryScript has the potential to be pretty hot (especially
+> in event dispatch). Nothing we're doing here is really all that expensive,
+> but if we add this and 10 other things it can be a real slowdown (this was a
+> big problem with JSContext pushing). So I think we should stick a counter on
+> the ScriptSettingStack called mProfilingConsumers. Callers can invoke
+> UseProfiling and DoneProfiling when this is turned on. If UseProfiling is
+> true when an AutoEntryScript is constructed, we do .emplace() on a
+> Maybe<RunToCompletionNotifier>, passing it the globalObject. This class QIs
+> the global to nsPIDOMWindow, and notifies the docshell as appropriate.
+
+Could you explain to me how ScriptSettingsStack would get accessed?  The entire API for it is private, and only exposed to ScriptSettings.cpp.
+
+Are you suggesting I add public functions to ScriptSettings.h that is a friend of ScriptSettingsStack, and those functions then incr/decr this counter?
+
+
+
+> In general, the AutoEntryScript stuff is kind of in flux because jimb was
+> supposedly refactoring it. Can you check in with him to see where he's at on
+> that?
+
+Will do.
+
+
+> I don't think this is safe to do on a worker thread. And anyway, the correct
+> way to get the window here is to QI original nsIGlobalObject to
+> nsPIDOMWindow.
+
+Done.
+(In reply to Kannan Vijayan [:djvj] from comment #28)
+> Are you suggesting I add public functions to ScriptSettings.h that is a
+> friend of ScriptSettingsStack, and those functions then incr/decr this
+> counter?
+
+Exactly.
+(In reply to Bobby Holley (:bholley) from comment #29)
+> (In reply to Kannan Vijayan [:djvj] from comment #28)
+> > Are you suggesting I add public functions to ScriptSettings.h that is a
+> > friend of ScriptSettingsStack, and those functions then incr/decr this
+> > counter?
+> 
+> Exactly.
+
+I'm working on sticking this directly onto ScriptSettingsStack (which is currently a bare class with no members and composed completely of static member functions that work off of thread-retrieved data.
+
+We could keep a global count of all consumers directly on the stack struct (i.e. one counter for all threads).  I wanted to make sure your intent wasn't to have the field be put into ScriptSettingsStackEntry* instead (and then maybe be copied forward when new entries are pushed?)
+
+I'm not sure where and how this stack gets manipulated, so I want to be sure I end up putting this data in the right place.
+It depends - do we ever want this to work on worker-threads, or is it main-thread-only? If the latter, then we don't have to stick it on the ScriptSettingsStack at all, and can just make it a static member in ScriptSettingsStack.cpp. But that's not quite as nice.
+
+I'd forgotten that there's no container ScriptSettingsStack struct in TLS, but just the topmost ScriptSettingsStackEntry. This stuff is all kind of tangled up in jimb's supposed refactoring which has been in limbo for some months now. Maybe ping him and coordinate?
+(In reply to Bobby Holley (:bholley) from comment #31)
+> It depends - do we ever want this to work on worker-threads, or is it
+> main-thread-only?
+
+We are only instrumenting the main thread, and we're not planning to instrument workers (with markers).
+Created attachment 8510641
+bug-1050774.patch
+
+Third revision.  Is this sort of what you had in mind, bholley?
+Created attachment 8510642
+bug-1050774.patch
+
+Whoops updated patch.  Previous one left out some non-committed changes.
+Comment on attachment 8510642
+bug-1050774.patch
+
+Review of attachment 8510642:
+-----------------------------------------------------------------
+
+::: docshell/base/nsDocShell.cpp
+@@ +13566,5 @@
+>  void
+> +nsDocShell::NotifyJSRunToCompletionStart()
+> +{
+> +    bool timelineOn;
+> +    GetRecordProfileTimelineMarkers(&timelineOn);
+
+See the infallibility bit in comment 21.
+
+::: docshell/base/nsDocShell.h
+@@ +951,5 @@
+>      nsWeakPtr mOpener;
+>      nsWeakPtr mOpenedRemote;
+>  
+> +    // A depth count of how many times NotifyRunToCompletionStart
+> +    // has been called without a matching NotifyRunToCompletionStop
+
+Nit - Period.
+
+::: docshell/base/nsIDocShell.idl
+@@ +1026,5 @@
+>    // URLSearchParams for the window.location is owned by the docShell.
+>    [noscript,notxpcom] URLSearchParams getURLSearchParams();
+>  
+>    /**
+> +   * Notify DocShell that a JS RunToCompletion event is being registered.
+
+Nit - this comment could be improved. What is a RunToCompletion event? Is it an actual "event" in the DOM sense, or something else? Why "is being registered"?
+
+In general, I think RunToCompletion is a bad name for this stuff. I think we should call it "Script Entry Profiling" or "Script Entry Timeline Markers" or somesuch.
+
+::: dom/base/ScriptSettings.cpp
+@@ +77,5 @@
+> +
+> +void
+> +IncrementRunToCompletionListeners()
+> +{
+> +    ++gRunToCompletionListeners;
+
+Please assert mainthreadedness here.
+
+@@ +472,5 @@
+>      return true;
+>  }
+>  
+> +static nsIDocShell *
+> +FindJSContextDocShell(JSContext *cx)
+
+This should be based on aGlobalObject, not the JSContext. Just QI the global to nsPIDOMWindow, from which you can get the docshell.
+
+@@ +501,5 @@
+>    MOZ_ASSERT(aGlobalObject);
+>    MOZ_ASSERT_IF(!aCx, aIsMainThread); // cx is mandatory off-main-thread.
+>    MOZ_ASSERT_IF(aCx && aIsMainThread, aCx == FindJSContext(aGlobalObject));
+> +
+> +  if (gRunToCompletionListeners > 0)
+
+We only want to do this in the main-thread case, right?
+
+::: dom/base/ScriptSettings.h
+@@ +67,5 @@
+> +/*
+> + * Static helpers in ScriptSettings which track the number of listeners
+> + * of RunToCompletion events.  These should be used by the code in
+> + * nsDocShell::SetRecordProfileTimelineMarkers to indicate to script
+> + * settings that script run-to-completion needs to be monitored.
+
+Same comments about the naming. Something {Use,Unuse}EntryScriptProfiling or something.
+
+Also, this stuff is main-thread-only, right? Please document as-such.
+
+@@ +341,5 @@
+>    // can't go away until then either.
+>    nsIPrincipal* mWebIDLCallerPrincipal;
+>    friend nsIPrincipal* GetWebIDLCallerPrincipal();
+> +
+> +  nsIDocShell* mDocShell;
+
+Given that we only set this in the case when we're profiling, we shouldn't imply that it has validity otherwise. Call it mDocShellForEntryScriptProfiling or whatever.
+(In reply to Bobby Holley (:bholley) from comment #35)
+> Comment on attachment 8510642
+> bug-1050774.patch
+> 
+> Review of attachment 8510642:
+> -----------------------------------------------------------------
+> 
+> ::: docshell/base/nsDocShell.cpp
+> @@ +13566,5 @@
+> >  void
+> > +nsDocShell::NotifyJSRunToCompletionStart()
+> > +{
+> > +    bool timelineOn;
+> > +    GetRecordProfileTimelineMarkers(&timelineOn);
+> 
+> See the infallibility bit in comment 21.
+
+I tried to use the infallbile bool-returning variant, but there's no function prototype defined for that, so it errors out at build time.  Am I missing something?
+(In reply to Kannan Vijayan [:djvj] from comment #36)
+> I tried to use the infallbile bool-returning variant, but there's no
+> function prototype defined for that, so it errors out at build time.  Am I
+> missing something?
+
+A 0-argument GetRecordProfileTimelineMarkers definitely gets generated (check the generated nsIDocShell.h in your objdir).
+Created attachment 8520313
+bug-1050774.patch
+
+Updated patch.
+
+For some reason I have to use the nsIDocument:: prefix for calling the infallible method.
+
+Haven't run this through try yet, due to try blockages today.
+(In reply to Kannan Vijayan [:djvj] from comment #38)
+
+> For some reason I have to use the nsIDocument:: prefix for calling the
+> infallible method.
+
+The method in nsDocShell shadows the methods inherited from nsIDocShell.
+See, e.g., http://stackoverflow.com/questions/411103/function-with-same-name-but-different-signature-in-derived-class
+Created attachment 8520686
+bug-1050774.patch
+
+Patch with comments addressed.  Try run: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=479d10fcc460
+Build issue on linux debug.  Attempted fix and re-try:  https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=3f6c81121ab9
+Comment on attachment 8520686
+bug-1050774.patch
+
+Review of attachment 8520686:
+-----------------------------------------------------------------
+
+Looks good - thanks for pushing this through.
+
+::: docshell/base/nsDocShell.cpp
+@@ +2838,4 @@
+>        mProfileTimelineRecording = true;
+>      } else {
+>        --gProfileTimelineRecordingsCount;
+> +      UnuseEntryScriptProfiling();
+
+Can you MOZ_ASSERT(!mProfileTimelineRecording) in ~nsDocShell?
+
+::: dom/base/ScriptSettings.cpp
+@@ +489,5 @@
+> +
+> +  if (aIsMainThread && gRunToCompletionListeners > 0) {
+> +    nsCOMPtr<nsPIDOMWindow> window = do_QueryInterface(aGlobalObject);
+> +    if (window)
+> +        mDocShellForJSRunToCompletion = window->GetDocShell();
+
+Need braces around the consequent.
+Comments addressed.  I'm pretty close to landing this, but I'm running into a UI test that's breaking due to newly introduced functionality.  I'm not sure how to fix the test:
+
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=22e216be1da8
+
+See (dt) in the link above.  I tried adding the RGB equivalent for the Javascript HSL to the gRGB_TO_HSL table, but that seems to not be enough.  Paul, are you familiar with this test and how it works?
+(In reply to Kannan Vijayan [:djvj] from comment #43)
+> 
+> See (dt) in the link above.  I tried adding the RGB equivalent for the
+> Javascript HSL to the gRGB_TO_HSL table, but that seems to not be enough. 
+
+Can I see the updated patch?
+Comment on attachment 8520686
+bug-1050774.patch
+
+Review of attachment 8520686:
+-----------------------------------------------------------------
+
+::: browser/devtools/timeline/widgets/global.js
+@@ +56,5 @@
+>      stroke: "hsl(0,0%,60%)",
+>      label: L10N.getStr("timeline.label.consoleTime")
+> +  },
+> +  "Javascript": {
+> +    group: 5,
+
+How about making this share the same group as "ConsoleTime" (4)? We're adding too many rows and the overview rects are getting much too tiny. Increasing the overall height isn't a very good idea either.
+Created attachment 8521778
+bug-1050774.patch
+
+Updated patch.  Carrying r+ over from obsoleted patch.  I'm trying to use category 4 for JS timeline entries, as suggested.  Try run here: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=63b0888cdc1b
+Try run still failing browser/devtools/timeline/test/browser_timeline_waterfall-styles.js after assigning category 4 (with same color) to JS timelines:
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=63b0888cdc1b
+
+Victor, can you advise?
+(In reply to Kannan Vijayan [:djvj] from comment #47)
+> Try run still failing
+
+Add:
+> "rgb(204, 204, 204)": "hsl(0,0%,80%)",
+> "rgb(153, 153, 153)": "hsl(0,0%,60%)",
+
+... to `browser/devtools/timeline/test/browser_timeline_waterfall-styles.js`
+
+Works here.
+
+(In reply to Victor Porof [:vporof][:vp] from comment #45)
+> How about making this share the same group as "ConsoleTime" (4)? We're
+> adding too many rows and the overview rects are getting much too tiny.
+> Increasing the overall height isn't a very good idea either.
+
+If this is a thing we want to do, let's do that in a follow-up. I'd like to discuss it first.
+There are plenty of other things we can do (hide DOM events by default, only show a row when there's at least one marker, ...).
+That seems to fix it.  Running try one last time rebased to tip before pushing.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/451e1d755d89
+https://hg.mozilla.org/mozilla-central/rev/451e1d755d89
+Sorry for the spam. Moving bugs to Firefox :: Developer Tools: Performance Tools (Profiler/Timeline).
+
+dkl

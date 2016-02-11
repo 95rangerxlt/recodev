@@ -1,0 +1,301 @@
+Created attachment 8650458
+webide-fxos-addon-screenshot-2015-08-20.png
+
+Currently when I choose my FxOS addon with the new manifest format:
+https://etherpad.mozilla.org/converting-fxos-addons
+It didn't look for the new manifest files,
+instead it still requires manifest.webapp,
+which blocks me from installing my addon.
+
+Created attachment 8650458
+webide-fxos-addon-screenshot-2015-08-20.png
+
+Currently when I choose my FxOS addon with the new manifest format:
+https://etherpad.mozilla.org/converting-fxos-addons
+It didn't look for the new manifest files,
+instead it still requires manifest.webapp,
+which blocks me from installing my addon.
+Happy to take this if no one else wants it.
+
+Going to be on a transatlantic flight all day tomorrow, so I won't be able to post a patch for a day or so.
+For local development, just look for manifest.json. No need for update.webapp
+Status update: I've got the WebIDE part into good shape, but I'm having trouble debugging the webapps actor. Wish me luck on my flight :)
+Created attachment 8651514
+Initial patch to support packaged WebExtensions in WebIDE
+
+Attached first draft of a patch.
+
+I can't see anything missing from this patch, but for whatever reason, it's not working on my end.
+
+What works:
+
+1. Loading a WebExtension in the WebIDE
+2. Pushing it to another device
+3. application.zip and manifest.json appear in /data/local/webapps/{app-id}/
+4. The "{app name} successfully installed" notification appears
+5. The RDP chatter looks normal and reports that the package was installed
+6. Entries for the add-on appear in /data/local/webapps/webapps.json
+
+What doesn't work:
+
+1. After pushing, the WebIDE reports "Operation timed out: installing and running app"
+2. The add-on does not appear in Settings
+3. The add-on is not applied to the system
+
+Old-style add-ons installed via WebIDE and WebExtensions installed from https://people.mozilla.org/~fdesre/extensions/ work correctly, so something's missing from my patch.
+
+Comparing Les Orchard's Brightness Slider installed via Fabrice's page and via the WebIDE, I see only two potentially meaningful differences in /data/local/webapps/webapps.json:
+
+    "appStatus": 2,      // (1 when installed from WebIDE)
+    "role": "addon",     // ("" when installed from WebIDE)
+
+Other fields differ ("installerAppId", "installerIsBrowser"), but they all appear to be inconsequential metadata. Installing from the web also results in entries like "manifestHash", "packageHash", "downloadSize", and "updateManifest", which are not present when installed from the WebIDE. The WebIDE installation results in "sideloaded": true. The "sideloaded" key is not present when installing from the Web.
+
+Help would be appreciated at this point. :)
+Oh, hey! When I install the Brightness Slider from https://people.mozilla.org/~fdesre/extensions/, I end up with the following files in /data/local/webapps/{app-id}:
+
+    application.zip
+    manifest.webapp // <-- ???
+    update.webapp
+
+If I download application.zip, unpack it, and install it directly from the WebIDE, I get the following files in that location:
+
+    application.zip
+    manifest.json // <-- ???
+
+When installed from the web, the contents of manifest.webapp are:
+
+    {
+      "type": "privileged",
+      "name": "Brightness slider!",
+      "role": "addon",
+      "developer": {
+        "name": "Les Orchard"
+      }
+    }
+
+So I'm apparently missing some code path that spits out a manifest.webapp for WebExtensions when installed via navigator.mozApps.installPackage("https://example.com/update.webapp");
+Comment on attachment 8651514
+Initial patch to support packaged WebExtensions in WebIDE
+
+Review of attachment 8651514:
+-----------------------------------------------------------------
+
+See inlined notes, I hope it helps.
+
+::: browser/devtools/app-manager/app-validator.js
+@@ +203,5 @@
+>  };
+>  
+>  AppValidator.prototype.validateLaunchPath = function (manifest) {
+>    // Addons don't use index page (yet?)
+> +  if (manifest.content_scripts || manifest.role === "addon") {
+
+I would rather bypass all validations from AppValidator.prototype.validate as addons are quite different from apps. Some rules may be similar/close, but at the end it is quite different.
+Also manifest.manifest_version is a better field to distinguish apps from addons.
+
+We would have liked to have a better architecture in WebIDE, where it would be easier to support new kind of projects like old firefox addons, just a regular webpage or a nodejs app... But we never did the necessary refactoring to make that happen.
+
+Finally, I think we will get rid of all specifics of old fxos addons and remove such checks.
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +480,5 @@
+>                              .createInstance(Ci.nsIZipReader);
+>            zipReader.open(zipFile);
+>  
+> +          let manifestName = zipReader.findEntries("manifest.json").hasMore() ?
+> +                             "manifest.json" : "manifest.webapp";
+
+See this changeset, there is a better zipreader api to looks for file existence (hasEntry):
+  http://hg.mozilla.org/mozilla-central/rev/54f3e2979aa2
+
+Also look into Webapps.jsm modification. We need to replicate it there. We need to call UserCustomizations.checkExtensionManifest/convertManifest functions.
+Created attachment 8652144
+Work in progress patch (v2)
+
+With this patch, WebExtensions can be pushed to and installed on a target device. Minor nits remain.
+
+Realizing I bit off more than expected for my first contribution in here. Thanks for sticking with me, :ochameau.
+
+Outstanding concerns:
+
+1. Upon install, WebExtensions get launched, which loads a window showing the contents of application.zip. Old-style add-ons are, correctly, not launched. Need to grep around and figure out what suppresses the launch RDP message for old-style add-ons.
+
+2. I had to move ~40 lines of installPackagedApp's runnable into a .then() block since DOMApplicationRegistry._writeFile(path, data) is asynchronous. Should I pull in Task.jsm and yield to _writeFile, or is there a synchronous API that I should use?
+
+3. In general, I'm not happy with the cleanliness of the patch.
+
+Can I please get one last round of pointers and preliminary review before I set the r? flag? Thanks!
+Comment on attachment 8652144
+Work in progress patch (v2)
+
+Review of attachment 8652144:
+-----------------------------------------------------------------
+
+I'm not blaming you, but doing so much here starts to really make me cringe. We need to expose the right functions from Webapps.jsm instead. That's harder though, so don't feel like you have to do it. File a follow-up on me is ok.
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +481,5 @@
+>                              .createInstance(Ci.nsIZipReader);
+>            zipReader.open(zipFile);
+>  
+> +          let manifestName = zipReader.hasEntry("manifest.json") ?
+> +                             "manifest.json" : "manifest.webapp";
+
+That's not exactly the right logic. What we need in the "normal" install flow is explained at http://mxr.mozilla.org/mozilla-central/source/dom/apps/Webapps.jsm?rev=8b37e978d607#3707
+(In reply to Dan Callahan [:callahad] from comment #7)
+> 1. Upon install, WebExtensions get launched, which loads a window showing
+> the contents of application.zip. Old-style add-ons are, correctly, not
+> launched. Need to grep around and figure out what suppresses the launch RDP
+> message for old-style add-ons.
+
+You need to tweak that:
+  http://mxr.mozilla.org/mozilla-central/source/browser/devtools/webide/modules/app-manager.js#661
+
+> 2. I had to move ~40 lines of installPackagedApp's runnable into a .then()
+> block since DOMApplicationRegistry._writeFile(path, data) is asynchronous.
+> Should I pull in Task.jsm and yield to _writeFile, or is there a synchronous
+> API that I should use?
+
+That's fine, we are used to nested code in this file.
+I think it is better to spend time on what fabrice suggested in followup.
+Created attachment 8652448
+webide-webextensions.patch
+
+I believe this patch addresses the concerns raised above and is ready for proper review.
+
+If this looks good, I'll file a second bug for broader refactoring as discussed above.
+Hm. It's hard to see in Bugzilla's side-by-side diff, but there are only whitespace changes to lines 550-591 (old) / 571-612 (new) in toolkit/devtools/server/actors/webapps.js.
+
+They were indented to place them inside a promise chain initiated by _writeFile().
+*** Bug 1198433 has been marked as a duplicate of this bug. ***
+Comment on attachment 8652448
+webide-webextensions.patch
+
+Review of attachment 8652448:
+-----------------------------------------------------------------
+
+Looks good to me.
+
+Could you push it to try with linux64/b2g platforms running xpcshell/mochitests?
+
+::: browser/devtools/app-manager/app-validator.js
+@@ +277,5 @@
+>        if (manifest) {
+>          this.manifest = manifest;
+> +
+> +        // Skip validations for add-ons
+> +        if (manifest.role === "addon" || manifest.manifest_version) {
+
+You can remove the old addon support, at the end old addons won't ship in any release.
+
+::: browser/devtools/webide/modules/app-manager.js
+@@ +659,5 @@
+>        }
+>  
+>        // Addons don't have any document to load (yet?)
+>        // So that there is no need to run them, installing is enough
+> +      if (project.manifest.manifest_version || project.manifest.role === "addon") {
+
+Same here.
+
+::: browser/locales/en-US/chrome/browser/devtools/app-manager.properties
+@@ +17,5 @@
+>  project.installing=Installing…
+>  project.installed=Installed!
+>  validator.nonExistingFolder=The project folder doesn't exists
+>  validator.expectProjectFolder=The project folder ends up being a file
+> +validator.wrongManifestFileName=Packaged apps require at least one manifest file named either 'manifest.webapp' or 'manifest.json' at project root folder
+
+This message can be disturbing for app developers not knowing about addons.
+I would phrase it to something like this:
+  A manifest file is required at project root folder.
+  Either named 'manifest.webapp' for packaged apps or 'manifest.json' for addons.
+...evidently, I don't have try access. Fixing that in Bug 1198717, if you would be so kind as to vouch for me.
+
+I'll fix the error message.
+
+I'd like to wait on pulling the old add-on support until we push a foxfooding build, so we don't break people working on existing add-ons, if that sounds good to you.
+(In reply to Dan Callahan [:callahad] from comment #14)
+> ...evidently, I don't have try access. Fixing that in Bug 1198717, if you
+> would be so kind as to vouch for me.
+
+Oh, I can push it for you. I thought you already had access to it.
+
+> I'd like to wait on pulling the old add-on support until we push a
+> foxfooding build, so we don't break people working on existing add-ons, if
+> that sounds good to you.
+
+Hum. I think this is only gaia developers, isn't it? But anyway, that sounds good to me.
+Created attachment 8652832
+webide-webextensions.patch (v2)
+
+Updated patch, only change is the tweaked error message.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=fdceb65bcac9
+For my OCD
+Created attachment 8653597
+webide-webextensions.patch (v3)
+
+This is the patch that landed on Try. 
+
+I had to tweak the context in the patch to cleanly apply it to fx-team tip.
+
+Try looks good, other than two unrelated failures. What's the next step to get this landed?
+
+Thanks!
+Comment on attachment 8653597
+webide-webextensions.patch (v3)
+
+Review of attachment 8653597:
+-----------------------------------------------------------------
+
+Carrying forward earlier r+
+https://hg.mozilla.org/integration/b2g-inbound/rev/64e74cd8eabc
+https://hg.mozilla.org/mozilla-central/rev/64e74cd8eabc
+I'm not sure how we can fix this, but it's the second or third time this week I have to file bugs to get strings renamed in devtools.
+
+Can we make sure all developers, and in particular reviewers, are aware of this? Any way to enforce this in the devtools group?
+https://developer.mozilla.org/en-US/docs/Mozilla/Localization/Localization_content_best_practices#Changing_existing_strings
+(In reply to Francesco Lodolo [:flod] PTO-BACK ON SEP 7 from comment #23)
+> I'm not sure how we can fix this, but it's the second or third time this
+> week I have to file bugs to get strings renamed in devtools.
+> 
+> Can we make sure all developers, and in particular reviewers, are aware of
+> this? Any way to enforce this in the devtools group?
+> https://developer.mozilla.org/en-US/docs/Mozilla/Localization/
+> Localization_content_best_practices#Changing_existing_strings
+
+You could send a mail to dev-developer-tools about it.  I think most are *aware* of it, but sometimes it can be hard to remember.
+I still get following error, trying to install local clone of
+https://github.com/mdn/simple-addon.git
+on my flame device running latest nightly (20150820) OTA update.
+
+navigator.buildID
+    20150901030226
+navigator.javaEnabled()
+    true
+navigator.language
+    de
+navigator.languages
+    de,en-US
+navigator.userAgent
+    Mozilla/5.0 (Windows NT 5.1; rv:43.0) Gecko/20100101 Firefox/43.0
+
+10:19:25.408 Connection status changed: disconnected app-manager.js:161
+10:22:29.653 Connection status changed: connecting app-manager.js:161
+10:22:31.621 Connection status changed: connected app-manager.js:161
+10:22:48.516 Installing app from C:\Users\AichnerAd\tmp\mozilla\simple-addon app-manager.js:635
+10:22:48.891 Starting bulk upload app-actor-front.js:183
+10:22:48.892 File size: 49547 app-actor-front.js:185
+10:22:48.897 Bulk upload done app-actor-front.js:203
+10:22:48.961 "Operation failed: installing and running app (installationFailed): [Exception... "Component returned failure code: 0x80520006 (NS_ERROR_FILE_TARGET_DOES_NOT_EXIST) [nsIZipReader.getInputStream]"  nsresult: "0x80520006 (NS_ERROR_FILE_TARGET_DOES_NOT_EXIST)"  location: "JS frame :: resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/server/actors/webapps.js :: run :: line 484"  data: no]" webide.js:386:5
+
+10:22:48.965 Object { error: "installationFailed", message: "[Exception... "Component returned f…", appId: "d9908f9b-6805-4d93-a061-b540a90b6ea4", from: "server1.conn0.webappsActor5" }
+Unfortunately, you'll need a newer build of b2g, since this patch introduced changes on both the WebIDE and target device sides. :(
+
+
+WebIDE should recognize new FxOS addon manifest format
+
+
+
+Bug 1196734 - Support packaged WebExtensions in WebIDE r=ochameau 

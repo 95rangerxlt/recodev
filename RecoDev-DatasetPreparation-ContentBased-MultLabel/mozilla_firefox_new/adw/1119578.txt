@@ -1,0 +1,81 @@
+> markh: https://www.dropbox.com/s/qm3qkvmjnl3h5f3/Registration%20Form.pdf is the closest I can find - it shows the checkbox but is wrong about "the next step is datatype selection"
+> markh: datatype selection is after migration once sync is setup for FxA
+> markh: and browserid_identity already has support for that (as the same basic thing happens on normal fxa sync setup)
+> markh: the distinction for migration is "checkbox should default to checked if user has some engines already unselected, and default to unchecked if all engines are already enabled"
+> markh: so the test would be that line above, plus:
+> markh: after migration ensure that dialog does indeed popup, has the correct "defaults", and changing the defaults does the right thing
+> markh: Some of the complexity is that about 7 prefs need to be changed to hit the fxa staging server
+> markh: and at least one of those prefs is reset after migration, meaning it needs to be changed multiple times
+> adw: are you imagining an automated test or manual testing?
+> markh: manual - I don't think we have the capability of reasonable sync automated testing
+
+> markh: https://www.dropbox.com/s/qm3qkvmjnl3h5f3/Registration%20Form.pdf is the closest I can find - it shows the checkbox but is wrong about "the next step is datatype selection"
+> markh: datatype selection is after migration once sync is setup for FxA
+> markh: and browserid_identity already has support for that (as the same basic thing happens on normal fxa sync setup)
+> markh: the distinction for migration is "checkbox should default to checked if user has some engines already unselected, and default to unchecked if all engines are already enabled"
+> markh: so the test would be that line above, plus:
+> markh: after migration ensure that dialog does indeed popup, has the correct "defaults", and changing the defaults does the right thing
+> markh: Some of the complexity is that about 7 prefs need to be changed to hit the fxa staging server
+> markh: and at least one of those prefs is reset after migration, meaning it needs to be changed multiple times
+> adw: are you imagining an automated test or manual testing?
+> markh: manual - I don't think we have the capability of reasonable sync automated testing
+Adding some relevant pointers - bug 1098694 in particular has information about the staging server and when it should hit prod
+This doesn't quite work right.  I tried various cases several times, and when "Choose what to sync" was checked, I usually did not get the customize.xul modal dialog after migration completed.  "Usually" -- the first time I tried with "Choose what to sync" checked, I did get the dialog as expected.  Every other time, I didn't.  So there may be some race condition.
+
+First, what does work right:  The "Choose what to sync" checkbox on the signup page is checked correctly depending on whether I had previously unselected any engines, the data of the "login" command received by aboutaccounts.js correctly contains a customizeSync bool, onLogin in aboutaccounts.js correctly sets the showCustomizationDialog pref, and needsCustomization() in browserid_identity.js correctly checks the pref.
+
+The problem is that once I click the verification email and Firefox sees that I've been verified, a whole bunch of services.sync.* prefs get set, or cleared maybe.  At the same time, browserid_identity.js is going through the initializeWithCurrentIdentity flow.  In every case after I started instrumenting the flow, services.sync.ui.showCustomizationDialog was cleared before browserid_identity.js examined it.  I'm guessing that the one time where I got the customize.xul dialog as expected, it just so happened that showCustomizationDialog was cleared after browserid_identity.js examined it.  Or maybe the whole bunch of prefs wasn't set/cleared that time, maybe because I used an old profile and/or and old Sync account.  That was before I started instrumenting things and used new profiles and Sync accounts.
+
+I'm guessing the whole bunch of prefs being set/cleared is due to the prefs engine kicking in?  I'll investigate more and file follow-up bugs as necessary.
+(In reply to Drew Willcoxon :adw from comment #2)
+> I'm guessing the whole bunch of prefs being set/cleared is due to the prefs
+> engine kicking in?
+
+Oh, no.  The bunch of prefs being set/cleared are things like services.sync.clients.lastRecordUpload, things that look like appropriate metadata.  Not just a wholesale set/clearing of the sync.* branch.  And I actually unchecked the prefs engine anyway.
+
+showCustomizationDialog is cleared by Weave.Service.startOver: http://mxr.mozilla.org/mozilla-central/source/services/sync/modules/service.js#909
+
+Which is called by the migrator in _promiseCurrentUserState: http://mxr.mozilla.org/mozilla-central/source/services/sync/modules/FxaMigrator.jsm#238
+
+So that's the race?
+startOver both clears all the Sync prefs and triggers initializeWithCurrentIdentity, and the latter happens *serially* after the former -- no race condition at all.  At least that's what I'm seeing.  initializeWithCurrentIdentity has multiple callers, but I'm seeing it on startOver's stack when startOver accesses Status._authManager: http://mxr.mozilla.org/mozilla-central/source/services/sync/modules/service.js#931  (The _authManager getter then calls BrowserIDManager.initialize, which calls initializeWithCurrentIdentity.)
+
+Notice that that happens after the Svc.Prefs.resetBranch("") several lines above.
+
+So is this even a migration bug?
+> markh: obvious and easy answer would be to change that pref name
+> adw: so that resetPrefs doesn't reset it?
+> markh: yeah
+> ...
+> markh: something like services.sync-setup... or something?
+> ...
+> markh: renaming the pref will expose and edge case though - if they login
+>        before verifying, then exit their browser, then the browser updates to
+>        the new version on restart, they will not get the dialog
+> markh: but I think we can live with that
+> ...
+> markh: I don't think there's an ordering problem really - it's just that the
+>        existing code was only considering the flow for first time use when sync
+>        can't have previously been configured
+> ...
+> markh: It's simply that we never considered that .startOver() would be called
+>        *after* an FxA user was logged in
+> markh: before this migration, that would "reset" sync and there's be no user
+>        logged in
+> markh: so it would end up as the normal first-time-use flow
+> adw: when would that pref ever be true then?
+> markh: on that first time flow - ie, when a user signs up for sync - there's no
+>        .startOver() in that case as Sync was never previously configured
+> markh: ie, on a new profile and you sign in to sync, there's no .startOver()
+>        call made
+> markh: previously, .startOver() was called when sync was configured for legacy
+>        account and you did "unlink"
+> markh: then you ended up with a fully reset sync and no FxA user logged in
+> markh: then you did the "Create FxA user" flow and things work fine
+> markh: this is changing things such that we are resetting sync *after* an FxA
+>        user is logged in
+Closing this bug as I tested Sync engine selection after migration, with the result that it does not work when "Choose what to sync" is checked, and it needs to be fixed.  I filed bug 1124956 to fix it.
+
+
+Manually test that Sync engine selection does the right thing after FxA migration
+

@@ -1,0 +1,181 @@
+Build Identifier: Version: Helios Service Release 1, Build id: 20100917-0705
+
+Portion of code with comments about the problem:
+      boolean handleDeclarations() {
+         if (!bLinkageSectionSeen) {
+            linkageSectionMatcher = linkageSectionPattern.matcher(srcIn.strLine);
+            bLinkageSectionSeen   = linkageSectionMatcher.find();
+            if (bLinkageSectionSeen) {
+               // TODO: Fix bug in HELIOS SR1 that does not occur in GALILEO SR2
+               // Can't do watch, inspect, or display on this variable
+               // Gets error: "Unable to resolve binding for: "
+               srcOut.bCommentLine = true; 
+            }
+         }
+         return bEndLinkageSectionSeen;
+      } // HandleDeclarations
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. Build project with attached source HeliosBug.java  
+2. Set breakpoint on the line:  srcOut.bCommentLine = true;
+3. Attempt display, inspect, or watch on that variable
+
+Build Identifier: Version: Helios Service Release 1, Build id: 20100917-0705
+
+Portion of code with comments about the problem:
+      boolean handleDeclarations() {
+         if (!bLinkageSectionSeen) {
+            linkageSectionMatcher = linkageSectionPattern.matcher(srcIn.strLine);
+            bLinkageSectionSeen   = linkageSectionMatcher.find();
+            if (bLinkageSectionSeen) {
+               // TODO: Fix bug in HELIOS SR1 that does not occur in GALILEO SR2
+               // Can't do watch, inspect, or display on this variable
+               // Gets error: "Unable to resolve binding for: "
+               srcOut.bCommentLine = true; 
+            }
+         }
+         return bEndLinkageSectionSeen;
+      } // HandleDeclarations
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. Build project with attached source HeliosBug.java  
+2. Set breakpoint on the line:  srcOut.bCommentLine = true;
+3. Attempt display, inspect, or watch on that variable
+Created attachment 182243
+Test case for the problem
+I ran into this problem too. The problem was that source lookup was incorrectly configured. Source lookup in my setup did contain the Default item and the Workspace.
+
+I had to remove the Workspace from source lookup and add every project in my workspace as a Java Project to source lookup.
+
+An indicator for that problem might be that when a breakpoint is hit, the source file isn't openend in a Java Editor (the one where the Editor Icon in the editor tabs contains a filled blue J) but in another editor that has an unfilled blue J as an icon (don't know how that editor is named).
+
+I experienced this on Indigo with Maven Projects.
+*** Bug 401401 has been marked as a duplicate of this bug. ***
+bug 401401 comment #0 has a proposed fix in the source generator.
+Here is a snippet that will reproduce the problem:
+
+package a.b.c;
+public class bug329294 {
+
+	public static void main(String[] args) {
+		try {
+			Inner1 i1 = new Inner1();
+			Inner2 i2 = new Inner2(i1);
+			System.out.println(i2.isTrue());
+		}
+		catch(Exception e) {
+			
+		}
+	}
+	private static class Inner1 {
+		boolean innerBool;
+	}
+	//breaking line comment
+	private static class Inner2 {
+		Inner1 fInner1 = null;
+		Inner2(Inner1 inner) {
+			fInner1 = inner;
+		}
+		
+		boolean isTrue() {
+			return fInner1.innerBool; //breakpoint here, inspect / watch fInner1.innerBool
+		}
+	}
+}
+
+
+If you remove the '//breaking line comment' line it works as expected, leave it there evals fail.
+Debugging through the code it looks like the IType and the AST node have differing source ranges - even when they are talking about the same type.
+pushed fix + regression tests to:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.debug.git/commit/?id=4ea05f9ee3e2b5f189c2e7243205b6ccf65b45ce
+(In reply to comment #6)
+> pushed fix + regression tests to:
+> 
+> http://git.eclipse.org/c/jdt/eclipse.jdt.debug.git/commit/
+> ?id=4ea05f9ee3e2b5f189c2e7243205b6ccf65b45ce
+
+Why does SourceBasedSourceGenerator#isRightType(ASTNode) use fType.getElementName() and not fType.getNameRange()? Why is the error handling not the same in both branches?
+
+Why did you change EvaluationSourceGenerator? That change looks wrong, since it doesn't set the COMPILER_TASK_TAGS option to "" any more, but removes the project-specific, so that the compiler will fall back to the workspace-specific setting.
+(In reply to comment #7)
+
+> Why does SourceBasedSourceGenerator#isRightType(ASTNode) use
+> fType.getElementName() and not fType.getNameRange()? Why is the error
+> handling not the same in both branches?
+> 
+
+I figured since we had name information about the type in that case (non-anonymous) we could use that rather than trying to ensure a name range was covered 
+by the nodes' range.
+
+The error handing differs because we could still assume the correct type has been found even if we fail to compare the flags - fail meaning the flags could not be computed rather than the flags not being equal.
+
+If you would prefer we could have the same logic for (normal) types and anonymous declarations.
+
+> Why did you change EvaluationSourceGenerator? That change looks wrong, since
+> it doesn't set the COMPILER_TASK_TAGS option to "" any more, but removes the
+> project-specific, so that the compiler will fall back to the
+> workspace-specific setting.
+
+This commit also works and sync's the error handling, etc.
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.debug.git/commit/?id=94be52051acead14b2b216ca42e1b5e97f69e967
+(In reply to comment #8)
+Now SourceBasedSourceGenerator#isRightType(ASTNode) checks whether the type declaration's name is contained in the type declaration. Couldn't this give false positives if you have nested types?
+
+Example:
+
+class A {
+    class B {
+    }
+}
+
+If fType is B, then fType.getNameRange() is inside the TypeDeclaration for A, but it's not the right type. 
+
+For the 3 calls in endVisit methods, this is probably not an issue, since they are called in "inside-out" order. But for visit(MethodDeclaration), I think you can construct cases where it fails.
+
+You should make sure fType.getNameRange() is equal to AbstractTypeDeclaration#getName()'s range or it is inside ClassInstanceCreation#getType()'s range.
+
+Note that visit(MethodDeclaration) calls "isRightType(node.getParent())", so you have to consider the case where isRightType(..) is called with an AnonymousClassDeclaration as argument (not a ClassInstanceCreation).
+(In reply to comment #9)
+
+Updated the handling of name ranges + AnonymousTypeDeclarations + added more tests for types in enums:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.debug.git/commit/?id=c902bd25dbe0046d0dd354652292c65366ad4719
+
+Also I found a bug with anonymous types in enums like the following:
+
+public enum Menum {
+	One;
+		
+	Menum() {}
+	
+	public <T> boolean eTrue(Inner1<T> i1) {
+		Inner2<T> i2 = new Inner2<T>(i1) {
+			boolean isTrue() {
+				return fInner1.innerBool; //bp
+			}
+		};
+		i2.isTrue();
+		return i2.fInner1.innerBool; 
+	}
+}
+
+trying to eval / watch 'fInner1.innerBool' in the isTrue() method would fail because we were not correctly adding the type parameters to the ___eval method we generate.
+Looks good now.
+*** Bug 415993 has been marked as a duplicate of this bug. ***
+
+
+"Unable to resolve binding" error on inspect, display, or watch of a variable
+
+
+
+Bug 329294 - "Unable to resolve binding" - handle name ranges better + enums 
+
+Bug 329294 - "Unable to resolve binding" - alternate fix 
+
+Bug 329294 - "Unable to resolve binding" error on inspect, display, or watch of a variable 

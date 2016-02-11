@@ -1,0 +1,123 @@
+I cannot click-and-release, then move the mouse, then click the selection to select.
+
+40.0a1 (2015-04-08), Mac OS X, on bugzilla.mozilla.org.
+
+Similar to Bug 1082510.
+
+I cannot click-and-release, then move the mouse, then click the selection to select.
+
+40.0a1 (2015-04-08), Mac OS X, on bugzilla.mozilla.org.
+
+Similar to Bug 1082510.
+This appears to be e10s only.
+Also, I could not reproduce with a clean profile (e10s or non-e10s), but I can reproduce on a w3schools site, suggesting it's not a Bugzilla-related add-on.
+I see this too.
+I narrowed this down: happens only with browser.tabs.drawInTitlebar=false (i.e. "Title Bar" enabled in Customize), with e10s enabled.
+(In reply to :Gavin Sharp [email: gavin@gavinsharp.com] from comment #4)
+> I narrowed this down: happens only with browser.tabs.drawInTitlebar=false
+> (i.e. "Title Bar" enabled in Customize), with e10s enabled.
+
+Interesting.  This matches my configuration: I'm running with Vertical Tabs.
+*** Bug 1152900 has been marked as a duplicate of this bug. ***
+If I had to make a guess as to what's happening here, I would say that we don't take the height of the titlebar into account.  Either that, or cosmic rays!
+Also note that for me this bug only happened if I clicked the text part of the dropdown, instead of the dropdown arrow specifically.
+I suspect bug 1152900 had a better summary. Also, I think bug 1155436 is likely a dupe of this as well, once I confirm that gkw has tabs in titlebar disabled.
+
+Because we're only hearing about this now, I suspect something landed recently that has changed how we calculate the positioning of popups. A regression window would be super helpful.
+Re-nomming because this is pretty brutal.
+*** Bug 1155436 has been marked as a duplicate of this bug. ***
+*** Bug 1156162 has been marked as a duplicate of this bug. ***
+I have a regression range:
+
+Last good nightly: 2015-04-10
+First bad nightly: 2015-04-11
+
+Pushlog:
+http://hg.mozilla.org/mozilla-central/pushloghtml?startdate=2015-04-10&enddate=2015-04-11
+I did that wrong - that regression range is bogus.
+This regression range seems more correct:
+
+Last good nightly: 2015-04-01
+First bad nightly: 2015-04-02
+
+Pushlog:
+http://hg.mozilla.org/mozilla-central/pushloghtml?startdate=2015-04-01&enddate=2015-04-02
+
+Any interesting candidates in there, George?
+Nothing obvious, but *yoink*. This is mine now.
+I think the last regression range was bogus too. I think this one is correct:
+
+http://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=0b88606f8fe7&tochange=d222742756c4
+This is a regression from bug 1075670.
+Created attachment 8598820
+0001-Bug-1152585-Account-for-window-offset-when-calculati.patch
+
+So GetChildProcessOffset only gives the offset between the PrimaryFrameOfOwningContent and the TabParent's widget, which doesn't account for the top level browser window. This code adds a calculated window offset to that to cater for that window having extra padding.
+
+I didn't want to muck around with GetChildProcessOffset because a lot of the plugin code uses that, and that all works.
+Created attachment 8598831
+0001-Bug-1152585-Account-for-window-offset-when-calculati.patch
+
+Updated patch that adds a nullptr check for widget, as widget can be null.
+Comment on attachment 8598831
+0001-Bug-1152585-Account-for-window-offset-when-calculati.patch
+
+We rely elsewhere that GetChildProcessOffset() returns the right data, so
+I think we should just fix that.
+
+Do we get wrong mouseEvent.screenX/Y on child process when 
+browser.tabs.drawInTitlebar=false or what?
+
+We're trying to get rid of all these error prone special cases in coordinates handling in case of child processes, so let's not add more, if possible.
+Oh, interesting. :jimm told me that the plugin code was all working fine with events (which use GetChildProcessOffset()), and that's why I didn't want to touch that function. But it looks like this bug might be limited to only OS X, because I am definitely seeing the same event offset issues with flash player on OS X, whereas I presume Jim was testing on Windows.
+
+I'll prepare a patch to move this logic into GetChildProcessOffset() and I'll rename this bug accordingly.
+
+Jim - are there any pitfalls I should be aware of by changing the logic for GetChildProcessOffset()?
+(In reply to George Wright (:gw280) from comment #22)
+> Jim - are there any pitfalls I should be aware of by changing the logic for
+> GetChildProcessOffset()?
+
+Here's a couple bugs with test cases and str:
+
+bug 1094304
+bug 1128238
+
+If you flag me for review I can test with a number of windowless test cases saved locally as well.
+Hey George,
+
+A few things:
+* I looked into this a bit and came to the same conclusion about OSX.  I don't trust the OSX widget's code that handles drawInTitleBar.  In fact, I may have isolated the core issue... in the widget.  Here's a quick rundown of my understanding of drawInTitleBar on OSX:
+
+** First, the nsCocoaWindow makes the call to draw into the titlebar or not.  For example: [1].
+
+** The nsCocoaWindow resizes its nsChildView based on new rects when it decides whether to draw into the titlebar.  This size is the size of the window minus the size of the OS titlebar.
+
+** That "resize" does not include a "move".  The childview stays relative to the origin of the window, which is actually where the titlebar is.  This is correct if we are drawing into the titlebar.  It is not if we don't.
+
+In earlier discussions, I mentioned that compensating for the geometry of window chrome is the job of the widgets GetClientOffset routine.  The nsCocoaWindow has the right ClientOffset but the nsChildView doesn't (it has none).  You cannot get the nsCocoaWindow from the nsChildView in dom code (its not a parent widget or anything) so this would be hard to get.  I *think* the correct solution might be to set the ClientOffset on nsChildView in this case.  I've done this and it works for me in e10s (and doesn't have any affect on non-e10s).  Places that the ClientOffset are most likely to be popups/tooltips, OS widget events (window resize/move, etc) and things like screen coordinates reported to client code.  All three work in both e10s and non-e10s for me.  But I'm not promising that this is right.
+
+* The OSX plugin mouse-event code is different than in Windows.  I dont even think GetChildProcessOffset is relevant to them (again, on OSX -- and I not 100% certain of its irrelevance).  The code that handles mouse events for mac plugins is in nsPluginInstanceOwner.  For example, [2] and [3].  My patch doesn't repair the plugin coordinates (see below).
+
+I've also got a couple of test tools from earlier bugs that should help with this:
+* bug 1075670 attachment 8498327 simply shows event.screenX/event.screenY in a popup window when you click.  By moving the corner of the browser window slightly past the bottom-right and clicking the corner, you can compare the screen coordinates it has with your screen size.
+* bug 1075670 attachment 8554859 is a plugin that works similarly.  It has a large border around it because border calculations are an extra layer of math.  Using it the same way as the other test, you can compare plugin screen coordinates with the dimensions of your display.
+
+There's a lot here.  Let me know if this isn't clear.
+
+[1] https://mxr.mozilla.org/mozilla-central/source/widget/cocoa/nsCocoaWindow.mm#2810
+[2] https://mxr.mozilla.org/mozilla-central/source/dom/plugins/base/nsPluginInstanceOwner.cpp#1646
+[3] https://mxr.mozilla.org/mozilla-central/source/dom/plugins/base/nsPluginInstanceOwner.cpp#758
+Created attachment 8599360
+WIP: Set the ClientOffset on nsChildView when drawInTitleBar=false
+
+NI to George so he actually gets this.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=d0345b37ffa7
+
+Let's run it through try to get an idea if this breaks anything.
+Comment on attachment 8599360
+WIP: Set the ClientOffset on nsChildView when drawInTitleBar=false
+
+This looks good to me. When GetClientOffset() was added initially, it was only used for panels / popups, and those are nsCocoaWindows, so there was no need to add it to nsChildView.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/68335ef1d403
+https://hg.mozilla.org/mozilla-central/rev/68335ef1d403

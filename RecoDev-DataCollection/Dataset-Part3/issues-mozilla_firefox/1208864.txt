@@ -1,0 +1,407 @@
+This would be really convenient to have, basically it would be a handy shortcut for: "Copy outer HTML" then "Paste > After".
+
+This would be really convenient to have, basically it would be a handy shortcut for: "Copy outer HTML" then "Paste > After".
+Created attachment 8669344
+Patch
+Created attachment 8669351
+Patch v1.1
+
+Added commit message.
+Created attachment 8669352
+Tests
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5dfbc9b78fbd
+Comment on attachment 8669351
+Patch v1.1
+
+Review of attachment 8669351:
+-----------------------------------------------------------------
+
+I agree this could be useful.
+I have made a few comments in the code.
+I guess the only other worry I have is that our inspector contextual-menu is growing rapidly, and the more items we put in there, the more difficult we make it for someone to find any item. Although this feature sounds useful, I'm not sure it would be used more than, say, delete or lock :hover for example. So it'd be nice if it was grouped with others in a second level sub menu.
+
+::: devtools/client/inspector/inspector-panel.js
+@@ +1184,5 @@
+> +    if (!this.selection.isNode()) {
+> +      return;
+> +    }
+> +    let node = this.selection.nodeFront;
+> +    return this.markup.duplicateNode(node);
+
+I don't think there's a need to involve the markup-view here. It only calls the walker, which the inspector-panel could do itself right here.
+So I'd remove the duplicateNode method in markup-view, and bring the code over here instead.
+
+::: devtools/client/markupview/markup-view.js
+@@ +687,5 @@
+> +        node.nodeType == Ci.nsIDOMNode.DOCUMENT_TYPE_NODE ||
+> +        node.isAnonymous) {
+> +      return;
+> +    }
+> +    this.walker.duplicateNode(node);
+
+2 important problems with this new method (apart from my earlier comment in inspector-panel.js):
+- duplicateNode is a new server-side method of the WalkerActor, however since the toolbox can be connected to older servers, this method might not always exist. So we need some backward compatibility handling here. We did something very similar not long ago with the "scroll into view" menu. This menu also relies on a server-side method that might not be here. See inspector-panel.js and look for:
+    this._target.actorHasMethod("domnode", "scrollIntoView").then(value => {
+      scrollIntoView.hidden = !value;
+    });
+
+- The other problem is that since duplicateNode is an actor method, it is async, and so we must allow the front-end to track when it is done processing and handle errors nicely when needed.
+Here, since this is meant to be called from an event listener, there's no need to return the promise, but at least, you should catch potential errors to avoid  unhandled rejections:
+
+this.walker.duplicateNode(node).catch(e => console.error(e));
+
+::: devtools/server/actors/inspector.js
+@@ +2597,5 @@
+> +   *
+> +   * @param {NodeActor} node The node to duplicate.
+> +   */
+> +  duplicateNode: method(function(node) {
+> +    let rawNode = node.rawNode;
+
+nit: Maybe destructure node in the method signature to save 1 line:
+
+duplicateNode: method(function({rawNode}) {
+
+@@ +2602,5 @@
+> +    let clonedNode = rawNode.cloneNode(true);
+> +    rawNode.parentNode.insertBefore(clonedNode, rawNode.nextSibling);
+> +
+> +    let newRawNodes = Array.from(clonedNode.childNodes);
+> +    return this.attachElements(newRawNodes);
+
+The way the walker works makes it possible to not have to return anything in fact.
+If you just clone the node and append it, that should be sufficient:
+
+duplicateNode: method(function(node) {
+  let rawNode = node.rawNode;
+  let clonedNode = rawNode.cloneNode(true);
+  rawNode.parentNode.insertBefore(clonedNode, rawNode.nextSibling);
+}, {
+  request: {
+    node: Arg(0, "domnode")
+  },
+  response: {}
+}
+
+That is because the Walker listens to DOM mutations already, and when they happen, it sends data to the front-end to display the changes. So unless you specifically wanted the caller of the duplicateNode to get a reference to the newly inserted node (which I don't think you do), you shouldn't need to return anything here.
+Comment on attachment 8669352
+Tests
+
+Review of attachment 8669352:
+-----------------------------------------------------------------
+
+::: devtools/client/inspector/test/browser_inspector_menu-05-other.js
+@@ +46,5 @@
+> +
+> +    let menuItem = inspector.panelDoc.getElementById("node-menu-duplicatenode");
+> +    ok(menuItem, "'Duplicate node' menu item should exist");
+> +
+> +    info("Triggering 'Duplicate Node' and waiting for inspector to update");
+
+The comment says the test waits for the inspector to update, but there's no waiting in the code, I wonder how the test even works. There's probably a race between duplicating the node and checking the number of elements in the is() assertion below that we're lucky works.
+
+You should, at the very least, use:
+let updated = inspector.once("inspector-updated");
+and later:
+yield updated;
+
+just like in testDeleteNode, to make sure the test waits until the updates have occurred in the markup-view.
+
+Additionally, it could be nice to also check if the nodes have appeared in the markup-view. This test only checks that the node was duplicated on the server (which is nice), I think we could add a simple check that gets verifies that a MarkupContainer was created on the client (in the markup-view) for this new node.
+
+::: devtools/client/shared/test/test-actor.js
+@@ +86,5 @@
+>    /**
+> +   * Helper to get the number of elements matching a selector
+> +   * @param {string} CSS selector.
+> +   */
+> +  getNumberOfElementMatches: protocol.method(function (selector) {
+
+nit: to make this even more useful for future tests, maybe pass an optional second argument that could be used as the root to search for matches in (several tests use iframes).
+
+getNumberOfElementMatches: protocol.method(function(selector, root=this.content.document) {
+  return root.querySelectorAll(selector).length;
+}, {
+  request: ....
+Thanks for the review !
+
+
+(In reply to Patrick Brosset [:pbrosset] [:pbro] from comment #6)
+> Comment on attachment 8669352
+> Tests
+> 
+> Review of attachment 8669352:
+> -----------------------------------------------------------------
+> 
+> ::: devtools/client/inspector/test/browser_inspector_menu-05-other.js
+> @@ +46,5 @@
+> > +
+> > +    let menuItem = inspector.panelDoc.getElementById("node-menu-duplicatenode");
+> > +    ok(menuItem, "'Duplicate node' menu item should exist");
+> > +
+> > +    info("Triggering 'Duplicate Node' and waiting for inspector to update");
+> 
+> The comment says the test waits for the inspector to update, but there's no
+> waiting in the code, I wonder how the test even works. There's probably a
+> race between duplicating the node and checking the number of elements in the
+> is() assertion below that we're lucky works.
+> 
+> You should, at the very least, use:
+> let updated = inspector.once("inspector-updated");
+> and later:
+> yield updated;
+> 
+> just like in testDeleteNode, to make sure the test waits until the updates
+> have occurred in the markup-view.
+It originally was in the test, but for some reason it made the test fail, so I've removed it, and now it magically works.
+Created attachment 8669878
+Patch v2
+
+Filed bug 1211613 to tidy the context menu.
+
+New tests will come as soon as I can. What I'm seeing in comment 7 is pretty weird btw, any idea what's going on ?
+Comment on attachment 8669878
+Patch v2
+
+Review of attachment 8669878:
+-----------------------------------------------------------------
+
+Looks good to me. Just a last change in the WalkerActor needed, but no need to ping me for review after this.
+
+::: devtools/server/actors/inspector.js
+@@ +2603,5 @@
+> +  }, {
+> +    request: {
+> +      node: Arg(0, "domnode")
+> +    },
+> +    response: RetVal("disconnectedNodeArray")
+
+There's no return value anymore, please change this to:
+response: {}
+(In reply to Tim Nguyen [:ntim] from comment #8)
+> New tests will come as soon as I can. What I'm seeing in comment 7 is pretty
+> weird btw, any idea what's going on ?
+That doesn't ring any bell. If you're struggling to make this test work, or if it fails randomly for unknown reasons, please do attach the patch, I'll try to take a look at it locally.
+(In reply to Patrick Brosset [:pbrosset] [:pbro] from comment #10)
+> (In reply to Tim Nguyen [:ntim] from comment #8)
+> > New tests will come as soon as I can. What I'm seeing in comment 7 is pretty
+> > weird btw, any idea what's going on ?
+> That doesn't ring any bell. If you're struggling to make this test work, or
+> if it fails randomly for unknown reasons, please do attach the patch, I'll
+> try to take a look at it locally.
+
+It's the same patch I've uploaded with this:
+let updated = inspector.once("inspector-updated");
+[...]
+yield updated;
+
+I haven't got time to touch the test since your review. I had tried to add the above before asking for review, but that is just making the test fail.
+Comment on attachment 8669878
+Patch v2
+
+Review of attachment 8669878:
+-----------------------------------------------------------------
+
+::: devtools/client/inspector/inspector-panel.js
+@@ +1188,5 @@
+> +    let node = this.selection.nodeFront;
+> +    if (!this.selection.isNode() ||
+> +        node.isDocumentElement ||
+> +        node.nodeType == Ci.nsIDOMNode.DOCUMENT_TYPE_NODE ||
+> +        node.isAnonymous) {
+
+I failed to see this in my previous review, but you should also early return if node.isPseudoElement is true, since ::before or ::after nodes can't be duplicated either.
+
+Also another thing I missed is that it would be nice if you could enable/disable this menu item dynamically inside _setupNodeMenu so that users know that duplicating <DOCTYPE> or ::before doesn't work. Right now it's always enabled.
+I'm going to spend some time looking at the test now.
+Created attachment 8672597
+duplicate-markup-test.patch.diff
+
+Here's your test patch, I've only changed inspector-updated with markupmutation.
+Indeed, in this particular case, the inpsector-updated isn't emitted because none of the inspector panels need to update, this only occurs when the current node selection changes, and it's not the case here. 
+So we can make the test wait for the markupmutation event instead.
+
+I have 2 additional requests:
+- what I said in comment 6: it'd be nice if that test also checked that the markup-view showed the right nodes,
+- and also please add a new backend test for the new duplicateNode server-side method. This test should be in a new file in \devtools\server\tests\mochitest\
+You can probably get some inspiration from \devtools\server\tests\mochitest\test_inspector-scroll-into-view.html which should be somewhat similar.
+Created attachment 8675451
+Patch v3
+Created attachment 8675453
+Tests v2
+
+Includes:
+- Check for MarkupContainer
+- Server-side test
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=efb1def80167
+Comment on attachment 8675451
+Patch v3
+
+Review of attachment 8675451:
+-----------------------------------------------------------------
+
+Just a few final changes and this is good to go.
+
+::: devtools/client/inspector/inspector-panel.js
+@@ +654,5 @@
+>                               !this.selection.isPseudoElementNode();
+>      let isEditableElement = isSelectionElement &&
+>                              !this.selection.isAnonymousNode();
+> +    let isDuplicatableElement = isSelectionElement &&
+> +                                !this.selection.nodeFront.isDocumentElement;
+
+Will these 2 checks correctly filter out anonymous nodes too? I'm not sure.
+
+@@ +1198,5 @@
+> +    if (!this.selection.isNode() ||
+> +        node.isDocumentElement ||
+> +        node.nodeType == Ci.nsIDOMNode.DOCUMENT_TYPE_NODE ||
+> +        node.isAnonymous ||
+> +        node.isPseudoElement) {
+
+For consistency reason, I would only use this.selection in this condition. So, I would create a new isDocumentElement method in selection.js (next to all the other is*Node methods), and then would rewrite this condition like:
+
+let selection = this.selection;
+if (!selection.isElementNode() ||
+    selection.isDocumentElement() ||
+    selection.isAnonymousNode() ||
+    selection.isPseudoElementNode()) {
+
+::: devtools/server/actors/inspector.js
+@@ +2603,5 @@
+> +  }, {
+> +    request: {
+> +      node: Arg(0, "domnode")
+> +    },
+> +    response: RetVal("disconnectedNodeArray")
+
+Please use
+response: {}
+since your method does not return anything.
+Comment on attachment 8675453
+Tests v2
+
+Review of attachment 8675453:
+-----------------------------------------------------------------
+
+::: devtools/client/inspector/test/browser_inspector_menu-05-other.js
+@@ +33,5 @@
+>      info("Checking if 'inspect($0)' was evaluated");
+>      ok(webconsoleUI.jsterm.history[0] === 'inspect($0)');
+>      yield toolbox.toggleSplitConsole();
+>    }
+> +  function* testDuplicateNode() {
+
+nit: please add an empty line before this function.
+(In reply to Patrick Brosset [:pbrosset] [:pbro] from comment #18)
+> Comment on attachment 8675451
+> Patch v3
+> 
+> Review of attachment 8675451:
+> -----------------------------------------------------------------
+> 
+> Just a few final changes and this is good to go.
+> 
+> ::: devtools/client/inspector/inspector-panel.js
+> @@ +654,5 @@
+> >                               !this.selection.isPseudoElementNode();
+> >      let isEditableElement = isSelectionElement &&
+> >                              !this.selection.isAnonymousNode();
+> > +    let isDuplicatableElement = isSelectionElement &&
+> > +                                !this.selection.nodeFront.isDocumentElement;
+> 
+> Will these 2 checks correctly filter out anonymous nodes too? I'm not sure.
+isSelectionElement already has `!this.selection.isPseudoElementNode()`. That should be enough.
+
+> @@ +1198,5 @@
+> > +    if (!this.selection.isNode() ||
+> > +        node.isDocumentElement ||
+> > +        node.nodeType == Ci.nsIDOMNode.DOCUMENT_TYPE_NODE ||
+> > +        node.isAnonymous ||
+> > +        node.isPseudoElement) {
+> 
+> For consistency reason, I would only use this.selection in this condition.
+> So, I would create a new isDocumentElement method in selection.js (next to
+> all the other is*Node methods), and then would rewrite this condition like:
+>
+> let selection = this.selection;
+> if (!selection.isElementNode() ||
+>     selection.isDocumentElement() ||
+>     selection.isAnonymousNode() ||
+>     selection.isPseudoElementNode()) {
+Will do.
+
+> ::: devtools/server/actors/inspector.js
+> @@ +2603,5 @@
+> > +  }, {
+> > +    request: {
+> > +      node: Arg(0, "domnode")
+> > +    },
+> > +    response: RetVal("disconnectedNodeArray")
+> 
+> Please use
+> response: {}
+> since your method does not return anything.
+Sorry, forgot to do this, will do as well.
+(In reply to Tim Nguyen [:ntim] from comment #20)
+> (In reply to Patrick Brosset [:pbrosset] [:pbro] from comment #18)
+> > Comment on attachment 8675451
+> > Patch v3
+> > 
+> > Review of attachment 8675451:
+> > -----------------------------------------------------------------
+> > 
+> > Just a few final changes and this is good to go.
+> > 
+> > ::: devtools/client/inspector/inspector-panel.js
+> > @@ +654,5 @@
+> > >                               !this.selection.isPseudoElementNode();
+> > >      let isEditableElement = isSelectionElement &&
+> > >                              !this.selection.isAnonymousNode();
+> > > +    let isDuplicatableElement = isSelectionElement &&
+> > > +                                !this.selection.nodeFront.isDocumentElement;
+> > 
+> > Will these 2 checks correctly filter out anonymous nodes too? I'm not sure.
+Misread this as pseudo elements, I'll add a check for anonymous nodes.
+(In reply to Patrick Brosset [:pbrosset] [:pbro] from comment #19)
+> Comment on attachment 8675453
+> Tests v2
+> 
+> Review of attachment 8675453:
+> -----------------------------------------------------------------
+> 
+> ::: devtools/client/inspector/test/browser_inspector_menu-05-other.js
+> @@ +33,5 @@
+> >      info("Checking if 'inspect($0)' was evaluated");
+> >      ok(webconsoleUI.jsterm.history[0] === 'inspect($0)');
+> >      yield toolbox.toggleSplitConsole();
+> >    }
+> > +  function* testDuplicateNode() {
+> 
+> nit: please add an empty line before this function.
+There already seems to be a new line, you can see it if you check the patch as a raw file. For some reason, Splinter removes it.
+Created attachment 8675898
+Patch v3.1
+
+Comments addressed.
+Try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=efb1def80167
+Pushed this to fx-team:
+https://hg.mozilla.org/integration/fx-team/rev/c641e850dd92
+https://hg.mozilla.org/integration/fx-team/rev/399f9492ad3c
+https://hg.mozilla.org/mozilla-central/rev/c641e850dd92
+https://hg.mozilla.org/mozilla-central/rev/399f9492ad3c
+I've updated the bit on the popup menu to include these items: https://developer.mozilla.org/en-US/docs/Tools/Page_Inspector/How_to/Examine_and_edit_HTML#Element_popup_menu
+
+I've also changed the format of that from a screenshot to a bulleted list of links into the table. Hopefully this is a bit easier to navigate, although not as pretty. We could omit the list of links, and just have the table? But I think it might make it hard to find things, now we have 31 items in the menu.
+(In reply to Will Bamberg [:wbamberg] from comment #27)
+> I've updated the bit on the popup menu to include these items:
+> https://developer.mozilla.org/en-US/docs/Tools/Page_Inspector/How_to/
+> Examine_and_edit_HTML#Element_popup_menu
+Thanks !
+
+> I've also changed the format of that from a screenshot to a bulleted list of
+> links into the table. Hopefully this is a bit easier to navigate, although
+> not as pretty. We could omit the list of links, and just have the table? But
+> I think it might make it hard to find things, now we have 31 items in the
+> menu.
+I like the new navigation ! Particularly helps since there are a lot of items, thanks !

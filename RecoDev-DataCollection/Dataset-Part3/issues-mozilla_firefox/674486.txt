@@ -1,0 +1,212 @@
+Followup to bug 670463 -- browser_410196_paste_into_tags.js still leaks.
+
+Followup to bug 670463 -- browser_410196_paste_into_tags.js still leaks.
+I guess if this is due to taking clipboard ownership on copy (when it's actually needed only on cut). Will look into it.
+there are various reasons here.
+One is clipboard ownership, that I solved locally.
+One is wrong scopes use in the test, that I solved locally.
+One is still PlacesAggregatedTransaction, even after the array copy thing, there must be more there.
+I think found it, other transactions are getting input arrays.
+Created attachment 549184
+patch v1.0
+
+This fixes the 3 owenrship issues explained above:
+- loses clipboard ownership when the controller is destroyed
+- avoids test retaining useless global references to nodes
+- avoids arrays passed to transactions keeping alive their global object
+Created attachment 549185
+patch v1.1
+
+fixed minor things noticed while reading patch
+Comment on attachment 549185
+patch v1.1
+
+>@@ -75,55 +76,44 @@ let tests = {
+
+>-  focusTag: function (paste){
+>+  focusTag: function (){
+>     // focus the new tag
+>     PlacesOrganizer.selectLeftPaneQuery("Tags");
+>     let tags = PlacesOrganizer._places.selectedNode;
+>     tags.containerOpen = true;
+>     let fooTag = tags.getChild(0);
+>-    this.tagNode = fooTag;
+>+    let tagNode = fooTag;
+
+I don't think this should keep the node alive. The tests object will be removed from the test scope after the test.
+
+> function PlacesAggregatedTransaction(aName, aTransactions)
+> {
+>-  // Copy the transactions array to decouple it from its prototype, which
+>-  // otherwise keeps alive its associated global object.
+>+  // Copy the array to decouple it from its prototype, which otherwise keeps
+>+  // alive its associated global object.
+
+You're only removing "transactions" here, right? Buries original code blame for no useful reason that I can see.
+
+>-  this._transactions = Array.slice(aTransactions);
+>+  this._transactions = aTransactions.slice(0);
+
+This seems a bit more magical. It's not clear to me why foo.slice() _should_ return an Array whose prototype is that of the current context rather than foo's. With Array.slice, it seems pretty clear.
+(In reply to comment #6)
+> >-    this.tagNode = fooTag;
+> >+    let tagNode = fooTag;
+> 
+> I don't think this should keep the node alive. The tests object will be
+> removed from the test scope after the test.
+
+It leaked though during my tests, btw that local property is really useless, this test is a bit sucky, should ideally be rewritten but I don't have time or will to do that atm.
+
+> > function PlacesAggregatedTransaction(aName, aTransactions)
+> > {
+> >-  // Copy the transactions array to decouple it from its prototype, which
+> >-  // otherwise keeps alive its associated global object.
+> >+  // Copy the array to decouple it from its prototype, which otherwise keeps
+> >+  // alive its associated global object.
+> 
+> You're only removing "transactions" here, right? Buries original code blame
+> for no useful reason that I can see.
+
+I removed "transactions" to reuse the comment on the other arrays in the module.  I don't think blame is really useful here, since the comment is repeated and repeated (and repeated!) in lots of places.
+
+> >-  this._transactions = Array.slice(aTransactions);
+> >+  this._transactions = aTransactions.slice(0);
+> 
+> This seems a bit more magical. It's not clear to me why foo.slice() _should_
+> return an Array whose prototype is that of the current context rather than
+> foo's. With Array.slice, it seems pretty clear.
+
+In both cases, the first argument to slice() is not options according to specs (checked both mdn and w3c suggestions), so should be Array.slice(aTransactions, 0) that doesn's look much more readable than the simple .slice(0). We use slice(0) in other points of Places code, so looks fine for consistency.
+I meant "is not optional"
+ah well, actually tests.tagNode leaked because I was checking leaks before the test was completed. that noise was hurting my debugging.
+(In reply to comment #7)
+> > >-  // Copy the transactions array to decouple it from its prototype, which
+> > >-  // otherwise keeps alive its associated global object.
+> > >+  // Copy the array to decouple it from its prototype, which otherwise keeps
+> > >+  // alive its associated global object.
+> > 
+> > You're only removing "transactions" here, right? Buries original code blame
+> > for no useful reason that I can see.
+> 
+> I removed "transactions" to reuse the comment on the other arrays in the
+> module.  I don't think blame is really useful here, since the comment is
+> repeated and repeated (and repeated!) in lots of places.
+
+The commit message on the blamed changeset itself wouldn't be more useful than the comment itself, but when I said blame, I really meant the reference to the bug introducing this code.
+
+> In both cases, the first argument to slice() is not options according to
+> specs (checked both mdn and w3c suggestions), so should be
+
+Well, I guess there can be different meanings of "optional". In this case undefined just gets treated as 0 automatically. This is pretty common in JS, I think. In any case, there's no risk that slice() would ever be rejected, as it would break the Web.
+
+> Array.slice(aTransactions, 0) that doesn's look much more readable than the
+> simple .slice(0). We use slice(0) in other points of Places code, so looks
+> fine for consistency.
+
+It's not about readability, my point is that you care about the new array's prototype here. In other cases where you call slice directly on the array (i.e. foo.slice(0)), you don't care about this.
+(In reply to comment #10)
+> The commit message on the blamed changeset itself wouldn't be more useful
+> than the comment itself, but when I said blame, I really meant the reference
+> to the bug introducing this code.
+
+Right, but since this bug introduces the same exact code in a bunch more places with the same exact scope and reasons, blaming to this bug is fine, maybe even better.
+
+> Well, I guess there can be different meanings of "optional". In this case
+> undefined just gets treated as 0 automatically. This is pretty common in JS,
+> I think. In any case, there's no risk that slice() would ever be rejected,
+> as it would break the Web.
+
+I agree they may be hardly changed, but I prefer sticking to the official documentation.  Actually I also thought we couldn't drop arguments.calle, but we did, even if just in strict mode.
+
+> It's not about readability, my point is that you care about the new array's
+> prototype here. In other cases where you call slice directly on the array
+> (i.e. foo.slice(0)), you don't care about this.
+
+I don't have strong preferences, I think both are pretty clear to me and I expect them to act the same exact way.
+I'll leave the decision to Dietrich.
+> > Well, I guess there can be different meanings of "optional". In this case
+> > undefined just gets treated as 0 automatically. This is pretty common in JS,
+> > I think. In any case, there's no risk that slice() would ever be rejected,
+> > as it would break the Web.
+> 
+> I agree they may be hardly changed, but I prefer sticking to the official
+> documentation.  Actually I also thought we couldn't drop arguments.calle,
+> but we did, even if just in strict mode.
+
+You can introduce strict mode only once, after that code depends on the defined rules and tightening them would break stuff again :)
+But as I said, I think the auto-conversion to 0 for omitted integer parameters is in line with JS anyway.
+
+Oh, and I actually prefer slice() over slice(0) since the latter encourages me to think about the semantics of the slice method, when all I really care about here is creating a new array.
+
+> > It's not about readability, my point is that you care about the new array's
+> > prototype here. In other cases where you call slice directly on the array
+> > (i.e. foo.slice(0)), you don't care about this.
+> 
+> I don't have strong preferences, I think both are pretty clear to me and I
+> expect them to act the same exact way.
+
+How exactly is foo.slice clear about creating an array whose constructor is that of the current global rather than the same as foo's?
+How you slice() is up to you, as long as it works. There's a comment on each use, which makes things more than clear enough. Global code convention on how best to slice() doesn't need to be solved in this bug. Take that conversation to dev.platform, or to the ECMAScript group.
+
+I agree with Dao about the unnecessary blame change on the first comment.
+Comment on attachment 549185
+patch v1.1
+
+Review of attachment 549185:
+-----------------------------------------------------------------
+
+r=me w/ these changes.
+
+::: browser/components/places/content/controller.js
+@@ +1126,5 @@
+>  
+>      return action;
+>    },
+>  
+> +  _loseClipboardOwnership: function PC__loseClipboardOwnership() {
+
+i'd prefer s/lose/release/ since we're intentionally giving up ownership.
+foo.slice() vs. Array.slice(foo) is *not* about code conventions. It's about what this code is supposed to do in this specific case, i.e. not only create a separate array, but create an array whose constructor is not that of foo.
+(In reply to comment #15)
+> foo.slice() vs. Array.slice(foo) is *not* about code conventions. It's about
+> what this code is supposed to do in this specific case, i.e. not only create
+> a separate array, but create an array whose constructor is not that of foo.
+
+It appears in the comments above that you both were saying that approaches do reset the ctor, but that one looked clearer than the other. If that's not the case, then my mistake, and the patch is incorrect.
+Right, it does work:
+aTransactions.constructor != aTransactions.slice().constructor
+
+But it's actually not clear to me why that's the case.
+
+This makes a lot of sense to me:
+aTransactions.constructor != Array == Array.slice(aTransactions).constructor
+
+So as I see it, the patch is replacing a clear line with a magical one.
+Created attachment 549808
+patch v1.2
+
+Personally I think there's nothing magical where javascript specifications clearly state that slice() returns a new array and deep copies elements inside it, unless they are objects.  That's what everyone should expect, the two calling methods above are identical per specifications.
+
+But since I'm not really willing to lose time on discussing minor details, I've addressed all the comments in this bug to just fix it, that should be what matters more.  I'm really willing to fix these leaks.
+(In reply to comment #18)
+> Personally I think there's nothing magical where javascript specifications
+> clearly state that slice() returns a new array and deep copies elements
+> inside it, unless they are objects.  That's what everyone should expect, the
+> two calling methods above are identical per specifications.
+
+I can only repeat what I said before: It's clear that slice returns a new array. The interesting question here is what that array's constructor is.
+I.e. I had to actually try the first snippet in comment 17 to know that your code worked. Does the spec specify this? Good if it does, but it certainly wasn't clear to me.
+I can only assume it's personal interpretation, that I admit may even be a bad thing: 'slice does not alter the original array, but returns a new "one level deep" copy that contains...'.
+I read this as the new array cannot have a relationship with the original one, the word 'copy' may be confusing though, should probably be 'returns a new array containing copies of the elements sliced from the original array.'.
+(In reply to comment #21)
+> I read this as the new array cannot have a relationship with the original
+> one, the word 'copy' may be confusing though, should probably be 'returns a
+> new array containing copies of the elements sliced from the original array.'.
+
+Well... they can have a relationship, since they necessarily share the constructor when slice is called in the same context the original array was created in:
+
+var foo = [];
+foo.constructor == foo.slice().constructor
+While playing around with more code snippets, I realized that new arrays always belong to the current global's Array constructor, even if you call reference_to_some_other_global.Array(). Came quite surprising for me! I seem to vaguely remember that this changed in SpiderMonkey some years ago, now that I think of it.
+http://hg.mozilla.org/integration/mozilla-inbound/rev/06394cdd40ce
+http://hg.mozilla.org/mozilla-central/rev/06394cdd40ce

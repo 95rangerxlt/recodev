@@ -1,0 +1,414 @@
+In order to stop writing state immediately after startup in Bug 887780, we must be able to detect crashes using the new CrashMonitor being introduced in Bug 888373. Since the Crash Monitor API is async only, we are not able to rely on it in the sync initialization fallback in nsiSessionStartup. Removing the fallback would also allow us to get rid of the sync reading in _SessionFile.
+
+The sync fallback was initially introduced in Bug 532150, and the reasons for needing it were discussed there. The places that might be invoking this fallback are the following:
+
+http://hg.mozilla.org/mozilla-central/file/c870b2803c2b/browser/components/downloads/src/DownloadsStartup.js#l127
+This should be fine, since it happens after "sessionstore-browser-state-restored"
+
+http://hg.mozilla.org/mozilla-central/file/c870b2803c2b/browser/components/nsBrowserGlue.js#l689
+This should be fine, since it happens after ""sessionstore-windows-restored"
+
+http://hg.mozilla.org/mozilla-central/file/c870b2803c2b/browser/components/nsBrowserContentHandler.js#l573
+This happens pretty early on startup, after the browser has been updated. This will trigger the synchronous fallback, in order to check if there is a session to restore. 
+
+The call to |doRestore| ends up looking at |_sessionType| to see if it is either |Ci.nsISessionStartup.RECOVER_SESSION| or |Ci.nsISessionStartup.RESUME_SESSION|. The code that actually sets |_sessionType| is the following:
+
+      let doResumeSessionOnce = Services.prefs.getBoolPref("browser.sessionstore.resume_session_once");
+      let doResumeSession = doResumeSessionOnce ||
+            Services.prefs.getIntPref("browser.startup.page") == 3;
+
+      let resumeFromCrash = Services.prefs.getBoolPref("browser.sessionstore.resume_from_crash");
+      let lastSessionCrashed =
+        this._initialState && this._initialState.session &&
+        this._initialState.session.state &&
+        this._initialState.session.state == STATE_RUNNING_STR;
+
+      ...
+
+      // set the startup type
+      if (lastSessionCrashed && resumeFromCrash)
+        this._sessionType = Ci.nsISessionStartup.RECOVER_SESSION;
+      else if (!lastSessionCrashed && doResumeSession)
+        this._sessionType = Ci.nsISessionStartup.RESUME_SESSION;
+      else if (this._initialState)
+        this._sessionType = Ci.nsISessionStartup.DEFER_SESSION;
+      else
+        this._initialState = null; // reset the state
+
+So we are unable to detect RECOVER_SESSION synchronously, but we could detect RESUME_SESSION without going to session store by reading the Pref. Using this would only change behavior if we were to crash right after an update has been applied.
+
+What's everyone think?
+
+In order to stop writing state immediately after startup in Bug 887780, we must be able to detect crashes using the new CrashMonitor being introduced in Bug 888373. Since the Crash Monitor API is async only, we are not able to rely on it in the sync initialization fallback in nsiSessionStartup. Removing the fallback would also allow us to get rid of the sync reading in _SessionFile.
+
+The sync fallback was initially introduced in Bug 532150, and the reasons for needing it were discussed there. The places that might be invoking this fallback are the following:
+
+http://hg.mozilla.org/mozilla-central/file/c870b2803c2b/browser/components/downloads/src/DownloadsStartup.js#l127
+This should be fine, since it happens after "sessionstore-browser-state-restored"
+
+http://hg.mozilla.org/mozilla-central/file/c870b2803c2b/browser/components/nsBrowserGlue.js#l689
+This should be fine, since it happens after ""sessionstore-windows-restored"
+
+http://hg.mozilla.org/mozilla-central/file/c870b2803c2b/browser/components/nsBrowserContentHandler.js#l573
+This happens pretty early on startup, after the browser has been updated. This will trigger the synchronous fallback, in order to check if there is a session to restore. 
+
+The call to |doRestore| ends up looking at |_sessionType| to see if it is either |Ci.nsISessionStartup.RECOVER_SESSION| or |Ci.nsISessionStartup.RESUME_SESSION|. The code that actually sets |_sessionType| is the following:
+
+      let doResumeSessionOnce = Services.prefs.getBoolPref("browser.sessionstore.resume_session_once");
+      let doResumeSession = doResumeSessionOnce ||
+            Services.prefs.getIntPref("browser.startup.page") == 3;
+
+      let resumeFromCrash = Services.prefs.getBoolPref("browser.sessionstore.resume_from_crash");
+      let lastSessionCrashed =
+        this._initialState && this._initialState.session &&
+        this._initialState.session.state &&
+        this._initialState.session.state == STATE_RUNNING_STR;
+
+      ...
+
+      // set the startup type
+      if (lastSessionCrashed && resumeFromCrash)
+        this._sessionType = Ci.nsISessionStartup.RECOVER_SESSION;
+      else if (!lastSessionCrashed && doResumeSession)
+        this._sessionType = Ci.nsISessionStartup.RESUME_SESSION;
+      else if (this._initialState)
+        this._sessionType = Ci.nsISessionStartup.DEFER_SESSION;
+      else
+        this._initialState = null; // reset the state
+
+So we are unable to detect RECOVER_SESSION synchronously, but we could detect RESUME_SESSION without going to session store by reading the Pref. Using this would only change behavior if we were to crash right after an update has been applied.
+
+What's everyone think?
+I think we shouldn't really force a sync read of the session store file always after the browser has been updated in the background. I don't think it's worth doing that and keeping around all the legacy code just to handle crashes before we restarted to apply an update.
+
+AFAIU the worst thing that can happen is that we have a couple more tabs around after the session has been restored. That would be the home page and the new version page. And this would only ever happen after crashing with an update applied in the background.
+
++1 on removing all that code and leaving a comment in nsBrowserContentHandler.
+Created attachment 810647
+Patch - Remove Synchronous Reading of the Session
+
+This patch removes the Synchronous fallback for reading the session file, and alters the code in nsBrowserContentHandler.js which triggers the fallback.
+
+I left in the |_ensureInitialized| calls for now, which will throw an error if Session Store isn't initialized. Try: https://tbpl.mozilla.org/?tree=Try&rev=16ec867a34b5
+This could possibly affect add-ons.
+Comment on attachment 810647
+Patch - Remove Synchronous Reading of the Session
+
+Review of attachment 810647:
+-----------------------------------------------------------------
+
+Yeah, the *_sync.js xpcshell tests will have to removed. Or we keep them and just ensure that we throw but I don't think that makes a lot of sense.
+
+The other failure (browser_bug538331.js) seems to be caused by haveUpdateSession being true now when running tests. The default value is '1' but Panorama sets this pref automatically to '3' when it detects that Panorama 'is used', which is the case when tabview tests are run before browser_bug538331.js. Previously, we read browser.startup.page at startup when we read the session. Now we actually take the current pref value into account.
+
+One solution would probably be to call clearUserPref('browser.startup.page') at the beginning of the test, because all these subtests clearly assume that we will not restore a session / have an update session.
+
+::: browser/components/nsBrowserContentHandler.js
+@@ +572,5 @@
+> +            // session store initialization. Since we no longer account for
+> +            // crashes, if a crash occurs before restarting after an update
+> +            // we may open the startPage in addition to restoring the session.
+> +            haveUpdateSession = Services.prefs.getBoolPref("browser.sessionstore.resume_session_once") ||
+> +                                Services.prefs.getIntPref("browser.startup.page") == 3;
+
+Can we move this to nsISessionStartup maybe? That's some logic that should be hidden there and just exposed by an attribute or method.
+
+Also, 'haveUpdateSession' isn't a good name anymore (or never was). We can only determine whether we would automatically restore a session if there is one. But we don't know yet if we have one.
+The same behavior causing issues in Bug 900910 can also trigger the synchronous fallback due to SessionStoreInternal.onLoad being called to early on windows. This case will be fixed in Bug 900910
+Steven, what's the status here? Are there any blockers left before we can attack this?
+Created attachment 827484
+Patch - Remove Synchronous Reading of the Session v2
+
+(In reply to Tim Taubert [:ttaubert] from comment #6)
+> Steven, what's the status here? Are there any blockers left before we can
+> attack this?
+
+I believe we are fine to move forward. I've updated the patch based on your feedback, and pushed to try: https://tbpl.mozilla.org/?tree=Try&rev=10be4518745f
+
+I'm not happy at all with the name of the new method I've added "isRestoreConfigured". Any ideas for something better?
+Comment on attachment 827484
+Patch - Remove Synchronous Reading of the Session v2
+
+Yoric, do you have some cycles to review this?
+Comment on attachment 827484
+Patch - Remove Synchronous Reading of the Session v2
+
+Review of attachment 827484:
+-----------------------------------------------------------------
+
+Looks good, thanks.
+
+::: browser/components/nsBrowserContentHandler.js
+@@ +565,5 @@
+>              // New profile.
+>              overridePage = Services.urlFormatter.formatURLPref("startup.homepage_welcome_url");
+>              break;
+>            case OVERRIDE_NEW_MSTONE:
+> +            // Check whether we will restore a session. If we will, we assume
+
+I preferred the previous formulation of "we have a session to restore", it's slightly clearer. Unless something has changed that I failed to understand?
+
+@@ +567,5 @@
+>              break;
+>            case OVERRIDE_NEW_MSTONE:
+> +            // Check whether we will restore a session. If we will, we assume
+> +            // that this is an "update" session. Detection in the case of a
+> +            // crash was removed, as it required falling back to synchronous
+
+I'd remove the sentence about the detection being removed, I believe it makes things more confuse.
+
+::: browser/components/sessionstore/nsISessionStartup.idl
+@@ +26,5 @@
+>     * Determines whether there is a pending session restore and makes sure that
+>     * we're initialized before returning. If we're not yet this will read the
+>     * session file synchronously.
+>     */
+>    boolean doRestore();
+
+Do I understand correctly that this method is now deprecated? If so, please mark it @deprecated and use Deprecated.warning in the implementation.
+
+@@ +29,5 @@
+>     */
+>    boolean doRestore();
+>  
+>    /**
+> +   * Determines whether there is a pending session restore due to configuration.
+
+"due to configuration" isn't very clear
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +232,4 @@
+>     * @returns bool
+>     */
+>    doRestore: function sss_doRestore() {
+>      this._ensureInitialized();
+
+Is this code still meaningful?
+
+@@ +242,5 @@
+> +   * @returns bool
+> +   */
+> +  isRestoreConfigured: function sss_isRestoreConfigured() {
+> +    return Services.prefs.getBoolPref("browser.sessionstore.resume_session_once") ||
+> +           Services.prefs.getIntPref("browser.startup.page") == 3;
+
+Could you replace the magic constant 3 by something more meaningful?
+
+@@ +251,5 @@
+>     * @returns bool
+>     */
+>    _willRestore: function () {
+>      return this._sessionType == Ci.nsISessionStartup.RECOVER_SESSION ||
+>             this._sessionType == Ci.nsISessionStartup.RESUME_SESSION;
+
+Is this code still meaningful?
+
+::: browser/components/test/browser_bug538331.js
+@@ +116,5 @@
+>  
+>  function test()
+>  {
+>    waitForExplicitFinish();
+> +  Services.prefs.clearUserPref('browser.startup.page')
+
+Could you add a comment to explain why you do this?
+Also, please add a ';' at the end of the line.
+Comment on attachment 827484
+Patch - Remove Synchronous Reading of the Session v2
+
+Review of attachment 827484:
+-----------------------------------------------------------------
+
+::: browser/components/nsBrowserContentHandler.js
+@@ +565,5 @@
+>              // New profile.
+>              overridePage = Services.urlFormatter.formatURLPref("startup.homepage_welcome_url");
+>              break;
+>            case OVERRIDE_NEW_MSTONE:
+> +            // Check whether we will restore a session. If we will, we assume
+
+It's actually not so much about having a session but about also restoring it automatically. A deferred session means that we have a session but we won't automatically restore it (at least no unpinned tabs and that's what counts here).
+
+::: browser/components/sessionstore/nsISessionStartup.idl
+@@ +30,5 @@
+>    boolean doRestore();
+>  
+>    /**
+> +   * Determines whether there is a pending session restore due to configuration.
+> +   * This will return false if restoration will be caused only a crash alone.
+
+Missing a word here?
+
+@@ +33,5 @@
+> +   * Determines whether there is a pending session restore due to configuration.
+> +   * This will return false if restoration will be caused only a crash alone.
+> +   * @returns bool
+> +   */
+> +  boolean isRestoreConfigured();
+
+The function name isn't great, I think... How about something that mentions that the session is automatically restored? Not that I have a better suggestion right now...
+
+::: browser/components/sessionstore/src/SessionFile.jsm
+@@ -170,5 @@
+> -  readAuxSync: function (aPath) {
+> -    let text;
+> -    try {
+> -      let file = new FileUtils.File(aPath);
+> -      let chan = NetUtil.newChannel(file);
+
+We can now remove FileUtils.jsm, NetUtil.jsm and Deprecated.jsm imports from the top of the file.
+
+@@ -197,5 @@
+> -   * instead.
+> -   */
+> -  syncRead: function () {
+> -    // Start measuring the duration of the synchronous read.
+> -    TelemetryStopwatch.start("FX_SESSION_RESTORE_SYNC_READ_FILE_MS");
+
+We should remove those histograms.
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ -92,5 @@
+> -    // be called by SessionFile.syncRead() before SessionStore.jsm had a chance
+> -    // to call writeLoadStateOnceAfterStartup(). It's safe to ignore
+> -    // setInitialState() calls if this happens.
+> -    if (!this.initialState) {
+> -      this.initialState = aState;
+
+Don't forget to also remove the .initialState property a few lines up.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +291,4 @@
+>    _ensureInitialized: function sss__ensureInitialized() {
+> +    if (!this._initialized) {
+> +      throw new Error("Synchronous Session Store initialization has been " +
+> +                      "removed, could not fallback.");
+
+Maybe "is not supported" instead of "has been removed"?
+Comment on attachment 827484
+Patch - Remove Synchronous Reading of the Session v2
+
+Review of attachment 827484:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/nsISessionStartup.idl
+@@ +26,5 @@
+>     * Determines whether there is a pending session restore and makes sure that
+>     * we're initialized before returning. If we're not yet this will read the
+>     * session file synchronously.
+>     */
+>    boolean doRestore();
+
+No, this method is not deprecated. It should only be used after initialization is complete though. I'll update the comments.
+
+@@ +33,5 @@
+> +   * Determines whether there is a pending session restore due to configuration.
+> +   * This will return false if restoration will be caused only a crash alone.
+> +   * @returns bool
+> +   */
+> +  boolean isRestoreConfigured();
+
+I decided to go with |isAutomaticRestoreEnabled|. It can be changed again if we come up with something better.
+
+::: browser/components/sessionstore/src/SessionFile.jsm
+@@ -170,5 @@
+> -  readAuxSync: function (aPath) {
+> -    let text;
+> -    try {
+> -      let file = new FileUtils.File(aPath);
+> -      let chan = NetUtil.newChannel(file);
+
+Ah, thanks for catching those :D
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ -92,5 @@
+> -    // be called by SessionFile.syncRead() before SessionStore.jsm had a chance
+> -    // to call writeLoadStateOnceAfterStartup(). It's safe to ignore
+> -    // setInitialState() calls if this happens.
+> -    if (!this.initialState) {
+> -      this.initialState = aState;
+
+We still need the .initialState property for |writeLoadStateOnceAfterStartup()|. The property will be removed in Bug 887780
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +232,4 @@
+>     * @returns bool
+>     */
+>    doRestore: function sss_doRestore() {
+>      this._ensureInitialized();
+
+I'm keeping the _ensureInitialized() calls in to flush out any remaining uses of the synchronous fallback, if they exist. _ensureInitialized will not throw an error if initialization hasn't completed.
+
+@@ +251,5 @@
+>     * @returns bool
+>     */
+>    _willRestore: function () {
+>      return this._sessionType == Ci.nsISessionStartup.RECOVER_SESSION ||
+>             this._sessionType == Ci.nsISessionStartup.RESUME_SESSION;
+
+Yes, SessionStore still uses this stuff.
+Created attachment 832361
+Patch - Remove Synchronous Reading of the Session v3
+Comment on attachment 832361
+Patch - Remove Synchronous Reading of the Session v3
+
+Review of attachment 832361:
+-----------------------------------------------------------------
+
+r=me, with a little more work on these comments :)
+
+::: browser/components/sessionstore/nsISessionStartup.idl
+@@ +31,5 @@
+>    /**
+> +   * Determines whether automatic session restoration is enabled for this
+> +   * launch of the browser. This does not include crash restoration, and will
+> +   * return false if restoration will only be caused by a crash.
+> +   * @returns bool
+
+Nit: That @returns is actually pretty useless.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +47,5 @@
+>    "resource:///modules/sessionstore/SessionFile.jsm");
+>  
+>  const STATE_RUNNING_STR = "running";
+>  
+> +const BROWSER_STARTUP_RESUME_SESSION = 3;
+
+Could you document that constant?
+
+@@ +234,1 @@
+>     * @returns bool
+
+Nit: I'd rather write
+@throws Error if initialization is not complete yet.
+
+@@ +240,5 @@
+>  
+>    /**
+> +   * Determines whether automatic session restoration is enabled for this
+> +   * launch of the browser. This does not include crash restoration, and will
+> +   * return false if restoration will only be caused by a crash.
+
+I believe that the following formulation would be clearer: "This does not include crash restoration. In particular, if session restore is configured to restore only in case of crash, this method returns false."
+
+@@ +289,5 @@
+>    },
+>  
+> +  // Ensure that initialization is complete. If initialization is not complete
+> +  // yet, throw an error, something is attempting to use the old synchronous
+> +  // initialization.
+
+"If initialization is not complete yet, something is attempting to use the old synchronous initialization, throw an error."
+
+@@ +294,4 @@
+>    _ensureInitialized: function sss__ensureInitialized() {
+> +    if (!this._initialized) {
+> +      throw new Error("Synchronous Session Store initialization is not " +
+> +                      "supported could not fallback.");
+
+Just "Session Store is not initialized." would be sufficient and clearer.
+Created attachment 8334031
+Patch - Remove Synchronous Reading of the Session v4
+https://hg.mozilla.org/integration/fx-team/rev/eb1b72a56988
+https://hg.mozilla.org/mozilla-central/rev/eb1b72a56988

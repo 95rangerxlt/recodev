@@ -1,0 +1,132 @@
+NPE in LambdaExpression#getMethodBinding() for lambda with unresolved type.
+The example is the same as in bug 423582.
+
+interface I { }
+
+public class X {
+    static void goo(I i) {
+        System.out.println("goo(I)");
+    }
+    
+    public static void main(String[] args) {
+        goo(s -> 0);
+    }
+}
+
+java.lang.NullPointerException
+	at org.eclipse.jdt.internal.compiler.ast.LambdaExpression.getMethodBinding(LambdaExpression.java:912)
+	at org.eclipse.jdt.core.dom.DefaultBindingResolver.resolveMethod(DefaultBindingResolver.java:886)
+	at org.eclipse.jdt.core.dom.LambdaExpression.resolveMethodBinding(LambdaExpression.java:319)
+	at org.eclipse.jdt.astview.views.ASTViewContentProvider.getNodeChildren(ASTViewContentProvider.java:149)
+
+NPE in LambdaExpression#getMethodBinding() for lambda with unresolved type.
+The example is the same as in bug 423582.
+
+interface I { }
+
+public class X {
+    static void goo(I i) {
+        System.out.println("goo(I)");
+    }
+    
+    public static void main(String[] args) {
+        goo(s -> 0);
+    }
+}
+
+java.lang.NullPointerException
+	at org.eclipse.jdt.internal.compiler.ast.LambdaExpression.getMethodBinding(LambdaExpression.java:912)
+	at org.eclipse.jdt.core.dom.DefaultBindingResolver.resolveMethod(DefaultBindingResolver.java:886)
+	at org.eclipse.jdt.core.dom.LambdaExpression.resolveMethodBinding(LambdaExpression.java:319)
+	at org.eclipse.jdt.astview.views.ASTViewContentProvider.getNodeChildren(ASTViewContentProvider.java:149)
+Thanks for the report. If any of the recent bugs are super blockers for your
+project, let me know - I am deeply submerged in the code assist land (https://bugs.eclipse.org/bugs/show_bug.cgi?id=422468) and would like to
+avoid context switches - For serious blockers, I will switch context.
+Created attachment 238233
+code patch
+
+Hello,
+Uploading code patch. Complete patch with testcase to follow.
+This had 2 issues. (1) NPE while 'LambdaExpression', that was reported, is solved. (2) UnsupportedOperationException, which was unreported, and which was happening when 'LambdaExpression' is expanded. That is also fixed.
+Thanks
+Anirban
+Bug 423574 reports the UnsupportedOperationException. Missed that.
+This patch suffers from some serious problems:
+
+(1) Lambda expressions cannot be resolved by calling resolveType on them,
+They need to be furnished with a context and an expected type and only then
+can be meaningfully resolved.
+
+(2) PolyTypeBinding's are supposed to transient short lived objects that
+should not "escape" the overload resolution context. That they seem to do
+as witnessed by the recent spate of 4-5 bugs shows some fundamental problem
+that cannot papered over by instanceof checks.
+
+(3) Nobody but code assist should ask for elided parameters to be treated
+as JLO. Actually, with the recent fixes to code assist, even code assist
+does not do that.
+
+We need to understand the control flow here. We need a junit that shows the
+problem.
+OK, the fix for this is simple. (I got confused because of this
+being combined with PolyTypeBinding escape/leak issues)
+
+When getMethodBinding() is called, if this.binding is null, we should
+simply compose and return a PMB.
+(In reply to Srikanth Sankaran from comment #5)
+> OK, the fix for this is simple. (I got confused because of this
+> being combined with PolyTypeBinding escape/leak issues)
+> 
+> When getMethodBinding() is called, if this.binding is null, we should
+> simply compose and return a PMB.
+
+Steps:
+
+1. Please start by adding a test in ASTConverter18Test that shows the NPE.
+2. In FunctionalExpression.resolveType, if we encounter a problem, create a
+ProblemMethodBinding with a suitable problem id and assign it to this.binding.
+3. Verify that we do the right thing for ReferenceExpressions also.
+I'll take over this one so Anirban can focus on EA2 testing.
+(In reply to ANIRBAN CHAKRABORTY from comment #2)
+> Created attachment 238233 [details]
+> code patch
+> 
+> Hello,
+> Uploading code patch. Complete patch with testcase to follow.
+> This had 2 issues. (1) NPE while 'LambdaExpression', that was reported, is
+> solved. 
+
+Interestingly, completely inadvertently and unwittingly, I ended up releasing
+this part of the fix along with unconnected ones in http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=3a372fa727520c809be84deca2b7b9c51a2e6869.
+
+This does not solve the problem as witnessed by a new test which very much
+continues to NPE:
+
+	public void test423584() throws JavaModelException {
+		String contents =
+				"interface I { }\n" +
+				"public class X {\n" +
+				"    static void goo(I i) {\n" +
+				"        System.out.println(\"goo(I)\");\n" +
+				"    }\n" +
+				"    public static void main(String[] args) {\n" +
+				"        goo(s -> 0);\n" +
+				"    }\n" +
+				"}\n";
+		this.workingCopy = getWorkingCopy("/Converter18/src/X.java", true/*resolve*/);
+		ASTNode node = buildAST(contents, this.workingCopy, false);
+		assertEquals("Not a compilation unit", ASTNode.COMPILATION_UNIT, node.getNodeType());
+		CompilationUnit compilationUnit = (CompilationUnit) node;
+		assertProblemsSize(compilationUnit, 2, "The method goo(I) in the type X is not applicable for the arguments ((<no type> s) -> 0)\n" + 
+												"The target type of this expression must be a functional interface");
+		node = getASTNode(compilationUnit, 1);
+		assertEquals("Not a type declaration", ASTNode.TYPE_DECLARATION, node.getNodeType());
+		MethodDeclaration[] methods = ((TypeDeclaration) node).getMethods();
+		assertEquals("Incorrect no of methods", 2, methods.length);
+		MethodDeclaration method = methods[1];
+		List statements = method.getBody().statements();
+		LambdaExpression lambda = (LambdaExpression) ((MethodInvocation) ((ExpressionStatement) statements.get(0)).getExpression()).arguments().get(0);
+		IMethodBinding resolveMethodBinding = lambda.resolveMethodBinding();
+		assertTrue("Should be effectively final", true);
+	}
+Fix and tests available here: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=42f1e70a46f62ba06d110671431cc4e0acafff68

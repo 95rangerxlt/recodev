@@ -1,0 +1,324 @@
+20031119
+
+1. create a selfhosting eclipse workspace that has all plugins as binary except 
+jdt.core from HEAD.
+2. open CompilationUnitSorter, and select the first parameter from 
+method 'sort'. (ICompilationUnit compilationUnit)
+3. Invoke 'Generalize Type'. It takes a very long time, them VM memory goes up 
+to 300 MB
+4. The wizard report: No type 
+   This is not correct, IJavaElement is valid (when changing the array
+ICompilationUnit[] compilationUnits = new ICompilationUnit[] { 
+compilationUnit };
+to IJavaElement as well.
+
+20031119
+
+1. create a selfhosting eclipse workspace that has all plugins as binary except 
+jdt.core from HEAD.
+2. open CompilationUnitSorter, and select the first parameter from 
+method 'sort'. (ICompilationUnit compilationUnit)
+3. Invoke 'Generalize Type'. It takes a very long time, them VM memory goes up 
+to 300 MB
+4. The wizard report: No type 
+   This is not correct, IJavaElement is valid (when changing the array
+ICompilationUnit[] compilationUnits = new ICompilationUnit[] { 
+compilationUnit };
+to IJavaElement as well.
+For M5 we decided to only change the type of the declaration and not to change 
+types of other declarations as well.
+
+But we should have a look why the memory consumption is that high. I did some 
+testing and the long time seems to come from the fact that the refactoring 
+searches for all references to the method sort. This seems to be unnecessary 
+if we generalize the type (but is needed if we make it more concrete).
+
+Frank, can you please look at this. We should try to minimize the memory 
+consumption if possible for M5. At least we should know why where we spend the 
+memory.
+I will investigate. This will probably have to wait until M6.
+
+  -Frank
+Hi Frank,
+
+I debugged your code a little bit. One problem seems to be how you call the 
+search engine. You are search using names not Java elements. So for example if 
+you search for all "sort" method by name then the result contains all matches 
+without taking the type that declares the sort method into consideration. So 
+the result is unnecessary huge (all delcarations and all references to all 
+sort method declared in any type).
+
+If I change the search pattern for the method and fields in the following way
+
+ISearchPattern pattern= SearchEngine.createSearchPattern(
+  iMethod,IJavaSearchConstants.ALL_OCCURRENCES);
+
+and 
+
+ISearchPattern pattern= SearchEngine.createSearchPattern(
+  iField, IJavaSearchConstants.ALL_OCCURRENCES);
+
+then the results are much smaller, hence the memory consumption is lower.
+
+Is there a reason why you construct the search pattern using the name only ?
+
+We really have to do something here for M5. I tested it a little bit as well 
+and with a heap of 400MB I received out of memory exceptions.
+
+Hi Dirk,
+
+I remember looking at this a while ago. The problem was that the Search Engine
+was not finding all the references if I searched for specific signatures.
+perhaps this was due to a bug in the search engine that has been fixed now.
+
+I will try your suggestion tonight, and send you a patch if all my tests work
+with the changes you propose. I can add a few tests to do some more checking.
+
+Does that sound like a good plan?
+
+  -Frank 
+I tried to understand the relevant code a little bit more and I think that the 
+relevant cus must contain all cus that have a "ripple" method as well. So I 
+changed the code in the following way:
+
+IMethod iMethod= Bindings.findMethod(fMethodBinding, project);
+if (! iMethod.getDeclaringType().isInterface()) {
+	IMethod inInterface= MethodChecks.isDeclaredInInterface(iMethod, new 
+SubProgressMonitor(pm, 5));
+	if (inInterface != null && !inInterface.equals(iMethod))
+		iMethod= inInterface;
+}
+IMethod[] rippleMethods= RippleMethodFinder.getRelatedMethods(iMethod, new 
+SubProgressMonitor(pm, 15), null);
+ISearchPattern pattern=
+	RefactoringSearchEngine.createSearchPattern(
+		rippleMethods,
+		IJavaSearchConstants.ALL_OCCURRENCES);
+IJavaSearchScope scope= RefactoringScopeFactory.create(rippleMethods);
+ICompilationUnit[] workingCopies= null;
+SearchResultGroup[] groups=
+	RefactoringSearchEngine.search(
+		new SubProgressMonitor(pm, 80),
+		scope,
+		pattern,
+		workingCopies);
+
+fAffectedUnits= getCus(groups);
+
+
+
+Dirk,
+
+You are correct that we should collect CUs for ripple methods. However,
+we currently don't correctly construct type constraints for ripple method
+(see bug 41989), so even if we included those CUs, we would still not
+compute correct results. 
+
+  -Frank
+Dirk,
+
+I tried your improved search queries and my tests still pass. I will do a bit
+more investigating and send you a patch tonight that you can integrate tomorrow
+morning. I will try to address some of the other bugs as well.
+
+  -Frank
+Ok, here is an search algorithm that does the right thing (I hope). The last 
+one may miss some matches due to the fact that a wrong starting project for 
+the scope was choosen. The right algorithm is:
+
+IMethod selectedMethod= Bindings.findMethod(fMethodBinding, project);
+IMethod root= selectedMethod;
+if (! root.getDeclaringType().isInterface()) {
+	IMethod inInterface= MethodChecks.isDeclaredInInterface(root, new 
+SubProgressMonitor(pm, 5));
+	if (inInterface != null && !inInterface.equals(root))
+		root= inInterface;
+}
+IMethod[] rippleMethods= RippleMethodFinder.getRelatedMethods(root, new 
+SubProgressMonitor(pm, 15), null);
+ISearchPattern pattern= RefactoringSearchEngine.createSearchPattern(
+	rippleMethods,
+	IJavaSearchConstants.ALL_OCCURRENCES);
+// To compute the scope we have to use the selected method. Otherwise we
+// might start from the wrong project.
+IJavaSearchScope scope= RefactoringScopeFactory.create(selectedMethod);
+ICompilationUnit[] workingCopies= null;
+SearchResultGroup[] groups=
+RefactoringSearchEngine.search(
+		new SubProgressMonitor(pm, 80),
+		scope,
+		pattern,
+		workingCopies);
+
+fAffectedUnits= getCus(groups);
+
+OK, I'll put this in my patch tonight. Thanks for all your help!
+
+  -Frank
+But the memory consumption is still bad. Almost every change type triggered on 
+IBuffer.getUnderlyingResource increases the heap by 20 MB. Frank can you 
+please have look at this. Renaming getUnderlying resource (which causes the 
+same search engine query) doesn't increase the heap.
+
+Frank, I am not saying that generalize type is the one causing the memory 
+problem but we have to understand from where it is coming.
+I am looking into it. It could be that bringing all type constraints
+in memory is just taking up too much space. I'll do whatever I can.
+
+  -Frank
+Created attachment 6878
+fix for SearchEngine problem in "Generalize Type"
+
+Dirk,
+
+This includes your improved SearchEngine code + the fix for the NPE problem
+(bug 46933) for which I submitted a patch yesterday. Also includes some
+code for analyzing performance (disabled). 
+
+  -Frank
+Frank, I looked into the leak problem using a memory profiler. Interestingly 
+the memory profiler doesn't report any heap problem. After executing the 
+refactoring and closing the dialog all AST, type constraint and refactoring 
+relater objects are garbage collected. 
+
+Regarding your patch. Does the search engine code you added to the patch 
+differ from the code I pasted into the PR. If not, I would like to release 
+what I have in the workspace without merging the patch. I did some changes to 
+the field search as well.
+Released speed and memory consumption improvements for M5. But it is still not 
+optimal. We have to add additional improvements for M6.
+The scenario described in comment #0 takes now less than two seconds and 
+doesn't increase the memory noticeable using the Windows Task Manager for 
+verification.
+Frank, here are steps to reproduce the memory consumption using the M5 build.
+
+- create a fresh workspace
+- import org.eclipse.jdt.ui and all its dependend projects as binary
+- replace org.eclipse.jdt.ui with source from the repository. To make sure
+  it compiles use version v20031120.
+- open class refactoring
+- select method checkActivation
+- try to generalize the return type.
+Released improvements for speed and memory consumption. But we still don't 
+fully understand the memory consumption on certain usages of change type. 
+Frank, I therefore retag this one as M7. 
+Created attachment 7447
+improvements to implementation of type constraints
+
+This attachment contains a number of improvements to the implementation
+of type constraints. ConstraintVariables are created using a Factory now,
+and care is taken to avoid the generation of duplicate ConstraintVariables.
+As a result, the ugly equals() methods in the various ConstraintVariable
+classes have been removed.
+
+This makes the Extract Interface, Use Supertype, and Generalize Type 
+refactorings significantly more efficient, both in terms of speed and
+in terms of memory consumption.
+Great.
+I will have a look at these (the tests are all fine, i hear).
+AFAIK type constraints are only used only by GeneralizeType, ExtractInterface
+and UseSupertype... -- unless someone from the 'kernel' jdt ui team protests,
+i'm going to release the patch after reviewing it and running tests.
+
+Dirk, is that OK with you?
+Adam, before releasing the patch can you give me a short summary of what is 
+changes. 
+
+The only problem I see with releasing the patch is that we don't really know 
+you is going to maintain the type constraints code. Hence it is unclear you is 
+going to fix new bugs <g>. I know that ZRH has to decide this, but currently 
+we are really busy with other things. So I would like to understand the impact 
+of the patch.
+Dirk,
+
+I volunteer to maintain the type constraints code. I think it makes sense
+for someone at Watson to do this, because we will be doing a lot more
+work that is based on the type constraints. Moreover, I'm now familiar with
+all 3 refactorings that use the type constraints. I just spent 2 days full-time
+analyzing how Extract Interface and Use Supertype use the type constraints.
+
+Regarding the level of commitment I can offer: as you know, I am always busy.
+However, I expect to be able to respond to urgents problems within a week
+most of the time.
+
+  -Frank
+Frank,
+
+thanks for offering to maintain the type constraint code. My perferred 
+solution is that we can find a working relation ship similar to the one that 
+you had with Adam. That would mean that ZRH still owns and maintains the code, 
+but in a closed relationship with Adam, you and Bob.
+
+The major argument is that 1.5 refactorings are important for 3.0 and we need 
+to have "control" over (at least parts of) the resources working on this <g>. 
+I will dicuss this here in ZRH and I will give you a call beginning of next 
+week. Is this OK with you ?
+
+Dirk,
+
+That arrangement sounds fine to me. All I'm saying is that I'm willing to come
+up with fixes for bugs and performance problems in the type constraints code. I
+already have some more ideas for performance improvements.
+
+  -Frank
+Created attachment 7508
+new test added for extract interface
+
+new test
+Created attachment 7509
+new version of the patch
+
+i reviewed the code.
+the impact on other parts of jdt ui (those not using types constraints) is none
+or marginal (i did not see any)
+
+the main difference is the intruduced factory for constraint variables that
+reuses constraints when possible.
+no ast nodes are kept by the factory - it's all binding based.
+
+changed that had to be made to existing refactorings that use type constraints
+are minimal.
+
+no tests are failing.
+i added a new test (test99) that checks one scenario that was probably not
+tested before.
+
+i'm attaching a version of the patch made against jdt ui 20040120b
+and refactoring tests against 20040120
+the only changes i made were using more conventional field names and
+changing the new data slot in constraint variable to be a private field with
+accessors (which a more flexible design)
+
+Dirk, i know that you're currently working on refactoring API.
+Do you want to release the patches or are you OK with me releasing them?
+Adam,
+
+thanks a lot for the review. Go ahead and release the code. That's fine with 
+me. I have to merge code before I release the API changes anyway <g>
+it's in now
+Adam, we have now three failing test cases in tzpe constraints. Can you please 
+have a look ?
+oops, sorry
+i ran the 3 refactoring test suites but forgot about the type constraint test suite.
+(we desperately need a tool that figures out which test suites are affected by a
+selected set of classes. the result set doesn't have to minimal. anybody knows one?)
+
+
+i will have a quick look and unless i can see the problem right away i will
+disable the tests (and enter a bug report) until we know what's up.
+the refactoring test suites are fine so i wouldn't worry too much.
+
+Frank, Dirk, does that sound ok for you?
+
+
+
+bug 50658 entered
+Is ok for me.
+I'm working on a patch.
+
+  -Frank
+Frank, please note that I am heavily reorganizing the refactoring and change 
+world. I will release this as soon as we have the EclipseCon build ready. This 
+will be either Friday or Saturday. Can you wait with our changes until I have 
+released mine. 
+Got fixed for M7 by improving the type constraint creation engine.

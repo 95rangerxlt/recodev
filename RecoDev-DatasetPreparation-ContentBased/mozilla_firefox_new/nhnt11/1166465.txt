@@ -1,0 +1,176 @@
+Bug 1137234 made middle-clicks on search suggestions in about:home and newtab match the behavior of middle clicks elsewhere in the browser, but it did so in a hard-coded, one-off way.  We should use the function we normally use to open links from browser chrome, openUILink in utilityOverlay.js, which figures out where they should open.
+
+Bug 1137234 made middle-clicks on search suggestions in about:home and newtab match the behavior of middle clicks elsewhere in the browser, but it did so in a hard-coded, one-off way.  We should use the function we normally use to open links from browser chrome, openUILink in utilityOverlay.js, which figures out where they should open.
+Created attachment 8607749
+Patch for about:newtab
+
+This is a tentative patch for about:newtab.
+
+Passing the event object directly didn't work (I got a complaint about it being a non-clonable XPCOM object) so I just copied over the relevant properties to a new object.
+
+Requesting f? to make sure I'm in the correct general direction while I work on about:home.
+Hmm, Cmd+Click with this patch opens the result in a new tab, but switches to it immediately (which I don't think it's supposed to). I'm investigating it now.
+Okay, for some reason I missed the fact that openUILinkIn forces fromChrome to true (https://mxr.mozilla.org/mozilla-central/source/browser/base/content/utilityOverlay.js#206)
+
+I guess this is intended behavior then?
+Created attachment 8607769
+Patch v2
+
+Fixes about:home as well now.
+The loading in background stuff isn't consistent with what the search bar does, so I'm going to look at how that works and see if it's manually setting params by calling openLinkIn directly.
+Comment on attachment 8607769
+Patch v2
+
+Review of attachment 8607769:
+-----------------------------------------------------------------
+
+Looks good.  I'm surprised by the fromChrome thing too.  Didn't realize that was there, and I don't know why the main search bar apparently bypasses it.  Maybe the search bar is not using openUILink after all but something else like it.
+
+::: browser/base/content/abouthome/aboutHome.js
+@@ +317,5 @@
+> +        shiftKey: aEvent.shiftKey,
+> +        ctrlKey: aEvent.ctrlKey,
+> +        metaKey: aEvent.metaKey,
+> +        altKey: aEvent.altKey,
+> +        button: aEvent.button
+
+Nit: As a general rule, please use a trailing comma even for the final properties in multi-line object literals like this.  That way when someone comes along and adds a new property, they don't need to add a comma to the previous line, preserving its blame.  (You might find people who disagree with that, but that's what I think. :-))
+
+@@ +318,5 @@
+> +        ctrlKey: aEvent.ctrlKey,
+> +        metaKey: aEvent.metaKey,
+> +        altKey: aEvent.altKey,
+> +        button: aEvent.button
+> +      }
+
+Here too.
+
+@@ +354,5 @@
+>    searchText.addEventListener("blur", function searchText_onBlur() {
+>      searchText.removeEventListener("blur", searchText_onBlur);
+>      searchText.removeAttribute("autofocus");
+>    });
+> +
+
+Is your text editor automatically removing trailing spaces?  I like it, but normally you should only touch the code that's related to the bug, to keep patches tight and to preserve blame, so could you please revert these trailing space changes?
+
+::: browser/modules/AboutHome.jsm
+@@ +201,5 @@
+>  
+>            // Trigger a search through nsISearchEngine.getSubmission()
+>            let submission = engine.getSubmission(data.searchTerms, null, "homepage");
+> +          window.openUILink(submission.uri.spec, data.originalEvent, null, null,
+> +                            null, submission.postData);
+
+Please pass false for the three middle arguments since their parameters are booleans (even though null is falsey so it doesn't actually matter).
+
+::: browser/modules/ContentSearch.jsm
+@@ +213,3 @@
+>      try {
+> +      browser.ownerDocument.defaultView.openUILink(submission.uri.spec,
+> +                       data.originalEvent, null, null, null, submission.postData);
+
+Move the `win` definition from below up above so you can use it here.
+Created attachment 8607792
+Patch v3
+
+(In reply to Drew Willcoxon :adw from comment #5)
+> Comment on attachment 8607769
+> Patch v2
+> 
+> Review of attachment 8607769:
+> -----------------------------------------------------------------
+> 
+> Looks good.  I'm surprised by the fromChrome thing too.  Didn't realize that
+> was there, and I don't know why the main search bar apparently bypasses it. 
+> Maybe the search bar is not using openUILink after all but something else
+> like it.
+
+The main search bar uses another pref called browser.search.openintab, and employs its own logic to decide whether to open a result in a new tab, in the background, etc.
+
+Considering that the search UI in about:home and about:newtab is simpler than the main search bar, this patch just uses whereToOpenLink browser.tabs.loadInBackground.
+
+> Nit: As a general rule, please use a trailing comma even for the final
+> properties in multi-line object literals like this.  That way when someone
+> comes along and adds a new property, they don't need to add a comma to the
+> previous line, preserving its blame.  (You might find people who disagree
+> with that, but that's what I think. :-))
+
+Noted.
+
+> Is your text editor automatically removing trailing spaces?  I like it, but
+> normally you should only touch the code that's related to the bug, to keep
+> patches tight and to preserve blame, so could you please revert these
+> trailing space changes?
+
+Sorry about this, I saw this in the diff but forgot to fix it before uploading.
+Comment on attachment 8607792
+Patch v3
+
+Review of attachment 8607792:
+-----------------------------------------------------------------
+
+Thanks, r+ with the changes below.
+
+::: browser/modules/AboutHome.jsm
+@@ +203,5 @@
+>            let submission = engine.getSubmission(data.searchTerms, null, "homepage");
+> +          let where = window.whereToOpenLink(data.originalEvent);
+> +          let params = {
+> +            postData: submission.postData,
+> +            inBackground: window.getBoolPref("browser.tabs.loadInBackground"),
+
+Please use Services.prefs.getBoolPref instead of relying on getBoolPref being defined on the window.
+
+Services.jsm provides access to a bunch of XPCOM services in a way that's nicer to use in JS than by doing Cc/Ci/getService stuff.  It's used so much in browser code that you rarely have to import it in patches because someone else probably already has.
+
+http://mxr.mozilla.org/mozilla-central/source/toolkit/modules/Services.jsm
+
+::: browser/modules/ContentSearch.jsm
+@@ +209,5 @@
+>      ]);
+>      let engine = Services.search.getEngineByName(data.engineName);
+>      let submission = engine.getSubmission(data.searchString, "", data.whence);
+>      let browser = msg.target;
+> +    let win = browser.ownerDocument.defaultView;
+
+There's a comment below this part about the browser possibly being closed at this point.  In that case, browser.ownerDocument will be undefined, so browser.ownerDocument.defaultView will throw an exception.  Let's just do everything from this point to win.openUILinkIn() in the try-catch that's already here.
+
+@@ +213,5 @@
+> +    let win = browser.ownerDocument.defaultView;
+> +    let where = win.whereToOpenLink(data.originalEvent);
+> +    let params = {
+> +      postData: submission.postData,
+> +      inBackground: win.getBoolPref("browser.tabs.loadInBackground"),
+
+Here too re: getBoolPref.
+Created attachment 8607825
+Patch v4
+
+Addressed review comments. Carrying forward the r+.
+Do you have a Try run handy for this? :)
+Created attachment 8608319
+Patch v5
+
+A try push (https://treeherder.mozilla.org/#/jobs?repo=try&revision=954df451892b) revealed that the patch broke a test that ensures searches get loaded in the tab that triggered them even if the user switches tabs in the meantime.
+
+This test did not cover AboutHome.jsm, which had the same bug.
+
+This new patch fixes the issue in both places. I've pushed to try again (https://treeherder.mozilla.org/#/jobs?repo=try&revision=0a0788981a35), hopefully this time it should be fine.
+
+It unfortunately results in a bit of duplication, but I don't see any easy/obvious way of avoiding that.
+
+adw r+'d in person, so carrying it forward.
+Created attachment 8608322
+Patch v5.1
+
+Missed a couple of semicolons.
+https://hg.mozilla.org/integration/fx-team/rev/c18385c3f2d7
+https://hg.mozilla.org/mozilla-central/rev/c18385c3f2d7
+
+
+about:home and about:newtab search suggestions should use openUILink
+
+
+
+Bug 1166465 - about:home and about:newtab search suggestions should use openUILink. r=adw 

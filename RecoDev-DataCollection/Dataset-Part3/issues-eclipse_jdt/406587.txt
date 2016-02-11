@@ -1,0 +1,195 @@
+Can't see an existing bug for this (apologies if there is one!). This came up whilst working on JSR308 code generation.
+
+For this code:
+====
+import java.lang.annotation.*;
+
+@Target(ElementType.TYPE_USE)
+@Retention(RetentionPolicy.CLASS)
+@interface B {
+    int value() default -1;
+}
+
+class X {
+  @B(1) java.lang.String field;
+}
+====
+
+javac flags that 'nested type cannot be annotated'.  ECJ just lets it compile.  IIRC as of the current spec version it should be written 'java.lang.@B(1) String field' for a type_use annotation that is intended to apply to the String reference.
+
+Can't see an existing bug for this (apologies if there is one!). This came up whilst working on JSR308 code generation.
+
+For this code:
+====
+import java.lang.annotation.*;
+
+@Target(ElementType.TYPE_USE)
+@Retention(RetentionPolicy.CLASS)
+@interface B {
+    int value() default -1;
+}
+
+class X {
+  @B(1) java.lang.String field;
+}
+====
+
+javac flags that 'nested type cannot be annotated'.  ECJ just lets it compile.  IIRC as of the current spec version it should be written 'java.lang.@B(1) String field' for a type_use annotation that is intended to apply to the String reference.
+(In reply to comment #0)
+> Can't see an existing bug for this (apologies if there is one!). This came
+> up whilst working on JSR308 code generation.
+
+
+Thanks for the report. Jay, please take a look.
+This is something of a strange problem. It was at the suggestion from
+Eclipse JDT/UI team that the spec was adjusted to forbid annotations
+prefixed to package.
+
+But where a SE8 annotation occurs in a SE5 location, I am not sure
+such a transfer of annotations as can be inferred from this test case
+is warranted/required by the spec.
+
+It would seem even when transferred, the annotation should be transferred
+to the "type" of the field which is String.
+
+What about the case where we have
+
+@TypeAnnot OuterType.InnerType field ? 
+
+I am not sure I saw anything in the way of transfer behavior that would
+spell out whether @TypeAnnot annotates OuterType or InnerType. Intuitively
+I feel it should annotate InnerType.
+
+I do recall a passage of hybrid annotations and how they must show up
+twice in the AST at appropriate places.
+
+Jay, please read through the latest draft carefully and then we can discuss.
+>  @B(1) java.lang.String field;
+
+According to the latest spec, that's wrong and should instead be:
+
+   java.lang.@B(1) String field;
+
+2.1->1. says: "A type annotation appears before the type’s simple name, as in @NonNull String or java.lang.@NonNull String".
+
+See also 2.2.2 "Syntax of annotations on qualified types".
+
+
+The mails on [type-annos-observers] with subjects containing "Constraining type annotations to occur just before type" also deal with this issue. The @B(1) in front of the package reference would be legal if the @Target also contained FIELD. But in that case, the compiler would only consider it as an SE 7 annotation on the field, and it would *not* consider it as type-use annotation.
+
+OTOH,
+   java.lang.@B(1) String field;
+is only a type-use annotation, and not an SE 7 annotation (even if @Target includes FIELD).
+
+Only
+   @B(1) String field;
+with @Target({FIELD, TYPE_USE}) means we have to write SE 7 annotations as well as type-use annotations into the classfile.
+
+And
+   @B(1) String[] field;
+with @Target({FIELD, TYPE_USE}) is the absurd case where we have an SE 7 annotation on the field and a type-use annotation on String (not on String[]!).
+
+The type-use annotation on String[] would be:
+   String @B(1)[] field;
+(In reply to comment #3)
+> >  @B(1) java.lang.String field;
+> 
+> According to the latest spec, that's wrong and should instead be:
+> 
+>    java.lang.@B(1) String field;
+> 
+> 2.1->1. says: "A type annotation appears before the type’s simple name, as
+> in @NonNull String or java.lang.@NonNull String".
+
+Yes, I need to read it closely. ECJ behavior could indeed be wrong.
+I have tended to view a type annotation as one that occurs in a SE8
+specific location as opposed to one with a SE8 specific target type.
+
+It is likely the latter is the right definition.
+Created attachment 232586
+Patch under test
+
+Patch with test. One of the existing test had to be modified too. I will update once the tests complete.
+(In reply to comment #5)
+> Created attachment 232586 [details]
+> Patch under test
+> 
+> Patch with test. One of the existing test had to be modified too. I will
+> update once the tests complete.
+
+All tests pass with b92.
+The previous patch doesn't handle local variables. Thanks Srikanth for pointing out. Along same lines, should we fix the method parameters too, like the following code:
+
+	@B(1) java.lang.String foo(@B(1)  java.lang.String str1) { ...
+}
+
+@Target({ElementType.TYPE_USE})
+@interface B {
+	int value() default -1;
+}
+
+Should we report that @B is not allowed in both the places?
+(In reply to comment #7)
+
+> Should we report that @B is not allowed in both the places?
+
+yes, please.
+Created attachment 232774
+Updated patch
+
+New patch covering other places such as local variables and methods as well. A note about the patch: The new code seems to be doing a lot to find whether a type field/local declaration has package qualifier. I couldn't find more efficient way to do it inside Annotation#resolveType. Actually, we do something similar in QualifiedTypeReference#rejectAnnotationsOnPackageQualifiers(), but the problem is, the annotation is not fully resolved at this point - for e.g. Annotation#recipient is not yet assigned.
+
+Srikanth, what do you think?
+(In reply to comment #9)
+
+> a type field/local declaration has package qualifier. I couldn't find more
+> efficient way to do it inside Annotation#resolveType. Actually, we do
+
+(1) MethodBinding.returnType.getPackage.compoundName
+FieldBinding.type.getPackage.compoundName etc may be of help.
+
+
+(2) In Annotation#resolveType, case Binding.METHOD, there is a suspicious
+clearing of methodBinding.returnType = null;
+
+(3) I got a CCE while testing the following code: 
+
+// --
+import java.lang.annotation.*;
+import java.util.List;
+
+class X {
+	public static void main(String[] args) {
+		 List l = (@Marker java.util.@Marker List) null;
+	}
+	
+	@Marker java.util.String foo() {
+		return null;
+	}
+	
+	void goo() {
+		int x = foo();
+	}
+}
+
+@java.lang.annotation.Target(ElementType.TYPE_USE)
+@interface Marker {
+	
+}
+(In reply to comment #10)
+
+> (1) MethodBinding.returnType.getPackage.compoundName
+> FieldBinding.type.getPackage.compoundName etc may be of help.
+
+ This didn't help because, either type binding is null at this point or it's resolved and always has the package regardless how the field etc. is declared.
+
+> 
+> (2) In Annotation#resolveType, case Binding.METHOD, there is a suspicious
+> clearing of methodBinding.returnType = null;
+> 
+> (3) I got a CCE while testing the following code: 
+
+These two have been addressed the fix has been released via commit:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=bfe1e5f410410e285c8a77b5130cabdbc82cde90
+Review comments raised are already addressed. Thanks

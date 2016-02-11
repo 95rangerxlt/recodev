@@ -1,0 +1,111 @@
+ttaubert tells me that we thumbnail the page on every page load. Looks like we certainly grab it more often then we display in the new tab page.
+
+We should limit grabbing them to something such as perhaps no more then once a day. One problem is that panorama is also using these thumbnails.
+
+ttaubert tells me that we thumbnail the page on every page load. Looks like we certainly grab it more often then we display in the new tab page.
+
+We should limit grabbing them to something such as perhaps no more then once a day. One problem is that panorama is also using these thumbnails.
+*** Bug 890119 has been marked as a duplicate of this bug. ***
+(In reply to Benoit Girard (:BenWa) from comment #0)
+> We should limit grabbing them to something such as perhaps no more then once
+> a day. One problem is that panorama is also using these thumbnails.
+
+Let's just go ahead and implement it like that. The Panorama thumbnails being slightly out of date shouldn't matter too much, I think.
+Created attachment 792624
+PageThumbs.captureAndStoreIfStale
+
+Just sketching an idea: we added a freshness check for the background service; we can use it for the foreground service, too.  Add a new PageThumbs.captureAndStoreIfStale that gBrowserThumbnails calls.  (Also move the current PageThumbs.captureIfStale to BackgroundPageThumbs.  Not strictly necessary, but it uses the background service so it fits better there, especially if there's now a foreground counterpart in PageThumbs.)
+
+This trades the canvas draw that currently happens with file I/O, but the I/O happens in a worker.  Alternatively we could keep metadata on every thumbnail in memory at all times, or only for thumbnails that have been captured since the app started, but I like how this complements the background case.
+Comment on attachment 792624
+PageThumbs.captureAndStoreIfStale
+
+Review of attachment 792624:
+-----------------------------------------------------------------
+
+The patch looks good, but deferring feedback request as we consider if we really want to do this.  My concern is how it may interact with bug 897880 - specifically:
+
+* Take initial foreground snapshot.
+* Later it goes stale, b/g capture attempted but 404 response found - so we touch it.
+* Later, foreground service starts capture process, but finds it's not stale.
+* Later, it goes stale again, b/g capture starts again, gets 404, file gets touched.
+* Rinse, repeat
+
+With the end result being that neither the f/g or b/g service ever actually update it.  This could be avoided if we had metadata for the thumbnail (so we could differentiate "we captured it on this date" versus "we declined to capture it on this date" - but that's non-trivial.  Or maybe it isn't that hard - eg, maybe we could store a zero-byte file next to the thumbnail (same base but different extension) to record the fact we declined to capture due to an error response.  Then the background service includes the modified-time of this second file when deciding if it is stale, while the foreground service does not (and removal of a thumbnail removes both files).  Or something.
+
+Does that make sense?
+(In reply to Mark Hammond (:markh) from comment #4)
+> * Later it goes stale, b/g capture attempted but 404 response found
+
+Oops - I meant 401 (auth required) rather than 404.
+Yeah, that's great thinking.  And my patch is moot anyway if we go ahead with bug 906615.
+
+How about just keeping a capture timestamp per thumbnail, in memory?  On capture, check the metadata: if it doesn't exist or it says the thumbnail is too old, go ahead with capture; otherwise, decline.  Don't worry about persisting the metadata anywhere.
+
+I was talking with Gavin about this bug and he raised the interesting possibility of content JS being able to tell whether an arbitrary URL has been visited by measuring jank due to thumbnailing, or the absence of jank due to skipping thumbnailing, when the JS opens that URL.
+If bug 906615 goes ahead and the background service doesn't ever overwrite an existing thumbnail, can't we just use the timestamp of the file?
+I think that's not possible, because we want the foreground service to be able to overwrite background thumbnails.  e.g.,
+
+1. Thumbnail for URL is missing, so bg service captures it
+2. User visits that URL soon after
+3. fg service declines to capture because the file is too new
+
+On step 3 we want the fg service to capture and overwrite, right?  In other words, this bug is about limiting how often the fg service captures a URL.  If we wanted to similarly limit the bg service, what you suggest would work, but like you say we're planning on having the bg service never overwrite.
+(In reply to Drew Willcoxon :adw from comment #8)
+> I think that's not possible, because we want the foreground service to be
+> able to overwrite background thumbnails.  e.g.,
+> 
+> 1. Thumbnail for URL is missing, so bg service captures it
+> 2. User visits that URL soon after
+> 3. fg service declines to capture because the file is too new
+
+I'm not sure that is a problem in practice:
+
+* If the thumbnail for a top-site was missing, it's most likely that the foreground service declined to capture it.  Thus, at (3), the fg service is likely to decline to capture it again for the same reason rather than because it is too new.
+
+* Even if (1) didn't capture it for other reasons, the problem isn't too bad.  (3) will be blocked for (say) 2 days, but that will happen exactly once - now that the thumbnail exists the bg service will forever decline to overwrite it.
+
+IOW, (3) will happen exactly once, and only for 2 days after (1) happened for the first time.
+
+[FWIW, there may still be value in having an in-memory cache of the (say) 50 most recent thumbnail modification dates to keep the disk IO down, but I'm not sure we should assume a thumbnail is stale if not in that cache  - we'd just be avoiding a small amount of IO that reads the mtime at the cost of much more IO in saving a capture that wasn't really stale]
+You may be right.  I was thinking of a case like this: I open a new tab because I want to visit a top site.  Its thumbnail is missing for whatever reason -- it expired.  I click the thumbnail to visit the site, but I don't visit it again in a while.  Now every time I open a new tab, I'm looking at the worse bg thumbnail.
+
+It's possible, but it is probably a pretty rare case: it looks like thumbnails aren't expired as long as they remain top sites, and the "whatever reason" is probably the fg service's declining to capture as you say.
+
+I'll work on a patch that (only) checks file timestamps.
+(In reply to Drew Willcoxon :adw from comment #10)
+> You may be right.  I was thinking of a case like this: I open a new tab
+> because I want to visit a top site.  Its thumbnail is missing for whatever
+> reason -- it expired.
+
+IMO, that's a different bug - we shouldn't expire a thumbnail that is on top-sites.  Even if we previously expired it because it wasn't a top site but has since become one, the process of it becoming a top-site should have offered enough opportunities to re-capture it by the fg service.
+
+> I click the thumbnail to visit the site, but I don't
+> visit it again in a while.  Now every time I open a new tab, I'm looking at
+> the worse bg thumbnail.
+
+I think that would be "For the next 2 days I'm looking at the worse bg thumbnail".  Not ideal, but not a big deal IMO - especially given the fact that the only reason the bg service captured it in the first place was that it was missing - so the alternative is probably that there was no thumbnail at all for those 2 days.
+
+> It's possible, but it is probably a pretty rare case: it looks like
+> thumbnails aren't expired as long as they remain top sites, and the
+> "whatever reason" is probably the fg service's declining to capture as you
+> say.
+> 
+> I'll work on a patch that (only) checks file timestamps.
+
+Awesome, thanks.
+(In reply to Mark Hammond (:markh) from comment #11)
+> IMO, that's a different bug - we shouldn't expire a thumbnail that is on
+> top-sites.
+
+Just glancing at the expiration code and searching for callers of addExpirationFilter, it looks like we already don't expire top-site thumbnails: http://mxr.mozilla.org/mozilla-central/source/toolkit/modules/NewTabUtils.jsm#746
+
+> I think that would be "For the next 2 days I'm looking at the worse bg
+> thumbnail".
+
+Well, in my example I don't visit the site again for quite a while.  If I don't visit it, the fg service doesn't have an opportunity to recapture it, so I'm stuck with the bg thumbnail.  If I visit lots of other sites in the meantime, then maybe that site gets pushed out of top sites.  But maybe I don't visit lots of sites that aren't already in top sites, so the thumbnail stays.
+
+> Awesome, thanks.
+
+Thank you!  I'm 100% sure thumbnailing would be way worse off if I were working on it by myself.
+This was fixed in bug 906615.

@@ -1,0 +1,668 @@
+APT currently handles only SE7 annotations and new code has to be added for annotations in SE8 locations, such as receiver, type use etc.
+
+I believe AnnotationDiscoveryVisitor should be updated to provide support for new annotatable AST nodes. This needs further investigation, though.
+
+APT currently handles only SE7 annotations and new code has to be added for annotations in SE8 locations, such as receiver, type use etc.
+
+I believe AnnotationDiscoveryVisitor should be updated to provide support for new annotatable AST nodes. This needs further investigation, though.
+Been going through the proposed changes to the APT apis, such as AnnotatedConstruct etc. and I couldn't determine whether we have enough support for type annotations. It's been said that an AnnotatedConstruct can be a an Element or TypeMirror. It's also been said that the existing methods such as RoundEnvironment#getElementsAnnotatedWith(...) support only declaration elements, which itself is fine. 
+
+I can't figure out (from the javadoc) how to get handles to the TypeMirror from the type use locations, such as a cast expression. Even if one says we get the TypeMirror by invoking Element#asType, I don't know what elements are to be used for such scenarios.
+
+Honestly, I don't know if this is a valid question as I might have missed something and hence would like to hear from Walter if the question makes sense before checking with the type annotations team.
+
+Walter, can you throw some light on this? Thanks in advance.
+I guess cast expression is an unlucky example since javax.lang.model doesn't encode method bodies, right?
+
+
+Would the following sequence answer your question?
+
+- TypeElement#getTypeParameters()
+  -> List<? extends TypeParameterElement>
+- TypeParameterElement#getBounds()
+  -> List<? extends TypeMirror>
+
+Now you want to see the @NonNull from
+
+  class X<T extends @NonNull Y> { .. }
+
+Similar for 
+
+  class X<@NonNull T> { .. }
+
+  class X extends @NonNull Y { .. }
+
+  class X extends Y<@NonNull String> { .. }
+
+  void foo(Object @NonNull[] arg) { ... }
+
+etc.
+Created attachment 235009
+Prototype
+
+This patch provides APT support for type annotations in super classes, like the following example:
+
+public class Test extends @TypeUseAnnotation("super") Object {}
+
+This is just a POC that we can make it work with the compiler support. However, you can also see there are lot of issues with it. I am listing them just for the records and don't expect to have any further discussion on or spend more time on.
+
+1. In the current implementation (not talking about this patch), the APT models just wrap the bindings and provide additional information such as getSuperClass() on the fly from the binding. If want to make it work for SE8, we should start storing additional information in the APT models, such as TypeElementImpl, as this prototype shows.
+
+2. Worst of all, the effort to reconstruct the model. In the AnnotationDiscoveryVisitor, we create an element (such as TypeElementImpl and store it only when necessary, i.e. only when it the type declaration has annotations. But that won't work anymore.
+
+Anyway, we will have a better picture when we conclude our discussion on bug 409586.
+Created attachment 236059
+Combined fix for this and bug 414627
+
+Now that we have the annotated bindings, the work for supporting SE8 annotations in SE8 locations is far simplified and hence I have moved the fix for bug 414627 into this one. Only question that remains to be answered is how best to accommodated the new tests that need Java 8 in the test project's classpath.
+Forgot to mention that three of the new tests and an existing APT tests fail with Javac 8. The existing test is about how Javac interprets whitespace in Javadoc. And failure of new tests could simply mean Javac's APT is incomplete.
+Created attachment 236094
+Latest patch
+
+The previous patch had some glitch with the path for one of the files. Looks like some problem with patch generator. I have manually adjusted the patch, which should apply fine now.
+Created attachment 236098
+Latest patch
+
+The last one had problems too. This one should work.
+I made one pass over the changes and here are some comments. I need to study
+this more closely as well as read up the relevant parts of the spec, will do
+so next week:
+
+1. AnnotationDiscoveryVisitor: I think needs much more changes. For example
+when we see a type declaration, don't we have to visit the super types, 
+type parameters etc ? Likewise for MethodDeclaration: thrown types, receiver,
+type variables etc ? Basically we have to visit most every node types in
+the TypeReference hierarchy ? If this is not essential and we have tests that
+show that to be the case, I need to understand how things work in the APT
+world - it is unfamiliar territory for me.
+
+2. ArrayTypeImpl.getAnnotationBindings: I don't think we need to spell out
+the fully qualified name of AB, because the method already returns just AB
+and suitable imports should be in place. (3 places use FQN)
+
+3. Should org.eclipse.jdt.internal.compiler.apt.model.ElementImpl.toString()
+explicitly print the annotations ? _binding.toString would also print them.
+(This is true for type annotations. Not for SE7 annotations)
+
+4. I don't think ElementsImpl.isFunctionalInterface(TypeElement) should
+check for STB. BinaryTypeBindings, ParameterizedTypeBindings, RawTypeBindings
+etc could also be functional interfaces.
+
+5. ExecutableElementImpl: remove the comment, "What is the likelihood ..."
+The code is doing being defensive and that is good for us.
+
+6. TypeMirrorImpl: The comment: Caution: _env will be NULL for PrimitiveTypeImpl
+needs to be suitably amended.
+
+7. TypeMirrorImpl.getAnnotationBindings() should cast to TypeBinding and invoke
+getTypeAnnotations() and
+
+8. PrimitiveTypeImpl#getAnnotationBindings can be gotten rid of.
+
+I didn't review the test changes yet.
+(9) TypeMirrorImpl.getAnnotationMirrors() calls 
+TypeMirrorImpl.getAnnotationBindings() which calls getTypeAnnotations().
+This would mean that we would loose the ability to query SE5 annotations
+on a TypeMirror that corresponds to a declaration site ?
+
+This may require some changes on the compiler side. We may have to remove
+the new API and make getAnnotations() do its job instead.
+(10) org.eclipse.jdt.internal.compiler.apt.model.ElementImpl.equals(Object)
+and similar methods may need inspection.
+(In reply to Srikanth Sankaran from comment #8)
+> 1. AnnotationDiscoveryVisitor: I think needs much more changes. For example
+> when we see a type declaration, don't we have to visit the super types, 
+> type parameters etc ? Likewise for MethodDeclaration: thrown types, receiver,
+> type variables etc ? Basically we have to visit most every node types in
+> the TypeReference hierarchy ? If this is not essential and we have tests that
+> show that to be the case, I need to understand how things work in the APT
+> world - it is unfamiliar territory for me.
+
+javax.annotation.processing.RoundEnvironment doesn't have any API that pertains to TypeMirror. An annotated construct can either be an Element or TypeMirror. While an Element represent declaration elements such as field, type declaration, method etc, TypeMirror represents a 'type use'. So, I guess we are not obliged to track them. This was my initial confusion too as there didn't appear to be any API that expose type annotated type mirrors. So, looks like the only way to get hold of them is via the Element's APIs that return a TypeMirror, such as javax.lang.model.element.TypeElement.getSuperclass().
+
+
+(In reply to Srikanth Sankaran from comment #9)
+> (9) TypeMirrorImpl.getAnnotationMirrors() calls 
+> TypeMirrorImpl.getAnnotationBindings() which calls getTypeAnnotations().
+> This would mean that we would loose the ability to query SE5 annotations
+> on a TypeMirror that corresponds to a declaration site ?
+> 
+> This may require some changes on the compiler side. We may have to remove
+> the new API and make getAnnotations() do its job instead.
+
+May be not. As I just mentioned, elements represent declarations. For e.g. in case of a method, the method declaration is represented by ExecutableElementImpl but the return type is a ExecutableTypeImpl. Also note that the former uses getAnnotations() but the latter invokes getTypeAnnotations(). For a field, it's even more straight forward, as we will have two distinct objects of type VariableElement and TypeMirror to hold the SE7 and SE8 annotations respectively.
+(In reply to Jayaprakash Arthanareeswaran from comment #11)
+
+> javax.annotation.processing.RoundEnvironment doesn't have any API that
+> pertains to TypeMirror. An annotated construct can either be an Element or
+> TypeMirror. While an Element represent declaration elements such as field,
+> type declaration, method etc, TypeMirror represents a 'type use'. So, I
+> guess we are not obliged to track them. This was my initial confusion too as
+> there didn't appear to be any API that expose type annotated type mirrors.
+> So, looks like the only way to get hold of them is via the Element's APIs
+> that return a TypeMirror, such as
+> javax.lang.model.element.TypeElement.getSuperclass().
+
+We need to check if for example, 
+RoundEnvironment.getElementsAnnotatedWith(Class<? extends Annotation>) should return field below if T a type annotation:
+
+public class X {
+class Y {}
+X.@T Y xy;
+}
+
+(1) Can you check what javac does here ? 
+
+Something else that may need change on the compiler side:
+
+@T
+public class X {
+X x;
+}
+
+Today, the field x's type shares the binding with the declaration. We may
+have to start doling out unique bindings for unannotated type uses and not
+let them bind to declaration.
+
+(2) Can you see what javac does here ?
+(In reply to Jayaprakash Arthanareeswaran from comment #11)
+
+> TypeMirror. While an Element represent declaration elements such as field,
+> type declaration, method etc, TypeMirror represents a 'type use'.
+
+Let us check that assumption. TypeMirror is not a Java 8 interface. I think
+it can represent both a type use and type declaration.
+(In reply to Srikanth Sankaran from comment #13)
+> Let us check that assumption. TypeMirror is not a Java 8 interface. I think
+> it can represent both a type use and type declaration.
+
+This is from the Javadoc of DeclaredType, which is a sub type of TypeMirror:
+
+"While a TypeElement represents a class or interface element, a DeclaredType represents a class or interface type, the latter being a use (or invocation) of the former. See TypeElement for more on this distinction."
+
+The TypeElement also has this:
+
+"While a TypeElement represents a class or interface element, a DeclaredType represents a class or interface type, the latter being a use (or invocation) of the former. The distinction is most apparent with generic types, for which a single element can define a whole family of types. For example, the element java.util.Set corresponds to the parameterized types java.util.Set<String> and java.util.Set<Number> (and many others), and to the raw type java.util.Set."
+(In reply to Jayaprakash Arthanareeswaran from comment #14)
+> (In reply to Srikanth Sankaran from comment #13)
+> > Let us check that assumption. TypeMirror is not a Java 8 interface. I think
+> > it can represent both a type use and type declaration.
+> 
+> This is from the Javadoc of DeclaredType, which is a sub type of TypeMirror:
+
+I believe this is orthogonal to the issue at hand, let us write some programs
+to verify reference compiler behavior early next week and take it from there.
+(In reply to Srikanth Sankaran from comment #8)
+
+> 1. AnnotationDiscoveryVisitor: I think needs much more changes. For example
+> when we see a type declaration, don't we have to visit the super types, 
+> type parameters etc ? Likewise for MethodDeclaration: thrown types, receiver,
+> type variables etc ? Basically we have to visit most every node types in
+> the TypeReference hierarchy ? If this is not essential and we have tests that
+
+Note that org.eclipse.jdt.internal.compiler.CompilationResult.hasAnnotations
+is not updated properly for type annotations, so if a file has only type
+annotations, it won't be exposed to the processor at the moment.
+(In reply to Srikanth Sankaran from comment #12)
+> We need to check if for example, 
+> RoundEnvironment.getElementsAnnotatedWith(Class<? extends Annotation>)
+> should return field below if T a type annotation:
+> 
+> public class X {
+> class Y {}
+> X.@T Y xy;
+> }
+> 
+> (1) Can you check what javac does here ? 
+
+Both Javac and eclipse return empty result.
+
+> Something else that may need change on the compiler side:
+> 
+> @T
+> public class X {
+> X x;
+> }
+> 
+> Today, the field x's type shares the binding with the declaration. We may
+> have to start doling out unique bindings for unannotated type uses and not
+> let them bind to declaration.
+> 
+> (2) Can you see what javac does here ?
+
+Both Javac and eclipse expose the annotation only through the TypeElement of 'X' and not through TypeElement.asType and x's type mirror.
+(In reply to Srikanth Sankaran from comment #8)
+> I made one pass over the changes and here are some comments. I need to study
+> this more closely as well as read up the relevant parts of the spec, will do
+> so next week:
+> 
+> 1. AnnotationDiscoveryVisitor: I think needs much more changes.
+
+For the record, Jay and I review the specification and here are the
+findings:
+
+    - Type use annotations from a type use site are not "to be discovered"
+    - Annotations on a type parameter are a part of the discovery process.
+
+so AnnotationDiscoveryVisitor needs to change only to accommodate the
+latter.
+
+(In reply to Jayaprakash Arthanareeswaran from comment #17)
+> (In reply to Srikanth Sankaran from comment #12)
+> > We need to check if for example, 
+> > RoundEnvironment.getElementsAnnotatedWith(Class<? extends Annotation>)
+> > should return field below if T a type annotation:
+> > 
+> > public class X {
+> > class Y {}
+> > X.@T Y xy;
+> > }
+> > 
+> > (1) Can you check what javac does here ? 
+> 
+> Both Javac and eclipse return empty result.
+
+Great, per above, we know now that this is the intended behavior.
+
+> 
+> > Something else that may need change on the compiler side:
+> > 
+> > @T
+> > public class X {
+> > X x;
+> > }
+> > 
+> > Today, the field x's type shares the binding with the declaration. We may
+> > have to start doling out unique bindings for unannotated type uses and not
+> > let them bind to declaration.
+> > 
+> > (2) Can you see what javac does here ?
+> 
+> Both Javac and eclipse expose the annotation only through the TypeElement of
+> 'X' and not through TypeElement.asType and x's type mirror.
+
+OK, I have asked on the EG list about this.
+Created attachment 236197
+Latest patch
+
+All but 3 new tests (Javac tests) fail.
+
+Srikanth, the AnnotationDiscoveryVisitor has to call ASTNode#resolveAnnotations(..., true) explicitly to get type annotations on parameters, even though we do have the following code in the visit(Argument ...) method:
+
+typeDeclaration.binding.resolveTypesFor(binding);
+
+For other nodes, resolveTypesFor seems to be sufficient. Any idea?
+(In reply to Jayaprakash Arthanareeswaran from comment #19)
+> Created attachment 236197 [details]
+> Latest patch
+> 
+> All but 3 new tests (Javac tests) fail.
+> 
+> Srikanth, the AnnotationDiscoveryVisitor has to call
+> ASTNode#resolveAnnotations(..., true) explicitly to get type annotations on
+> parameters, even though we do have the following code in the visit(Argument
+> ...) method:
+> 
+> typeDeclaration.binding.resolveTypesFor(binding);
+
+That is because, to support null analysis, we have pulled up the code that
+handles annotations on arguments to a different code path. See org.eclipse.jdt.internal.compiler.ast.Argument.createBinding(MethodScope, TypeBinding)
+
+> For other nodes, resolveTypesFor seems to be sufficient. Any idea?
+
+I am actually surprised that we need to call resolveAnnotations at all
+from APT. We need to study this further.
+Comments on the latest patch:
+
+(1) (a) I prefer that we retain the old behavior in ADV with respect to
+calling ASTNode#resolveAnnotations - until we understand this better
+and (b) eliminate the code change in ASTNode#resolveAnnotations. This
+change does not look right actually, it would copy over the compiler
+binding just for annotations[0] and return after the switch breaks.
+
+(2) In TypeMirrorImpl: since for unannotated primitive types env could
+be null, the implementations of AnnotatedConstruct methods in TypeMirrorImpl
+should guard for that case ? You are advising caution in the comment and
+throwing caution to the wind :) Could we have a test case for the unannotated
+primitive case please ?
+
+(3) ExecutableTypeImpl.getReceiverType() should guard for binding being
+null which may the case for initializers.
+
+(4) Same method; Per javadoc of javax.lang.model.type.ExecutableType.getReceiverType(), should return
+javax.lang.model.type.NoType for statics, initializers and non-inner
+class constructors. Presently would return a mirror for declaring class
+of statics/initializers/non-inner constructors which is wrong.
+
+(5) Same comment as (3) and (4) for ExecutableElementImpl.getReceiverType()
+*and* ExecutableElementImpl.isDefault()
+
+(6) TypesImpl.isSameType(TypeMirror, TypeMirror) should compare types
+ignoring annotations.
+
+(7) Per comment#16, TypeVariableBinding.setTypeAnnotations should update
+org.eclipse.jdt.internal.compiler.CompilationResult.hasAnnotations. We
+need a test case that has annotations only on type parameters and see if
+they get discovered.
+
+(8) We can remove the method org.eclipse.jdt.internal.compiler.ast.ASTNode.resolveAnnotations(BlockScope, Annotation[], Binding) since APT calls the other method now.
+
+I still have Factory.java and the tests to review, but you can start working
+in parallel on these tasks so we can push it out later today.
+Other than the issues listed in comment#21, the code changes looks good. 
+Released here: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=f8cf1cf93993a2a964d587ccb545506c0c4fdc0b.
+
+I'll now look through the tests.
+
+Jesper, this provides the framework for you to build a solution for
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=418000. Specifically
+TypeMirrorImpl.get* methods and ElementImpl.get* methods - both sets
+of methods fall back on Factory.get* methods.
+
+Stephan, thanks for raising the issue of lack of support for 
+javax.lang.model in Eclipse several weeks ago.
+(In reply to Srikanth Sankaran from comment #22)
+> Other than the issues listed in comment#21, the code changes looks good. 
+> Released here:
+> http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/
+> ?h=BETA_JAVA8&id=f8cf1cf93993a2a964d587ccb545506c0c4fdc0b.
+
+I overlooked the need to re-generate the jar with the processors to
+include the new Java 8 tests processor. Done and released here:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=5765df1275966cf54b6ae659d19f8222fd521042
+(In reply to Jayaprakash Arthanareeswaran from comment #5)
+> Forgot to mention that three of the new tests and an existing APT tests fail
+> with Javac 8. The existing test is about how Javac interprets whitespace in
+> Javadoc. And failure of new tests could simply mean Javac's APT is
+> incomplete.
+
+OK. I confirm that 3 new tests that are failing with javac (they pass with
+eclipse) are due to javac bugs. I have disabled those tests from being run
+with javac for now here:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=fe1cca21c75376196f24571fde35528fa6315198.
+
+------------------
+
+That leaves us with 3 old failures. These are in two buckets:
+
+(1) testTypesWithSystemCompiler and testTypesWithEclipseCompiler
+are due to the same problem. In JRE8, the class HashMap#HashIterator
+is not generic. I believe it was previously generic (JRE7 ?)
+
+I suspect this class is not standard API since it is missing in
+IBM JREs (See also https://bugs.eclipse.org/bugs/show_bug.cgi?id=258906)
+
+Tests should be rewritten to avoid using non-standard classes.
+
+(2) The other bug is due to as Jay mentioned how the javadoc is differently
+formatted. I see this comment in ElementsImpl#formatJavadoc:
+
+/**
+	 * Strip the comment characters from a javadoc comment. Assume the comment is already
+	 * missing its closing delimiter.
+	 *
+	 * Javac's behavior with regard to tab expansion and trimming of whitespace and
+	 * asterisks is bizarre and undocumented.  We do our best here to emulate it.
+	 */
+
+So the tests should be rewritten to convert all tabs to spaces, strip out all
+non-significant white spaces before comparing. Jay, please raise a follow
+up defect for (1) and (2) and assign this to Shankha and work with him
+on that.
+
+Once it is all green, we should hook up APT#AllTests to RunAllJava8Tests.
+(In reply to Srikanth Sankaran from comment #22)
+
+> I'll now look through the tests.
+
+The tests have been reviewed too. We have pretty good coverage there, Thanks
+Jay ! Once a follow up patch that addresses the review comments is posted,
+I'll glance through that and release it and we can declare done on APT work
+for Java 8.
+(In reply to Jayaprakash Arthanareeswaran from comment #19)
+> Created attachment 236197 [details]
+> Latest patch
+> 
+> All but 3 new tests (Javac tests) fail.
+
+You are a bad boy if you made all but 3 new tests fail :)
+(In reply to Srikanth Sankaran from comment #18)
+
+> > > Something else that may need change on the compiler side:
+> > > 
+> > > @T
+> > > public class X {
+> > > X x;
+> > > }
+> > > 
+> > > Today, the field x's type shares the binding with the declaration. We may
+> > > have to start doling out unique bindings for unannotated type uses and not
+> > > let them bind to declaration.
+> > > 
+> > > (2) Can you see what javac does here ?
+> > 
+> > Both Javac and eclipse expose the annotation only through the TypeElement of
+> > 'X' and not through TypeElement.asType and x's type mirror.
+> 
+> OK, I have asked on the EG list about this.
+
+We have clarification from EG that TypeMirror's only expose annotations from
+use sites and declaration annotations can be retrieved only from elements.
+So the observed behavior from both ECJ and javac is the right behavior and
+no follow up is needed.
+(In reply to Srikanth Sankaran from comment #8)
+
+> 4. I don't think ElementsImpl.isFunctionalInterface(TypeElement) should
+> check for STB. BinaryTypeBindings, ParameterizedTypeBindings, RawTypeBindings
+> etc could also be functional interfaces.
+
+This point can be ignored. Since we don't create elements for non-source
+constructs and since the type element for PTB and RTB is the generic type
+which is an STB.
+Created attachment 236290
+Follow up items
+
+Patch with changes as suggested + New tests added to cover the following scenarios:
+   Annotations present only on type parameters in a compilation unit being discovered
+   Unannotated primitive types
+   getReceiverType() being tested for member's constructor, top level constructor and method and static method
+	
+One of the new tests fail with Javac (_testTypeAnnotations14WithJavac). Looks like a bug again with Javac and I have disabled it for now.
+
+Some comments on some of the suggestions:
+
+(In reply to Srikanth Sankaran from comment #10)
+> (10) org.eclipse.jdt.internal.compiler.apt.model.ElementImpl.equals(Object)
+> and similar methods may need inspection.
+
+The current implementation depends on binding equality and with introduction of annotated bindings means the equality will be true only if they have the same annotations. The Javadoc of Element#equals() also is not very specific. So, I think we can live with this.
+
+> (1) (a) I prefer that we retain the old behavior in ADV with respect to
+> calling ASTNode#resolveAnnotations - until we understand this better
+> and (b) eliminate the code change in ASTNode#resolveAnnotations. This
+> change does not look right actually, it would copy over the compiler
+> binding just for annotations[0] and return after the switch breaks.
+
+Why aren't we expecting the recipient to be TYPE_PARAMETER? I have coded resolveAnnotations() to accommodate this.
+
+> (8) We can remove the method
+> org.eclipse.jdt.internal.compiler.ast.ASTNode.resolveAnnotations(BlockScope,
+> Annotation[], Binding) since APT calls the other method now.
+
+I still see quite a few references to this method. Should they start using the new method too, so we can get rid of this one?
+
+I have also made one additional change but not relevant here, but would be a fix for bug 416001.
+
+I made the following changes:
+
+ - AnnotationDiscoveryVisitor:
+   
+   - I don't think you meant to put the following statements inside the
+     for loop: :)
+     
+     ASTNode.resolveAnnotations(scope, annotations, currentBinding, true);
+     Element element = null;
+
+     The latter defeats the objective behind bug 416001 and the former
+     is loop invariant code.
+
+   - I apologize for not catching this in the prior round of review:
+     visit(MethodDeclaration) and visit(ConstructorDeclaration) should
+     not return true and fall back on the respective type's visit
+     methods to take over and drive. This will result in a whole bunch
+     of irrelevant nodes being traversed, most notably method and
+     constructor bodies. Instead these methods in ADV should explicitly
+     cause traversal of additional nodes relevant to Java 8 viz type
+     parameters.
+
+   - visit(TypeParameter, BlockScope) should the force the method
+     to declare itself. When we process annotations, it is guaranteed
+     that the type parameters for class/interfaces/member types are
+     connected, but this is not true for method type parameters.
+
+- ASTNode.java:
+
+   - The first change is not correct. We are in a context where we are
+     handling shared annotations: Only fields and locals can share
+     annotations. Since type parameters cannot, this code change should
+     be backed out.
+
+- TypeParameter.java:
+
+   - We should not check for hasTypeAnnotations() here. This one returns
+     true if there are any type annotations *anywhere* in the construct. 
+     So will return true, if the bounds of the type parameter has type 
+     annotations, but the type parameter itself is unannotated. I changed
+     this to look for annotations length > 0.
+
+- TypesImpl.java:
+
+   - Changed the calls to prototype() to unannotated(). prototype() would
+     work, in fact STB#unannotated() does return its prototype, but
+     unannotated() is the right method to call, politically correctly
+     speaking. unannotated() would work for any type that can be annotated
+     but prototype() would work only for those types that track a prototype.
+     STB is certainly one of them, but opting for the more general call.
+
+- Didn't see any material changes in LambdaTest.java and Z.java
+
+- I don't think you want to declare variables of KKK types :)
+
+With these changes, I released here: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=2e4e63b9ed8aad7925bed1f9109d7e2d1a341f45
+
+Jay, please add Java8ElementsTests to RunAllJava8Tests and send a note
+to the team that everyone should have APT projects imported into their
+workspace if not already done so.
+
+Thanks Jay, Walter many thanks for pitching in with your comments and views.
+(In reply to Srikanth Sankaran from comment #30)
+
+>    - visit(TypeParameter, BlockScope) should the force the method
+>      to declare itself. When we process annotations, it is guaranteed
+
+I meant to force the method to resolve itself.
+
+(In reply to Jayaprakash Arthanareeswaran from comment #29)
+
+> Patch with changes as suggested + New tests added to cover the following
+> scenarios:
+
+The tests offer excellent coverage, thanks. We caught 4 javac bugs, that
+is good :)
+
+> (In reply to Srikanth Sankaran from comment #10)
+> > (10) org.eclipse.jdt.internal.compiler.apt.model.ElementImpl.equals(Object)
+> > and similar methods may need inspection.
+> 
+> The current implementation depends on binding equality and with introduction
+> of annotated bindings means the equality will be true only if they have the
+> same annotations. The Javadoc of Element#equals() also is not very specific.
+> So, I think we can live with this.
+
+This method is broken, but is not relevant to current topic since we are
+dealing with TypeMirrors and not Element's. Basically this method should
+do what ITypeBinding.isEqualTo does: i.e compare binding keys.
+
+> > (1) (a) I prefer that we retain the old behavior in ADV with respect to
+> > calling ASTNode#resolveAnnotations - until we understand this better
+> > and (b) eliminate the code change in ASTNode#resolveAnnotations. This
+> > change does not look right actually, it would copy over the compiler
+> > binding just for annotations[0] and return after the switch breaks.
+> 
+> Why aren't we expecting the recipient to be TYPE_PARAMETER? I have coded
+> resolveAnnotations() to accommodate this.
+
+As I mentioned in earlier comment, this chunk of code is for handing
+shared annotations, type parameters cannot share annotations, Shared
+annotations come in to play only for fields and locals in declarations
+such as:
+
+ @Positive int @NonNull [] f1, f2;
+
+Since the fields, f1 and f2 share their types, they also share their
+annotations and the annotations resolved on behalf on one field should
+be copied over to the other.
+
+> > (8) We can remove the method
+> > org.eclipse.jdt.internal.compiler.ast.ASTNode.resolveAnnotations(BlockScope,
+> > Annotation[], Binding) since APT calls the other method now.
+> 
+> I still see quite a few references to this method. Should they start using
+> the new method too, so we can get rid of this one?
+
+Sorry, bad recommendation.
+(In reply to Srikanth Sankaran from comment #30)
+> With these changes, I released here:
+> http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/
+> ?h=BETA_JAVA8&id=2e4e63b9ed8aad7925bed1f9109d7e2d1a341f45
+
+Thanks Srikanth, the changes look good.
+
+Just noticed that there 3 additional failures in Java8ElementTests when run as part of org.eclipse.jdt.compiler.apt.tests.AllTests. Most likely to due to the fact there are additional elements being discovered in other tests' source. Will probably need a filter to exclude those. I will investigate.
+(In reply to Jayaprakash Arthanareeswaran from comment #32)
+> (In reply to Srikanth Sankaran from comment #30)
+> > With these changes, I released here:
+> > http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/
+> > ?h=BETA_JAVA8&id=2e4e63b9ed8aad7925bed1f9109d7e2d1a341f45
+> 
+> Thanks Srikanth, the changes look good.
+> 
+> Just noticed that there 3 additional failures in Java8ElementTests when run
+> as part of org.eclipse.jdt.compiler.apt.tests.AllTests. Most likely to due
+> to the fact there are additional elements being discovered in other tests'
+> source. Will probably need a filter to exclude those. I will investigate.
+
+Hmm. I am pretty certain I ran AllTests, don't know what went wrong.
+I will be running the tests again for https://bugs.eclipse.org/bugs/show_bug.cgi?id=418000 anyways and I can take a look too.
+(In reply to Jayaprakash Arthanareeswaran from comment #32)
+> Just noticed that there 3 additional failures in Java8ElementTests when run
+> as part of org.eclipse.jdt.compiler.apt.tests.AllTests. Most likely to due
+> to the fact there are additional elements being discovered in other tests'
+> source. Will probably need a filter to exclude those. I will investigate.
+
+Should've mentioned that these are failures with Javac compiler.
+The Java8ElementProcessor when used in IDE passes all but one test. 
+
+Missing root element KKK
+
+That's because unlike the unit tests, in IDE, I am not selectively copying source files to be processed. So, obviously we would get more elements discovered than we expect. I have manually verified that nothing is left out of discovery too.
+(In reply to Srikanth Sankaran from comment #33)
+
+> > Just noticed that there 3 additional failures in Java8ElementTests when run
+> > as part of org.eclipse.jdt.compiler.apt.tests.AllTests. Most likely to due
+> > to the fact there are additional elements being discovered in other tests'
+> > source. Will probably need a filter to exclude those. I will investigate.
+> 
+> Hmm. I am pretty certain I ran AllTests, don't know what went wrong.
+> I will be running the tests again for
+> https://bugs.eclipse.org/bugs/show_bug.cgi?id=418000 anyways and I can take
+> a look too.
+
+I still see only three failures, the same ones for which bug 418920 was raised.
+(In reply to Srikanth Sankaran from comment #36)
+> I still see only three failures, the same ones for which bug 418920 was
+> raised.
+
+You are right, no additional failures. Must have had something to do with my workspace state. I no longer see those failures.

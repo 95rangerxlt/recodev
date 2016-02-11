@@ -1,0 +1,225 @@
+Reviewing/landing bug 580952 in mozilla-central separate from the rest of tabcandy.
+
+Reviewing/landing bug 580952 in mozilla-central separate from the rest of tabcandy.
+Created attachment 462965
+v1
+I was thinking about changing the callback names to just match the original events, so no aliasing of TabAttrModified to onChange.
+
+Not sure if it should be Tabs.onSelect vs Tabs.Select vs Tabs.TabSelect though..
+We shouldn't use "browsers" to refer to browser DOM windows. "BrowserWindows", perhaps. Maybe it would be a good idea to pass the window to the callbacks as well? I guess you can get it otherwise using ownerDocument.defaultView... Otherwise this looks good to me, though I haven't looked into users of it (tabcandy) very much. Are there other potential users of it in existing frontend code?
+(In reply to comment #3)
+> Maybe it would be a good idea to pass the window to the callbacks as well?
+The current tabcandy codes just that to filter out non-current-window events:
+
+Tabs.onSelect(function() {
+  if (this.ownerDocument.defaultView != gWindow)
+    return;
+...
+});
+
+Regarding API, not sure if it should be Tabs.onSelect(callback, thisObj) and call the callback with thisObj as this and the tab as the first argument. This would make the unbind code a bit more complicated though.
+
+Also, any preference on the public api naming? Especially for TabAttrModified?
+
+(In reply to comment #3)
+> Are there other potential users of it in existing frontend code?
+This api is for code that doesn't live/need to live in each browser window instance. I believe this is mostly for other code that lives in js modules, which exist outside of any browser instance.
+(In reply to comment #4)
+> This api is for code that doesn't live/need to live in each browser window
+> instance. I believe this is mostly for other code that lives in js modules,
+> which exist outside of any browser instance.
+
+If so, why the (this.ownerDocument.defaultView != gWindow) check from above?
+It's in preparation for bug 578512 where part of the fix to the bug would be to split the code into a "model" service that lives independent of a browser window.
+Er. The tab events from all browsers is in preparation for bug 578512. The reason why we currently have the != gWindow check is to avoid breaking things right now such as trying to do gBrowser.removeTab(tab) where the tab doesn't exist in this current gBrowser.
+Well then landing a module to track this across windows seems premature at least.
+
+Also the let Tabs = let (T = {...}) T.init(); pattern looks pretty ugly. Is it somehow better than let Tabs = {...}; Tabs.init();?
+Comment on attachment 462965
+v1
+
+>+Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+
+>+  //////////////////////////////////////////////////////////////////////////////
+>+  //// nsISupports
+>+  //////////////////////////////////////////////////////////////////////////////
+>+
+>+  QueryInterface: XPCOMUtils.generateQI([Ci.nsIObserver]),
+
+There's no need for this.
+(In reply to comment #8)
+> Well then landing a module to track this across windows seems premature at
+> least.
+It was also to replace the existing tab wrapping code that was inherited from the old jetpack code. But yeah, it was somewhat premature as we're not entirely leveraging the benefit of the new module.
+
+> Also the let Tabs = let (T = {...}) T.init(); pattern looks pretty ugly. Is it
+> somehow better than let Tabs = {...}; Tabs.init();?
+T acts as "this" so that there's no need to do stuff like "let self = this;" all over the place when writing callback code.
+You could always use Tabs rather than self.
+Also /generally/ using "T" instead of "this" seemed nasty to me.
+Gavin will be away for a few days, so maybe you'd want to try to ask dolske for review?
+http://hg.mozilla.org/users/edward.lee_engineering.uiuc.edu/tabcandy-central/rev/0e2c2d0a0721
+Prepare for bug 584532 by renaming Tabs and T -> AllTabs, allTabs -> tabs, browsers -> browserWindows, and removing QI(nsIObserver).
+Created attachment 463682
+v2
+Comment on attachment 463682
+v2
+
+>+    return Array.concat.apply({}, browserWindows.map(function(browserWindow) {
+>+      return Array.slice(browserWindow.gBrowser.tabs);
+>+    }));
+
+s/{}/null/
+
+>+   * @usage AllTabs.onSelect(handleSelect);
+>+   *        AllTabs.onSelect.unbind(handleSelect);
+
+This API looks pretty strange, the second line in particular. There's going to be a native Function.prototype.bind, which your unbind apparently has nothing to do with.
+
+How about AllTabs.(un)register("select", handleSelect);?
+
+>+   *        Callback that gets called with the tab being closed as "this" and
+>+   *        the event as the first argument.
+
+The first part seems unnecessary. What happens if the caller passes this.handleClose.bind(this)?
+
+>+  //////////////////////////////////////////////////////////////////////////////
+>+  //// Private
+>+  //////////////////////////////////////////////////////////////////////////////
+
+Don't export this stuff, just make it functions and variables in the global scope.
+
+I think we should actually land this in tabview/modules/. We can always move it later when the module is used, has proven useful and the API had a chance to mature.
+Created attachment 464237
+v3
+
+http://hg.mozilla.org/users/edward.lee_engineering.uiuc.edu/tabcandy-central/rev/ce0c948f1554
+Move private variables/methods into local declarations not exported by AllTabs and change the interface to .register("change") instead of .onChange() for bug 584532.
+(In reply to comment #16)
+> http://hg.mozilla.org/users/edward.lee_engineering.uiuc.edu/tabcandy-central/rev/ce0c948f1554
+> Move private variables/methods into local declarations not exported by AllTabs
+> and change the interface to .register("change") instead of .onChange() for bug
+> 584532.
+
+--- a/browser/base/content/tabview/ui.js
++++ b/browser/base/content/tabview/ui.js
+
+-            if (this && this.tabItem)
+-              this.tabItem.setZoomPrep(false);
++            if (tab && tab.tabItem)
++              tab.tabItem.setZoomPrep(false);
+
+Not really related to this bug, but it looks like tabItem should have a clearer name (tabviewItem?) and start with an underscore, since this is non-tabbrowser.xml code setting a custom property on a tabbrowser node.
+Comment on attachment 464237
+v3
+
+>+const Cc = Components.classes;
+>+const Ci = Components.interfaces;
+>+const Cu = Components.utils;
+>+const Cr = Components.results;
+
+Remove all but Cu.
+
+>+  register: function register(eventName, callback) {
+>+    // Either create the first entry or add additional callbacks
+>+    let listeners = eventListeners[eventName];
+>+    if (listeners == null)
+
+>+  unregister: function unregister(eventName, callback) {
+>+    // Nothing to remove for this event
+>+    let listeners = eventListeners[eventName];
+>+    if (listeners == null)
+
+>+      // Make sure we've gotten listeners before trying to call
+>+      let listeners = eventListeners[eventName];
+>+      if (listeners == null)
+
+if (!listeners)
+
+>+      let tab = event.originalTarget;
+
+event.target
+
+>+      // Make a copy of the listeners, so it can't change as we call back
+>+      listeners.slice().forEach(function(callback) {
+>+        try {
+>+          callback(tab, event);
+>+        }
+>+        // Ignore failures from the callback
+>+        catch(ex) {}
+
+catch (ex) {
+  Cu.reportError(ex);
+}
+
+>+let observer = {
+>+  observe: function observe(subject, topic, data) {
+>+    switch (topic) {
+>+      case "domwindowopened":
+>+        subject.addEventListener("load", function() {
+>+          subject.removeEventListener("load", arguments.callee, false);
+>+
+>+          // Now that the window has loaded, only register on browser windows
+>+          let doc = subject.document.documentElement;
+>+          if (doc.getAttribute("windowtype") == "navigator:browser")
+>+            registerBrowserWindow(subject);
+>+        }, false);
+>+        break;
+>+    }
+>+  }
+>+};
+
+flatten this, i.e.:
+
+function observer(subject, topic, data) {
+  ...
+}
+
+instead of:
+
+let observer = {
+  observe: function observe(subject, topic, data) {
+    ...
+  }
+};
+
+r=me with these changes
+(In reply to comment #18)
+> function observer(subject, topic, data) {
+> instead of:
+> let observer = {
+>   observe: function observe(subject, topic, data) {
+Hey, that's neat!
+
+http://hg.mozilla.org/mozilla-central/rev/b369f6e53db9
+
+Landed with revision history:
+http://hg.mozilla.org/mozilla-central/log/b369f6e53db9/browser/base/content/tabview/modules/AllTabs.jsm
+(In reply to comment #18)
+> Comment on attachment 464237 [details]
+http://hg.mozilla.org/users/edward.lee_engineering.uiuc.edu/tabcandy-central/rev/d06bed205b76
+Address review comments from bug 584532 comment 18: !listeners, event.target, observers function.
+(In reply to comment #19)
+> > function observer(subject, topic, data) {
+> Hey, that's neat!
+
+Thank bug 538920! :)
+
+
+Land Tabs module to get Tab* events from any window
+
+
+
+Prepare for bug 584532 by renaming Tabs and T -> AllTabs, allTabs -> tabs, browsers -> browserWindows, and removing QI(nsIObserver). 
+
+Move private variables/methods into local declarations not exported by AllTabs and change the interface to .register("change") instead of .onChange() for bug 584532. 
+
+Address review comments from bug 584532 comment 18: !listeners, event.target, observers function. 
+
+Bug 584532 - Land Tabs module to get Tab* events from any window [r=dao] 
+
+Prepare for bug 584532 by renaming Tabs and T -> AllTabs, allTabs -> tabs, browsers -> browserWindows, and removing QI(nsIObserver). 
+
+Move private variables/methods into local declarations not exported by AllTabs and change the interface to .register("change") instead of .onChange() for bug 584532. 
+
+Address review comments from bug 584532 comment 18: !listeners, event.target, observers function. 

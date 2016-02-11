@@ -1,0 +1,116 @@
+Intermittently (but frequently) after running a browser mochitest I'm writing for bug 804611, I get this error message at the end of the (successful) test run:
+
+ 0:06.71 *** End BrowserChrome Test Results ***
+ 0:06.79 console.error:
+ 0:06.79   Message: Error: SessionFile is closed
+ 0:06.79   Stack:
+ 0:06.79     SessionFileInternal.write@resource:///modules/sessionstore/SessionFile.jsm:151
+ 0:06.79 this.SessionFile.write@resource:///modules/sessionstore/SessionFile.jsm:59
+ 0:06.79 SessionSaverInternal._writeState@resource:///modules/sessionstore/SessionSaver.jsm:294
+ 0:06.79 SessionSaverInternal._saveState@resource:///modules/sessionstore/SessionSaver.jsm:239
+ 0:06.79 SessionSaverInternal._saveStateAsync/<@resource:///modules/sessionstore/SessionSaver.jsm:266
+ 0:06.79 Handler.prototype.process@resource://gre/modules/Promise.jsm:767
+ 0:06.79 this.PromiseWalker.walkerLoop@resource://gre/modules/Promise.jsm:531
+
+Intermittently (but frequently) after running a browser mochitest I'm writing for bug 804611, I get this error message at the end of the (successful) test run:
+
+ 0:06.71 *** End BrowserChrome Test Results ***
+ 0:06.79 console.error:
+ 0:06.79   Message: Error: SessionFile is closed
+ 0:06.79   Stack:
+ 0:06.79     SessionFileInternal.write@resource:///modules/sessionstore/SessionFile.jsm:151
+ 0:06.79 this.SessionFile.write@resource:///modules/sessionstore/SessionFile.jsm:59
+ 0:06.79 SessionSaverInternal._writeState@resource:///modules/sessionstore/SessionSaver.jsm:294
+ 0:06.79 SessionSaverInternal._saveState@resource:///modules/sessionstore/SessionSaver.jsm:239
+ 0:06.79 SessionSaverInternal._saveStateAsync/<@resource:///modules/sessionstore/SessionSaver.jsm:266
+ 0:06.79 Handler.prototype.process@resource://gre/modules/Promise.jsm:767
+ 0:06.79 this.PromiseWalker.walkerLoop@resource://gre/modules/Promise.jsm:531
+Saw this today shutting down a 20141015 Linux x86-64 nightly.  Never seen it before, no steps to reproduce, just commenting to say this is Still A Thing.  :-\  Slightly different stack now, tho (assuming it's the same issue, and not merely the same error message):
+
+console.error: 
+  Message: Error: SessionFile is closed
+  Stack:
+    SessionFileInternal.write@resource://app/modules/sessionstore/SessionFile.jsm:274:29
+this.SessionFile.write@resource://app/modules/sessionstore/SessionFile.jsm:67:12
+SessionSaverInternal._writeState@resource://app/modules/sessionstore/SessionSaver.jsm:264:19
+SessionSaverInternal._saveState@resource://app/modules/sessionstore/SessionSaver.jsm:227:12
+SessionSaverInternal.run@resource://app/modules/sessionstore/SessionSaver.jsm:129:12
+this.SessionSaver<.run@resource://app/modules/sessionstore/SessionSaver.jsm:72:12
+ssi_uninit@resource:///modules/sessionstore/SessionStore.jsm:504:7
+ssi_onQuitApplication@resource:///modules/sessionstore/SessionStore.jsm:1127:5
+ssi_observe@resource:///modules/sessionstore/SessionStore.jsm:532:9
+So even with bug 1020831 fixed, we still have the same problem when something spins the event loop. "quit-application-granted" sets the RunState to QUITTING and then "quit-application" makes the last and final write. If something spins the event loop in between then a schedules SessionSaver.runDelayed() call can close the SessionFile and "quit-application" would then cause the above error message.
+Created attachment 8507813
+0001-Bug-960959-Use-RunState-to-keep-track-of-the-Session.patch
+
+So... what do you think about using RunState to track the SessionFile's closed state as well?
+Comment on attachment 8507813
+0001-Bug-960959-Use-RunState-to-keep-track-of-the-Session.patch
+
+Review of attachment 8507813:
+-----------------------------------------------------------------
+
+This looks good.
+I'm a bit nervous, because the previous patch looked good, too, and still didn't fix the issue. Do you see any way we could test for this race condition?
+
+::: browser/components/sessionstore/RunState.jsm
+@@ +76,5 @@
+>    setRunning() {
+>      if (this.isStopped) {
+>        state = STATE_RUNNING;
+>      }
+> +  },
+
+Shouldn't we have something along the lines of:
+
+set state(v) {
+  if (v < state) {
+    throw new Error("We are starting/shutting down in the wrong order");
+  }
+  state = v;
+}
+
+?
+
+::: browser/components/sessionstore/SessionFile.jsm
+@@ -196,5 @@
+>  
+> -  /**
+> -   * |true| once we have decided to stop receiving write instructiosn
+> -   */
+> -  _isClosed: false,
+
+Getting rid of this is a good idea, indeed.
+(In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment #4)
+> I'm a bit nervous, because the previous patch looked good, too, and still
+> didn't fix the issue. Do you see any way we could test for this race
+> condition?
+
+Wait, which patch are you referring to? Bug 1020831 was about the time frame between mShuttingDown=true and quit-application-granted. This one is about the time frame between quit-application-granted and quit-application. Same possible root cause but two separate issues.
+
+> ::: browser/components/sessionstore/RunState.jsm
+> @@ +76,5 @@
+> >    setRunning() {
+> >      if (this.isStopped) {
+> >        state = STATE_RUNNING;
+> >      }
+> > +  },
+> 
+> Shouldn't we have something along the lines of:
+> 
+> set state(v) {
+>   if (v < state) {
+>     throw new Error("We are starting/shutting down in the wrong order");
+>   }
+>   state = v;
+> }
+
+We could do that but then we'd have to export the states itself. I thought it would be nice to not look like we're offering to set an arbitrary state and throwing at runtime but rather making the API more explicit.
+https://hg.mozilla.org/integration/fx-team/rev/12386b78d39a
+(In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment #4)
+> Do you see any way we could test for this race
+> condition?
+
+FTR, I thought about this and testing it shouldn't be too hard. BUT this is the shutdown path and we can't test that at all. It shouldn't be too hard with Marionette shutdown/restart tests though...
+Forgot to assign myself.
+https://hg.mozilla.org/mozilla-central/rev/12386b78d39a

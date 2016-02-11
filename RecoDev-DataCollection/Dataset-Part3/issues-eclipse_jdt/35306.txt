@@ -1,0 +1,208 @@
+Build 20030318
+
+When the Java indexing queue gets the following requests in sequence, while it 
+is busy doing something else:
+1- addJar
+2- removeJar
+3- addJar 
+
+When (3) comes in, it will think that it doesn't need to perform, since (1) is 
+already in the queue. Even though (2) is in between.
+
+Also, (1) is rewriting itself (possibly for source/lib folders) and may rewrite 
+itself behind the removal job enqueued. If this happens, even though the add 
+job is cancelled by the remove one, the indexing will still perform (in case of 
+a lib folder, where it is simply removed from a classpath).
+
+This is mostly breaking test suites sometimes, and more often since we made 
+some performance improvements (bug 15040) which affect the test run profile.
+
+Kent - pls release fix in HEAD, will try to escaladate this defect.
+
+Build 20030318
+
+When the Java indexing queue gets the following requests in sequence, while it 
+is busy doing something else:
+1- addJar
+2- removeJar
+3- addJar 
+
+When (3) comes in, it will think that it doesn't need to perform, since (1) is 
+already in the queue. Even though (2) is in between.
+
+Also, (1) is rewriting itself (possibly for source/lib folders) and may rewrite 
+itself behind the removal job enqueued. If this happens, even though the add 
+job is cancelled by the remove one, the indexing will still perform (in case of 
+a lib folder, where it is simply removed from a classpath).
+
+This is mostly breaking test suites sometimes, and more often since we made 
+some performance improvements (bug 15040) which affect the test run profile.
+
+Kent - pls release fix in HEAD, will try to escaladate this defect.
+I think you meant bug 34040.
+
+I don't think this scenario can happen.
+
+Remove jobs are NOT posted to the queue to remove a project's index (ie. its 
+source folders), or the index for a jar file or binary library folder.
+
+The DeltaProcessor calls discardJobs() then removeIndexFamily() to ensure that 
+no Add jobs are on the queue when an index is removed.
+
+Calls to removeIndex() are not preceded by calls to discardJobs() so the first 
+Add job would remain on the queue until it was run. At that point it won't find 
+anything to index.
+Looking at senders of JobManager.request(), there are 2 in IndexManager.indexAll
+() & IndexManager.indexLibrary() which check for a matching job on the queue 
+before adding the new job.
+
+All of these add jobs do not have matching remove jobs since they are 'big' 
+jobs that create the index files. Their corresponding remove 'jobs' are direct 
+calls to IndexManager.removeIndex() and IndexManager.removeIndexFamily().
+
+I don't believe the scenario can happen since remove jobs are not added to the 
+queue to get in between these 'optimized' add jobs.
+Looking at the call to #removeIndex from SetClasspathOperation, as soon as a 
+JAR is dereferenced, then its index is removed. I don't see how queued jobs get 
+discarded in this scenario.
+
+It could thus be executed immediately, though an AddIndex is queued already 
+(and hasn't performed yet) ? In this case, we would get an extra useless index 
+created, wouldn't we ? 
+
+If so, isn't it possible that such an extra index would be stored in memory and 
+only left empty/incomplete (maybe subsequent small additions got discarded)... 
+then when subsequent requested would come for indexing the same JAR again, it 
+would be ignored since the index is already in memory ?
+
+Also, if the current job is an IndexJar (rewritting itself), isn't it possible 
+that the removal wait for current job to complete, but since it is only 
+rewriting itself into subjob, then we still have all subjobs after the index 
+removal did occur ?
+
+Still we are failing one search tests... so something must be wrong...
+AddJarFileToIndex does not check to see if the jar file actually exists on disk.
+
+It should remove the newly created index file if the jar file doesn't exist. 
+Then if another job is added to the queue when the jar file reappears, the 
+index would be created properly.
+
+Releasing potential fix. The search all test doesn't fail on my machine with 
+this fix (not that it failed all the time before anyway).
+Still I wonder if SetClasspathOperation shouldn't also ensure it does a call to 
+#updateIndex from delta processor. It deletes the index file, but doesn't 
+discard potential queued jobs on the same family.
+
+Jerome - don't you think it should ?
+Changed SetClasspathOperation to properly remove the index and queued jobs.
+Still saw some test failures (without Kent's other change).
+
+Tried to comment out alltogether the SetClasspathOperation change (for bug 
+35132), it still failed tests.
+
+Must be something else revealed by change in timing.
+
+Added some print tracing on the offending test, here it is when the test pass.
+
+BEFORE QUERY
+Enabled:true
+Jobs in queue:13
+In-memory indexes:
+ -Index for \Compiler(length: 8212)
+ -Index for D:\jdk1.4.1\jre\lib\rt.jar(length: 2612940)
+ -Index for \LibProj\otherlib.jar(length: 8212)
+ -Index for \LibProj\mylib.jar(length: 8212)
+ -Index for D:\eclipse\sdk\eclipse\jclMinsrc.zip(length: 8212)
+ -Index for \Class File Tests(length: 24669)
+ -Index for D:\eclipse\sdk\eclipse\converterJclMin.jar(length: 24706)
+
+AFTER QUERY
+Enabled:true
+Jobs in queue:0
+In-memory indexes:
+ -Index for \Reconciler(length: 24676)
+ -Index for \Compiler(length: 164552)
+ -Index for \LibProj\otherlib.jar(length: 8212)
+ -Index for \Minimal Jar(length: 24663)
+ -Index for C:\JDK\classes.zip(length: 444645)
+ -Index for \GraphicsTest(length: 24671)
+ -Index for D:\eclipse\sdk\eclipse\converterJclMin.jar(length: 24706)
+ -Index for \NervousText(length: 24675)
+ -Index for D:\jdk1.4.1\jre\lib\rt.jar(length: 2612940)
+ -Index for \CompilerBatch(length: 24700)
+ -Index for \LibProj\mylib.jar(length: 8212)
+ -Index for \Minimal Jar\Minimal.zip(length: 24692)
+ -Index for D:\eclipse\sdk\eclipse\jclMinsrc.zip(length: 8212)
+ -Index for \Class File Tests(length: 24669)
+ -Index for \Compiler\lib\classes.zip(length: 444671)
+ -Index for \Resources(length: 8212)
+
+
+Kent's fix should be a noop, since when the JAR doesn't exist, an IO exception 
+should occur, discarding the index as well.
+
+However, I undid Kent's fix locally, and was able to fail test again (lucky?), 
+with following trace:
+Jobs in queue:13
+In-memory indexes:
+ -Index for \Compiler(length: 8212)
+ -Index for D:\jdk1.4.1\jre\lib\rt.jar(length: 2612940)
+ -Index for \LibProj\otherlib.jar(length: 8212)
+ -Index for \LibProj\mylib.jar(length: 8212)
+ -Index for D:\eclipse\sdk\eclipse\jclMinsrc.zip(length: 8212)
+ -Index for \Class File Tests(length: 24669)
+ -Index for \Compiler\lib\classes.zip(length: 8212)
+ -Index for D:\eclipse\sdk\eclipse\converterJclMin.jar(length: 24706)
+
+Enabled:true
+Jobs in queue:0
+In-memory indexes:
+ -Index for \Reconciler(length: 24676)
+ -Index for \Compiler(length: 164552)
+ -Index for \LibProj\otherlib.jar(length: 8212)
+ -Index for \Minimal Jar(length: 24663)
+ -Index for C:\JDK\classes.zip(length: 444645)
+ -Index for \GraphicsTest(length: 24671)
+ -Index for D:\eclipse\sdk\eclipse\converterJclMin.jar(length: 24706)
+ -Index for \NervousText(length: 24675)
+ -Index for D:\jdk1.4.1\jre\lib\rt.jar(length: 2612940)
+ -Index for \CompilerBatch(length: 24700)
+ -Index for \LibProj\mylib.jar(length: 8212)
+ -Index for \Minimal Jar\Minimal.zip(length: 24692)
+ -Index for D:\eclipse\sdk\eclipse\jclMinsrc.zip(length: 8212)
+ -Index for \Class File Tests(length: 24669)
+ -Index for \Compiler\lib\classes.zip(length: 444671)
+ -Index for \Resources(length: 8212)
+Interestingly, in failure case, the compiler classes.zip is initially close to 
+being empty:
+
+ -Index for \Compiler\lib\classes.zip(length: 8212)
+were after the search job has run, it is:
+ -Index for \Compiler\lib\classes.zip(length: 444671)
+
+In non-failure mode, this index isn't in memory so far.
+
+Note that the trace isn't causing any index file to be saved, so the file 
+length is really a snapshot at one point in time.
+Suspecting IndexSelector could cache for a search job some indexes which got 
+recreated in the meantime...
+Sanity check:
+
+IIndex inMemIndex = indexManager.peekAtIndex(new Path(((Index)
+index).toString.substring("Index for ".length()).replace('\\','/')));
+if (inMemIndex != index) {
+  System.out.println("SANITY CHECK: search job using obsolete index: 
+["+index+ "] instead of: ["+inMemIndex+"]");
+}
+Created attachment 4264
+IndexSelector new version
+
+Sanity check caught a case in JDTUI tests.
+Here is a patch to try on it.
+With this fix, JDT/UI tests are now passing. There is no measurable performance 
+loss when computing a hierarchy.
+Released IndexSelector fix to HEAD. Discarded Kent's unnecessary one.
+Fixed in latest
+Is it going to be RC3 or RC4 ?
+Released regression test SearchTests.testConcurrentJob()
+Will go into RC3 rebuild.

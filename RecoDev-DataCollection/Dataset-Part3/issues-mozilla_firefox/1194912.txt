@@ -1,0 +1,102 @@
+ProgressTracker sometimes ends up having a huge number of observers. That's not great, but since it can happen, we should store the observer list as a hash table, because maintaining a list of non-duplicate observers in an array requires a linear search every time we add an observer.
+
+ProgressTracker sometimes ends up having a huge number of observers. That's not great, but since it can happen, we should store the observer list as a hash table, because maintaining a list of non-duplicate observers in an array requires a linear search every time we add an observer.
+Created attachment 8650194
+(Part 1) - Add CopyOnWrite<T> to support automatic copy-on-write for recursive writes to data structures
+
+This part adds a new data structure to ImageLib. (We could eventually consider
+moving it to MFBT, if it proves its usefulness). CopyOnWrite<T> lets us ensure
+that if a data structure gets written to while we're reading from it, the read
+won't be affected by that write. This makes it safe to use an XPCOM hash table
+as an observer list in ProgressTracker, preventing iterator invalidation issues
+and ensuring that observers get all the notifications they're supposed to
+recieve.
+
+CopyOnWrite<T> is implemented by forcing all accesses to the underlying data
+structure (the T value) to happen in functions passed to the
+CopyOnWrite<T>::Read() and CopyOnWrite<T>::Write() methods. Any number of calls
+to Read() can be nested. A Write() call can be nested inside a Read() call; if
+this happens, the data structure will be copied so that Write() can update the
+current version while older Read() calls continue to use the old version.
+Nothing can be nested inside a Write() call, as it's assumed that the state of
+the data structure may be inconsistent during the Write().
+
+With this implemented, we can get a hash table suitable for image observer
+notifications just by creating a CopyOnWrite<nsDataHashtable<K,V>>.
+Created attachment 8650200
+(Part 2a) - Store ProgressTracker observers in a hash table, and dispatch notifications to them using a template
+
+(Part 2a and 2b don't compile separately; I'll fold them before landing.)
+
+In this part, we start storing ProgressTracker's image observers in a hash
+table. We need to create a new type for this (ObserverTable) because a normal
+nsDataHashtable is not reference counted and doesn't support copy construction,
+and we need those features to use CopyOnWrite<T>.
+
+It's not trivially cheap to create one of these hash tables, so as long as I was
+forced to rework SyncNotifyInternal and the like to work with them, I replaced
+the old macro-based notification code with a template called
+ImageObserverNotifier. This allowed me to create two specializations: one for
+hash tables, and one for pointers to single observers. This should make
+ProgressTracker::SyncNotify() significantly cheaper than if we created a hash
+table there just to store the single observer that we work with in that method.
+(Indeed, this should be better than the old approach of creating a temporary
+array, as well.)
+Created attachment 8650204
+(Part 2b) - Use CopyOnWrite<T> to ensure that recursive notifications work correctly with ProgressTracker's observer hash table
+
+This part uses the CopyOnWrite<T> API to make the changes in part 2a safe in the
+presence of recursive notifications that end up mutating the observer list. We
+simply do all reads from inside a CopyOnWrite<T>::Read() call, and all writes
+from inside a CopyOnWrite<T>::Write() call.
+
+We shouldn't actually hit the copy-on-write case much on real web content.
+(That's the reason I have use print a warning if we hit it; I'd like to know if
+there's some content that *does* tickle this.) However, it gets exercised quite
+well in our tests, since the ScriptedNotificationObserver pattern that the
+xpcshell tests (and some of the mochitests) use causes us to go down this code
+path.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=22555778f948
+So how well does this work? I tested this testcase:
+
+https://bug1129368.bmoattachments.org/attachment.cgi?id=8559041
+
+Using Nightly, and an opt build with this patch applied. With Nightly, the <img> element test took 20332 ms on my machine. With this patch applied, the test took 9641 ms. That's a 53% improvement, and it removes ProgressTracker::AddObserver as the bottleneck. The remaining bottlenecks appear to be in layout and text code. We also *never* hit the copy-on-write case (i.e., the NS_WARNING in ObserverTable's copy constructor) during this test.
+
+I also tried just surfing around with this patch applied, visiting several popular sites, and didn't hit the copy-on-write case once. So it looks like, outside of our tests, it should be rare to hit this case.
+Comment on attachment 8650200
+(Part 2a) - Store ProgressTracker observers in a hash table, and dispatch notifications to them using a template
+
+>+class ObserverTable
+>+  : public nsDataHashtable<nsPtrHashKey<IProgressObserver>,
+>+                           WeakPtr<IProgressObserver>>
+>+  ObserverTable(const ObserverTable& aOther)
+>+  {
+>+    NS_WARNING("Forced to copy ObserverTable due to nested notifications");
+>+    for (auto iter = aOther.ConstIter(); !iter.Done(); iter.Next()) {
+>+      this->Put(iter.Key(), iter.Data());
+>+    }
+>+  }
+
+Can we not use a move constructor to avoid reconstructing the hashtable from scratch? So we can basically do a memcopy of the hashtable? Or does WeakPtr not allow that?
+(In reply to Timothy Nikkel (:tn) from comment #6)
+> Can we not use a move constructor to avoid reconstructing the hashtable from
+> scratch? So we can basically do a memcopy of the hashtable? Or does WeakPtr
+> not allow that?
+
+WeakPtr won't allow that, unfortunately; we need to AddRef the underlying WeakReference. (And it's unclear to me whether nsDataHashtable can be safely memcpy'd, but I haven't investigated that.)
+Alright, would be nice if we could do something a little faster but we shouldn't hit this case very often.
+Created attachment 8652116
+(Part 1) - Add CopyOnWrite<T> to support automatic copy-on-write for recursive writes to data structures
+
+This updated version of part 1:
+
+- Adds |explicit| to CopyOnWrite's constructors, fixing the static analysis
+  failure from the last try job.
+
+- Adds some simple gtests for CopyOnWrite, just as a sanity check.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=8253772e760e
+https://hg.mozilla.org/integration/mozilla-inbound/rev/c61c1035879c
+https://hg.mozilla.org/integration/mozilla-inbound/rev/4797d5683bf3
+https://hg.mozilla.org/mozilla-central/rev/c61c1035879c
+https://hg.mozilla.org/mozilla-central/rev/4797d5683bf3

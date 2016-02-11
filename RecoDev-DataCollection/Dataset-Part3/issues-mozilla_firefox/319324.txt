@@ -1,0 +1,272 @@
+To implement live updating of results, we can make each result be a history / bookmark observer, but this will create a reference cycle that will keep the result around indefinitely.  We should support adding an observer as a weak reference, as the various other observer APIs do.
+
+To implement live updating of results, we can make each result be a history / bookmark observer, but this will create a reference cycle that will keep the result around indefinitely.  We should support adding an observer as a weak reference, as the various other observer APIs do.
+Created attachment 205158
+patch
+
+Support weak refs, and add some helper classes to avoid duplicating code.
+Comment on attachment 205158
+patch
+
+>Index: public/nsINavBookmarksService.idl
+
+>+  void addObserver(in nsINavBookmarkObserver aObserver, in boolean ownsWeak);
+
+nit: Use consistent parameter naming convention.  "a" prefix on all
+or none :)
+
+
+>Index: public/nsINavHistory.idl
+
+>+  void addObserver(in nsINavHistoryObserver aObserver, in boolean ownsWeak);
+
+ditto
+
+
+>Index: src/nsMaybeWeakPtr.cpp
+
+>+#include "nsMaybeWeakPtr.h"
+>+
+>+void*
+>+nsMaybeWeakPtr_base::GetValueBase(const nsIID &iid) const
+>+{
+>+  nsresult rv;
+>+  void *ref = nsnull;
+>+  if (mPtr) {
+>+    rv = mPtr->QueryInterface(iid, &ref);
+
+I'm surprised that you can call QueryInterface on a const
+nsCOMPtr<nsISupports>, but I guess that works because it
+must have a const version of operator-> that returns a
+non-const pointer.  Shrug.
+
+
+
+>+    if (NS_FAILED(rv)) {
+>+      ref = nsnull;
+>+    }
+
+nit: If you turned this around to be "if (NS_SUCCEEDED(rv)) return ref;"
+then you would not need to test "!ref" below, and you could even avoid
+initializing ref to nsnull.
+
+
+>+  if (!ref) {
+>+    nsCOMPtr<nsIWeakReference> weakRef = do_QueryInterface(mPtr);
+...
+
+
+
+>+/* static */ nsresult
+>+nsMaybeWeakPtrArray_base::AppendWeakElementBase(nsTArray_base *aArray,
+>+                                                nsISupports *aElement,
+>+                                                PRBool aOwnsWeak)
+>+{
+>+  nsCOMPtr<nsISupports> ref;
+>+  if (aOwnsWeak) {
+>+    nsCOMPtr<nsIWeakReference> weakRef;
+>+    weakRef = do_GetWeakReference(aElement);
+>+    NS_STATIC_CAST(nsCOMPtr<nsISupports>, weakRef).swap(ref);
+
+Doesn't this casting construct an intermediate object?  I recommend
+casting by pointer instead:
+
+      NS_STATIC_CAST(nsCOMPtr<nsISupports>*, &weakRef)->swap(ref);
+
+
+>+  if (array->IndexOf(ref) != PRUint32(-1))
+
+nit: you could also use "isupports_type::NoIndex" instead of PRUint32(-1)
+
+
+>+    return NS_ERROR_INVALID_ARG; // already present
+
+I think it is a little odd to enforce this at this level.  The
+function says it is going to append the object, but it doesn't
+say that it is only going to allow one occurance of the object
+in the array.  Maybe the consumer should enforce that.  At least
+document the behavior on the method declaration.
+
+
+>Index: src/nsMaybeWeakPtr.h
+
+
+>+class nsMaybeWeakPtr_base
+>+{
+>+protected:
+>+  // Returns an addref'd pointer to the requested iid
+
+nit: s/iid/interface/
+
+
+>+  void* GetValueBase(const nsIID& iid) const;
+
+nit: This name is a bit funky.  Maybe call it "GetValueAs"?
+
+
+>+template<class T>
+>+class nsMaybeWeakPtr : private nsMaybeWeakPtr_base
+>+{
+>+public:
+>+  nsMaybeWeakPtr(nsISupports *ref) { mPtr = ref; }
+
+
+>+  nsMaybeWeakPtr(nsCOMPtr<nsIWeakReference> &ref) { mPtr = ref; }
+>+  nsMaybeWeakPtr(nsCOMPtr<T> &ref) { mPtr = ref; }
+
+Hmm... why take nsCOMPtr's as parameters?  Why not just take
+interface pointers?  Seems like the nsCOMPtr<T> version is somewhat
+redundant with the version taking nsISupports.
+
+
+>+  PRBool operator==(const nsMaybeWeakPtr<T> &other) const {
+>+    return mPtr == other.mPtr;
+>+  }
+
+
+>+  operator nsCOMPtr<T>() const { return GetValue(); }
+
+Hmm... a const method returning a non-const object... should
+this maybe be |const nsCOMPtr<T>|?  Or, do you need to use
+this return value in conjunction with getter_AddRefs?
+
+
+>+  nsCOMPtr<T> operator->() const { return GetValue(); }
+
+Isn't this a dangerous operator to implement?  A weak pointer
+is one that could be null in some cases, so wouldn't use of this
+operator potentially result in some null pointer deferencing?
+
+
+>+protected:
+>+  nsCOMPtr<T> GetValue() const {
+>+    return nsCOMPtr<T>(dont_AddRef(NS_STATIC_CAST(T*, GetValueBase(NS_GET_IID(T)))));
+>+  }
+
+nit: change return type to "const nsCOMPtr<T>" if possible, and
+wrap long lines to 80 chars.
+
+
+>+template<class T>
+>+class nsMaybeWeakPtrArray : public nsTArray< nsMaybeWeakPtr<T> >,
+>+                            private nsMaybeWeakPtrArray_base
+
+I don't understand why this class needs to inherit from
+nsMaybeWeakPtrArray_base.  It seems to only define static
+methods, so there is nothing really to inherit.
+
+
+>+  nsresult AppendWeakElement(T *aElement, PRBool aOwnsWeak)
+>+  {
+>+    return AppendWeakElementBase(this, aElement, aOwnsWeak);
+>+  }
+>+
+>+  nsresult RemoveWeakElement(T *aElement)
+>+  {
+>+    return RemoveWeakElementBase(this, aElement);
+>+  }
+
+Do you really need to return nsresult here?  The corresponding
+functions defined on nsTArray return boolean and void, respectively.
+I see that you wish to have RemoveWeakElement return failure if the
+element is not in the array.
+
+
+
+>Index: src/nsNavBookmarks.cpp
+
+>+      if (!detailObservers.AppendObject(nsCOMPtr<nsINavBookmarkObserver>(mObservers[i]))) {
+
+Is the nsCOMPtr<..> constructor really needed?  Doesn't mObservers[i]
+return a nsMaybeWeakPtr, which has a cast operator to the right
+nsCOMPtr type?
+
+
+>Index: src/nsNavHistory.cpp
+
+>+    nsCOMPtr<nsINavHistoryObserver> obs(mObservers[i]);
+
+So, this does some extra addref and release... if you could make
+mObservers[i] cast to |const nsCOMPtr<T>|, then you could change
+this code to:
+
+      const nsCOMPtr<T> &obs = mObservers[i];
+
+
+>     mObservers[i]->OnPageChanged(aURI, nsINavHistoryObserver::ATTRIBUTE_HIDDEN,
+>                                  NS_LITERAL_STRING(""));
+
+EmptyString()
+
+
+>                                  NS_LITERAL_STRING(""));
+
+ditto
+(In reply to comment #2)
+> >+    return NS_ERROR_INVALID_ARG; // already present
+> 
+> I think it is a little odd to enforce this at this level.  The
+> function says it is going to append the object, but it doesn't
+> say that it is only going to allow one occurance of the object
+> in the array.  Maybe the consumer should enforce that.  At least
+> document the behavior on the method declaration.
+
+I did document this behavior in the header.  Might be able to enforce this in the consumer by overriding IndexOf to locate a strong or weak reference.
+
+> >+  nsMaybeWeakPtr(nsCOMPtr<nsIWeakReference> &ref) { mPtr = ref; }
+> >+  nsMaybeWeakPtr(nsCOMPtr<T> &ref) { mPtr = ref; }
+> 
+> Hmm... why take nsCOMPtr's as parameters?  Why not just take
+> interface pointers?  Seems like the nsCOMPtr<T> version is somewhat
+> redundant with the version taking nsISupports.
+
+This was necessary in order for the code to compile on VC6.
+
+> >+  nsCOMPtr<T> operator->() const { return GetValue(); }
+> 
+> Isn't this a dangerous operator to implement?  A weak pointer
+> is one that could be null in some cases, so wouldn't use of this
+> operator potentially result in some null pointer deferencing?
+> 
+
+Turns out that it does, yes.  What I'd really like is to be able to call the method without checking for null, maybe something like this using a pointer to member:
+
+nsresult Call(T::* aMethod);
+
+> >+template<class T>
+> >+class nsMaybeWeakPtrArray : public nsTArray< nsMaybeWeakPtr<T> >,
+> >+                            private nsMaybeWeakPtrArray_base
+> 
+> I don't understand why this class needs to inherit from
+> nsMaybeWeakPtrArray_base.  It seems to only define static
+> methods, so there is nothing really to inherit.
+
+It's just to keep those base class methods private.
+
+> >+      if (!detailObservers.AppendObject(nsCOMPtr<nsINavBookmarkObserver>(mObservers[i]))) {
+> 
+> Is the nsCOMPtr<..> constructor really needed?  Doesn't mObservers[i]
+> return a nsMaybeWeakPtr, which has a cast operator to the right
+> nsCOMPtr type?
+> 
+
+You'd think so, but again, doesn't compile on VC6.
+
+Created attachment 205333
+new patch
+
+addressing darin's comments.  See above for explanation of the points not addressed.
+checked in.
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

@@ -1,0 +1,296 @@
+
+
+
+The 'screenshot' command will result in the same output, although not that accessible .
+Hi, I was playing around with this, and I have a question, can I call the gCli built in command "screenshot" programmatically? I wanted to re-use that implementation.
+
+Here is the little I've done so far: https://gist.github.com/xonecas/269cef65524f320cd917
+
+Sean
+That would not work as BuiltinCommands is not an object.
+
+There are two ways of what you want to achieve, either make the screenshot command behave like a button (Just like the Tilt, scratchpad and responsive mode commands) and then the screenshot command button can be accessed via CommandUtils.createButtons method in DeveloperToolbar.jsm . Although that will give you a full list of the commands that are button type, and makine screenshot command a button type will also automatically add it to the developer toolbox (That I think we don't want). The other hacky way you can do that is :
+
+Cu.import("resource:///modules/devtools/DeveloperToolbar.jsm");
+let d = new DeveloperToolbar(window, window.document.querySelector("#developer-toolbar"));
+d.show(true, function() {
+  d.display.inputter.setInput("screenshot lisr");
+  let output = d.display.requisition.exec();
+  d.hide();
+});
+
+The |output| will be a string containing "Save to ..../lisr.png" and the screenshot will be saved at that location. This will cause the developer toolbar to show up, so maybe you can hide it later on
+My bad, I am already hiding the toolbar in the code.
+I'm not sure we want to use the gcli command:
+- we don't want to start the whole gcli machinery
+- we want the button to be in the responsive mode UI, not in the toolbox (maybe we want both)
+- we need a popup to ask where to save the file (can the gcli do that?)
+
+Also, could we do that in a way that would benefit bug 848760?
+
+Maybe we want to extract the screenshot code from gcli, move it in share/, then make the responsive mode, the inspector and the gcli use this code.
+
+How does that sound?
+That sounds like a better implementation, even if I love hacks. I agree that loading a whole new DeveloperToolbar() would be too much.
+
+If we extract the grabScreen() function (https://github.com/mozilla/mozilla-central/blob/master/browser/devtools/commandline/BuiltinCommands.jsm#L1920) to share/ then we can reference it both from the gcli code, and the responsive design button. And later can be reused to resolve https://bugzilla.mozilla.org/show_bug.cgi?id=848760.
+
+I have a few questions:
+ * Where can I find an example of an existing popup implementation? I want an example before so I can learn from it.
+ * And where should I place the code for the popup?
+ * How do I import something from share/ from within another file (Are there docs for this api?).
+
+Thank you,
+Sean
+
+Sean
+(In reply to Paul Rouget [:paul] from comment #5)
+> I'm not sure we want to use the gcli command:
+> - we don't want to start the whole gcli machinery
+> - we want the button to be in the responsive mode UI, not in the toolbox
+> (maybe we want both)
+> - we need a popup to ask where to save the file (can the gcli do that?)
+> 
+> Also, could we do that in a way that would benefit bug 848760?
+> 
+> Maybe we want to extract the screenshot code from gcli, move it in share/,
+> then make the responsive mode, the inspector and the gcli use this code.
+> 
+> How does that sound?
+
+Give me a few ticks to think about this properly (just landed in SF). There should be a better way than doing that.
+Thanks.
+I could try fixing this bug, any pointers will be helpful!
+(In reply to Paul Rouget [:paul] from comment #5)
+
+> Also, could we do that in a way that would benefit bug 848760?
+> 
+> Maybe we want to extract the screenshot code from gcli, move it in share/,
+> then make the responsive mode, the inspector and the gcli use this code.
+
+I had a look at this last weekend, as i want to try to work on one of the screenshot bugs. 
+The grabScreen() function for the gcli command not only takes the screenshot and saves it, but also creates UI elements and displays them that get shown after the shot has been taken. We could seperate those two and move the screenshot taking to some place where we can also call it form the responsive interface and the inspector. 
+What has to be considered too though is where to put the localized messages that are currently in gclicommands.properties as some/most of those messages will also be the same across all three ways to take a screenshot.
+Waiting for Joe's thoughts on that
+Sorry for the delay.
+
+So first, lets check if we really want this. Mac and Win already have a quick screenshot feature. Our screenshot command really comes into it's own with the params (which are not available with a button)
+
+We could also be in danger of adding too many features to buttons in our UX.
+
+I have thoughts on how to do it, if we still want to, to follow
+This is a refactoring of createButton which helps a bit.
+
+  /**
+   * A toolbarSpec is an array of buttonSpecs. A buttonSpec is an array of
+   * strings each of which is a GCLI command (including args if needed).
+   *
+   * Warning: this method uses the unload event of the window that owns the
+   * buttons that are of type checkbox. this means that we don't properly
+   * unregister event handlers until the window is destroyed.
+   */
+  createButtons: function CU_createButtons(toolbarSpec, target, document, requisition) {
+    return toolbarSpec.map(function(buttonSpec) {
+      return this.createButton(buttonSpec, target, document, requisition);
+    });
+  },
+
+  createButton: function(buttonSpec, target, document, requisition) {
+    let button = document.createElement("toolbarbutton");
+    if (typeof buttonSpec == "string") {
+      buttonSpec = { typed: buttonSpec };
+    }
+
+    // Ask GCLI to parse the typed string (doesn't execute it)
+    let promise = requisition.update(buttonSpec.typed);
+
+    // requisition.update() could be asynchronous in theory, but in practice
+    // for any command that we are likely to need it will be synchronous, so
+    // we just do a quick check because we'd rather fail fast
+    var resolved = false;
+    promise.then(function() {
+      resolved = true;
+    });
+    if (!resolved) {
+      throw new Error("The command '" + buttonSpec.typed +
+                      "' could not be resolved synchronously");
+    }
+
+    // Ignore invalid commands
+    let command = requisition.commandAssignment.value;
+    if (command == null) {
+      // TODO: Have a broken icon
+      // button.icon = 'Broken';
+      button.setAttribute("label", "X");
+      button.setAttribute("tooltip", "Unknown command: " + buttonSpec.typed);
+      button.setAttribute("disabled", "true");
+    }
+    else {
+      if (command.buttonId != null) {
+        button.id = command.buttonId;
+      }
+      if (command.buttonClass != null) {
+        button.className = command.buttonClass;
+      }
+      if (command.tooltipText != null) {
+        button.setAttribute("tooltiptext", command.tooltipText);
+      }
+      else if (command.description != null) {
+        button.setAttribute("tooltiptext", command.description);
+      }
+
+      button.addEventListener("click", function() {
+        requisition.updateExec(buttonSpec.typed);
+      }, false);
+
+      // Allow the command button to be toggleable
+      if (command.state) {
+        button.setAttribute("autocheck", false);
+        let onChange = function(event, eventTab) {
+          if (eventTab == target.tab) {
+            if (command.state.isChecked(target)) {
+              button.setAttribute("checked", true);
+            }
+            else if (button.hasAttribute("checked")) {
+              button.removeAttribute("checked");
+            }
+          }
+        };
+        command.state.onChange(target, onChange);
+        onChange(null, target.tab);
+        document.defaultView.addEventListener("unload", function() {
+          command.state.offChange(target, onChange);
+        }, false);
+      }
+    }
+
+    requisition.update('');
+
+    return button;
+  },
+
+// ----------------
+
+// We need to have access to a requisition for this to work so
+
+// We should have a central requisition object, but for now ...
+Cu.import("resource://gre/modules/devtools/Require.jsm");
+Cu.import("resource:///modules/devtools/gcli.jsm");
+
+let Requisition = require('gcli/cli').Requisition;
+let environment = { chromeDocument: chromeDocument };
+let requisition = new Requisition(environment);
+
+// Target could be null for our case here so we would use the code below with:
+
+CommandUtil.createButton("screenshot", null, chromeDocument, requisition);
+Created attachment 770075
+Patch v1
+
+Using the command code is too complicated. Here is a very simple way to take a screenshot and save it in the download folder.
+Icons are missing. Waiting for shorlander.
+Comment on attachment 770075
+Patch v1
+
+Review of attachment 770075:
+-----------------------------------------------------------------
+
+Some minor comments.
+
+::: browser/devtools/responsivedesign/responsivedesign.jsm
+@@ +347,4 @@
+>      this.rotatebutton.addEventListener("command", this.bound_rotate, true);
+>  
+> +    this.screenshotbutton = this.chromeDoc.createElement("toolbarbutton");
+> +    this.screenshotbutton.setAttribute("tabindex", "0");
+
+tabindex = 0 to both this and rotate button ?
+
+@@ +594,5 @@
+> +      let date = new Date();
+> +      let month = ("0" + (date.getMonth() + 1)).substr(-2, 2);
+> +      let day = ("0" + (date.getDay() + 1)).substr(-2, 2);
+> +      let dateString = [date.getFullYear(), month, day].join("-");
+> +      let timeString = date.toTimeString().split(" ")[0];
+
+The screenshot command saves files with the time string in HH.MM.SS fashion. Shouln't we be consistent ?
+
+::: browser/locales/en-US/chrome/browser/devtools/responsiveUI.properties
+@@ +16,1 @@
+>  responsiveUI.rotate=rotate
+
+Since now this is a tooltip, R capital, and also, if we can add some more information in the tooltip, like : "Rotate the screen" or something like that.
+
+@@ +16,4 @@
+>  responsiveUI.rotate=rotate
+>  
+> +# LOCALIZATION NOTE  (responsiveUI.screenshot): tooltip of the screenshot button.
+> +responsiveUI.screenshot=screenshot
+
+ditto.
+
+@@ +20,5 @@
+> +
+> +# LOCALIZATION NOTE (responsiveUI.screenshotFileName): The auto generated filename.
+> +# The first argument (%1$S) is the date string in yyyy-mm-dd format and the second
+> +# argument (%2$S) is the time string in HH:MM:SS format.
+> +responsiveUI.screenshotGeneratedFilename=screenshot-%1$S-%2$S
+
+Again, screenshot command generates the name as "<dateString> at <timeString>.png" . So if we can be consistent with that :)
+(In reply to Girish Sharma [:Optimizer] from comment #15)
+> tabindex = 0 to both this and rotate button ?
+
+Yes. That makes them focusable and the focus order follow dom.
+
+> Shouln't we be consistent ?
+
+(in the filename).
+
+Yes.
+
+> ::: browser/locales/en-US/chrome/browser/devtools/responsiveUI.properties
+> @@ +16,1 @@
+> >  responsiveUI.rotate=rotate
+> 
+> Since now this is a tooltip, R capital, and also, if we can add some more
+> information in the tooltip, like : "Rotate the screen" or something like
+> that.
+
+I'll keep the name "Rotate". It worked well as a label. No need to make it longer.
+Created attachment 770112
+Patch v1.1
+
+Addressed Optmizer's comments.
+
+Mike, please ignore the icons. Shorlander will provide the files soon.
+Created attachment 770113
+Patch v1.1
+Comment on attachment 770113
+Patch v1.1
+
+Review of attachment 770113:
+-----------------------------------------------------------------
+
+r+ with my nit addressed.
+
+::: browser/devtools/responsivedesign/test/browser_responsiveui.js
+@@ +157,5 @@
+> +      if (file.exists()) {
+> +        ok(true, "Screenshot file exists");
+> +        file.remove(false);
+> +        finishUp();
+> +      } else {
+
+You should add a timeout here so that if the file is not created then you can log an error and finish the test.
+https://tbpl.mozilla.org/?tree=Try&rev=ef222ab360fc
+https://tbpl.mozilla.org/?tree=Try&rev=8d5678a7a658
+https://tbpl.mozilla.org/?tree=Try&rev=36c0c4ba8765
+https://hg.mozilla.org/integration/fx-team/rev/0d0feeec23a8
+https://hg.mozilla.org/mozilla-central/rev/0d0feeec23a8
+
+
+Add a "screenshot" button to the responsive mode
+
+
+
+Bug 849236 - Add a screenshot button to the responsive mode. r=mratcliffe 

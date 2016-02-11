@@ -1,0 +1,224 @@
+Created attachment 8602270
+Screen Shot 2015-05-06 at 11.17.28 AM.png
+
+https://twitter.com/thunder/status/596022039783178241
+
+Created attachment 8602270
+Screen Shot 2015-05-06 at 11.17.28 AM.png
+
+https://twitter.com/thunder/status/596022039783178241
+Created attachment 8602309
+Screen Shot 2015-05-06 at 11.17.38 AM.png
+Created attachment 8602311
+Screen Shot 2015-05-06 at 11.23.51 AM.png
+Created attachment 8602314
+Screen Shot 2015-05-06 at 11.32.11 AM.png
+STR:
+I just rolled a new user profile on my windows box to try, and here’s what I did.
+
+Installed Chrome.
+Installed Firefox 37.
+Ran Chrome, logged into Twitter and Gmail. (Google secured with 2 factor auth)
+Launched Firefox, went through new profile creation and migrated. Told me cookies, bookmarks, browsing history were successfully brought over.
+
+Bookmarks look right, but neither Gmail nor Twitter are authed. 
+
+Enter credentials for Twitter and home page reloads with no auth errors. Just as if nothing happened.
+
+Enter credentials for gmail and it redirects to nowhere.
+Created attachment 8602359
+Screen shot of imported cookies - All but bottom 2 are missing content
+
+It seems like the contents of some cookies aren't being imported and that's getting us into a bad state.
+
+QE is supposed to be regularly testing migration from other browsers (bug 1019489) but I haven't seen bug reports recently and don't know whether that's actually happening. Since we don't want to or can't install all browsers in our automation environment, we rely on manual testing to detect browser changes.
+I think there have been some schema changes to their sqlite database. I would guess this bug has something to do with encrypted_value:
+
+sqlite> .width 3 20 10 7 10 2
+sqlite> PRAGMA table_info(cookies);
+cid  name                  type        notnull  dflt_value  pk
+---  --------------------  ----------  -------  ----------  --
+0    creation_utc          INTEGER     1                    1 
+1    host_key              TEXT        1                    0 
+2    name                  TEXT        1                    0 
+3    value                 TEXT        1                    0 
+4    path                  TEXT        1                    0 
+5    expires_utc           INTEGER     1                    0 
+6    secure                INTEGER     1                    0 
+7    httponly              INTEGER     1                    0 
+8    last_access_utc       INTEGER     1                    0 
+9    has_expires           INTEGER     1        1           0 
+10   persistent            INTEGER     1        1           0 
+11   priority              INTEGER     1        1           0 
+12   encrypted_value       BLOB        0        ''          0 
+13   firstpartyonly        INTEGER     0        0           0
+We currently only use the following query:
+> SELECT host_key, path, name, value, secure, httponly, expires_utc FROM cookies
+I see. They may just be encrypting all cookies to break imports? If so it means that chrome conquests will have a broken Fx instance.
+http://stackoverflow.com/questions/22532870/encrypted-cookies-in-chrome
+http://n8henrie.com/2014/05/decrypt-chrome-cookies-with-python/
+Should we just *not* attempt to import encrypted cookies so we don't block users from sites? I don't think users are going to realize they need to clear cookies to do proceed.
+Created attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+
+/r/8315 - Bug 1162205 - Don't import encrypted cookies from Chrome.
+
+Pull down this commit:
+
+hg pull -r e24e8c2a5e3811f31568ac8f2d8cc43f27041a3d https://reviewboard-hg.mozilla.org/gecko/
+(In reply to Nick Nguyen [:osunick] from comment #8)
+> I see. They may just be encrypting all cookies to break imports? If so it
+> means that chrome conquests will have a broken Fx instance.
+
+I suspect it's more likely for better local security than to break imports.
+
+(In reply to Chris More [:cmore] from comment #9)
+Their code is open source so we can just read it instead of looking on Stack Overflow :)
+
+https://mxr.mozilla.org/chromium/source/src/content/browser/net/sqlite_persistent_cookie_store.cc
+https://mxr.mozilla.org/chromium/source/src/components/os_crypt/os_crypt_posix.cc <= static key and salt
+https://mxr.mozilla.org/chromium/source/src/components/os_crypt/os_crypt_mac.mm
+https://mxr.mozilla.org/chromium/source/src/components/os_crypt/os_crypt_win.cc
+
+(In reply to Chris More [:cmore] from comment #11)
+> Should we just *not* attempt to import encrypted cookies so we don't block
+> users from sites? I don't think users are going to realize they need to
+> clear cookies to do proceed.
+
+Right, in this bug I will just not import encrypted cookies (only unencrypted ones) then we can have separate follow-up bugs to implement decryption for each platform we care about.
+
+Waiting to flag for review until I finish my automated test.
+> Whiteboard: [fxgrowth]
+
+Btw. I would argue that importing passwords is more important than cookies for FxGrowth: bug 1018667 & bug 707044
+Comment on attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+
+/r/8315 - Bug 1162205 - Don't import encrypted cookies from Chrome. r=mak
+
+Pull down this commit:
+
+hg pull -r dadab21f9c12cd433d9bbc571ae5afdfb0fcd7db https://reviewboard-hg.mozilla.org/gecko/
+Comment on attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+
+https://reviewboard.mozilla.org/r/8313/#review7099
+
+r=me with the following addressed:
+
+::: browser/components/migration/ChromeProfileMigrator.js:313
+(Diff revision 2)
+> +        WHERE encrypted_value == ""`);
+
+note: usually in SQL you don't use ==, but just =.
+
+I'd prefer a more robust check here, cause you are comparing an empty string to an empty blob, they are not exactly the same thing. I'd expect this query to select nothing, just by reading it... To make it proper you should cast the string to a blob, that is not very nice.
+
+Either length(encrypted_value) = 0
+
+Or select both value and encrypted_value and skip the row in the for loop, with a nice TODO comment pointing to the bug that will implement import of encrypted entries.
+
+Strange that the test passes, unless you added data manually to the db and maybe set the blob column to a string instead of a blob? (in Sqlite you can store any data type in any column)
+Fwiw, in my Chrome profile I only see encrypted entries, so I suspect in most cases we won't import ANY cookie. The follow-up bug should be prioritized if we care about properly migrating users.
+We should also uplift this as far as possible to avoid broken imports.
+Looks like users have been complaining about this on input for a while:
+
+https://input.mozilla.org/en-US/?q=gmail+%2B+redirect&date_end=2015-05-08&date_start=2014-05-01
+(In reply to Marco Bonardo [::mak] from comment #16)
+> ::: browser/components/migration/ChromeProfileMigrator.js:313
+> (Diff revision 2)
+> > +        WHERE encrypted_value == ""`);
+> 
+> note: usually in SQL you don't use ==, but just =.
+
+Oops.
+
+> I'd prefer a more robust check here, cause you are comparing an empty string
+> to an empty blob, they are not exactly the same thing. I'd expect this query
+> to select nothing, just by reading it... To make it proper you should cast
+> the string to a blob, that is not very nice.
+> 
+> Either length(encrypted_value) = 0
+
+The column defaults to '' (see comment 6) but the switch to length(…) makes sense.
+
+> Or select both value and encrypted_value and skip the row in the for loop,
+> with a nice TODO comment pointing to the bug that will implement import of
+> encrypted entries.
+> 
+> Strange that the test passes, unless you added data manually to the db and
+> maybe set the blob column to a string instead of a blob? (in Sqlite you can
+> store any data type in any column)
+
+I just double-checked the comparison to empty string in my Chrome profile that has a mix of encrypted an unencrypted cookies.
+
+(In reply to Chris More [:cmore] from comment #18)
+> Looks like users have been complaining about this on input for a while:
+> 
+> https://input.mozilla.org/en-US/?q=gmail+%2B+redirect&date_end=2015-05-
+> 08&date_start=2014-05-01
+
+Note that this patch isn't going to help users who already did the import from Chrome. They will have to clear their cookies as I don't think there is a straightforward way to know which cookies were imported with this problem since an empty cookie value isn't uncommon. Maybe we could look at the timestamps to see when a bunch of cookies were created all around the same time with empty values? Of course we can special-case top sites like Gmail/Twitter but that seems a bit dirty.
+
+In order to get this fix for new imports released ASAP I'd rather postpone fixing existing users to another bug if others think it's worthwhile.
+Agreed. Let's stop the bleeding ASAP.
+https://hg.mozilla.org/integration/fx-team/rev/8c7c0bb5cf55
+Comment on attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+
+/r/8315 - Bug 1162205 - Don't import encrypted cookies from Chrome. r=mak
+
+Pull down this commit:
+
+hg pull -r 80cb10f85a2e48e59f89a39bd193652f9ea7eb8c https://reviewboard-hg.mozilla.org/gecko/
+Comment on attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+
+[Approval Request Comment]
+If this is not a sec:{high,crit} bug, please state case for ESR consideration: 
+User impact if declined: Users who import cookies from Chrome can end up with broken websites (redirect loops or repeated failed logins)
+Fix Landed on Version: 40
+Risk to taking this patch (and alternatives if risky): Low risk. Worst case is that Chrome cookie import fails which is a better situation that importing broken cookies.
+String or UUID changes made by this patch: None
+[Describe test coverage new/current, TreeHerder]: Automated xpcshell test against a test Cookie database.
+https://hg.mozilla.org/mozilla-central/rev/8c7c0bb5cf55
+Comment on attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+
+Approved for uplift to beta (39). 
+
+This missed landing on 39 aurora but is already on 40, so it doesn't need uplift to aurora.
+Comment on attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+
+After reviewing with Matt and Gavin, this issue is severe enough and the change is isolated enough to warrant taking this as a ride along in a point release. I'm approving for 38.0.1, 38.0.5, and ESR38. As we're very close to the end of the ESR31 cycle, I don't think we should take the fix on that branch.
+
+Note that this patch needs to land on:
+Firefox 38 relbranch (38.0.1)
+m-r (38.0.5)
+ESR38 relbranch (38.0.1)
+m-esr38 (38.1.0)
+Pushed to GECKO380_2015050320_RELBRANCH: https://hg.mozilla.org/releases/mozilla-release/rev/7bf6c9a78588
+Bustage fix for GECKO380_2015050320_RELBRANCH: https://hg.mozilla.org/releases/mozilla-release/rev/7bf6c9a78588
+Bustage fix for GECKO380_2015050320_RELBRANCH: https://hg.mozilla.org/releases/mozilla-release/rev/f0fbb7ca3977
+GECKO380esr_2015050513_RELBRANCH: https://hg.mozilla.org/releases/mozilla-esr38/rev/9c6b3cb88632
+
+ESR38 (default): https://hg.mozilla.org/releases/mozilla-esr38/rev/5ffc47b299cb
+38.0.5 (default branch): https://hg.mozilla.org/releases/mozilla-release/rev/c5a80a2102b6
+https://hg.mozilla.org/releases/mozilla-beta/rev/b45fa21a84d5
+Release Note Request (optional, but appreciated)
+[Why is this notable]: Chrome importer may cause broken sites
+[Suggested wording]: Fixed: Users who import cookies from Chrome can end up with broken websites
+[Links (documentation, blog post, etc)]:
+Reproduced with 38.0 ESR on Windows 7 x64.
+Verified fixed on 38.0.1 ESR (Build ID: 20150513173914) and 38.0.1 RC (Build ID: 20150513174244), across the following platforms: Windows 7 x64, Windows 8.1 x86, Mac OS X 10.9.5 and Ubuntu 14.04 x64.
+Relnote is actually "Fixed: Users who import cookies from Google Chrome can end up with broken websites"
+Verified as fixed using the following environment:
+
+FF 39.0b1
+BUild Id:20150520170903
+OS: Win 7 x64, Ubuntu 14.04 x64, Mac Os X 10.9.5
+Comment on attachment 8602505
+MozReview Request: bz://1162205/MattN (r=mak)
+Created attachment 8620244
+MozReview Request: Bug 1162205 - Don't import encrypted cookies from Chrome. r=mak

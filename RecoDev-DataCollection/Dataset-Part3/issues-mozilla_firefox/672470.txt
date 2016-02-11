@@ -1,0 +1,260 @@
+Follow up bug report from bug 592469 comment 57.
+
+Follow up bug report from bug 592469 comment 57.
+Created attachment 546758
+proposed patch
+
+Proposed patch.
+
+This patch fixes memory leaks in the code that became more obvious since bug 592469 landed. What it does:
+
+- removes some event listeners we never removed.
+- removes the Web Console command controller - we never removed it.
+
+
+Please see bug 592469 comment 65. Continuing from that... see:
+
+http://pastebin.mozilla.org/1275729
+
+This pastebin page shows the results after running the HUDService tests with this patch applied. Fewer leaked DOM windows.
+
+Notice that:
+
+--DOMWINDOW == 17 (0x2ac4c11c4078) [serial = 244] [outer = (nil)] [url = data:text/html,Web%20Console%20test%20for%20bug%20626484]
+--DOMWINDOW == 19 (0x2ac4c9f2b878) [serial = 372] [outer = (nil)] [url = data:text/html,<p>test%20for%20bug%20577721]
+--DOMWINDOW == 8 (0x2b8c135b1878) [serial = 200] [outer = (nil)] [url = data:text/html,<div%20style="-moz-opacity:0;">test%20repeated%20css%20warnings</div><p%20style="-moz-opacity:0">hi</p>]
+
+... are all gone. These no longer leak.
+
+We still have test-error.html, test-console.html and test-network-request.html that leak.
+
+Based on investigation test-error.html leaks because it has an event listener in the page, which was surprising. For testing purposes, I added a delay as suggested and it no longer leaks. I also played with forceGC() and garbageCollect(), and these also fix the leak. So, this is really not a problem with the Web Console code - it's a matter of how the mochitest runs, and how soon those DOMWindows are garbage collected.
+
+For test-console.html and test-network-request.html I believe the situation is similar. I made a test run which includes a change in head.js, in the tearDown() function to always forceGC() and garbageCollect(). The results are here:
+
+http://pastebin.mozilla.org/1275730
+
+Far fewer DOMWindows are leaked. test-error.html still remains because, as it seems, it needs a forceGC() call in the test itself, for some reason. I assume for test-console.html the need is the same (but I don't which of the JS test files is the culprit here ... because we have several tests that load the test-console.html file).
+
+Given these results and the situation, any further changes are needed?
+
+Looking forward to your review. Thank you!
+Comment on attachment 546758
+proposed patch
+
+>--- a/toolkit/components/console/hudservice/tests/browser/browser_webconsole_bug_580030_errors_after_page_reload.js
+>+++ b/toolkit/components/console/hudservice/tests/browser/browser_webconsole_bug_580030_errors_after_page_reload.js
+>@@ -92,13 +92,15 @@ var consoleObserver = {
+> 
+>     Services.console.unregisterListener(this);
+> 
+>     let outputNode = HUDService.getHudByWindow(content).outputNode;
+> 
+>     executeSoon(function() {
+>       let msg = "Found the error message after page reload";
+>       testLogEntry(outputNode, "fooBazBaz", msg);
+>+
+>+      consoleObserver = msg = outputNode = null;
+>       finishTest();
+>     });
+>   }
+> };
+
+This looks like it shouldn't be needed.
+
+>--- a/toolkit/components/console/hudservice/tests/browser/browser_webconsole_bug_626484_output_copy_order.js
+>+++ b/toolkit/components/console/hudservice/tests/browser/browser_webconsole_bug_626484_output_copy_order.js
+
+> function nextTest() {
+>   if (itemsSet.length === 0) {
+>     outputNode.clearSelection();
+>     HUD.jsterm.clearOutput();
+>-    finish();
+>+    outputNode = null;
+>+    HUD = null;
+>+    itemsSet = null;
+>+    executeSoon(finish);
+>   }
+
+ditto
+Created attachment 546795
+patch update 2
+
+Updated the patch based on Dão's comments.
+
+Thanks Dão!
+Comment on attachment 546795
+patch update 2
+
++    this._keyPress = this.keyPress.bind(this);
++    this._inputEventHandler = this.inputEventHandler.bind(this);
++
+     this.inputNode.addEventListener("keypress",
+-      this.keyPress.bind(this), false);
++      this._keyPress, false);
+
+what's the purpose of this bit?
+
+is it...
+
++  destroy: function JST_destroy()
++  {
++    this.inputNode.removeEventListener("keypress", this._keyPress, false);
+
+?
+
+I see!
+
+This looks promising. R+ with a successful try run.
+(In reply to comment #4)
+> Comment on attachment 546795 [details] [review]
+> patch update 2
+> 
+> +    this._keyPress = this.keyPress.bind(this);
+> +    this._inputEventHandler = this.inputEventHandler.bind(this);
+> +
+>      this.inputNode.addEventListener("keypress",
+> -      this.keyPress.bind(this), false);
+> +      this._keyPress, false);
+> 
+> what's the purpose of this bit?
+> 
+> is it...
+> 
+> +  destroy: function JST_destroy()
+> +  {
+> +    this.inputNode.removeEventListener("keypress", this._keyPress, false);
+> 
+> ?
+> 
+> I see!
+
+Yep, we need a way to remove these event listeners. If we don't, they leak memory.
+
+> This looks promising. R+ with a successful try run.
+
+Thank you! Will push the patch to the try server.
+Try server results are green:
+http://tbpl.mozilla.org/?tree=Try&rev=78c3ae1fa27b
+
+This patch can land now.
+Comment on attachment 546795
+patch update 2
+
+Asking for review from a toolkit peer.
+Comment on attachment 546795
+patch update 2
+
+Do every one of these changes have a noticeable effect?
+
+I don't understand why you'd need to remove eventListeners that are added to nodes that you later remove (e.g. positionMenuitems). Do you really need to do that to fix leaks?
+(In reply to comment #8)
+> Comment on attachment 546795 [details] [review]
+> patch update 2
+> 
+> Do every one of these changes have a noticeable effect?
+> 
+> I don't understand why you'd need to remove eventListeners that are added to
+> nodes that you later remove (e.g. positionMenuitems). Do you really need to
+> do that to fix leaks?
+
+I was surprised to see that, yes, doing that fixed the memleaks. I checked each. If I don't remove one of those event listeners, I get the memleak back.
+
+Ugly and weird.
+*** Bug 670140 has been marked as a duplicate of this bug. ***
+Comment on attachment 546795
+patch update 2
+
+>diff --git a/toolkit/components/console/hudservice/HUDService.jsm b/toolkit/components/console/hudservice/HUDService.jsm
+
+>+  this.activatedContexts = [];
+>+  this.windowIds = {};
+>+  this.filterPrefs = {};
+>+  this.hudReferences = {};
+>+  this.openRequests = {};
+>+  this.openResponseHeaders = {};
+
+Can you remove these properties from the prototype as well?
+
+>             // Add listener for the response body.
+>             let newListener = new ResponseListener(httpActivity);
+>             aChannel.QueryInterface(Ci.nsITraceableChannel);
+
+You could move this down closer to its new first-use.
+
+>     let container = gBrowser.tabContainer;
+>-    container.addEventListener("TabClose", this.onTabClose, false);
+
+Same here - move container further down to keep it next to its first-use.
+
+>+    this._positionConsoleAbove = (function HUD_positionAbove() {
+>+      this.positionConsole("above");
+>+    }).bind(this);
+
+This could be:
+
+this._positionConsoleAbove = this.positionConsole.bind(this, "above");
+
+(you lose the unique name, but I imagine that isn't a big deal)
+
+It's generally sucky to have to be so careful to remove everything manually like this. I suspect there are some weird cycles going on with event listeners entraining their global objects. It would be nice to try to rely less on closures and simplify things such that we don't have to do so much explicit tear-down.
+(In reply to comment #11)
+> Comment on attachment 546795 [diff] [details] [review]
+> patch update 2
+> 
+
+> >+    this._positionConsoleAbove = (function HUD_positionAbove() {
+> >+      this.positionConsole("above");
+> >+    }).bind(this);
+> 
+> This could be:
+> 
+> this._positionConsoleAbove = this.positionConsole.bind(this, "above");
+> 
+> (you lose the unique name, but I imagine that isn't a big deal)
+
+True, I wanted to do this, but the position UI test fails, because what it does is:
+
+  let param = null;
+  hudRef.positionConsole = function(aPosition) {
+    param = aPosition;
+  };
+
+  hudRef.positionMenuitems.above.doCommand();
+
+  is(param, "above", "menuitem for above positioning calls positionConsole() correctly");
+
+This allows me to keep track if positionConsole() is called correctly.
+
+If I bind the method as you asked, then my overwriting of positionConsole() is never invoked.
+
+I could overwrite each _positionConsole*() method from the test, but that depends, I would say, too much on the implementation. Hence I preferred to keep it as it is in the patch.
+
+Shall I make the change?
+
+
+> It's generally sucky to have to be so careful to remove everything manually
+> like this. I suspect there are some weird cycles going on with event
+> listeners entraining their global objects. It would be nice to try to rely
+> less on closures and simplify things such that we don't have to do so much
+> explicit tear-down.
+
+Agreed. In some of these cases the listeners do not rely on any global objects or closures, but for some reason I still get memleaks if I do not manually remove each listener. (for example the jsterm input event listeners.)
+
+
+Thank you for the review+!
+Created attachment 550456
+[in-fx-team] patch update 3
+
+Updated the patch based on Gavin's review comments.
+
+Please note that I did not make the change wrt. positionConsole(). Simply overwriting _positionConsoleAbove/Below/Window() won't work since that event listener is already attached to the given menuitem. Testing the UI commands becomes non-trivial for such simple reasons. I would say that the cost is not worth the code style improvement.
+
+Thank you!
+
+This patch can land.
+Comment on attachment 550456
+[in-fx-team] patch update 3
+
+http://hg.mozilla.org/integration/fx-team/rev/183aba2199bf
+http://hg.mozilla.org/mozilla-central/rev/183aba2199bf

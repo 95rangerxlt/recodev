@@ -1,0 +1,183 @@
+We have some elaborate logic to save pages out of the cache rather than loading from the network. However, this doesn't work in e10s.
+
+We have some elaborate logic to save pages out of the cache rather than loading from the network. However, this doesn't work in e10s.
+Starting investigations now.
+So bug 1058251 was the original bug for making "Save Page As" work, and what happened was that a band-aid fix was landed to get basic functionality, and bug 1101100 was spun out to do the more hardcore permanent fix.
+
+The bandaid fix allows us to save pages in the e10s case, but we still hit the network to do it in at least some cases. Bug 1101100 is the long-term fix for this, as it will move all of the document walking into the content process, and just blast up information to the parent to write to disk.
+
+Bug 1101100 is currently M8, so it's clear that full Save As functionality isn't a priority. But this bug is M6 meaning that we want the bandaid fix to be able to work with at least some caching.
+
+So I guess I need to document which cases we hit the network on in the e10s case when saving pages, and try to come up with some workarounds until bug 1101100 is all set.
+I forgot to mention - one thing that we might want to do is to grab and serialize the cache key from the nsISHEntry of the loaded document from the content process, and re-attempt to use it in the parent. That might be a potential workaround.
+
+That would require bug 1156493.
+The other thing about the current band-aid for Save As is that it basically just makes e10s treat DOM-having documents like non-DOM-having documents — so if we're not using the cache for them, then we're probably also not using the cache for, e.g., saving a large image regardless of e10sness.  Unless there's something else going on there.
+Ok, I did (what I think to be) a reasonably thorough examination of the Save Page As, and comparison between e10s and non-e10s.
+
+My findings:
+
+# Basic page (no image, script or style assets, just text with some links):
+
+Saving a basic page works mostly the same. In e10s, we don't resolve relative URLs in anchors to absolute URLs, whereas we do with non-e10s.
+
+# A page reached via a POST request
+
+This is busted with e10s - we throw a NS_ERROR_XPC_CANT_PASS_CPOW_TO_NATIVE when calling nsIWebBrowserPersist.savePrivacyAwareURI.
+
+# Saving a page with image, script, style assets
+
+We just save the document with e10s. In non-e10s, we save a folder full of assets (css files, script files, images, subframes, and assets for those subframes).
+
+As with the basic page, the e10s case doesn't resolve relative URLs to absolutes.
+
+# Save a frame.
+
+Same behaviour as when saving a page with assets.
+
+# Save Link As
+
+This seems to work the same between e10s and non-e10s. That's not too surprising, because I think the e10s case is using the Save Link As mechanism as part of its "bandaid" fix.
+
+# Save image as
+
+This seems to work the same between e10s and non-e10s, and seems to properly request assets from the cache. The Browser Toolbox did not record any network activity when saving images in either case.
+
+# Save Page As when the page is an image
+
+Same as above.
+It seems to me that all of the above will be fixed with bug 1101100 fixed.
+
+Probably the most serious part of this is the total failure to save the page if we reached it by way of a POST request. This is just flat-out broken.
+
+I assume if the rest of the "bandaid" fix was acceptable, and the proper fix is milestoned at M8, then we're OK to keep the above behaviour with the exception of the POST case.
+
+So, until I hear otherwise, I will be attempting to make the Save Page As case work in the POST case - though it might have the same deficiencies as the rest of the Save Page As behaviour in e10s (no assets, no absolute URLs).
+Created attachment 8599897
+[e10s] Make it possible to save pages that were reached via a POST request. r=?
+Created attachment 8599906
+[e10s] Make it possible to save pages that were reached via a POST request. r=?
+Comment on attachment 8599906
+[e10s] Make it possible to save pages that were reached via a POST request. r=?
+
+So here's my bandage solution for the POST request problem.
+
+It's pretty ugly. Basically, I send a message down to the child passing down the target document, have it serialize the nsISHEntry for that document and send a response message. The parent deserializes the nsISHEntry, and passes that off to the nsIWebBrowserPersist machinery.
+
+It's not amazing. It's also pretty depressing that for the postData stuff (which I assume we need, looking at nsWebBrowserPersist::SaveURIInternal) is slurped down from the parent process, converted to a string, and then sent back up to the parent again. I'm not even sure I'm doing the string conversion correctly - it's been a long time since I worked with streams.
+
+The serialization / deserialization code is mostly copied from SessionHistory.jsm. I'm not sure how much of it is needed for nsIWebBrowserPersist to do its job. I added the postData bit though, which SessionHistory doesn't seem to store.
+
+I'm able to save pages I've reached via POST with this patch.
+Comment on attachment 8599906
+[e10s] Make it possible to save pages that were reached via a POST request. r=?
+
+Talked to Mike over irc and it looks like more debugging is needed.
+Created attachment 8600354
+MozReview Request: bz://1128050/mconley (r+'d by billm)
+
+/r/8023 - Bug 1156493 - "e10s: move .cacheKey to nsICacheInfoChannel so child channels can get/set it" [r=michal.novotny]
+/r/8025 - Bug 1128050 - [e10s] Make it possible to save pages that were reached via a POST request. r=?
+
+Pull down these commits:
+
+hg pull -r 2ef04bc74e84fba70f88c49d4ba75f7304949645 https://reviewboard-hg.mozilla.org/gecko/
+So I've kinda given up on sending the nsIInputStream over. Gecko is fighting me the whole way.
+
+Even if I serialize the nsIInputStream like I did in the last patch, NetUtil.asyncCopy automatically closes the stream. And if I use my own stream copier, I can't seem to seek back to the beginning of the stream on the main thread.
+
+So I've opted to not send postData at all.
+
+What this means is that if a user reaches a page via POST, and then clears their cache, and then attempts to save the page, the page will probably not be saved correctly (since the postData won't be resubmitted, which is what we do in the non-e10s case).
+
+I think this is strictly better than being unable to save pages reached via POST at all, and I suspect we can live with this until bug 1101100 fixes this properly.
+https://reviewboard.mozilla.org/r/8025/#review6773
+
+::: toolkit/content/contentAreaUtils.js:157
+(Diff revision 1)
+> +      let shEntry = BrowserUtils.deserializeSHEntry(message.data.shEntryObj);
+
+You go through a lot of effort to get the entire shEntry, but the only part we use is the cacheKey (which is just an nsISupportsPRUint32). Let's kill all the shEntry serialization/deserialization and only send up the cacheKey as a number. Then you can make a new nsISupportsPRUint32 in the parent and pass it to internalSave. Note that nsWebBrowserPersist::SaveURIInternal allows its cacheKey argument to be either an nsISHEntry, an nsIWebPageDescriptor, or an actual cache key [1]. We'll use the latter version.
+
+[1] http://mxr.mozilla.org/mozilla-central/source/embedding/components/webbrowserpersist/nsWebBrowserPersist.cpp#1181
+
+::: toolkit/content/contentAreaUtils.js
+(Diff revision 1)
+> -      sourcePostData    : aDocument ? getPostData(aDocument) : null,
+
+Can we just leave this line as-is, but change the condition to aDocument and !Cu.isCrossProcessWrapper(aDocument)?
+Comment on attachment 8600354
+MozReview Request: bz://1128050/mconley (r+'d by billm)
+
+I'd like to see this again.
+Comment on attachment 8600354
+MozReview Request: bz://1128050/mconley (r+'d by billm)
+
+/r/8023 - Bug 1156493 - "e10s: move .cacheKey to nsICacheInfoChannel so child channels can get/set it" [r=michal.novotny]
+/r/8025 - Bug 1128050 - [e10s] Save page as... doesn't always load from cache. r=?
+
+Pull down these commits:
+
+hg pull -r bda4c1f32026b75c57c742d6ea8ff0e195ad0a99 https://reviewboard-hg.mozilla.org/gecko/
+(In reply to Bill McCloskey (:billm) from comment #13)
+> https://reviewboard.mozilla.org/r/8025/#review6773
+> 
+> ::: toolkit/content/contentAreaUtils.js:157
+> (Diff revision 1)
+> > +      let shEntry = BrowserUtils.deserializeSHEntry(message.data.shEntryObj);
+> 
+> You go through a lot of effort to get the entire shEntry, but the only part
+> we use is the cacheKey (which is just an nsISupportsPRUint32). Let's kill
+> all the shEntry serialization/deserialization and only send up the cacheKey
+> as a number. Then you can make a new nsISupportsPRUint32 in the parent and
+> pass it to internalSave. Note that nsWebBrowserPersist::SaveURIInternal
+> allows its cacheKey argument to be either an nsISHEntry, an
+> nsIWebPageDescriptor, or an actual cache key [1]. We'll use the latter
+> version.
+> 
+> [1]
+> http://mxr.mozilla.org/mozilla-central/source/embedding/components/
+> webbrowserpersist/nsWebBrowserPersist.cpp#1181
+
+Yes, this is much simpler, thank you! I should probably have red the nsIWebBrowserPersist IDL a bit more closely.
+
+> 
+> ::: toolkit/content/contentAreaUtils.js
+> (Diff revision 1)
+> > -      sourcePostData    : aDocument ? getPostData(aDocument) : null,
+> 
+> Can we just leave this line as-is, but change the condition to aDocument and
+> !Cu.isCrossProcessWrapper(aDocument)?
+
+Done.
+https://reviewboard.mozilla.org/r/8025/#review6923
+
+Thanks! Looks good.
+
+::: toolkit/content/contentAreaUtils.js:150
+(Diff revision 2)
+> -    cacheKey =
+> +    shEntry =
+
+I think you need |let| here.
+Thanks!
+https://hg.mozilla.org/integration/fx-team/rev/9a98694d89a6
+https://hg.mozilla.org/mozilla-central/rev/9a98694d89a6
+Bug 1156493 was backed out from mozilla-aurora due to bug 1163900, so this bug is still open on 40, but fixed on 41.
+Comment on attachment 8600354
+MozReview Request: bz://1128050/mconley (r+'d by billm)
+Created attachment 8619262
+MozReview Request: Bug 1128050 - [e10s] Save page as... doesn't always load from cache. r=?
+Created attachment 8619263
+MozReview Request: Bug 1156493 - "e10s: move .cacheKey to nsICacheInfoChannel so child channels can get/set it" [r=michal.novotny]
+Created attachment 8621621
+Bugnotes
+
+http://people.mozilla.org/~mconley2/bugnotes/bug-1128050.html
+
+
+[e10s] Save page as... doesn't always load from cache
+
+
+
+Bug 1128050 - [e10s] Save page as... doesn't always load from cache. r=billm. 

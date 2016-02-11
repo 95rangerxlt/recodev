@@ -1,0 +1,367 @@
+Code needs to be written to add our default web-based protocol handlers to the mimeTypes.rdf in existing profiles for protocols that we care about.  This should be fairly straightforward, I think: I suspect something similar to the strategy used in the mochitests for nsIHandlerService should work pretty nicely.  
+
+We also need to have reasonable defaults for new profiles, which we could easily do by just putting them in the default mimeTypes.rdf.  Alternately, we could just use the dynamic insertion code described above unconditionally.
+
+Code needs to be written to add our default web-based protocol handlers to the mimeTypes.rdf in existing profiles for protocols that we care about.  This should be fairly straightforward, I think: I suspect something similar to the strategy used in the mochitests for nsIHandlerService should work pretty nicely.  
+
+We also need to have reasonable defaults for new profiles, which we could easily do by just putting them in the default mimeTypes.rdf.  Alternately, we could just use the dynamic insertion code described above unconditionally.
+Er, I actually meant the "make check" tests, not the mochitests.
+OK, my current theory is to put the stuff that should be injected into mimeTypes.rdf into browser/locales/en-US/chrome/browser-region/region.properties.  One thing that's slightly odd about this is that most (all?) of the stuff in that file currently appears to be used by localized preference redirection rather than directly via the stringbundle service.  Axel, do you have any thoughts on this?
+
+I'd think that using the pref redirection would enable partner extensions to customize these settings. Benjamin, Dan?
+More things customizable via prefs is good for distribution customizations, yes.  That means we can stuff customizations into the distribution.ini instead of having to ship an extension bundle.  Big difference!
+Created attachment 279686
+patch, v1
+
+An in-progress patch for a sanity check from myk...
+Comment on attachment 279686
+patch, v1
+
+>Index: browser/app/profile/firefox.js
+
+>+pref("gecko.handlerService.version", "chrome://browser-region/locale/region.properties");
+>+pref("gecko.handlerService.schemes.webcal.0.name", "chrome://browser-region/locale/region.properties");
+>+pref("gecko.handlerService.schemes.webcal.0.uriTemplate", "chrome://browser-region/locale/region.properties");
+
+Wow, funky.
+
+
+>Index: browser/locales/en-US/chrome/browser-region/region.properties
+
+>+# the default set of web-based protocol handlers shown in the application
+>+# selection dialog
+>+gecko.handlerService.schemes.webcal.0.name=WebCal Test Handler 
+>+gecko.handlerService.schemes.webcal.0.uriTemplate=http://handler-test.mozilla.org/webcal?url=%s
+
+I guess the other thing you could do is make these JSON objects, which would simplify the extraction code but might make the prefs a bit harder to read.  Hmm, I guess I'd err on the side of making the extraction code harder to read and the properties easier, so this seems good as is.
+
+
+>+# at startup, if the handler service notices that the version number here
+>+# is newer than the version number in the handler service datastore, it will
+>+# add any handlers it finds in the prefs (as seeded by this file) to its
+>+# datastore
+>+gecko.handlerService.version=0
+
+Note: we'll want to version the datastore schema when we switch to SQLite, and components like the handler service have version numbers in their contract IDs, so I think it would make sense to call this something more specific, like defaultHandlersVersion.
+
+
+>Index: uriloader/exthandler/nsHandlerService.js
+
+>   _init: function HS__init() {
+>     // Observe profile-before-change so we can switch to the datasource
+>     // in the new profile when the user changes profiles.
+>     this._observerSvc.addObserver(this, "profile-before-change", false);
+> 
+>     // Observe xpcom-shutdown so we can remove these observers
+>     // when the application shuts down.
+>     this._observerSvc.addObserver(this, "xpcom-shutdown", false);
+>+    
+>+    this._upgradeDS();
+
+For transparency, I think it'd make sense to do something like this here (but with shorter names, if we can think of some):
+
+if (this._datastoreDefaultHandlersVersion < this._applicationDefaultHandlersVersion)
+  this._updateDefaultHandlers();
+
+Where _datastoreDefaultHandlersVersion and _applicationDefaultHandlersVersion are getters that retrieve the current version from the datastore and application, respectively.  That way it's clear that at this point we're only going to upgrade the default handlers if they're out-of-date.  The other thing we could do is call the method _maybeUpdateDefaultHandlers, but I think checking here is a bit clearer.
+
+
+>+  _upgradeDS: function HS__upgradeDS() {
+>+
+>+    // XXX should datastore include locale token?
+
+Good question!  If I switch to a different locale, it'd make sense to get its new handlers, and comparing versions wouldn't make sense.  Perhaps we could record locale and reset the version string when starting up with a new one?
+
+
+>+    // get handler service pref branch
+>+    var prefSvc = Cc["@mozilla.org/preferences-service;1"]
+>+                    .getService(Ci.nsIPrefService);
+>+    var handlerSvcBranch = prefSvc.getBranch("gecko.handlerService");
+>+  
+>+    // get the version of the preferences for this locale
+>+    var handlerSvcPrefsVersion = 
+>+      Number(handlerSvcBranch.getComplexValue(".version",
+>+                                              Ci.nsIPrefLocalizedString).data);
+
+Wow, you sure do have to jump through a lot of hoops to use the preference service!  Are version strings really complex values?  They look like simple numbers to me.  Or maybe that's the result of the funky redirection to region.properties?
+
+
+>+    // YYY datastore version
+>+    var datastoreVersion = -1;
+
+Right, so, we could store the version as an assertion like "urn:root" NC:defaultHandlersVersion -1.  It doesn't really matter what URI we use as the "source" of the assertion as long as we agree on the semantics of that URN.  We could also use something like "urn:datastore".
+
+
+>+    // if the datastore version is older than the preferences version,
+>+    // we should inject any new handlers and bump the datastore version 
+>+    if (datastoreVersion < handlerSvcPrefsVersion) {
+
+This code all seems reasonable.
+
+
+>+          let handlerApp = Cc["@mozilla.org/uriloader/web-handler-app;1"].
+>+                           createInstance(Ci.nsIWebHandlerApp);
+
+Might we ever ship with entries for local apps that are likely to be around (f.e. iCal.app on Mac OS X) but that the OS for some reason doesn't tell us about?
+
+
+>+   // YYY dataStoreversion++           
+
+Note: the datastore might be several versions out of date, so don't just ++!
+> >+    // YYY datastore version
+> >+    var datastoreVersion = -1;
+> 
+> Right, so, we could store the version as an assertion like "urn:root"
+> NC:defaultHandlersVersion -1.  It doesn't really matter what URI we use as 
+> the "source" of the assertion as long as we agree on the semantics of that 
+> URN.  We could also use something like "urn:datastore".
+
+Another option would be to store it in a preference.  That has the disadvantage of being somewhat decoupled from the datastore (the user might lose prefs.js or copy mimeTypes.rdf from one profile to another), but those occasions would be pretty rare, and doing so means we wouldn't have to change how we do it when we switch to SQLite (where it might be harder to put the version in the database anyway).
+
+(In reply to comment #6)
+> 
+> I guess the other thing you could do is make these JSON objects, which would
+> simplify the extraction code but might make the prefs a bit harder to read. 
+> Hmm, I guess I'd err on the side of making the extraction code harder to read
+> and the properties easier, so this seems good as is.
+
+Yeah, part of the goal is to make things easy on localizers.  What we really want is for nsIPrefBranch2 to have a getAsJSON() method to automatically do what I'm doing for any arbitrary branch of the pref tree.  This would allow us to keep the prefs themselves simple.
+
+> so I think it would make sense to call this something more specific, like
+> defaultHandlersVersion.
+
+Sold.
+
+> [...]
+> 
+> That way it's clear that at this point we're only
+> going to upgrade the default handlers if they're out-of-date.  
+
+Sold, though I did a slight variation in order to keep the init method small.
+
+> >+  _upgradeDS: function HS__upgradeDS() {
+> >+
+> >+    // XXX should datastore include locale token?
+> 
+> Good question!  If I switch to a different locale, it'd make sense to get its
+> new handlers, and comparing versions wouldn't make sense.  Perhaps we could
+> record locale and reset the version string when starting up with a new one?
+
+I'll buy that.
+
+> Wow, you sure do have to jump through a lot of hoops to use the preference
+> service!  Are version strings really complex values?  They look like simple
+> numbers to me.  Or maybe that's the result of the funky redirection to
+> region.properties?
+
+GetComplexValue is necessary for the localized pref redirection.
+
+> >+          let handlerApp = Cc["@mozilla.org/uriloader/web-handler-app;1"].
+> >+                           createInstance(Ci.nsIWebHandlerApp);
+> 
+> Might we ever ship with entries for local apps that are likely to be around
+> (f.e. iCal.app on Mac OS X) but that the OS for some reason doesn't tell us
+> about?
+
+Conceivably, though I very much doubt it for Firefox 3, anyway.  That seems like it adds enough complexity that that would be worth dealing with in a future patch.
+
+One more thought: might we ever want to remove handlers?  In general that seems like a bad idea, since we're removing something users might have gotten used to seeing.  But say we discover that some handler is doing something with user data that we think is so wrong that we want to stop offering that provider even to existing users, it might make sense to have a way to remove providers.
+
+But I don't think we actually need to implement that functionality at this stage, just make sure we aren't doing anything that would prevent its later implementation.  At first glance, I don't think we're doing anything problematic.  We could add a branch like gecko.handlerService.removeSchemes.* and then add functionality to remove the schemes contained therein.
+
+I'll need to do more thinking about the right way to do the preferences for l10n, in particular to get a good answer for the "prefix with locale or not". Maybe chat with Mic, too. We just had a bug about something similar with Thunderbird, so I need to really analyze this, which I won't get done today, sadly.
+
+Could we keep the prefs in content for M8, and localize it with more time and thought for M9? Follow-up bug would be fine.
+PS: doing the getComplexValue for nsILocalizedString should just work for a chrome://browser/content/foo.properties url, too. So there should hardly be any code differences if we do this.
+Created attachment 279850
+patch, v2
+(In reply to comment #11)
+> PS: doing the getComplexValue for nsILocalizedString should just work for a
+> chrome://browser/content/foo.properties url, too. So there should hardly be any
+> code differences if we do this.
+> 
+
+It turns out there is some sort of encoding issue mismatch which causes this to fail in the guts of the stringbundle code.  So for now, I just stuck these prefs directly in prefs.js instead of indirecting them.  I continue to use GetComplexValue, but now with nsISupportsString instead of nsIPrefLocalizedString, in order to keep the code flow as similar as possible.
+
+Created attachment 279852
+patch, v3
+(In reply to comment #13)
+> So for now, I just stuck these prefs directly in prefs.js instead of 
+> indirecting them.
+
+firefox.js, I meant.
+
+rs=mconnor in irc for the firefox.js changes.
+Comment on attachment 279852
+patch, v3
+
+>Index: browser/app/profile/firefox.js
+
+>+pref("gecko.handlerService.schemes.webcal.0.uriTemplate", "http://handler-test.mozilla.org/webcal?url=%s");
+
+In case it affects your timeline for getting this server up and running, note that M8 is looking to be another alpha rather than a beta, and that means the release process is likely to take just a few days rather than a couple weeks.
+
+
+>Index: uriloader/exthandler/nsHandlerService.js
+
+>+// the most recent default handlers that have ben injected
+>+const NC_DEFAULT_HANDLERS_VERSION = NC_NS + "defaultHandlersVersion";
+
+Nit: ben -> been
+
+>     // Observe xpcom-shutdown so we can remove these observers
+>     // when the application shuts down.
+>     this._observerSvc.addObserver(this, "xpcom-shutdown", false);
+>+
+>+    // Observe xpcom-shutdown so we can remove these observers
+>+    // when the application shuts down.
+>+    this._observerSvc.addObserver(this, "profile-do-change", false);
+
+Nit: "Observice xpcom-shutdown" -> "Observe profile-do-change"
+
+
+>+    if (this._datastoreDefaultHandlersVersion < 
+>+        this._prefsDefaultHandlersVersion) {
+>+      try { 
+>+        this._injectNewDefaults();
+>+        this._datastoreDefaultHandlersVersion = 
+>+          this._prefsDefaultHandlersVersion;
+>+      } catch (ex) {
+>+        // if injecting the defaults failed, life goes on...
+>+      }
+
+This is a well-placed try/catch block; we don't want any unexpected error to hork things at this stage.
+
+
+>+  _inHandlerArray: function HS__inHandlerArray(aArray, aHandler) {
+
+Nit: I wonder if this would be easier to grok on first sight if it were named _isInHandlerArray.
+
+
+>+  get _prefsDefaultHandlersVersion() {
+>+    // get handler service pref branch
+>+    var prefSvc = Cc["@mozilla.org/preferences-service;1"]
+>+                    .getService(Ci.nsIPrefService);
+>+    var handlerSvcBranch = prefSvc.getBranch("gecko.handlerService");
+
+Nit: for consistency, format the service retrieval code like this:
+
+    var prefSvc = Cc["@mozilla.org/preferences-service;1"].
+                  getService(Ci.nsIPrefService);
+
+Also, it looks like you grab the pref service a couple times, so it might make sense to memoize it in the Convenience Getters section.
+
+
+>+      let [scheme, handlerNumber, attribute] = schemePrefName.split(".");
+>+
+>+      if (!(scheme in schemes))
+>+        schemes[scheme] = {};
+>+      if (!(handlerNumber in schemes[scheme]))
+>+        schemes[scheme][handlerNumber] = {};
+
+It's a bit wonky that the schemes are numbered in preferences with array-like indices that are then used here as hash keys.  It's not a big deal, and maybe this is the right way to do it; it just threw me for a loop for a moment.
+
+
+>+    return;
+>+  },
+
+Is there a reason to explicitly return here?
+
+Otherwise looks great, r=myk.  Fix the nits at your discretion before checkin.
+(In reply to comment #17)
+> (From update of attachment 279852 [details])
+>
+> In case it affects your timeline for getting this server up and running, note
+> that M8 is looking to be another alpha rather than a beta, and that means the
+> release process is likely to take just a few days rather than a couple weeks.
+
+Yeah, I think it's actually OK for this server to come online after the release.  We'll still get testing starting sooner rather than later, which is what the goal here is.
+ 
+> This is a well-placed try/catch block; we don't want any unexpected error to
+> hork things at this stage.
+
+Right; that code also ensures that everything goes smoothly even in embedding apps that don't provide any prefs to inject.
+  
+> Also, it looks like you grab the pref service a couple times, so it might make
+> sense to memoize it in the Convenience Getters section.
+
+Since there are only two callers, and this is only going to happen at times where the cycles are dwarfed by IO waits, this doesn't seem worth the effort.
+
+> >+      let [scheme, handlerNumber, attribute] = schemePrefName.split(".");
+> >+
+> >+      if (!(scheme in schemes))
+> >+        schemes[scheme] = {};
+> >+      if (!(handlerNumber in schemes[scheme]))
+> >+        schemes[scheme][handlerNumber] = {};
+> 
+> It's a bit wonky that the schemes are numbered in preferences with array-like
+> indices that are then used here as hash keys.  It's not a big deal, and maybe
+> this is the right way to do it; it just threw me for a loop for a moment.
+
+It's entirely arbitrary, really.  They need to be differentiated in preferences somehow, so I picked numbers because that's how the feed handlers stuff did it.  Then I mapped the prefs almost directly to JS objects.  I guess I'm too close to this code to see: what's confusing about it?
+
+> >+    return;
+> >+  },
+> 
+> Is there a reason to explicitly return here?
+
+I tend to like being explicit about returns, because it makes it clear that I finished writing the function and intended it to return (as opposed to getting distracted while coding and forgetting to finish it).  But it goes against prevailing style here, so I'll remove.
+Created attachment 279872
+patch, v4; review comments addressed
+Created attachment 279874
+patch, v5
+
+Inadvertantly omitted a . when changing formatting.  Fixed.
+> Since there are only two callers, and this is only going to happen at times
+> where the cycles are dwarfed by IO waits, this doesn't seem worth the effort.
+
+It's not just that.  It also makes the calling code simpler.  But it's not a big deal; this way is fine as well.
+
+
+> It's entirely arbitrary, really.  They need to be differentiated in 
+> preferences somehow, so I picked numbers because that's how the feed handlers
+> stuff did it.
+> Then I mapped the prefs almost directly to JS objects.  I guess I'm too close
+> to this code to see: what's confusing about it?
+
+I guess I just expected to see you looping across an array! :-)
+
+Comment on attachment 279874
+patch, v5
+
++// Eventually it will get merged into region.properties.
+
+perhaps you should file a bug about that and mention the number in this comment
+
+
++    var version = handlerSvcBranch.getComplexValue(".defaultHandlersVersion",
+
+Hm, I'd put the dot in the getBranch call (like you do in _injectNewDefaults)
+
++  // Bug 395131 has been filed to make this test work properly in 
++  // non-firefox trees. 
+
+This is going to break SeaMonkey tinderboxes. don't do that.
+Created attachment 279983
+patch, v6 for landing
+
+Nits addressed.  I tweaked the test case to not expect to see a webcal handler unless it can find one of the relevant preferences, so it should do the right thing in all embeddings for now.  Leaving that other bug open to truly do the right thing with a custom prefs file to make it less fragile.
+Checking in browser/app/profile/firefox.js;
+/cvsroot/mozilla/browser/app/profile/firefox.js,v  <--  firefox.js
+new revision: 1.202; previous revision: 1.201
+done
+Checking in uriloader/exthandler/nsHandlerService.js;
+/cvsroot/mozilla/uriloader/exthandler/nsHandlerService.js,v  <--  nsHandlerService.js
+new revision: 1.12; previous revision: 1.11
+done
+Checking in uriloader/exthandler/tests/unit/test_handlerService.js;
+/cvsroot/mozilla/uriloader/exthandler/tests/unit/test_handlerService.js,v  <--  test_handlerService.js
+new revision: 1.13; previous revision: 1.12
+done
+
+
+web-based protocol handler defaulting in mimeTypes.rdf
+
+
+
+Inject default web-based protocol handlers into mimeTypes.rdf (bug 392978), r=myk, sr=biesi, a=mconnor 

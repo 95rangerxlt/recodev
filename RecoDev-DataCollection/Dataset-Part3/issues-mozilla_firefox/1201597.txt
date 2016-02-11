@@ -1,0 +1,315 @@
+Right now, ThreadSafeChromeUtil::saveHeapSnapshot opens the file at the given path and writes to disk. This is not possible in sandboxed child processes which do not have direct access to the file system.
+
+~~~~~~~~~~
+
+Here is a quick review of why we chose writing directly to disk when saving heap snapshots:
+
+When saving a heap snapshot we need to capture and serialize the exact heap graph that exists at that moment. This means we need to be very careful not to touch any JS or cycle collected things, and we most definitely cannot pump the event loop. Additionally, we need to support taking heap snapshots on memory constrained devices (which one is probably more likely to be interested in debugging memory consumption on) and this means we cannot serialize the data into some blob in memory because these serialized heap snapshots are huge.
+
+~~~~~~~~~~
+
+There are a few instances of the parent opening a file and transferring ownership of the file descriptor to the child which can then write to it. This is all using IPDL. So I think we need to do this as well for heap snapshots. This is going to involve changing the saveHeapSnapshot webidl interface as well (which assumes that the process can open files).
+
+Here is a diagram of what I think the brave new world will look like:
+
++------------------------------------------------------------+    
+|                                                            |    
+|                Client (Firefox Desktop)   ^            ^   |    
+|                                           |            |   |    
++---+------------------------------------------+-------------+    
+    |                                       |  |         |        
+    |take                                   |  |gimme    |here's  
+    |heap                                   |  |snapshot |snapshot
+    |snapshot                               |  |file     |file    
++------------------------------------------------------------+    
+|   |                                       |  |         |   |    
+|   |           Remote-debugged Device      |  |         |   |    
+|   |                                       |  |         |   |    
+| +------------------------------------------------------+-+ |    
+| | |                                       |  |           | |    
+| | |                Root Actor             |  v           | |    
+| | |     ^          (parent process)       |              | |    
+| | |     |                                 |              | |    
+| +--------------------------------------+-----------------+ |    
+|   |     |                              |  |                |    
+|   |     |            here's a file desc|  |                |    
+|   |     |                  (IPDL)      |  |                |    
+|   |     |                              |  |                |    
+|   |     |open temp file                |  |id              |    
+|   |     |   (IPDL)                     |  |                |    
+|   |     |                              |  |                |    
+|   |     |                              |  |                |    
+| +-------+---------------------------------+--------------+ |    
+| | |                                    |                 | |    
+| | v               Heap Snapshot Actor  v                 | |    
+| |                 (child process)                        | |    
+| |                                                        | |    
+| +--------------------------------------------------------+ |    
+|                                                            |    
++------------------------------------------------------------+    
+
+When not specified, the protocol used is the devtools' remote debugging protocol.
+
+The biggest open question I have is how to ensure we only open files in the parent and pass the file descriptor to the child process when we expect to be saving heap snapshot files. This way a rogue/compromised child process couldn't open a ton of files and write arbitrary amounts of data to them and exhaust file descriptors and/or disk space. For example, when the user clicks the "take a heap snapshot" button in the devtools UI, we might send a "unlock open temp file abilities for the child process" request along with the "take heap snapshot" request and then once we got the snapshot id response, we would lock the ability down again. If possible, it would be nice to be able to do this without an extra protocol request of some sort, but it doesn't seem to fit into the way the devtools RDP works right now.
+
+The scope of this bug is implementing the IPDL protocol support for giving the child process file descriptors for writing heap snapshots and the webidl changes that will need to happen to accommodate that. Integrating with the rest of the devtools RDP will be a follow up (and is mostly implemented / implemented for non-sandboxed child processes in bug 1200446).
+
+Right now, ThreadSafeChromeUtil::saveHeapSnapshot opens the file at the given path and writes to disk. This is not possible in sandboxed child processes which do not have direct access to the file system.
+
+~~~~~~~~~~
+
+Here is a quick review of why we chose writing directly to disk when saving heap snapshots:
+
+When saving a heap snapshot we need to capture and serialize the exact heap graph that exists at that moment. This means we need to be very careful not to touch any JS or cycle collected things, and we most definitely cannot pump the event loop. Additionally, we need to support taking heap snapshots on memory constrained devices (which one is probably more likely to be interested in debugging memory consumption on) and this means we cannot serialize the data into some blob in memory because these serialized heap snapshots are huge.
+
+~~~~~~~~~~
+
+There are a few instances of the parent opening a file and transferring ownership of the file descriptor to the child which can then write to it. This is all using IPDL. So I think we need to do this as well for heap snapshots. This is going to involve changing the saveHeapSnapshot webidl interface as well (which assumes that the process can open files).
+
+Here is a diagram of what I think the brave new world will look like:
+
++------------------------------------------------------------+    
+|                                                            |    
+|                Client (Firefox Desktop)   ^            ^   |    
+|                                           |            |   |    
++---+------------------------------------------+-------------+    
+    |                                       |  |         |        
+    |take                                   |  |gimme    |here's  
+    |heap                                   |  |snapshot |snapshot
+    |snapshot                               |  |file     |file    
++------------------------------------------------------------+    
+|   |                                       |  |         |   |    
+|   |           Remote-debugged Device      |  |         |   |    
+|   |                                       |  |         |   |    
+| +------------------------------------------------------+-+ |    
+| | |                                       |  |           | |    
+| | |                Root Actor             |  v           | |    
+| | |     ^          (parent process)       |              | |    
+| | |     |                                 |              | |    
+| +--------------------------------------+-----------------+ |    
+|   |     |                              |  |                |    
+|   |     |            here's a file desc|  |                |    
+|   |     |                  (IPDL)      |  |                |    
+|   |     |                              |  |                |    
+|   |     |open temp file                |  |id              |    
+|   |     |   (IPDL)                     |  |                |    
+|   |     |                              |  |                |    
+|   |     |                              |  |                |    
+| +-------+---------------------------------+--------------+ |    
+| | |                                    |                 | |    
+| | v               Heap Snapshot Actor  v                 | |    
+| |                 (child process)                        | |    
+| |                                                        | |    
+| +--------------------------------------------------------+ |    
+|                                                            |    
++------------------------------------------------------------+    
+
+When not specified, the protocol used is the devtools' remote debugging protocol.
+
+The biggest open question I have is how to ensure we only open files in the parent and pass the file descriptor to the child process when we expect to be saving heap snapshot files. This way a rogue/compromised child process couldn't open a ton of files and write arbitrary amounts of data to them and exhaust file descriptors and/or disk space. For example, when the user clicks the "take a heap snapshot" button in the devtools UI, we might send a "unlock open temp file abilities for the child process" request along with the "take heap snapshot" request and then once we got the snapshot id response, we would lock the ability down again. If possible, it would be nice to be able to do this without an extra protocol request of some sort, but it doesn't seem to fit into the way the devtools RDP works right now.
+
+The scope of this bug is implementing the IPDL protocol support for giving the child process file descriptors for writing heap snapshots and the webidl changes that will need to happen to accommodate that. Integrating with the rest of the devtools RDP will be a follow up (and is mostly implemented / implemented for non-sandboxed child processes in bug 1200446).
+I'm not sure I understand the question ... you should send the fd to the child when you want it to write.  Is the decision to take the heap snapshot made in the parent or the child?
+There isn't a specific question, more of a call for feedback before implementation and trying to avoid doing a bunch of work that gets thrown away. I suppose the question is "does this sound right?"
+
+In chronological order, things go like this:
+
+* User hits "save heap snapshot" button in the devtools UI on Firefox Desktop
+
+* Devtools RDP client sends "take heap snapshot" request to the heap snapshot actor in the child process. The child process is where the heap graph we care about is. All RDP packets sent to child processes are proxied through the parent process by the devtools RDP server.
+
+* The child process requests an fd from the parent process so that it can write the serialized heap graph somewehere.
+
+* The parent process opens a temp file and hands the fd and id/leaf name back to the child process.
+
+* The child process walks the heap graph while serializing and writing to the fd as it goes.
+
+* When the child is done serializing the heap graph, it responds to the devtools RDP request with the id/leaf name of the snapshot file.
+
+* If the devtools client is on the same device (eg e10s, not remote debugging fxos) the client calls ThreadSafeChromeUtils.readHeapSnapshot with $TEMP_DIR/$SNAPSHOT_ID.fxsnapshot (this is avoids an unnecessary copy) and can proceed to run offline analyses on the heap snapshot.
+
+* Otherwise (remote debugging fxos case) the client requests the serialized heap snapshot be sent over the RDP, and then the devtools RDP server responds by streaming the file over and the client can proceed to run offline analyses on the heap snapshot.
+So the “take heap snapshot” request passes through the parent process on its way to the child, but the file can't be opened at that point and passed to the child along with the request?  Is this because the code doing this is in JS and the MessageManager doesn't support that (yet), or are there devtools architectural issues involved as well?
+
+What's proposed here looks like it would work, but it would be nice if we could make it simpler, or if not then at least make sure we understand why it can't.
+The set of Debugger object and its set of debuggees is used to prune the heap graph so we can serialize only the subgraph that is related to the documents being debugged. This is necessarily on the same process as the content.
+
+The requests passes through the parent process on the way to the child via the devtools' Remote Debugging Protocol, which uses a message manager when proxying packets to child processes. As far as the client is concerned, it doesn't even need to know that there are different processes on the server.
+Created attachment 8658497
+Part 0: Make saveHeapSnapshot return the file path rather than take it as a parameter
+
+This changeset modifies the ThreadSafeChromeUtils::saveHeapSnapshot webidl
+method to return the path to the core dump file where the heap snapshot was
+serialized rather than taking the file path as a parameter.
+
+By removing the ability for callers to choose a path, we pave the way for
+enabling taking heap snapshots in sandboxed child processes (e10s, fxos) that do
+not have access to the filesystem directly and must be handed a file descriptor
+over IPDL. Additionally, the devtools API consumers were not taking advantage of
+the ability to choose a file path, and always saving heap snapshots into the
+temp directory anyways.
+Comment on attachment 8658497
+Part 0: Make saveHeapSnapshot return the file path rather than take it as a parameter
+
+Didn't realize bholley is on PTO.
+fyi I'm out the rest of the week.
+Comment on attachment 8658497
+Part 0: Make saveHeapSnapshot return the file path rather than take it as a parameter
+
+Blake has kindly offered his services :)
+I have an open file descriptor on the child process that was handed to me over IPDL, how can I get an nsIOutputStream that writes to said file descriptor? Do I need to implement my own concrete nsIOutputStream implementation?
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #9)
+> I have an open file descriptor on the child process that was handed to me
+> over IPDL, how can I get an nsIOutputStream that writes to said file
+> descriptor? Do I need to implement my own concrete nsIOutputStream
+> implementation?
+
+AFAICT, I do need to implement my own concrete nsIOutputStream.
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #10)
+> AFAICT, I do need to implement my own concrete nsIOutputStream.
+
+IIRC, I almost had to deal with this at some point, and it looked like nsFileStreamBase already had most of what would be needed to implement that, and it'd just need a subclass that takes the already-opened FD instead of trying to open the file itself.
+Try push for part 0: https://treeherder.mozilla.org/#/jobs?repo=try&revision=853d87bd67f5
+https://hg.mozilla.org/integration/fx-team/rev/94138758d2c6
+https://hg.mozilla.org/mozilla-central/rev/94138758d2c6
+Created attachment 8662134
+Part 1: Implement an nsIOutputStream for ipc::FileDescriptor
+Created attachment 8662135
+Part 2: Add an IPDL subprotocol for opening core dump files to save heap snapsots into
+Comment on attachment 8662134
+Part 1: Implement an nsIOutputStream for ipc::FileDescriptor
+
+I found it easier to just whip up a quick nsIOutputStream for my own purposes here, than to do what comment 11 suggests, but if you prefer that approach I can re-work things.
+Comment on attachment 8662135
+Part 2: Add an IPDL subprotocol for opening core dump files to save heap snapsots into
+
+I think this probably needs some work; I'm pretty unsure of how ownership of PProtocolChild*s that I get from AllocPProtocolChild() calls is supposed to work. See TODO FITZGEN comment in the patch.
+
+It does, however, seem to work and the xpcshell test that runs in the child process passes.
+Comment on attachment 8662134
+Part 1: Implement an nsIOutputStream for ipc::FileDescriptor
+
+Review of attachment 8662134:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/heapsnapshot/FileDescriptorOutputStream.cpp
+@@ +1,1 @@
+> +/* -*-  Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2; -*- */
+
+Nit: c-basic-offset is declared to be 2 here, but this file uses 4. The .h file uses 2, which is more common in our C++ code.
+
+::: toolkit/devtools/heapsnapshot/FileDescriptorOutputStream.h
+@@ +16,5 @@
+> +namespace devtools {
+> +
+> +class FileDescriptorOutputStream final : public nsIOutputStream
+> +{
+> +  PRFileDesc* fd;
+
+Please explicitly declare the private section and name this |mFd|.
+Comment on attachment 8662135
+Part 2: Add an IPDL subprotocol for opening core dump files to save heap snapsots into
+
+Review of attachment 8662135:
+-----------------------------------------------------------------
+
+r- for the Send__delete__ stuff as well as answering my question about sync vs. async.
+
+::: toolkit/devtools/heapsnapshot/HeapSnapshot.cpp
+@@ +861,5 @@
+> +
+> +  void operator()(PHeapSnapshotTempFileHelperChild* ptr) const {
+> +    // TODO FITZGEN: uncommmenting these lines causes segfaults, but not having
+> +    // them implies a leak to me? How do we clean up the
+> +    // PHeapSnapshotTempFileHelperChild* when done with it?
+
+You should be calling Send__delete__() on the PHeapSnapshotTempFileHelperChild. Otherwise, the IPC layer has a reference to it and will try cleaning it up later.
+
+@@ +895,5 @@
+> +
+> +    nsCOMPtr<nsIOutputStream> outputStream;
+> +    rv = NS_NewLocalFileOutputStream(getter_AddRefs(outputStream), file,
+> +                                     PR_WRONLY,
+> +                                     -1, 0);
+
+Nit: no need to put this on 3 lines.
+
+::: toolkit/devtools/heapsnapshot/HeapSnapshotTempFileHelperParent.cpp
+@@ +41,5 @@
+> +    rv = file->OpenNSPRFileDesc(PR_WRONLY, 0, &prfd);
+> +    if (NS_WARN_IF(rv.Failed()))
+> +        return openFileFailure(rv, outResponse);
+> +
+> +
+
+Uber-nit: Extra newline here.
+
+::: toolkit/devtools/heapsnapshot/PHeapSnapshotTempFileHelper.ipdl
+@@ +25,5 @@
+> +{
+> +    manager PContent;
+> +
+> +parent:
+> +    sync OpenHeapSnapshotTempFile() returns (OpenHeapSnapshotTempFileResponse response);
+
+The way the code is currently structured, this has to be synchronous. I was wondering how hard it would be to make this async. I guess it doesn't matter too much because the heap snapshot is already a slow operation, so the user will have to wait even if the parent process is busy.
+Comment on attachment 8662135
+Part 2: Add an IPDL subprotocol for opening core dump files to save heap snapsots into
+
+Review of attachment 8662135:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/heapsnapshot/HeapSnapshot.cpp
+@@ +849,5 @@
+> +// otherwise.
+> +static bool
+> +isParentProcess()
+> +{
+> +  return XRE_GetProcessType() == GeckoProcessType_Default;
+
+FYI, XRE_IsParentProcess already exists.
+(In reply to Jed Davis [:jld] from comment #21)
+> FYI, XRE_IsParentProcess already exists.
+
+Thanks!
+(In reply to Blake Kaplan (:mrbkap) (please use needinfo!) from comment #20)
+> The way the code is currently structured, this has to be synchronous. I was
+> wondering how hard it would be to make this async. I guess it doesn't matter
+> too much because the heap snapshot is already a slow operation, so the user
+> will have to wait even if the parent process is busy.
+
+Heap snapshots of all of the complete firefox runtime's heap graph with one tab open currently takes ~2700 ms on my machine. I have a patch that is still under review that lowers this to ~2400 ms, but its the same ballpark.
+
+If getting the fd was async, then (if I understand correctly) we would need the webidl method to also be async because we can't duplicate the heap graph in memory. That isn't so bad for the button click -> devtools RDP -> saveHeapSnapshot() workflow, but we also plan to add hooks like "automatically take a heap snapshot when size(allocated memory) > N" or "automatically take a heap snapshot right before/after the next GC" etc. For these workflows, we really need to serialize the current heap graph right at this instant, and not whatever heap graph we have after pumping the event loop while waiting for our async fd to arrive.
+
+Because the order of magnitude for time taken saving a heap snapshot is already in the seconds and our future workflows that rely on capturing the immediate heap snapshot, I don't think it is worth refactoring to make this IPDL request async.
+Created attachment 8663964
+Part 2: Add an IPDL subprotocol for opening core dump files to save heap snapsots into
+This new version of the patch also has a mochitest that uses the message manager to communicate with the child process and assert we can take a heap snapshot in the child process. Just having the child process xpcshell test wasn't letting me sleep at night :) Also, thanks for the example test cases you showed me, :mrbkap.
+
+Try push for parts 1 and 2: https://treeherder.mozilla.org/#/jobs?repo=try&revision=afbcc963f955
+Try push is green.
+Comment on attachment 8663964
+Part 2: Add an IPDL subprotocol for opening core dump files to save heap snapsots into
+
+Review of attachment 8663964:
+-----------------------------------------------------------------
+
+Looks good.
+Checkin needed for parts 1 and 2.
+(Actually, I will land myself.)
+https://hg.mozilla.org/integration/mozilla-inbound/rev/b820ac047035
+https://hg.mozilla.org/integration/mozilla-inbound/rev/e39c3474267e
+https://hg.mozilla.org/mozilla-central/rev/b820ac047035
+https://hg.mozilla.org/mozilla-central/rev/e39c3474267e
+Thunderbird is getting a compile error with this checked in:
+
+ c:\builds\moz2_slave\tb-c-cen-w32-d-000000000000000\build\mozilla\dom\ipc\PContent.ipdl:24: error: can't locate include file `PHeapSnapshotTempFileHelper.ipdl'
+
+Any idea why that might be?
+Do we not build devtools for Thunderbird?
+(In reply to Blake Kaplan (:mrbkap) (please use needinfo!) from comment #33)
+> Do we not build devtools for Thunderbird?
+
+Hmmm, looking at my object directory I used to have a devtools directory (as of about two weeks ago) and now no longer. So something stopped that from building?
+OK it was probably bug 912121 and not this one that result in the missing devtools.

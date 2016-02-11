@@ -1,0 +1,158 @@
+User-Agent:       Mozilla/5.0 (Windows; U; Windows NT 5.0; en-US; rv:1.8.1.1) Gecko/20061204 Firefox/2.0.0.1
+Build Identifier: Mozilla/5.0 (Windows; U; Windows NT 5.0; en-US; rv:1.8.1.1) Gecko/20061204 Firefox/2.0.0.1
+
+After installing a plugin using xpinstall, and triggering the install with InstallTrigger.install(xpi,installCompleteFunction), the browser crashes on exit in JS3250.dll if the Add-ons window (which pops up during plugin install) is closed after the last page.
+
+I built a debug build of Firefox 1.5.0.9 from sources and the crash happens in 
+JS3250.ddl: 
+
+nsXPITriggerInfo::~nsXPITriggerInfo()
+{
+    nsXPITriggerItem* item;
+
+    for(PRUint32 i=0; i < Size(); i++)
+    {
+        item = Get(i);
+        if (item)
+            delete item;
+    }
+    mItems.Clear();
+
+    if ( mCx && !JSVAL_IS_NULL(mCbval) ) {
+        JS_BeginRequest(mCx);
+>>>>    JS_RemoveRoot( mCx, &mCbval );
+        JS_EndRequest(mCx);
+    }
+
+    MOZ_COUNT_DTOR(nsXPITriggerInfo);
+}
+
+After some debugging, I verified that during the install, the nsXPITriggerInfo receives the pointer to the callback function installCompleteFunction in the SaveCallback() method, which saves it to the mCbval variable. 
+
+When install is completed, the callback is called and then the method 
+
+static void  destroyTriggerEvent(XPITriggerEvent* event)
+{
+    JS_BeginRequest(event->cx);
+    JS_RemoveRoot( event->cx, &event->cbval );
+    JS_EndRequest(event->cx);
+    delete event;
+}
+
+is correcly executed. 
+
+Then, when the last page has been closed and the add-on window has been closed, the destructor is called and crashes.
+
+
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. Open a web page that launches a plugin install with InstallTrigger.install(xpi,installCompleteFunction)
+1b. The add-on window pops up and display the installation advace
+2. Open a web page that uses the plugin 
+3. Open another page / tab
+4. Close all pages
+5. Close the Add-on window
+Actual Results:  
+Crash 
+
+Expected Results:  
+Smooth exit
+
+It was unable to reproduce the crash with Talkback installed.
+
+User-Agent:       Mozilla/5.0 (Windows; U; Windows NT 5.0; en-US; rv:1.8.1.1) Gecko/20061204 Firefox/2.0.0.1
+Build Identifier: Mozilla/5.0 (Windows; U; Windows NT 5.0; en-US; rv:1.8.1.1) Gecko/20061204 Firefox/2.0.0.1
+
+After installing a plugin using xpinstall, and triggering the install with InstallTrigger.install(xpi,installCompleteFunction), the browser crashes on exit in JS3250.dll if the Add-ons window (which pops up during plugin install) is closed after the last page.
+
+I built a debug build of Firefox 1.5.0.9 from sources and the crash happens in 
+JS3250.ddl: 
+
+nsXPITriggerInfo::~nsXPITriggerInfo()
+{
+    nsXPITriggerItem* item;
+
+    for(PRUint32 i=0; i < Size(); i++)
+    {
+        item = Get(i);
+        if (item)
+            delete item;
+    }
+    mItems.Clear();
+
+    if ( mCx && !JSVAL_IS_NULL(mCbval) ) {
+        JS_BeginRequest(mCx);
+>>>>    JS_RemoveRoot( mCx, &mCbval );
+        JS_EndRequest(mCx);
+    }
+
+    MOZ_COUNT_DTOR(nsXPITriggerInfo);
+}
+
+After some debugging, I verified that during the install, the nsXPITriggerInfo receives the pointer to the callback function installCompleteFunction in the SaveCallback() method, which saves it to the mCbval variable. 
+
+When install is completed, the callback is called and then the method 
+
+static void  destroyTriggerEvent(XPITriggerEvent* event)
+{
+    JS_BeginRequest(event->cx);
+    JS_RemoveRoot( event->cx, &event->cbval );
+    JS_EndRequest(event->cx);
+    delete event;
+}
+
+is correcly executed. 
+
+Then, when the last page has been closed and the add-on window has been closed, the destructor is called and crashes.
+
+
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. Open a web page that launches a plugin install with InstallTrigger.install(xpi,installCompleteFunction)
+1b. The add-on window pops up and display the installation advace
+2. Open a web page that uses the plugin 
+3. Open another page / tab
+4. Close all pages
+5. Close the Add-on window
+Actual Results:  
+Crash 
+
+Expected Results:  
+Smooth exit
+
+It was unable to reproduce the crash with Talkback installed.
+The bug happens in both 1.5.0.9 and 2.0.0.1
+Confirming.  Crash occurs with Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.8.1.2) Gecko/20070219 Firefox/2.0.0.2 as well.
+
+I installed the shockwave plug-in and received this crash on exit.
+
+Talkback incident TB29709734X.
+
+Created attachment 263077
+Make sure triggers are deleted before the context
+
+The crash is because we try to remove the callback function's root after the page context has gone away. Moving the trigger deletion into nsXPInstallManager::Shutdown()--which happens when the install finishes--works around this crash.
+
+But why is the nsXPInstallManager living until the ExtensionManager dialog goes away? It should have shut down when the page shut down, or caused the context to stick around until it did.
+
+While debugging this the JS_BeginRequest() calls for the event are happening on the wrong thread and triggering a JS_ASSERT. The threading in XPInstall has always worked like that so the asserts must have been added later (but I doubt people test much with install callback functions).
+
+The upshot is we may need additional fixes here, but this helps.
+No reviews or baking, guess this misses this release.
+Dan, did you want to consider changing this code to rely on the JSContext in question being an nsIScriptContext and holding a strong reference to that while you need the context rather than this workaround? I'm happy to review this if you're still interested in landing the workaround.
+Jst: I'd like to add this patch, please review it. The Extension Manager dialog _will_ hang on to the install manager as long as its open, and I don't need to keep the JS context alive that long. But I do need to clear the triggers when the install is finished, not when the Add-ons dialog is shut.
+Comment on attachment 263077
+Make sure triggers are deleted before the context
+
+approved for 1.8.1.8, a=release-drivers
+Fix checked into the 1.8 branch
+Comment on attachment 263077
+Make sure triggers are deleted before the context
+
+Would be nice to have this safe crash fix on the trunk.
+fix checked into trunk.
+Marking blocking 1.8.0.15+ to investigate further...

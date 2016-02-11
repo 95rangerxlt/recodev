@@ -1,0 +1,239 @@
+The global service and state are going away. This logic will need to become more complicated, as pb-per-window will enable concurrent PB and non-PB windows in existence.
+
+The global service and state are going away. This logic will need to become more complicated, as pb-per-window will enable concurrent PB and non-PB windows in existence.
+Hessam, are you interested in taking this?  Josh promised me to add some details on what needs to happen.
+
+This bug is a bit more work than the previous ones, but there's nothing too hard about it.  :-)
+There are a couple issues that need to be addressed here: http://mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/nsSessionStore.js
+
+1) the various uses of this._inPrivateBrowsing, which stores the current global state.
+2) the various observer notifications related to private browsing, which shouldn't be necessary once you're finished
+
+nsSessionStore is the component that controls storing the current browsing session so that you can easily return to all of your previously open tabs if you restart the browser. With global private browsing mode, we would save the session, enter PB mode and ignore any further session changes until leaving PB mode. Now, we need to move to a system that always notices session changes and checks if the source is in PB mode or not. Feel free to ask any questions; I haven't spent much time looking at this code, but I will do my best to answer them.
+I know this code a bit myself, and if I remember correctly I've written all of the private browsing related code in nsSessionStore, so I should also be able to help.  :-)
+Concretely:
+
+canRestoreLastSession - I think we can just remove the PB check here, since we should always be able to. Unless we only want to allow it when there are no private windows open?
+
+initService - scrap it.
+
+onLoad - we can probably replace this with a check of aWindow.gPrivateBrowsingUI.privateWindow
+
+onPrivateBrowsing, onPrivateBrowsingChangeGranted - I think we can scrap these whole methods
+
+init, onLoad, _getCurrentState, _collectWindowData, _collectTabData, saveStateDelayed - these need to be updated to ignore windows that are private
+
+saveState - just get rid of the check here, since we're trying to fix everywhere that could try to get information about private windows
+
+Fixing these areas will give us a good base to evaluate further work that needs doing.
+(In reply to Josh Matthews [:jdm] (travelling until June 25th) from comment #4)
+> canRestoreLastSession - I think we can just remove the PB check here, since
+> we should always be able to. Unless we only want to allow it when there are
+> no private windows open?
+
+That's fair, but we'll want to fix restore and it's helpers so it doesn't restore into private windows.
+Hessam, what's your status here?
+@Ehsan,Josh Can you refer https://bugzilla.mozilla.org/show_bug.cgi?id=769283#c1. Please can I take this up, if Chris hasn't yet started working on it.
+
+Thanks.
+(In reply to Saurabh Anand [:sawrubh] from comment #7)
+> @Ehsan,Josh Can you refer
+> https://bugzilla.mozilla.org/show_bug.cgi?id=769283#c1. Please can I take
+> this up, if Chris hasn't yet started working on it.
+> 
+> Thanks.
+
+Fine by me as Chris is apparently busy with some other stuff now!
+(In reply to Josh Matthews [:jdm] from comment #4)
+> Concretely:
+> 
+> canRestoreLastSession - I think we can just remove the PB check here, since
+> we should always be able to. Unless we only want to allow it when there are
+> no private windows open?
+
+No, we can just remove the PB check here (behind a #ifndef MOZ_PER_WINDOW_PRIVATE_BROWSING check, of course!)
+
+> initService - scrap it.
+
+Right (again hidden behind that macro).
+
+> onLoad - we can probably replace this with a check of
+> aWindow.gPrivateBrowsingUI.privateWindow
+
+Not quite, see below.
+
+> onPrivateBrowsing, onPrivateBrowsingChangeGranted - I think we can scrap
+> these whole methods
+
+Right (behind the macro etc.)
+
+> init, onLoad, _getCurrentState, _collectWindowData, _collectTabData,
+> saveStateDelayed - these need to be updated to ignore windows that are
+> private
+
+Correct.
+
+> saveState - just get rid of the check here, since we're trying to fix
+> everywhere that could try to get information about private windows
+
+Right.
+
+> Fixing these areas will give us a good base to evaluate further work that
+> needs doing.
+
+Indeed.  Here's the user experience we ultimately want to support.  The sessionstore service needs to know about the private windows, so that it can support things like reopening closed tabs, and also reopening closed windows if they're in private browsing mode (of course by making sure that the reopened windows are still in private browsing mode.)  What we want to avoid is saving the state of such windows.  In order to accomplish this, we need to store the window's privacy information in the window data that we collect, and ignore the private windows in saveState, i.e., never persisting information about those windows and the tabs inside them to disk.  This should be fairly easy given the fact that once we detect that a window is private, we should never have to worry about it again, since we will not support windows coming out of private browsing mode.
+Created attachment 679754
+Patch v1
+
+This patch includes the suggested changes. However, local tests are failing. 
+
+I added a |isPrivate| flag on the window data object when is created in the |onLoad| method. I think we need it for Bug 722977 Comment 12.
+Comment on attachment 679754
+Patch v1
+
+Review of attachment 679754:
+-----------------------------------------------------------------
+
+Here you avoid saving the state of tabs and windows in private browsing windows.  That will break things like re-opening closed tabs,/windows since we won't have any data for them.  I think we should just store information about the privacy state of windows, and when we want to persist the data to disk, skip over those windows, and otherwise treat them similar to regular windows.  That will enable us to implement the user experience I described in the last paragraph of comment 9.
+Created attachment 679892
+Patch v2
+
+I updated the patch to remove all about |_inPrivateBrowsing| on PB per window mode. 
+
+Also, in |saveState| it clears the tabs data of private windows before writing to disk. And handles when to open a private window again in |_openWindowWithState|. 
+
+However, there is an issue when trying to restore the session. If the selected window to be restored is private, then is not opened with |_openWindowWithState|, since this is the first window opened when browser starts (never private). And this the window used in |initService| to set the initial state, but here we can't 'toggle' this window to be private. Any suggestion on how to handle this?
+(In reply to Andres Hernandez [:andreshm] from comment #12)
+> Created attachment 679892
+> Patch v2
+> 
+> I updated the patch to remove all about |_inPrivateBrowsing| on PB per
+> window mode. 
+> 
+> Also, in |saveState| it clears the tabs data of private windows before
+> writing to disk. And handles when to open a private window again in
+> |_openWindowWithState|. 
+
+Hmm, I think you should just remove those windows from the array completely.
+
+> However, there is an issue when trying to restore the session. If the
+> selected window to be restored is private, then is not opened with
+> |_openWindowWithState|, since this is the first window opened when browser
+> starts (never private). And this the window used in |initService| to set the
+> initial state, but here we can't 'toggle' this window to be private. Any
+> suggestion on how to handle this?
+
+I'm not sure I understand.  Why do we need the first opened window to be private?
+(In reply to Ehsan Akhgari [:ehsan] from comment #13)
+> (In reply to Andres Hernandez [:andreshm] from comment #12)
+> > Created attachment 679892
+> > Patch v2
+> > 
+> > I updated the patch to remove all about |_inPrivateBrowsing| on PB per
+> > window mode. 
+> > 
+> > Also, in |saveState| it clears the tabs data of private windows before
+> > writing to disk. And handles when to open a private window again in
+> > |_openWindowWithState|. 
+> 
+> Hmm, I think you should just remove those windows from the array completely.
+> 
+> > However, there is an issue when trying to restore the session. If the
+> > selected window to be restored is private, then is not opened with
+> > |_openWindowWithState|, since this is the first window opened when browser
+> > starts (never private). And this the window used in |initService| to set the
+> > initial state, but here we can't 'toggle' this window to be private. Any
+> > suggestion on how to handle this?
+> 
+> I'm not sure I understand.  Why do we need the first opened window to be
+> private?
+
+If we want to restore the private windows as new private windows we need to do it or we don't want to restore private windows at all? If that is the case then is a lot easier just to remove the windows from the array as you suggested.
+(In reply to comment #14)
+> > > However, there is an issue when trying to restore the session. If the
+> > > selected window to be restored is private, then is not opened with
+> > > |_openWindowWithState|, since this is the first window opened when browser
+> > > starts (never private). And this the window used in |initService| to set the
+> > > initial state, but here we can't 'toggle' this window to be private. Any
+> > > suggestion on how to handle this?
+> > 
+> > I'm not sure I understand.  Why do we need the first opened window to be
+> > private?
+> 
+> If we want to restore the private windows as new private windows we need to do
+> it or we don't want to restore private windows at all? If that is the case then
+> is a lot easier just to remove the windows from the array as you suggested.
+
+We do not want to restore private windows when you start a new session (and in fact we can't do that anyway because we will not save the information about those windows in saveData).  We do however want to be able to restore recently closed windows, but that should not trigger the situation you're worried about here.  Do you agree?
+Created attachment 680253
+Patch v3
+
+(In reply to Ehsan Akhgari [:ehsan] from comment #15)
+> We do not want to restore private windows when you start a new session (and
+> in fact we can't do that anyway because we will not save the information
+> about those windows in saveData).  We do however want to be able to restore
+> recently closed windows, but that should not trigger the situation you're
+> worried about here.  Do you agree?
+
+I got it now! This patch handles both situations. Thanks.
+Comment on attachment 680253
+Patch v3
+
+Review of attachment 680253:
+-----------------------------------------------------------------
+
+Looks good, minus the comments below.  I also would like a sessionstore guru to look this over, perhaps ttaubert would be a good candidate.
+
+Thanks for your work here!
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +671,5 @@
+>      // and create its internal data object
+>      this._internalWindows[aWindow.__SSi] = { hosts: {} }
+>  
+> +    if (PrivateBrowsingUtils.isWindowPrivate(aWindow))
+> +      this._windows[aWindow.__SSi].isPrivate = true;
+
+This need to be put behind an #ifndef MOZ_PER_WINDOW_PRIVATE_BROWSING flag.
+
+@@ -3643,5 @@
+>     */
+>    saveState: function ssi_saveState(aUpdateAll) {
+> -    // if we're in private browsing mode, do nothing
+> -    if (this._inPrivateBrowsing)
+> -      return;
+
+Hmm, I think you need to hide this behind an #ifdef MOZ_PER_WINDOW_PRIVATE_BROWSING.
+
+@@ +3688,5 @@
+> +    for (let i = oState._closedWindows.length - 1; i >= 0; i--) {
+> +      if (oState._closedWindows[i].isPrivate) {
+> +        oState._closedWindows.splice(i, 1);
+> +      }
+> +    }
+
+This needs to be put behind an #ifndef MOZ_PER_WINDOW_PRIVATE_BROWSING....
+
+@@ +3856,5 @@
+>      });
+>  
+> +    if (winState.isPrivate) {
+> +      features += ",private";
+> +    }
+
+So does this one.
+Created attachment 681218
+Patch v4
+Comment on attachment 681218
+Patch v4
+
+Review of attachment 681218:
+-----------------------------------------------------------------
+
+Very nice patch. LGTM
+
+BTW, is MOZ_PER_WINDOW_PRIVATE_BROWSING something that we'll removed after landing the feature? Is this just something to ease developing it and land it in smaller chunks? Not really a deal breaker here it's probably just really hard to maintain in the future.
+It's the flag that will be used to disable the feature if necessary. It will disappear at some point after the feature is enabled and released to users, I expect.
+Thank you, that sounds good.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/564a68153de6
+https://hg.mozilla.org/mozilla-central/rev/564a68153de6

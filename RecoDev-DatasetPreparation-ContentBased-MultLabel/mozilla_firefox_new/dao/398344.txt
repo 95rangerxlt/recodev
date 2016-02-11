@@ -1,0 +1,219 @@
+We've seen this come up in startup and pageload tests.
+
+We've seen this come up in startup and pageload tests.
+Created attachment 283291
+favor getComputedStyle
+
+This assumes that accessing boxObject is more expensive than getComputedStyle, which could be wrong. Maybe you know this for sure, or you want to give it a try anyway ...
+
+Note that this patch is currently untested, as I'm going to bed now.
+Comment on attachment 283291
+favor getComputedStyle
+
+gaivn had plans here, I think. I don't know the code at all so I can't really review it. I don't know what is slow about the function either, but that can be answered by profiling.
+Comment on attachment 283291
+favor getComputedStyle
+
+getComputedStyle appears to be much slower.
+Created attachment 283322
+use boxObject only
+
+Only visibility:collapse and display:none are interesting here, no consumer is (and with this change: should be) caring about the visibility:hidden case.
+Created attachment 283788
+use boxObject only
+
+Also getSearchBar (and thereby isElementVisible) is redundant if addEngine calls updateSearchButton.
+Created attachment 283789
+use boxObject only
+
+Err, I redefined the searchButton variable, which doesn't make sense.
+Comment on attachment 283789
+use boxObject only
+
+>Index: browser/base/content/browser.js
+
+>-          this.updateSearchButton();
+>+          this.updateSearchButton(searchButton);
+
+>+   * @param searchButton
+>+   *        Optional reference to the search button so that the function
+>+   *        doesn't have to look for it.
+
+I think it'd be simpler to just have the search bar binding keep a reference to it's button as a property, and have the callers in this file use that to get it rather than getAnonymousElementByAttribute. 
+
+>     var engines = gBrowser.mCurrentBrowser.engines;
+
+>+    if (engines && engines.length > 0)
+>       searchButton.setAttribute("addengines", "true");
+>+    else if (searchButton.hasAttribute("addengines"))
+>+      searchButton.removeAttribute("addengines");
+
+Just remove the hasAttribute check, removeAttribute already checks whether the attribute exists.
+
+>Index: browser/base/content/utilityOverlay.js
+
+> function isElementVisible(aElement)
+> {
+>-  // * When an element is hidden, the width and height of its boxObject
+>-  //   are set to 0
+>-  // * css-visibility (unlike css-display) is inherited.
+>+  // If aElement or a direct or indirect parent is hidden or collapsed,
+>+  // height, width or both will be 0.
+>   var bo = aElement.boxObject;
+>-  return (bo.height != 0 && bo.width != 0 &&
+>-          document.defaultView
+>-                  .getComputedStyle(aElement, null).visibility == "visible");
+>+  return (bo.height > 0 && bo.width > 0);
+> }
+
+Doesn't this result in a different behavior for chromeless popups, where the searchbar is hidden by http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/toolkit/content/xul.css&rev=1.103&mark=45#40 ? I think what we want to do instead is move the isElementVisible check out of getSearchBar and add it to the callers that really care whether the search bar is visible. From a quick scan, it looks like the callers in nsContextMenu, and the browser.js callers in loadSearch and loadSearch are the only ones that also want to check for visibility. Mano pointed out that the callers in the engine-detection case should update the search bar as long as it's present, even if it's in a collapsed toolbar. 
+
+>Index: browser/components/places/content/bookmarkProperties.js
+
+>-    if (isElementVisible(this._folderMenuList))
+>+    if (!this._element("folderRow").hidden)
+
+>-    if (isElementVisible(this._folderMenuList))
+>+    if (!this._element("folderRow").hidden)
+
+Are these correct given http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/browser/components/places/content/editBookmarkOverlay.js&rev=1.6&mark=88#77 ?
+
+>Index: browser/components/places/content/editBookmarkOverlay.js
+
+>-    if (isElementVisible(this._folderTree)) {
+>+    if (!this._folderTree.collapsed) {
+
+>   toggleTagsSelector: function EIO_toggleTagsSelector() {
+
+>-    if (!isElementVisible(tagsSelector)) {
+>+    if (tagsSelector.collapsed) {
+
+These changes look OK, but Mano should probably look over all of the places changes.
+(In reply to comment #7)
+> the browser.js callers in loadSearch and loadSearch
+
+loadSearch and webSearch, I meant.
+Created attachment 283891
+patch v2
+Comment on attachment 283891
+patch v2
+
+Mano, could you please take a look at the components/places/ changes?
+Comment on attachment 283891
+patch v2
+
+So, last I checked, if a node got collapsed only after it has been visible, it's width or height may not be zero, thus the getComputedStyle check. I don't think you should change this function at all but rather make sure we call it only when necessary.
+(In reply to comment #7)
+> Doesn't this result in a different behavior for chromeless popups, where the
+> searchbar is hidden by
+> http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/toolkit/content/xul.css&rev=1.103&mark=45#40
+> ?
+
+different how? isElementVisible should return false in that case, because its parent (search-container) has display:none (equals: is hidden).
+
+> >Index: browser/components/places/content/bookmarkProperties.js
+> 
+> >-    if (isElementVisible(this._folderMenuList))
+> >+    if (!this._element("folderRow").hidden)
+> 
+> >-    if (isElementVisible(this._folderMenuList))
+> >+    if (!this._element("folderRow").hidden)
+> 
+> Are these correct given
+> http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/browser/components/places/content/editBookmarkOverlay.js&rev=1.6&mark=88#77
+> ?
+
+It appears to me that the folder menu list is only invisible if the folder row is hidden:
+http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/browser/components/places/content/editBookmarkOverlay.xul&rev=1.6&mark=109,113#100
+
+(In reply to comment #11)
+> (From update of attachment 283891 [details])
+> So, last I checked, if a node got collapsed only after it has been visible,
+> it's width or height may not be zero, thus the getComputedStyle check.
+
+I can't verify this with a quick DOM inspector test on #search-container:
+
+target.collapsed = true; alert(target.firstChild.boxObject.height + " " + target.firstChild.boxObject.width)
+-> "0 0"
+
+or on #searchbar:
+
+target.collapsed = true; alert(target.boxObject.height + " " + target.boxObject.width)
+-> "0 0"
+
+Did you have a different scenario in mind?
+
+> make sure we call it only when necessary.
+
+I do that, too. 
+OK, I cannot reproduce that at the moment (even in Fx2 which I'm almost sure had that issue).
+Comment on attachment 283891
+patch v2
+
+r=mano, please watch out for regressions.
+as always ;)
+(In reply to comment #11)
+> (From update of attachment 283891 [details])
+> So, last I checked, if a node got collapsed only after it has been visible,
+> it's width or height may not be zero
+
+I just reread your comment, and you're correct: width *or* height might not be zero (e.g. if you collapse the personal toolbar). But not both, which is what isElementVisible tests.
+Comment on attachment 283891
+patch v2
+
+apparently the nsContextMenu changes are missing from this diff
+Created attachment 283916
+full patch v2
+Comment on attachment 283916
+full patch v2
+
+>Index: browser/base/content/browser.js
+
+> const BrowserSearch = {
+>   addEngine: function(engine, targetDoc) {
+
+>+    var searchBar = this.searchBar;
+>+    if (!searchBar)
+>+      return;
+>+    var searchButton = searchBar.searchButton;
+
+searchButton was previously used just to check for the presence of the search bar. With your changes it's now unused. r=me with it removed.
+Comment on attachment 283916
+full patch v2
+
+looks good in dtrace
+Created attachment 283935
+for checkin
+Created attachment 283937
+for checkin
+Checking in browser/base/content/browser.js;
+/cvsroot/mozilla/browser/base/content/browser.js,v  <--  browser.js
+new revision: 1.864; previous revision: 1.863
+done
+Checking in browser/base/content/nsContextMenu.js;
+/cvsroot/mozilla/browser/base/content/nsContextMenu.js,v  <--  nsContextMenu.js
+new revision: 1.27; previous revision: 1.26
+done
+Checking in browser/base/content/utilityOverlay.js;
+/cvsroot/mozilla/browser/base/content/utilityOverlay.js,v  <--  utilityOverlay.js
+new revision: 1.55; previous revision: 1.54
+done
+Checking in browser/components/places/content/bookmarkProperties.js;
+/cvsroot/mozilla/browser/components/places/content/bookmarkProperties.js,v  <--  bookmarkProperties.js
+new revision: 1.62; previous revision: 1.61
+done
+Checking in browser/components/places/content/editBookmarkOverlay.js;
+/cvsroot/mozilla/browser/components/places/content/editBookmarkOverlay.js,v  <--  editBookmarkOverlay.js
+new revision: 1.7; previous revision: 1.6
+done
+Checking in browser/components/search/content/search.xml;
+/cvsroot/mozilla/browser/components/search/content/search.xml,v  <--  search.xml
+new revision: 1.105; previous revision: 1.104
+done
+
+
+utilityOverlay.js isElementVisible() is slow
+
+perf
+
+Bug 398344 - "utilityOverlay.js isElementVisible() is slow" [p=dao r=Mano r=gavin a1.9=schrep] 

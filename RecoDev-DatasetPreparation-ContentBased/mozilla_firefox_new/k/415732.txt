@@ -1,0 +1,110 @@
+It's not currently possible for chrome code (f.e. an extension) to programmatically register a feed handler that takes effect in the current session, so an extension that wants to register a feed handler has to make the user restart their browser after doing it in order for it to take effect.
+
+The problem isn't missing functionality, it's that the existing functionality isn't exposed in a way that is usable for extensions.  In particular, nsIWebContentHandlerRegistrar::registerContentHandler is designed to be used by untrusted content, so it requires an nsIDOMWindow in which it prompts the user to confirm the registration.
+
+nsIWebContentConverterRegistrar, on the other hand, advertises a registerContentHandler method with an amenable API, but the WebContentConverter service doesn't actually implement that method, and it couldn't even if it wanted to, since it already implements the same-named method in nsIWebContentHandlerRegistrar, and it can't implement two methods with the same name.
+
+MDC recommends extensions twiddle preferences to add feed readers <http://developer.mozilla.org/en/docs/Adding_feed_readers_to_Firefox>, but WebContentConverter caches the prefs on startup, and it doesn't invalidate its cache when the preferences change.
+
+And it's not possible to write the preferences before WebContentConverter gets to them, since it caches them at the earliest possible moment (on profile-after-change), and core components seem to get notified of startup events before extension components.
+
+I can think of a few ways to work around or fix this problem:
+
+1. WebContentConverter could cache preferences in a 0ms timeout, thus giving extensions time to write preferences before it reads them.
+
+2. WebContentConverter could listen for preference changes and invalidate its cache when they occur.
+
+3. WebContentConverter could lazily cache preferences the first time it gets called (which might also be a Ts win; it's not clear why these preferences get cached on startup in the first place, since AFAICT we only use them when the user loads a feed into a tab or opens Preferences > Applications).
+
+4. WebContentConverter could expose a method like the one described by nsIWebContentConverterRegistrar (but with a different name so as not to clash with the same-named method in nsIWebContentHandlerRegistrar).
+
+Of these, #1 is the simplest and potentially lowest-risk to implement, although it doesn't improve the API; #4 improves the API at moderate risk (because it involves refactoring some code); and #3 seems worth investigating regardless of what we do to fix this bug, given the potential for a Ts win, but perhaps in a separate bug.
+
+Requesting wanted-firefox3 for this extensibility fix.
+
+It's not currently possible for chrome code (f.e. an extension) to programmatically register a feed handler that takes effect in the current session, so an extension that wants to register a feed handler has to make the user restart their browser after doing it in order for it to take effect.
+
+The problem isn't missing functionality, it's that the existing functionality isn't exposed in a way that is usable for extensions.  In particular, nsIWebContentHandlerRegistrar::registerContentHandler is designed to be used by untrusted content, so it requires an nsIDOMWindow in which it prompts the user to confirm the registration.
+
+nsIWebContentConverterRegistrar, on the other hand, advertises a registerContentHandler method with an amenable API, but the WebContentConverter service doesn't actually implement that method, and it couldn't even if it wanted to, since it already implements the same-named method in nsIWebContentHandlerRegistrar, and it can't implement two methods with the same name.
+
+MDC recommends extensions twiddle preferences to add feed readers <http://developer.mozilla.org/en/docs/Adding_feed_readers_to_Firefox>, but WebContentConverter caches the prefs on startup, and it doesn't invalidate its cache when the preferences change.
+
+And it's not possible to write the preferences before WebContentConverter gets to them, since it caches them at the earliest possible moment (on profile-after-change), and core components seem to get notified of startup events before extension components.
+
+I can think of a few ways to work around or fix this problem:
+
+1. WebContentConverter could cache preferences in a 0ms timeout, thus giving extensions time to write preferences before it reads them.
+
+2. WebContentConverter could listen for preference changes and invalidate its cache when they occur.
+
+3. WebContentConverter could lazily cache preferences the first time it gets called (which might also be a Ts win; it's not clear why these preferences get cached on startup in the first place, since AFAICT we only use them when the user loads a feed into a tab or opens Preferences > Applications).
+
+4. WebContentConverter could expose a method like the one described by nsIWebContentConverterRegistrar (but with a different name so as not to clash with the same-named method in nsIWebContentHandlerRegistrar).
+
+Of these, #1 is the simplest and potentially lowest-risk to implement, although it doesn't improve the API; #4 improves the API at moderate risk (because it involves refactoring some code); and #3 seems worth investigating regardless of what we do to fix this bug, given the potential for a Ts win, but perhaps in a separate bug.
+
+Requesting wanted-firefox3 for this extensibility fix.
+(In reply to comment #0)
+> 3. WebContentConverter could lazily cache preferences the first time it gets
+> called (which might also be a Ts win; it's not clear why these preferences get
+> cached on startup in the first place, since AFAICT we only use them when the
+> user loads a feed into a tab or opens Preferences > Applications).
+
+Upon further consideration, I bet this is because the WebContentConverter has to register itself as a converter for those MIME types, and that does have to happen on startup, so lazily caching the preferences is not an option.
+
+Created attachment 302073
+patch v1: refactors code to expose functionality
+
+I discussed this with Mano, and we decided the best approach would be to remove nsIWebContentHandlerRegistrar and update the overlapping methods in nsIWebContentConverterService with an additional boolean parameter that would turn off prompting for user confirmation so that chrome code could simply use registerContentHandler to register a feed handler.
+
+But then I dug into it more and realized that we can't make nsGlobalWindow.cpp depend on nsIWebContentConverterService because the latter is in browser/, which is presumably the reason why nsIWebContentHandlerRegistrar exists in the first place.
+
+So instead of removing nsIWebContentHandlerRegistrar, I removed the overlapping functions from nsIWebContentConverterService, then I made the implementation of registerContentHandler conditionally prompt for user confirmation based on whether or not it gets passed a DOM window, so chrome code can register a handler by calling that method with a null argument to the contentWindow parameter.
+
+The patch also refactors the code that does the actual registration into a separate function so it can be called directly from registerContentHandler in addition to being called from the user confirmation callback.
+
+Note: I didn't do the same refactoring in registerProtocolHandler, even though it'd be useful to do so, because there's a workaround for protocol handlers (register it directly with the handler service), and this way the patch is lower risk.
+Created attachment 302217
+patch v2: resolves conflict from bug 402287
+
+This patch resolves a trivial conflict with the fix for bug 402287 but is otherwise identical to patch v1.
+Comment on attachment 302217
+patch v2: resolves conflict from bug 402287
+
+So, I was wondering whether nsIWebContentConverterService should inherit from the DOM interface, what do you think?
+Created attachment 305313
+patch v3: makes nsIWebContentConverterService inherit from nsIWebContentHandlerRegistrar
+
+> So, I was wondering whether nsIWebContentConverterService should inherit from
+> the DOM interface, what do you think?
+
+That makes sense.  The DOM interface shouldn't depend on the browser one, but there's no reason the browser one couldn't depend on the DOM one, and conceptually it seems reasonable.  Here's a patch that adds that.
+Comment on attachment 305313
+patch v3: makes nsIWebContentConverterService inherit from nsIWebContentHandlerRegistrar
+
+r=mano.
+Note to approvers: this is an extensibility fix that makes it easier for extensions to register themselves as feed handlers (currently they can do so in a hacky way, but the user has to restart the browser before the registration takes effect, resulting in a "double restart" when first installing a feed reader extension).
+
+The bulk of the patch is simply refactoring of code to expose the existing "register content handler" functionality, which is currently exposed only to content (via a mandatory notification in the content window), to chrome as well.  So no new functionality is being added, we're just better exposing existing functionality to extensions.
+
+Comment on attachment 305313
+patch v3: makes nsIWebContentConverterService inherit from nsIWebContentHandlerRegistrar
+
+a1.9+=damons
+Checking in browser/components/feeds/public/nsIWebContentConverterRegistrar.idl;
+/cvsroot/mozilla/browser/components/feeds/public/nsIWebContentConverterRegistrar.idl,v  <--  nsIWebContentConverterRegistrar.idl
+new revision: 1.7; previous revision: 1.6
+done
+Checking in browser/components/feeds/src/WebContentConverter.js;
+/cvsroot/mozilla/browser/components/feeds/src/WebContentConverter.js,v  <--  WebContentConverter.js
+new revision: 1.29; previous revision: 1.28
+done
+
+
+
+can't register feed handler from chrome in current session
+
+
+
+bug 415732: expose way for chrome/extensions to register feed handler in current session; r=mano, a=dsicore 

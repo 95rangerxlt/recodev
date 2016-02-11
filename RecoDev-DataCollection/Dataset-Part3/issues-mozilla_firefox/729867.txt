@@ -1,0 +1,365 @@
+The existing download manager code pops up a confirmation box asking if you're sure you want to exit private browsing mode if there are downloads in progress. The new per-window system has an observer notification that fires when the last docshell leaves PB mode or is destroyed while in PB mode - at that point, it's too late to be checking with the user. We need some way of determining when an action will cause all remaining PB contexts to be destroyed, and then we should probably fire an observer notification in the vein of quit-application-requested (and document it for addons that want to support similar behaviour).
+
+The existing download manager code pops up a confirmation box asking if you're sure you want to exit private browsing mode if there are downloads in progress. The new per-window system has an observer notification that fires when the last docshell leaves PB mode or is destroyed while in PB mode - at that point, it's too late to be checking with the user. We need some way of determining when an action will cause all remaining PB contexts to be destroyed, and then we should probably fire an observer notification in the vein of quit-application-requested (and document it for addons that want to support similar behaviour).
+We might be able to get away with adding a handler for closing windows that enumerates all navigator:browser windows, and if the current window's privateMode == true and the total number of windows with privateMode == true is 1, run through the observer rigmarole.
+I did some research: http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#2335 is the method called when a window is closed, which in turn checks if http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#6797 returns true and proceeds to close the window. I think we can crib from the existing check in warnAboutClosingWindow (http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#6824) and add another that checks if:
+1) the closing window's gPrivateBrowsingUI.privateWindow is true
+2) the total number of windows with a true gPrivateBrowsingUI.privateWindow is 1 (with the same navigator:browser loop)
+
+If both of these conditions are true, we want to execute the code very similar to the existing confirmation vote for exiting PB mode (http://mxr.mozilla.org/mozilla-central/source/browser/components/privatebrowsing/src/nsPrivateBrowsingService.js?force=1#334). I think we'll just want to duplicate that code and use a new notification (last-pb-context-exiting), otherwise we'll trigger multiple popups for the existing code that cares about this situation.
+Created attachment 621545
+WIP v1
+
+This patch would open a confirm dialog when user tries to close the last private browsing window.
+
+Do we also want to show a confirm dialog as well if user has some private browsing windows and quits firefox?
+Comment on attachment 621545
+WIP v1
+
+This isn't quite right; we don't want to pop up a confirmation box whenever the user closes the last private window. Instead, we want to fire a notification that the last window is being closed, in order to allow relevant components (such as the download manager) to pop up their own confirmation boxes if required. See http://mxr.mozilla.org/mozilla-central/source/browser/components/privatebrowsing/src/nsPrivateBrowsingService.js#385 for how this is currently done.
+
+I also think it would be clearer to start privateWindowCount at 1 if isPrivateWindow is true, since the else block in the loop that increments privateWindowCount will only execute once. We should probably also run the code that is conditioned on warnAboutClosingTabs regardless of the status of the private window warning.
+Created attachment 621913
+v1
+Comment on attachment 621913
+v1
+
+Review of attachment 621913:
+-----------------------------------------------------------------
+
+This looks great to me.
+Comment on attachment 621913
+v1
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+> function warnAboutClosingWindow() {
+
+>+  let isPrivateWindow = gPrivateBrowsingUI.privateWindow;
+>+  let privateWindowCount = isPrivateWindow ? 1 : 0;
+>+  let warnAboutClosingTabs = false;
+>   while (e.hasMoreElements()) {
+>     let win = e.getNext();
+>+    if (win != window) {
+>+      if (isPrivateWindow && win.gPrivateBrowsingUI.privateWindow)
+>+        privateWindowCount++;
+>+      if (win.toolbar.visible)
+>+        warnAboutClosingTabs = true;
+>+      if ((!isPrivateWindow || privateWindowCount > 1) && warnAboutClosingTabs)
+>+        break;
+>+    }
+>+  }
+
+This logic would be much easier to understand if you had an "otherPBWindowExists" boolean rather than "privateWindowCount", I think.
+
+Looks OK, but I'd like to re-check an updated patch.
+Created attachment 623922
+v2
+
+Updated the patch to use "otherPBWindowExists" boolean
+Gavin: ping?
+Comment on attachment 623922
+v2
+
+Review of attachment 623922:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +6875,5 @@
+>   */
+>  function warnAboutClosingWindow() {
+>    // Popups aren't considered full browser windows.
+>    if (!toolbar.visible)
+>      return gBrowser.warnAboutClosingTabs(true);
+
+Do we care about popups (other windows with window.toolbar.visible=false) in private browsing mode, which seems theoretically possible to me if some add-on sets that flag?
+
+Currently we would see them as other windows in private browsing mode but wouldn't notify observers that the last PB windows just got closed because of the early return here.
+
+@@ +6886,4 @@
+>    while (e.hasMoreElements()) {
+>      let win = e.getNext();
+> +    if (win != window) {
+> +      if (isPBWindow && win.gPrivateBrowsingUI.privateWindow)
+
+Please check if "gPrivateBrowsingUI" in win before accessing it.
+
+@@ +6888,5 @@
+> +    if (win != window) {
+> +      if (isPBWindow && win.gPrivateBrowsingUI.privateWindow)
+> +        otherPBWindowExists = true;
+> +      if (win.toolbar.visible)
+> +        warnAboutClosingTabs = true;
+
+That condition is quite hard to understand. Can you please add a comment that clarifies this piece a bit?
+
+@@ +6897,5 @@
+> +
+> +  if (isPBWindow && !otherPBWindowExists) {
+> +    let exitingCanceled = Cc["@mozilla.org/supports-PRBool;1"].createInstance(Ci.nsISupportsPRBool);
+> +    exitingCanceled.data = false;
+> +    Services.obs.notifyObservers(exitingCanceled, "private-browsing-last-context-exiting", null);
+
+Please wrap those two long lines.
+Comment on attachment 623922
+v2
+
+Review of attachment 623922:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +6890,5 @@
+> +        otherPBWindowExists = true;
+> +      if (win.toolbar.visible)
+> +        warnAboutClosingTabs = true;
+> +      if ((!isPBWindow || otherPBWindowExists) && warnAboutClosingTabs)
+> +        break;
+
+Darn, I meant this condition, of course. Please add a comment to clarify it.
+(In reply to Tim Taubert [:ttaubert] from comment #10)
+> Comment on attachment 623922
+> v2
+> 
+> Review of attachment 623922:
+> -----------------------------------------------------------------
+> 
+> ::: browser/base/content/browser.js
+> @@ +6875,5 @@
+> >   */
+> >  function warnAboutClosingWindow() {
+> >    // Popups aren't considered full browser windows.
+> >    if (!toolbar.visible)
+> >      return gBrowser.warnAboutClosingTabs(true);
+> 
+> Do we care about popups (other windows with window.toolbar.visible=false) in
+> private browsing mode, which seems theoretically possible to me if some
+> add-on sets that flag?
+> 
+> Currently we would see them as other windows in private browsing mode but
+> wouldn't notify observers that the last PB windows just got closed because
+> of the early return here.
+
+Not sure what you mean here...  These are only browser windows with the toolbar being hidden.  An extension might set the toolbar to hidden too, but I think that's an edge case.
+Let's say we have two windows. One with a toolbar and a second one without a toolbar, both in private browsing mode. If I close the one with the toolbar first, then the "private-browsing-last-context-exiting" notification will not be sent as we're aware of the other pb window still being there. If we now close the second window with the hidden toolbar, we'd bail out early in warnAboutClosingWindow() and we'll not notify anyone that the last private browsing window has just been closed.
+
+To be fair, that's a weird situation but it's possible to get into it with add-ons, isn't it? Maybe we just don't care, then?
+(In reply to comment #13)
+> Let's say we have two windows. One with a toolbar and a second one without a
+> toolbar, both in private browsing mode. If I close the one with the toolbar
+> first, then the "private-browsing-last-context-exiting" notification will not
+> be sent as we're aware of the other pb window still being there. If we now
+> close the second window with the hidden toolbar, we'd bail out early in
+> warnAboutClosingWindow() and we'll not notify anyone that the last private
+> browsing window has just been closed.
+> 
+> To be fair, that's a weird situation but it's possible to get into it with
+> add-ons, isn't it? Maybe we just don't care, then?
+
+Hmm, yeah.  Can you please file another bug about that?  I think we should fix it.
+Created attachment 638971
+v3
+
+(In reply to Tim Taubert [:ttaubert] from comment #10)
+> Comment on attachment 623922
+> v2
+> 
+> Review of attachment 623922:
+> -----------------------------------------------------------------
+> 
+> ::: browser/base/content/browser.js
+> @@ +6875,5 @@
+> >   */
+> >  function warnAboutClosingWindow() {
+> >    // Popups aren't considered full browser windows.
+> >    if (!toolbar.visible)
+> >      return gBrowser.warnAboutClosingTabs(true);
+> 
+> Do we care about popups (other windows with window.toolbar.visible=false) in
+> private browsing mode, which seems theoretically possible to me if some
+> add-on sets that flag?
+
+Moved that condition. Please check the patch.
+
+> 
+> Currently we would see them as other windows in private browsing mode but
+> wouldn't notify observers that the last PB windows just got closed because
+> of the early return here.
+> 
+> @@ +6886,4 @@
+> >    while (e.hasMoreElements()) {
+> >      let win = e.getNext();
+> > +    if (win != window) {
+> > +      if (isPBWindow && win.gPrivateBrowsingUI.privateWindow)
+> 
+> Please check if "gPrivateBrowsingUI" in win before accessing it.
+> 
+
+Added
+
+> @@ +6888,5 @@
+> > +    if (win != window) {
+> > +      if (isPBWindow && win.gPrivateBrowsingUI.privateWindow)
+> > +        otherPBWindowExists = true;
+> > +      if (win.toolbar.visible)
+> > +        warnAboutClosingTabs = true;
+> 
+> That condition is quite hard to understand. Can you please add a comment
+> that clarifies this piece a bit?
+> 
+
+Added
+
+> @@ +6897,5 @@
+> > +
+> > +  if (isPBWindow && !otherPBWindowExists) {
+> > +    let exitingCanceled = Cc["@mozilla.org/supports-PRBool;1"].createInstance(Ci.nsISupportsPRBool);
+> > +    exitingCanceled.data = false;
+> > +    Services.obs.notifyObservers(exitingCanceled, "private-browsing-last-context-exiting", null);
+> 
+> Please wrap those two long lines.
+
+Done
+Comment on attachment 638971
+v3
+
+Review of attachment 638971:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ -6052,5 @@
+>   */
+>  function warnAboutClosingWindow() {
+> -  // Popups aren't considered full browser windows.
+> -  if (!toolbar.visible)
+> -    return gBrowser.warnAboutClosingTabs(true);
+
+I think we should keep this condition at the top so that we don't do this unnecessary work of checking other windows. We should just change it to:
+
+> let isPBWindow = gPrivateBrowsingUI.privateWindow;
+> if (!isPBWindow && !toolbar.visible)
+>   return gBrowser.warnAboutClosingTabs(true);
+
+That way we're sure that we don't need to send 'private-browsing-last-context-exiting' for this window.
+
+@@ +6065,5 @@
+> +          ("gPrivateBrowsingUI" in win) &&
+> +          win.gPrivateBrowsingUI.privateWindow)
+> +        otherPBWindowExists = true;
+> +      // Check if it is a full browser window, set the warnAboutClosingTabs
+> +      // flag.
+
+I didn't mean this condition :) The comment pretty much just describes what you're doing in other words. Don't think we need this.
+
+@@ +6069,5 @@
+> +      // flag.
+> +      if (win.toolbar.visible)
+> +        warnAboutClosingTabs = true;
+> +      if ((!isPBWindow || otherPBWindowExists) && warnAboutClosingTabs)
+> +        break;
+
+This condition |if ((!isPBWindow || otherPBWindowExists) && warnAboutClosingTabs)| is what I'd like to have a comment for. Took me some time to get the logic behind it.
+One note: this work shouldn't land (or at least enabled by default) without the rest of per-window PB finished. I remember convincing myself that this won't interact well with the existing global PB mode.
+Created attachment 639247
+v4
+
+Updated based on comment 16
+Comment on attachment 639247
+v4
+
+Review of attachment 639247:
+-----------------------------------------------------------------
+
+Thank you! r=me with the little corrections below.
+
+::: browser/base/content/browser.js
+@@ +6072,5 @@
+> +      // break the loop if the current window is not in private browsing mode
+> +      // and should warn about closing tabs, or there are more than one 
+> +      // private browsing window and should warn about closing tabs.
+> +      if ((!isPBWindow || otherPBWindowExists) && warnAboutClosingTabs)
+> +        break;
+
+That's just the condition described in words. How about:
+
+If the current window is not in private browsing mode we don't need to look for other pb windows, we can leave the loop when finding the first non-popup window. If however the current window is in private browsing mode then we need at least one other pb and one non-popup window to break out early.
+
+@@ +6086,5 @@
+> +                                 null);
+> +    if (exitingCanceled.data)
+> +      return false;
+> +  }
+> +  if (!toolbar.visible || warnAboutClosingTabs)
+
+Must be |if (warnAboutClosingTabs)| now that the condition is at the top again.
+Created attachment 639258
+Patch for checkin r=ttaubert
+Is this ready to be landed, Raymond?
+(In reply to Ehsan Akhgari [:ehsan] from comment #21)
+> Is this ready to be landed, Raymond?
+
+Yes but please see comment 17
+(In reply to comment #22)
+> (In reply to Ehsan Akhgari [:ehsan] from comment #21)
+> > Is this ready to be landed, Raymond?
+> 
+> Yes but please see comment 17
+
+Heh, right.  I just submitted a patch in bug 769460.  Would you mind rebasing this on top of that, please?  Thanks!
+(In reply to Ehsan Akhgari [:ehsan] from comment #23)
+> (In reply to comment #22)
+> > (In reply to Ehsan Akhgari [:ehsan] from comment #21)
+> > > Is this ready to be landed, Raymond?
+> > 
+> > Yes but please see comment 17
+> 
+> Heh, right.  I just submitted a patch in bug 769460.  Would you mind
+> rebasing this on top of that, please?  Thanks!
+
+I have applied that patch in bug 769460 and then rebuilt the source.  Then, applied this patch, however, I am not sure how to test the per-window private browsing feature.  If I go into private mode and then create new windows, all those windows are private windows.  When closing the last private window, the "private-browsing-last-context-exiting" notification would be fired.  I wonder whether there is a way to create some normal windows and private windows at the same time, or I have to wait for the UI to be implemented?
+So this patch needs to be changed so that it only affects the build when MOZ_PER_WINDOW_PRIVATE_BROWSING is defined, and otherwise it should not change any existing code.  Then, to test this you need to add MOZ_PER_WINDOW_PRIVATE_BROWSING=1 to your mozconfig and rebuild with your patch, to make sure that you'll get the confirmation prompts when you leave the PB mode.  Note that for now, enabling MOZ_PER_WINDOW_PRIVATE_BROWSING=1 doesn't actually give you PB windows, as the UI doesn't exist yet.  But the feature is being designed in a way that almost all of the code could be switched to use the new infrastructure before we start putting UI elements in place.
+(In reply to Josh Matthews [:jdm] from comment #17)
+> One note: this work shouldn't land (or at least enabled by default) without
+> the rest of per-window PB finished. I remember convincing myself that this
+> won't interact well with the existing global PB mode.
+
+Hmm, thinking about this a bit more... I'm not entirely sure what Josh was worried about here.  Josh, can you please elaborate on why you think this should not be enabled with global PB mode?
+Actually, given that there are no consumers of the new notification yet (the download manager will be the first, I believe), I don't believe this patch should be a problem? I'm pretty sure I was concerned about either having multiple confirmation boxes pop up, or none at all.
+(In reply to Josh Matthews [:jdm] from comment #27)
+> Actually, given that there are no consumers of the new notification yet (the
+> download manager will be the first, I believe), I don't believe this patch
+> should be a problem? I'm pretty sure I was concerned about either having
+> multiple confirmation boxes pop up, or none at all.
+
+I believe we are safe to land this patch with global PB mode.
+Agreed.  Please proceed to land it.
+
+(As a nit, please land this with the notification renamed to last-pb-context-exiting, to be similar to the existing last-pb-context-exited notification.
+Created attachment 640267
+Patch for checkin
+
+Renamed the notification to "last-pb-context-exiting"
+
+Pushed to try
+https://tbpl.mozilla.org/?tree=Try&rev=a4381705803a
+(In reply to Raymond Lee [:raymondlee] from comment #30)
+> Created attachment 640267
+> Patch for checkin
+> 
+> Renamed the notification to "last-pb-context-exiting"
+> 
+> Pushed to try
+> https://tbpl.mozilla.org/?tree=Try&rev=a4381705803a
+
+There were some random oranges.
+
+Pushed to try and passed.
+https://tbpl.mozilla.org/?tree=Try&rev=3b18c1b4ffe7
+(removing "[don't land until per-window PB is finished]" per comment 26 - comment 29)
+Thanks, Raymond!
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/10326d838740
+https://hg.mozilla.org/mozilla-central/rev/10326d838740
+Is this covered by an automated test?
+
+Sorry for spamming you with this message. I didn't find automated tests for some manual tests/bugs and I need to know if I need to create automated tests for them or they are already covered.
+Yes, there are tests that exercise the last-pb-context-exiting notification.

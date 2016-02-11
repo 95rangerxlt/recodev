@@ -1,0 +1,143 @@
+
+
+
+Created attachment 8518574
+breakpoints-in-quote-same-unquote-source.patch
+
+That was fun.
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=7cdd245ddf0a
+For the record, this test fails without the script.js changes, and passes with them (of course).
+Unfortunately, that doesn't fix the frame script issue.
+Breakpoints still don't work for frame script loaded *after* you set the breakpoint.
+Thanks to jim's patch for onNewScript, _addScript is now correctly called.
+But `bp.actor.sources.has(aScript.source)` is always true for newly loaded frame scripts.
+I'm trying to understand this bug. Can anyone give me some contexT?
+(In reply to Alexandre Poirot [:ochameau] from comment #3)
+> Unfortunately, that doesn't fix the frame script issue.
+> Breakpoints still don't work for frame script loaded *after* you set the
+> breakpoint.
+
+What method of code loading are frame scripts using? How are they getting a new set of Debugger.Scripts for the source, but keeping the same Debugger.Source??
+
+(In reply to Eddy Bruel [:ejpbruel] from comment #4)
+> I'm trying to understand this bug. Can anyone give me some contexT?
+
+If you load the "same" source twice (resulting in multiple D.Source instances with the same url/text content/etc) the BPs will only end up being set in D.Scripts defined in the first D.Source, and D.Scripts from subsequent D.Sources won't ever get breakpoints set on them.
+
+This can happen in the wild via separate iframes loading the same remote script, for example.
+
+I thought this was what was going on in e10s frame scripts, but it appears not. I think we should land this fix anyways, as there is the testcase which fails without this patch. We can land subsequent patches for e10s frame scripts.
+Bill, do you know how frame scripts get loaded into SpiderMonkey? eval? Cu.evalInSandbox? <script> tags? Something else?
+It happens here:
+http://mxr.mozilla.org/mozilla-central/source/dom/base/nsFrameMessageManager.cpp#1465
+Ok, I believe that CloneScript doesn't also result in a cloned new Debugger.Source. I think what we want to do here is rather than filter by a provided source inside _setBreakpoint, we want to ensure that the scripts we consider adding a BP to are members of a provided set of scripts.
+Created attachment 8519266
+breakpoints-in-quote-same-unquote-source.patch
+
+Ok, this revision removes the dependence on having different Debugger.Source instances for the new Debugger.Scripts that we need to restore breakpoints upon, and should hopefully work with cloned scripts (and therefore e10s frame scripts).
+
+Alex, can you verify if this fixes the breakpoints problem on e10s with your content-process chrome debugging patches?
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=93b81f9976c0
+Comment on attachment 8519266
+breakpoints-in-quote-same-unquote-source.patch
+
+Review of attachment 8519266:
+-----------------------------------------------------------------
+
+I have some issues with this patch, but I'll still r+ it, since it solves the immediate problem, and we're going to refactor the breakpoint code anyway.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +1446,2 @@
+>     */
+> +  _setBreakpoint: function (aLocation, aOnlyThisScript=null) {
+
+What is the point of this code? Are you creating a copy to circumvent our naming convention for arguments? If that's the case, please don't do that. It's unnecessary overhead, and doesn't add any clarity. If anything, it confuses people, because it suggests there is some magic going on here that requires a copy to be made.
+
+That said, if there really *is* some magic going on here, and there's a good reason that this copy needs to be made, then please put a comment here, because it's not at all clear to me why this is needed.
+
+@@ +1460,2 @@
+>      } else {
+>        storedBp.actor = actor = new BreakpointActor(this, {
+
+Why create yet *another* copy here? Couldn't you just use the one you just made above?
+
+@@ +2372,1 @@
+>            && bp.line <= endLine) {
+
+If I understand the this code correctly, the point of this check was to make sure we don't set breakpoints for the same script twice. However, the condition we used is buggy, because it only allows stored breakpoints to be set for one script, which breaks when we have multiple scripts associated with the same source.
+
+The new code avoids this by explicitly passing the script on which the breakpoint should be set as a parameter to setBreakpoint. Personally, I feel this is the wrong solution, because setBreakpoint now has two different modes: set a breakpoint on a all script associated with a given location, and set a breakpoint on a specific script. I think those should be different functions.
+
+Having said that, this fix solves the problem, and we're already going to refactor the breakpoint code anyway, so I see no reason not to land this. It will solve the immediate problem, and we can clean it up during this refactor if we want to.
+(In reply to Eddy Bruel [:ejpbruel] from comment #11)
+> Comment on attachment 8519266
+> breakpoints-in-quote-same-unquote-source.patch
+> 
+> Review of attachment 8519266:
+> -----------------------------------------------------------------
+> 
+> I have some issues with this patch, but I'll still r+ it, since it solves
+> the immediate problem, and we're going to refactor the breakpoint code
+> anyway.
+> 
+> ::: toolkit/devtools/server/actors/script.js
+> @@ +1446,2 @@
+> >     */
+> > +  _setBreakpoint: function (aLocation, aOnlyThisScript=null) {
+> 
+> What is the point of this code? Are you creating a copy to circumvent our
+> naming convention for arguments? If that's the case, please don't do that.
+> It's unnecessary overhead, and doesn't add any clarity. If anything, it
+> confuses people, because it suggests there is some magic going on here that
+> requires a copy to be made.
+> 
+> That said, if there really *is* some magic going on here, and there's a good
+> reason that this copy needs to be made, then please put a comment here,
+> because it's not at all clear to me why this is needed.
+
+I think you are talking about location vs aLocation, but commented on the wrong line?
+
+We have all this crazy unexpected mutability going on due to all of these breakpoint methods taking ownership of breakpoint description rather than making their own internal copies. This is a partial workaround, but I can undo it and I've filed bug 1097141 for a Proper Solution.
+
+> @@ +2372,1 @@
+> >            && bp.line <= endLine) {
+> 
+> If I understand the this code correctly, the point of this check was to make
+> sure we don't set breakpoints for the same script twice. However, the
+> condition we used is buggy, because it only allows stored breakpoints to be
+> set for one script, which breaks when we have multiple scripts associated
+> with the same source.
+> 
+> The new code avoids this by explicitly passing the script on which the
+> breakpoint should be set as a parameter to setBreakpoint. Personally, I feel
+> this is the wrong solution, because setBreakpoint now has two different
+> modes: set a breakpoint on a all script associated with a given location,
+> and set a breakpoint on a specific script. I think those should be different
+> functions.
+> 
+> Having said that, this fix solves the problem, and we're already going to
+> refactor the breakpoint code anyway, so I see no reason not to land this. It
+> will solve the immediate problem, and we can clean it up during this
+> refactor if we want to.
+
+Essentially, yes, although a BP could be associated with many scripts right off the bat, it's just that new matching scripts won't get associated with BPs that already are associated with any scripts.
+
+Agree with "wrong" solution, but _setBreakpoint is super funky and wrong right now, and it is totally out of scope for this bug to refactor it all.
+Talked with Eddy on IRC and agreed to land this patch as-is and hold off on all of our refactoring + cleaning up breakpoints in other patches.
+https://hg.mozilla.org/integration/fx-team/rev/f2ee082ca472
+(In reply to Nick Fitzgerald [:fitzgen] from comment #9)
+> Created attachment 8519266
+>
+> Alex, can you verify if this fixes the breakpoints problem on e10s with your
+> content-process chrome debugging patches?
+
+Yes, it does. Thanks for having fixed that promptly!!
+https://hg.mozilla.org/mozilla-central/rev/f2ee082ca472
+
+
+Loading the "same" source concurrently (like e10s frame scripts) can mess up breakpoints
+
+
+
+Bug 1095216 - Fix breakpoints when multiple of the 'same' source are loaded concurrently. r=ejpbruel 

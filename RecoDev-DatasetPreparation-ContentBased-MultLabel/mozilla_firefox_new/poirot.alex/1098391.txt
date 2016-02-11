@@ -1,0 +1,290 @@
+Today, when we start a DebuggerServer instance, we end up loading many optional dependencies. "Optional" because you won't necessarely use them when opening a toolbox, or querying RDP with a custom (command line) tool.
+
+My workflow was to trace all JSM and JS modules being loaded when connecting to an app and querying a naive actor with no dependencies. Then I tracked down all callsites when we were loading such optional dependency and used lazy getter for them.
+
+It allowed me to strip down the memory usage from 3.6MB to 1.6MB in such STR (loading a debugger server in an app and querying an empty actor).
+
+Today, when we start a DebuggerServer instance, we end up loading many optional dependencies. "Optional" because you won't necessarely use them when opening a toolbox, or querying RDP with a custom (command line) tool.
+
+My workflow was to trace all JSM and JS modules being loaded when connecting to an app and querying a naive actor with no dependencies. Then I tracked down all callsites when we were loading such optional dependency and used lazy getter for them.
+
+It allowed me to strip down the memory usage from 3.6MB to 1.6MB in such STR (loading a debugger server in an app and querying an empty actor).
+Created attachment 8522278
+patch - v1
+
+WIP, needs to split it between SDK and non-SDK patch. (and ensure try stays green!)
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=e0a9c2231cdc
+Created attachment 8524598
+devtools patch v2
+
+Fixed some try failures:
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=83728eb77492
+Created attachment 8524600
+SDK module loader patch - v1
+
+Irakli, I'm tweaking the module loader in order to prevent loading Reflect.jsm
+and Console.jsm unless it is really required and used by a module.
+Created attachment 8525325
+devtools patch v3
+
+Try is even green, same patch with some more comment and tweaks!
+Comment on attachment 8525325
+devtools patch v3
+
+Review of attachment 8525325:
+-----------------------------------------------------------------
+
+Curious about console, so clearing review for now.
+
+::: toolkit/devtools/Loader.jsm
+@@ +363,5 @@
+>        isWorker: false,
+>        reportError: Cu.reportError,
+>        btoa: btoa,
+> +      get console() {
+> +        return Cu.import("resource://gre/modules/devtools/Console.jsm", {}).console;
+
+Does this mean console is re-imported for every access of the global?
+
+::: toolkit/devtools/server/actors/root.js
+@@ +392,5 @@
+>      return Cu.cloneInto(aRequest, {});
+>    },
+>  
+> +  onProtocolDescription: function () {
+> +    return require("devtools/server/protocol").dumpProtocolSpec();
+
+Use loader.lazyRequireGetter in the file header instead
+
+::: toolkit/devtools/server/actors/script.js
+@@ +23,5 @@
+> +  let Debugger = require("Debugger");
+> +  hackDebugger(Debugger);
+> +  return Debugger;
+> +});
+> +DevToolsUtils.defineLazyGetter(this, "SourceMapConsumer", () => {
+
+The following 3 blocks should use loader.lazyRequireGetter instead
+
+@@ +4938,5 @@
+>  
+>  exports.EnvironmentActor = EnvironmentActor;
+>  
+> +function hackDebugger(Debugger) {
+> +  // TODO: Improve native code instead of hacking on top of it
+
+I've asked fitzgen about similar changes in the past and he seemed to think it's fine for it to be here only, but might be worth asking again...  I agree it seems strange!
+
+::: toolkit/devtools/server/actors/webbrowser.js
+@@ +18,5 @@
+>  
+>  let {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+>  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+>  
+> +XPCOMUtils.defineLazyGetter(this, "AddonThreadActor", () => {
+
+The following 2 blocks should use loader.lazyRequireGetter instead
+
+::: toolkit/devtools/server/main.js
+@@ +75,5 @@
+>      throw e;
+>    }
+>  }
+>  
+> +DevToolsUtils.defineLazyGetter(this, "events", () => {
+
+Use loader.lazyRequireGetter instead
+Comment on attachment 8524600
+SDK module loader patch - v1
+
+Alex changes to loader look good, but I would suggest adding comments above inlined Cu.import to explain why they are where they are, to make sure they will remain inlined even after some changes to a loader.
+Created attachment 8526179
+SDK module loader patch - v2
+
+Added comments.
+Created attachment 8526182
+devtools patch v4
+
+Uses loader.* everywhere!
+
+> ::: toolkit/devtools/Loader.jsm
+> @@ +363,5 @@
+> >        isWorker: false,
+> >        reportError: Cu.reportError,
+> >        btoa: btoa,
+> > +      get console() {
+> > +        return Cu.import("resource://gre/modules/devtools/Console.jsm", {}).console;
+> 
+> Does this mean console is re-imported for every access of the global?
+> 
+
+Good catch! I'm not sure how bad it was, but yes, I think using a lazy getter would be better here.
+
+
+> @@ +4938,5 @@
+> >  
+> >  exports.EnvironmentActor = EnvironmentActor;
+> >  
+> > +function hackDebugger(Debugger) {
+> > +  // TODO: Improve native code instead of hacking on top of it
+> 
+> I've asked fitzgen about similar changes in the past and he seemed to think
+> it's fine for it to be here only, but might be worth asking again...  I
+> agree it seems strange!
+
+I asked Jim quite a long time ago and he agreed such stuff should be fixed at the root, in C++...
+Such monkey patching is only worth while prototyping, it ends up being hard to share.
+But it is also matter of time, writting this in C++ takes more time.
+(In reply to J. Ryan Stinnett [:jryans] from comment #5)
+> Comment on attachment 8525325
+> ::: toolkit/devtools/server/actors/root.js
+> @@ +392,5 @@
+> >      return Cu.cloneInto(aRequest, {});
+> >    },
+> >  
+> > +  onProtocolDescription: function () {
+> > +    return require("devtools/server/protocol").dumpProtocolSpec();
+> 
+> Use loader.lazyRequireGetter in the file header instead
+> 
+
+I would still have to do: onProtocolDescription: function () dumpProtocolSpec(),
+Do you still prefer lazyRequireGetter + this getter?
+(If I don't use a getter also here, it will always be important during actor loading)
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=1582bab730cf
+Comment on attachment 8526182
+devtools patch v4
+
+Review of attachment 8526182:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/root.js
+@@ +390,5 @@
+>      return Cu.cloneInto(aRequest, {});
+>    },
+>  
+> +  onProtocolDescription: function () {
+> +    return require("devtools/server/protocol").dumpProtocolSpec();
+
+Okay, this seems fine as-is.
+
+::: toolkit/devtools/server/main.js
+@@ +75,5 @@
+>      throw e;
+>    }
+>  }
+>  
+> +DevToolsUtils.defineLazyGetter(this, "events", () => {
+
+I believe loader.lazyRequireGetter can be used here too...?  But if not, this is fine.
+Created attachment 8526203
+devtools patch v5
+
+> ::: toolkit/devtools/server/main.js
+> @@ +75,5 @@
+> >      throw e;
+> >    }
+> >  }
+> >  
+> > +DevToolsUtils.defineLazyGetter(this, "events", () => {
+> 
+> I believe loader.lazyRequireGetter can be used here too...?  But if not,
+> this is fine.
+
+Oops, forgot about this one!
+Created attachment 8528291
+interdiff
+Created attachment 8528294
+devtools patch v6
+
+Ryan, I had to patch some more stuff to prevent breaking worker loader
+and debugger:
+- worker loader wasn't exposing `loader` and its lazy helper!!
+- getPromiseState definition was forcing the load of Debugger on script loading...
+And I wasn't able to keep it defined on `Object`, no idea why it doesn't work lazily.
+So I switched from polyfill to regular function.
+
+Green try:
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=385e7922323a
+Comment on attachment 8528294
+devtools patch v6
+
+Review of attachment 8528294:
+-----------------------------------------------------------------
+
+Well, the changes seem good to me... but I don't entirely follow what's allowed in worker-loader and what is not, so let's have Eddy check it.
+
+Eddy, take a look at worker-loader and see if these changes are okay.
+Comment on attachment 8528294
+devtools patch v6
+
+Review of attachment 8528294:
+-----------------------------------------------------------------
+
+This patch will break worker debugging in its current form. If you want to define lazyGetter, lazyImporter, etc. as module globals in the devtools loader, you also have to do so in the worker loader.
+
+The worker loader can be used on either the main thread or a worker thread (only support for the main thread has landed atm). You can use Cu.import on the main thread but not on a worker thread. To make this work on a worker thread, you need a way to load XPCOMUtils.jsm without the use of Cu.import. That usually means converting it into something other than a JSM (a CommonJS module would work just fine).
+
+You also need to make sure that the things you're importing from XPCOMUtils dont themselves use Components internally, since Components isn't available on the worker thread at all. If that's the case, things will be a bit more complicated, because we will have to extend the worker debugger API to support whatever you need. I can help out if that turns out to be the case.
+Created attachment 8537937
+devtools patch v7
+
+Simplified patch for worker-loader.js,
+only expose loader.{methods} that actually work in workers!
+The other one, that can't work are going to throw.
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=d1ec061a0e17
+
+(only worker-loader.js changed in this new patch)
+Created attachment 8540255
+devtools patch v8
+
+Rebased due to conflicts.
+
+Please Eddy, do not let my patch rot.
+This is one of my last Q4 goal, I would like to wrap it up and jump on the next quest!
+Comment on attachment 8540255
+devtools patch v8
+
+Review of attachment 8540255:
+-----------------------------------------------------------------
+
+r+ for the worker-loader.js part. I should be able to get this to work with worker debugging once the platform patches land.
+
+Sorry for the late review, but I was on PTO when you put this patch online. I hope it didn't bitrot too much.
+Thanks, I haven't seen it conflict during my rebase so it should still be landable as-is.
+https://hg.mozilla.org/integration/fx-team/rev/0f6c7aaaee35
+
+I'm under the impression that the Addon-SDK changes will be landing upstream first. Feel free to reset the checkin-needed otherwise.
+https://hg.mozilla.org/mozilla-central/rev/0f6c7aaaee35
+We still need to land SDK patch. We can land it on mozilla-central as long as we land it on github in parallel.
+I'll provide a PR.
+Created attachment 8554732
+Pull request 1840
+
+Irakli, I had to tweak this patch to apply on upstream and have green test.
+https://github.com/mozilla/addon-sdk/pull/1840/files#diff-9a5af8dfa35852b52322d92e2e2bcdf2R747
+The previous patch was doing:
+  delete this.console; this.console = ...;
+The new one uses Object.defineProperty.
+Comment on attachment 8554732
+Pull request 1840
+
+I have added on nit, otherwise looks good to me.
+Commits pushed to master at https://github.com/mozilla/addon-sdk
+
+https://github.com/mozilla/addon-sdk/commit/f425f60362e0fb542068e5d2a0b862d2f7192b95
+Bug 1098391 - Best effort to load SDK loader dependencies lazily. r=gozala
+
+https://github.com/mozilla/addon-sdk/commit/495c5bd9ff1d72798962612cf0c55f1b59797010
+Merge pull request #1840 from ochameau/loader-memory
+
+Bug 1098391 - Best effort to load SDK loader dependencies lazily r=@gozala
+
+
+lazy load DebuggerServer dependencies
+
+
+
+Bug 1098391 - Best effort to load debugger server dependencies lazily. r=jryans 

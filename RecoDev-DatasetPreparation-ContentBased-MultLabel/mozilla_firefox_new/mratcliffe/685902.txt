@@ -1,0 +1,561 @@
+Improve csshtmltree speeds by adding a has[Un]matchedSelectors() method. This can then be used to show a visual indicator / expander in the style inspector panel.
+
+Improve csshtmltree speeds by adding a has[Un]matchedSelectors() method. This can then be used to show a visual indicator / expander in the style inspector panel.
+Created attachment 561739
+has[Un]matchedSelectors patch 1
+
+Wow, that was harder than Chinese algebra. On the other hand I learned about [].some ;o)
+Comment on attachment 561739
+has[Un]matchedSelectors patch 1
+
+Review of attachment 561739:
+-----------------------------------------------------------------
+
+This is really good. Did some playing with the patch today and I see "the light" in terms of performance. We'll be able to remove the timer-based loops once this is done.
+
+Giving the patch r- for now because there's still some perf work left to do.
+
+Thanks for your work. Looking forward for the updated patch!
+
+::: browser/devtools/styleinspector/CssLogic.jsm
+@@ +654,5 @@
+> +              }
+> +            }
+> +          }, this);
+> +      }, this);
+> +    }, this);
+
+This is still note quite there yet. Problems I have identified:
+
+- The _matchId check works only if we had a CL_processMatchedSelectors() run before. That's useful for when we have it, but not in this case. CssHtmlTree calls this method whenever it needs. In the future the UI will probably make it so that it's called only after the user sees the matched selectors, but we cannot rely on that, in CssLogic.
+
+In your current implementation hasUnmatchedSelectors() always returns true.
+
+When _unmatchedSelectors === null, use element.mozMatchesSelector(selector) to check if the selector is a match.
+
+- Why do you skip system rules? Those count as unmatched selectors, when the user shows the list (if showOnlyUserStyles is false). Your sheetAllowed check is sufficient.
+
+- You go through each selector and check if the rule has aProperty. Why not skip going through selectors entirely if the rule has no aProperty? This would be an important perf win.
+
+- You also check cssRule.sheetAllowed within each selector of each rule. Why not check this in the main forSomeSheets() loop? Skip going through the rules and selectors if the sheet is not allowed.
+
+- Even more: you do not need to go through each comma-separated selector. The cssRule.selectors getter does "expensive parsing" of the domRule.selectorText to split it into an array.
+
+You can just do element.mozMatchesSelector(cssRule._domRule.selectorText). The browser will check much faster if any of the comma-separated selectors match.
+
+That's all for now. I hope performance will improve a lot now.
+Created attachment 563409
+has[Un]matchedSelectors patch 2
+
+> This is really good. Did some playing with the patch today and I see "the
+> light" in terms of performance. We'll be able to remove the timer-based
+> loops once this is done.
+> 
+
+I tried removing them and performance was bad :o(
+
+> ::: browser/devtools/styleinspector/CssLogic.jsm
+> @@ +654,5 @@
+> > +              }
+> > +            }
+> > +          }, this);
+> > +      }, this);
+> > +    }, this);
+> 
+> This is still note quite there yet. Problems I have identified:
+> 
+> - The _matchId check works only if we had a CL_processMatchedSelectors() run
+> before. That's useful for when we have it, but not in this case. CssHtmlTree
+> calls this method whenever it needs. In the future the UI will probably make
+> it so that it's called only after the user sees the matched selectors, but
+> we cannot rely on that, in CssLogic.
+> 
+
+Fixed
+
+> In your current implementation hasUnmatchedSelectors() always returns true.
+> 
+
+It has been tested and only returns true when there are unmatched rules.
+
+> When _unmatchedSelectors === null, use element.mozMatchesSelector(selector)
+> to check if the selector is a match.
+> 
+
+If you mean _matchedSelectors then done.
+
+> - Why do you skip system rules? Those count as unmatched selectors, when the
+> user shows the list (if showOnlyUserStyles is false). Your sheetAllowed
+> check is sufficient.
+> 
+
+UA rules are not supposed to show in unmatched selectors.
+
+> - You go through each selector and check if the rule has aProperty. Why not
+> skip going through selectors entirely if the rule has no aProperty? This
+> would be an important perf win.
+> 
+
+Done
+
+> - You also check cssRule.sheetAllowed within each selector of each rule. Why
+> not check this in the main forSomeSheets() loop? Skip going through the
+> rules and selectors if the sheet is not allowed.
+> 
+
+Done.
+
+> - Even more: you do not need to go through each comma-separated selector.
+> The cssRule.selectors getter does "expensive parsing" of the
+> domRule.selectorText to split it into an array.
+> 
+> You can just do element.mozMatchesSelector(cssRule._domRule.selectorText).
+> The browser will check much faster if any of the comma-separated selectors
+> match.
+> 
+
+Done ... I have also further optimized things in CL_hasUnmatchedSelectors to avoid using mozMatchesSelector() wherever possible ;o)
+Comment on attachment 563409
+has[Un]matchedSelectors patch 2
+
+Review of attachment 563409:
+-----------------------------------------------------------------
+
+Thanks for your improvements, this is good work!
+
+Unfortunately, with this patch the code style panel is still too slow on pages like ubuntu.com or github.com.
+
+I ended up doing investigation to see how we can further improve the performance of this critical-path code. This work turned out into a patch. I am going to submit my patch here, and ask dcamp for review. Then you can fold it into your patch.
+
+More comments below.
+
+::: browser/devtools/styleinspector/CssHtmlTree.jsm
+@@ +300,5 @@
+>     * @param {Event} aEvent the DOM Event object.
+>     */
+>    onlyUserStylesChanged: function CssHtmltree_onlyUserStylesChanged(aEvent)
+>    {
+> +    this.cssLogic.reset();
+
+Why is this needed?
+
+cssLogic should properly reset its state when sourceFilter changes. If it does not do so, it's a bug that needs to be fixed there.
+
+I am asking why, because I'd like to understand where's the bug. (I am not saying there isn't one ;) )
+
+::: browser/devtools/styleinspector/CssLogic.jsm
+@@ +166,5 @@
+>      this._sheetIndex = 0;
+>      this._sheets = {};
+>      this._sheetsCached = false;
+> +    this._passId = 0;
+> +    this._matchId = 0;
+
+These are not needed.
+
+@@ +432,5 @@
+> +    for each (let sheets in this._sheets) {
+> +      let halt = sheets.some(aCallback, aScope);
+> +      if (halt) {
+> +        return halt;
+> +      }
+
+You can do:
+
+if (sheets.some(aCallback, aScope)) {
+  return true;
+}
+
+@@ +592,5 @@
+>          return;
+>        }
+>  
+>        aSheet.forEachRule(function (aRule) {
+> +        if (!this.viewedElement.mozMatchesSelector(aRule._domRule.selectorText)) {
+
+A rule can have matched and unmatched selectors.
+
+This makes unmatched selectors never show up, when a rule has a matching selector.
+
+Also, if I am not mistaken, it makes the function slower because it calls a pretty expensive method (mozMatchesSelector) for every rule found in all user styles. This is more expensive than going through the selectors, to check their _matchId.
+
+@@ +649,5 @@
+> +  hasUnmatchedSelectors: function CL_hasUnmatchedSelectors(aProperty)
+> +  {
+> +    if (!this._unmatchedSelectors) {
+> +      this.processMatchedSelectors();
+> +    }
+
+This is not needed here. Also, calling processMatchedSelectors() will not set _unmatchedSelectors.
+
+In my previous review comment I pointed out you used _matchId in hasUnmatchedSelectors(). _matchId is only set when process(Un)MatchedSelectors() is called. So, the property is only usable if CssHtmlTree calls those before. Otherwise you need to use mozMatchesSelector() ... like you did, below, in this patch.
+
+@@ +660,5 @@
+> +
+> +      return aSheet.forSomeRules(function (aRule) {
+> +        if (aRule.getPropertyValue(aProperty) &&
+> +            !this.viewedElement.mozMatchesSelector(aRule._domRule.selectorText)) {
+> +          return true;
+
+This is much improved when compared to the previous patch.
+
+But it doesn't find rules that match against ancestors of viewedElement, so hasUnmatchedSelectors() will return true even for rules which match parents, so when you expand the "unmatched selectors" view ... it will show up empty.
+Created attachment 563811
+more performance work (wip)
+
+Worked on this yesterday and today. This patch applies on top of mike's patch.
+
+Changes:
+- removed the timers from CssHtmlTree, so I can compare raw performance unaffected by the timers.
+- made changes so that isSystemStyleSheet() result is cached.
+- matched rules are now cached by hasMatchedSelectors(), so the results can be reused by hasUnmatchedSelectors() and by processMatchedSelectors().
+- switched to use native window.matchMedia() instead of our own shim sheetMediaAllowed() - we implemented this last year, before matchMedia() was available.
+- added code that ensures disabled style sheets are skipped. Same for sheets that don't apply to the current view media.
+- made the hasMatchedSelectors() and hasUnmatchedSelectors() methods accept an array of properties you want to check. This improves performance because it only loops through the CSS rules once and it checks the properties in a single go, removing them from the array when they are found.
+
+- with the caching of matched rules hasUnmatchedSelectors() no longer needs to check if element.mozMatchesSelector(). So, I don't have to do this per selector, not even per rule. (I can use _matchId to determine if it's matched.)
+
+Unscientific "benchmarks":
+
+- without Bug 689968: around 10 seconds to open the style panel.
+- with bug 689968: around 7 seconds.
+- with Mike's patch (from this bug): around 5 seconds.
+- with this patch: around 1-2 seconds.
+
+Tested on the front page of ubuntu.com, document.querySelector(".header-home > h1"),
+
+With this patch toggling "show only user styles" is close to instant - not so without the patch.
+
+Perhaps this is the fastest we are going to get, with the current UI. I find performance quite acceptable (compared to how boring it was to wait 10 seconds :) ). Once the discussed UI changes will be implemented and merged with these changes, the style panel will be instant. Accessing matched selectors is really close to instant (and should continue to be). Unmatched selectors won't be too bad either.
+
+Please note this is a WIP. I didn't play with the tests - some UI tests might fail because the timer stuff has changed. I suggest this patch gets folded into Mike's patch once you review the CssLogic changes I did.
+
+Looking forward for your review. Thank you!
+Comment on attachment 563409
+has[Un]matchedSelectors patch 2
+
+Marked this patch as obsolete by mistake (due to my habit when I submit patches in other bugs). Sorry!
+Created attachment 564216
+has[Un]matchedSelectors patch 3
+
+> ::: browser/devtools/styleinspector/CssHtmlTree.jsm
+> @@ +300,5 @@
+> >     * @param {Event} aEvent the DOM Event object.
+> >     */
+> >    onlyUserStylesChanged: function CssHtmltree_onlyUserStylesChanged(aEvent)
+> >    {
+> > +    this.cssLogic.reset();
+> 
+> Why is this needed?
+> 
+> cssLogic should properly reset its state when sourceFilter changes. If it
+> does not do so, it's a bug that needs to be fixed there.
+> 
+> I am asking why, because I'd like to understand where's the bug. (I am not
+> saying there isn't one ;) )
+> 
+
+You are right, it now works without it. If anything changes with this removed then I don't see it.
+
+> ::: browser/devtools/styleinspector/CssLogic.jsm
+> @@ +166,5 @@
+> >      this._sheetIndex = 0;
+> >      this._sheets = {};
+> >      this._sheetsCached = false;
+> > +    this._passId = 0;
+> > +    this._matchId = 0;
+> 
+> These are not needed.
+> 
+
+Removed
+
+> @@ +432,5 @@
+> > +    for each (let sheets in this._sheets) {
+> > +      let halt = sheets.some(aCallback, aScope);
+> > +      if (halt) {
+> > +        return halt;
+> > +      }
+> 
+> You can do:
+> 
+> if (sheets.some(aCallback, aScope)) {
+>   return true;
+> }
+> 
+
+I don't know what I was thinking ... done.
+
+> @@ +592,5 @@
+> >          return;
+> >        }
+> >  
+> >        aSheet.forEachRule(function (aRule) {
+> > +        if (!this.viewedElement.mozMatchesSelector(aRule._domRule.selectorText)) {
+> 
+> A rule can have matched and unmatched selectors.
+> 
+> This makes unmatched selectors never show up, when a rule has a matching
+> selector.
+> 
+> Also, if I am not mistaken, it makes the function slower because it calls a
+> pretty expensive method (mozMatchesSelector) for every rule found in all
+> user styles. This is more expensive than going through the selectors, to
+> check their _matchId.
+> 
+
+Done
+
+> @@ +649,5 @@
+> > +  hasUnmatchedSelectors: function CL_hasUnmatchedSelectors(aProperty)
+> > +  {
+> > +    if (!this._unmatchedSelectors) {
+> > +      this.processMatchedSelectors();
+> > +    }
+> 
+> This is not needed here. Also, calling processMatchedSelectors() will not
+> set _unmatchedSelectors.
+> 
+> In my previous review comment I pointed out you used _matchId in
+> hasUnmatchedSelectors(). _matchId is only set when
+> process(Un)MatchedSelectors() is called. So, the property is only usable if
+> CssHtmlTree calls those before. Otherwise you need to use
+> mozMatchesSelector() ... like you did, below, in this patch.
+> 
+
+Aha, now that makes sense ... done.
+
+> @@ +660,5 @@
+> > +
+> > +      return aSheet.forSomeRules(function (aRule) {
+> > +        if (aRule.getPropertyValue(aProperty) &&
+> > +            !this.viewedElement.mozMatchesSelector(aRule._domRule.selectorText)) {
+> > +          return true;
+> 
+> This is much improved when compared to the previous patch.
+> 
+> But it doesn't find rules that match against ancestors of viewedElement, so
+> hasUnmatchedSelectors() will return true even for rules which match parents,
+> so when you expand the "unmatched selectors" view ... it will show up empty.
+
+Good catch! I guess that this means we need to recurse through parents checking for matches and return true only if there are none ... done.
+(In reply to Michael Ratcliffe from comment #7)
+> > @@ +660,5 @@
+> > > +
+> > > +      return aSheet.forSomeRules(function (aRule) {
+> > > +        if (aRule.getPropertyValue(aProperty) &&
+> > > +            !this.viewedElement.mozMatchesSelector(aRule._domRule.selectorText)) {
+> > > +          return true;
+> > 
+> > This is much improved when compared to the previous patch.
+> > 
+> > But it doesn't find rules that match against ancestors of viewedElement, so
+> > hasUnmatchedSelectors() will return true even for rules which match parents,
+> > so when you expand the "unmatched selectors" view ... it will show up empty.
+> 
+> Good catch! I guess that this means we need to recurse through parents
+> checking for matches and return true only if there are none ... done.
+
+Yep, but this makes the method even slower, unfortunately.
+Comment on attachment 564216
+has[Un]matchedSelectors patch 3
+
+Review of attachment 564216:
+-----------------------------------------------------------------
+
+Thanks for your patch update!
+
+The changes in CssLogic will perhaps be superseded by the patch I submitted for review, to dcamp.
+
+Giving the patch a tentative r+ (all tests pass!), but we need to see what dcamp says about my code proposal as well. I feel that the current hasUnmatchedSelectors() implementation in this patch is still far too slow.
+
+::: browser/devtools/styleinspector/CssHtmlTree.jsm
+@@ +434,5 @@
+>      return this.tree.cssLogic.getPropertyInfo(this.name);
+>    },
+>  
+>    /**
+> +   * Does the property have any matched selectors?
+
+I would suggest a different type of description:
+
+Check if the property has any matched selectors.
+
+@return boolean
+        True if the property has any matched selectors, false otherwise.
+
+@@ +443,5 @@
+> +  },
+> +
+> +  /**
+> +   * Does the property have any unmatched selectors?
+> +   */
+
+Same as above.
+Created attachment 564545
+has[Un]matchedSelectors patch 4
+
+Addressed Mihai's comment comments
+Comment on attachment 563811
+more performance work (wip)
+
+Review of attachment 563811:
+-----------------------------------------------------------------
+
+r- mostly for the removed timeouts.  If you think we can guarantee 50ms response without those, feel free to renom.
+
+::: browser/devtools/styleinspector/CssHtmlTree.jsm
+@@ -192,5 @@
+>  
+> -      // We use a setTimeout loop to display the properties in batches of 15 at a
+> -      // time. This results in a perceptibly more responsive UI.
+> -      let i = 0;
+> -      let batchSize = 15;
+
+You removed the timeouts for testing, right?  Do you intend to land this?
+
+We're generally trying to avoid letting chrome go more than 50ms without hitting the event loop (see https://wiki.mozilla.org/Firefox/Features/50ms_ASSERT). We need to take that into account here.
+
+::: browser/devtools/styleinspector/CssLogic.jsm
+@@ +588,5 @@
+>     * the domRules for the element are passed to the callback function.
+>     *
+>     * @param {function} [aCallback] Simple callback method
+>     */
+> +  hasMatchedSelectors: function CL_hasMatchedSelectors(aProperties)
+
+This method no longer matches its description.
+
+@@ +605,5 @@
+> +    if (this._matchedRules) {
+> +      if (aProperties.length > 0) {
+> +        this._matchedRules.some(function(aRule) {
+> +          aProperties = aProperties.filter(propertiesFilter.bind(this, aRule));
+> +          return aProperties.length == 0;
+
+The logic for building up |result| is just complicated enough that duplicating it (one way when _matchedRules already exists, another when building _matchedRules) that it took some time to verify both paths.  Might be nicer to just have:
+
+if (!this._matchedRules) {
+  // regen matched rules, maybe split up into its own method
+}
+
+this._matchedRules.some(aProperties.filter(// etc
+
+Splitting out the matched-rule-regeneration into its own method would make all the various callsites that have bare hasMatchedSelectors() calls less weird too.
+
+@@ +660,3 @@
+>        }
+> +    } while ((element = element.parentNode) &&
+> +             element.nodeType === Ci.nsIDOMNode.ELEMENT_NODE);
+
+Err, this parent node stuff seems incorrect.  It should take into account the fact that some properties (like text alignment) are inherited from parent nodes, but others (like borders) aren't.
+
+This patch didn't introduce this problem, but ick.  I filed bug 691978.
+
+@@ +669,5 @@
+>     * match the highlighted element or its parent elements.
+>     *
+>     * @param {String} aProperty The CSS property to check against
+>     */
+> +  hasUnmatchedSelectors: function CL_hasUnmatchedSelectors(aProperties)
+
+This comment needs updating too.
+
+Since on the surface they have such similar APIs, it's probably worth mentioning in the comments that hasUnmatchedSelectors() and hasMatchedSelectors() have vastly different performance characteristics.
+
+@@ +718,5 @@
+> +          result[aProperty] = unmatched;
+> +
+> +          // Keep this property if the rule matched. We need to find if a rule
+> +          // has this property while it doesn't match the viewedElement.
+> +          return !unmatched;
+
+If unmatched was false, we would have bailed out above the filter() call, right?  Will this ever return true?
+Comment on attachment 563811
+more performance work (wip)
+
+dcamp: thanks for your review! I will address your comments ASAP.
+
+
+
+As discussed, we'll move this into a separate bug. Mike's patch can land.
+Comment on attachment 564545
+has[Un]matchedSelectors patch 4
+
+Review of attachment 564545:
+-----------------------------------------------------------------
+
+Comments about JS code comments. Things I just noticed working on the UI patch review.
+
+::: browser/devtools/styleinspector/CssLogic.jsm
+@@ +423,5 @@
+> +   * @param {function} aCallback the function you want executed for some of the
+> +   * CssSheet objects cached.
+> +   * @param {object} aScope the scope you want for the callback function. aScope
+> +   * will be the this object when aCallback executes.
+> +   */
+
+Please update the comment to explain the return value.
+
+@@ +608,5 @@
+> +   * the domRules for the element are passed to the callback function.
+> +   *
+> +   * @param {function} [aCallback] Simple callback method
+> +   */
+> +  hasMatchedSelectors: function CL_hasMatchedSelectors(aCallback)
+
+Please update the first phrase of the comment to read something like: "Check if the highlighted element has selectors that match it or its parents."
+
+Additionally, please add info about the return value of the function, in jsdoc format (follow the style of the script you are editing).
+
+@@ +639,5 @@
+> +   * Returns true if the current element does not have CssSelector objects that
+> +   * match the highlighted element or its parent elements.
+> +   *
+> +   * @param {String} aProperty The CSS property to check against
+> +   */
+
+Similar to the above.
+
+@@ +1017,5 @@
+> +   * the style rules.
+> +   * @param {object} aScope the scope you want for the callback function. aScope
+> +   * will be the this object when aCallback executes.
+> +   */
+> +  forSomeRules: function CssSheet_forSomeRules(aCallback, aScope)
+
+Again, add info about the return value.
+
+@@ +1484,5 @@
+>  
+>    /**
+> +   * Check if the property has any matched selectors.
+> +   */
+> +  hasMatchedSelectors: function CssPropertyInfo_hasMatchedSelectors()
+
+return value
+
+@@ +1516,5 @@
+> +
+> +  /**
+> +   * Check if the property has any matched selectors.
+> +   */
+> +  hasUnmatchedSelectors: function CssPropertyInfo_hasUnmatchedSelectors()
+
+Ditto.
+For reference: opened bug 692543 and submitted an updated patch to address Dave's review comments.
+Created attachment 566769
+has[Un]matchedSelectors patch 5
+
+Addressed reviewers comments about comments
+https://hg.mozilla.org/integration/fx-team/rev/aa254d59e166
+
+I pulled out the fix to bug 685900's test, test should be fixed before 685900 lands.
+https://hg.mozilla.org/mozilla-central/rev/aa254d59e166
+
+
+Improve csshtmltree speeds by adding a has[Un]matchedSelectors() method
+
+
+
+Bug 685902 - Improve csshtmltree speeds by adding a has[Un]matchedSelectors() method. r=msucan 

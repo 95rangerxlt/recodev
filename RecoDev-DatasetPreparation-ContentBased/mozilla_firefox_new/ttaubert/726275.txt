@@ -1,0 +1,158 @@
+Shift-clicking on the back (or forward, when present) button should open the resulting page in a new window.
+
+I get a new window, with the URL set to the expected page, but the page doesn't actually load.
+
+Shift-clicking on the back (or forward, when present) button should open the resulting page in a new window.
+
+I get a new window, with the URL set to the expected page, but the page doesn't actually load.
+This works fine for me on Mozilla/5.0 (Windows NT 6.1; WOW64; rv:13.0a1) Gecko/20120212 Firefox/13.0a1.
+
+Is this bug only on OS X?
+Confirmed against Mozilla/5.0 (Windows NT 6.1; WOW64; rv:16.0) Gecko/16.0 Firefox/16.0 ID:20120629030530.
+Last good nightly: 2012-02-26
+First bad nightly: 2012-02-27
+
+Pushlog: http://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=cd4853b0b94a&tochange=d1b2fd680235
+The first bad revision is:
+changeset:   87392:efa3c85f1f37
+user:        Paolo Amadini <paolo.mozmail@amadzone.org>
+date:        Thu Feb 23 11:30:23 2012 +0100
+summary:     Bug 711193 - Turn on "Don't load tabs until selected" by default. r=zpao
+
+And indeed, toggling the Pref makes this work again.
+Ahh, forgot to post. Above Bisect was against Inbound cause of the large Merge on MC.
+
+Last good nightly: 2012-02-24
+First bad nightly: 2012-02-25
+
+Pushlog: http://hg.mozilla.org/integration/mozilla-inbound/pushloghtml?fromchange=bb48e7c6aef1&tochange=911c4d5ae460
+*** Bug 772927 has been marked as a duplicate of this bug. ***
+Bug 711193 isn't really a fair regression - that just made it more apparent. This may go back all the way to Firefox 4...
+
+Andres, Bellindira - you've both done some great work with SessionStore recently, so I think this shouldn't be too bad to track down if you're up for it. This is going through ss.duplicateTab (specifically, it's the "window" case here: https://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#7341). My theory is that something goes awry because the tab never got selected before being detached and that's not something that's currently possible via UI so I didn't really test for it.
+
+PS. Why does shift-clicking the back button exist? Can we [killthem]?
+The problem seems to be that we do the following:
+
+1) create a new hidden tab
+2) duplicate the current tab into the new tab
+3) open a new window
+4) switch those two tab's docShells
+5) remove the hidden tab again
+
+Now, when doing step [4] we don't swap any session store related properties (because SS doesn't know of that). I guess that's the root cause of it. We were probably a little lucky that it worked at all before?
+
+Also, we might be swapping docShells even before session store registered the new window:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#1102
+One solution might be, instead of having SessionStore.duplicateTab() create a new tab, pass it the tab of the newly created window after it has loaded. I just tried that approach and it seems to work for me, locally.
+
+The downside is that we're still don't support swapping docShells but we could file another bug for that...
+(In reply to Paul O'Shannessy [:zpao] (no longer moco, slower to respond) from comment #7)
+> PS. Why does shift-clicking the back button exist?
+
+To quote Justin: "Shift-clicking on the back (or forward, when present) button should open the resulting page in a new window."
+Are you asking why it was added in the first place? See bug 246719. We started using duplicateTab in bug 448546.
+(In reply to Tim Taubert [:ttaubert] from comment #9)
+> One solution might be, instead of having SessionStore.duplicateTab() create
+> a new tab, pass it the tab of the newly created window after it has loaded.
+> I just tried that approach and it seems to work for me, locally.
+> 
+> The downside is that we're still don't support swapping docShells but we
+> could file another bug for that...
+
+I think we just don't want "Don't load tabs until selected" to have any effect unless you're restoring a session.
+(In reply to Tim Taubert [:ttaubert] from comment #8)
+> The problem seems to be that we do the following:
+> 
+> 1) create a new hidden tab
+> 2) duplicate the current tab into the new tab
+> 3) open a new window
+> 4) switch those two tab's docShells
+> 5) remove the hidden tab again
+
+Further clarification:
+
+After the tab has been duplicated it's put in to the 'visible' bucket but not yet loaded because of 'load tabs on demand'. Then we swap the docShells without the ss-specific browser properties. The first problem here is that there will be no TabSelect event for the new tab in the window so it won't be restored. But even if there's a TabSelect event then there's no restore data because we didn't copy it.
+(In reply to Dão Gottwald [:dao] from comment #11)
+> I think we just don't want "Don't load tabs until selected" to have any
+> effect unless you're restoring a session.
+
+I'm not sure this is possible currently because we're kind of always about to restore something with 'load tabs on demand'. We don't really distinguish between tabs being loaded at startup and tabs being restored later while selecting a tab.
+
+An even simpler solution might be to ignore the 'load tabs on demand' pref when duplicating tabs. I don't think we ever want to lazy-load tabs that have been duplicated, even when they're put in the background.
+Created attachment 641385
+restore tabs right away when duplicating
+
+I don't think we want to lazy-load duplicated tabs, so this might be a simple fix that's not too heavy so we could backport it.
+Comment on attachment 641385
+restore tabs right away when duplicating
+
+Why do you introduce a new custom flag on the browser for this? You can pass all the needed information through the internal methods, right?
+(In reply to Dão Gottwald [:dao] from comment #15)
+> Why do you introduce a new custom flag on the browser for this? You can pass
+> all the needed information through the internal methods, right?
+
+Yeah, I thought of this as well, but wasn't too keen on adding another argument to:
+
+> function ssi_restoreHistoryPrecursor(aWindow, aTabs, aTabData, aSelectTab, aIx, aCount)
+
+This signature is quite messy already as the function calls itself recursively and needs to track state. But introducing another flag might also not be the best way to do it...
+Presumably you can also tack it on the tab data. That said, I don't really care about the number of arguments of internal methods.
+Created attachment 641388
+restore tabs right away when duplicating
+
+(In reply to Dão Gottwald [:dao] from comment #17)
+> Presumably you can also tack it on the tab data. That said, I don't really
+> care about the number of arguments of internal methods.
+
+Ok, I tacked it on the tab data. restoreHistoryPrecursor() and restoreHistory() take an array of tabs and tab data so it didn't feel quite right to pass an argument that would affect all of the given tabs.
+
+(If anyone feels confident to review this, please do!)
+(In reply to Tim Taubert [:ttaubert] from comment #18)
+> restoreHistoryPrecursor() and
+> restoreHistory() take an array of tabs and tab data so it didn't feel quite
+> right to pass an argument that would affect all of the given tabs.
+
+Doesn't really sound problematic to me.
+(In reply to Dão Gottwald [:dao] from comment #10)
+> Are you asking why it was added in the first place? See bug 246719.
+
+Thanks. I had no idea that has existed for the past 8 years. I think it's a bit unnecessary but yay history...
+
+(In reply to Dão Gottwald [:dao] from comment #19)
+> (In reply to Tim Taubert [:ttaubert] from comment #18)
+> > restoreHistoryPrecursor() and
+> > restoreHistory() take an array of tabs and tab data so it didn't feel quite
+> > right to pass an argument that would affect all of the given tabs.
+> 
+> Doesn't really sound problematic to me.
+
+I agree with Dão here. I think I'd rather keep it internal and not something that anybody could set when setting state.
+
+But a further concern: this works around the problem in this specific case, but it's still possible to do this by detaching an unrestored tab (programmatically), right? I feel like we should probably make sure that's not possible.
+Comment on attachment 641388
+restore tabs right away when duplicating
+
+This seems fine, but it sounds like we need a followup as Paul suggests: the tab detaching code needs to handle unloaded tabs properly somehow.
+*** Bug 833056 has been marked as a duplicate of this bug. ***
+Created attachment 705849
+restore tabs right away when duplicating
+
+Still the same approach but I'm not passing a flag to |restoreHistoryPrecursor()| and |restoreHistory()|. This patch does also fix bug 833056 (as the patch before did, too).
+(In reply to Tim Taubert [:ttaubert] from comment #23)
+> Still the same approach but I'm not passing a flag to
+
+Sorry, typo. I'm *now* passing a flag. Not not.
+Gavin, Dao: review ping? It would be very nice to land this soon.
+https://hg.mozilla.org/integration/fx-team/rev/f681a8eeea3e
+https://hg.mozilla.org/mozilla-central/rev/f681a8eeea3e
+*** Bug 817959 has been marked as a duplicate of this bug. ***
+*** Bug 817959 has been marked as a duplicate of this bug. ***
+
+
+Shift-click on back/forward button doesn't load page
+
+regression
+
+Bug 726275 - Shift-click on back/forward button doesn't load page; r=gavin 

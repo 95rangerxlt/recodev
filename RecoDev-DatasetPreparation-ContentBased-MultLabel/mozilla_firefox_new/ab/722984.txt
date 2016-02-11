@@ -1,0 +1,158 @@
+The service is going away, and it's used in _onQuitRequest to decide whether to show a prompt. We'll probably want to change the logic to check all docshells and possibly show a prompt if there exists a non-PB one.
+
+The service is going away, and it's used in _onQuitRequest to decide whether to show a prompt. We'll probably want to change the logic to check all docshells and possibly show a prompt if there exists a non-PB one.
+Also, the ContentPermissionPrompt class makes decisions based on the global state. That should also be hooked up to a docshell instead.
+The check in _onQuitRequest should probably be replaced by a loop like the one in bug 729867 that checks whether all windows are private ones. The check in ContentPermissionPrompt can be replaced by chromeWin.gPrivateBrowsingUI.privateWindow, as long as the definition of chromeWin is moved up before the check.
+Created attachment 633714
+WIP(Patch v1)
+
+Please tell me the tests that I need to run for this.
+Comment on attachment 633714
+WIP(Patch v1)
+
+Review of attachment 633714:
+-----------------------------------------------------------------
+
+::: browser/components/nsBrowserGlue.js
+@@ +501,5 @@
+>  
+>      if (!aQuitType)
+>        aQuitType = "quit";
+> +    
+> +    let pbFlagCurrentWindow = getChromeWindowLocal(window).gPrivateBrowsingUI.privateWindow;
+
+There is no |window| variable in a component javascript file.
+
+There's a loop in this function a little bit higher than this location where we iterate over the browser windows.  You can just modify that loop to look at the privateWindow variable of each of them.
+
+Also, note that here we want to show a prompt only if there is a non-private browser window open, so you should maintain a allWindowsPrivate boolean flag instead of otherPBWindowExists.
+
+@@ +523,5 @@
+> +      exitingCanceled.data = false;
+> +      Services.obs.notifyObservers(exitingCanceled, "private-browsing-last-context-exiting", null);
+> +      if (exitingCanceled.data)
+> +        return false;
+> +    }
+
+Instead of doing all this, you should just return if there is no non-private window, similarly to what the existing code does.
+
+@@ +527,5 @@
+> +    }
+> +    
+> +    if (warnAboutClosingTabs)
+> +      // FIXME This has to replaced by an appropriate code to extract gBrowser
+> +      return getChromeWindowLocal(window).gBrowser.warnAboutClosingTabs(true);
+
+This shouldn't happen here either.
+
+@@ +1615,4 @@
+>                                                     [requestingURI.host], 1);
+>  
+>        // Don't offer to "always/never share" in PB mode
+> +      var chromeWin = getChromeWindow(requestingWindow).wrappedJSObject;
+
+This won't work as you have not moved the definition of requestingWindow...
+
+Also, you shouldn't move them inside the else branch, because then they will be undefined if we take the if branch.  You should move them to before the if/else statement.
+AFAIK, we don't have tests for the quit prompt case, so you need to test that manually.  For the geolocation part, I'm sure we do have tests somewhere but I can't find any right now.  Maybe dougt knows?
+Hum, what's the relation between the code being changed in bug 729867 and here? The results end up looking really similar; is there some way we can end up sharing the checks, Gavin?
+FWIW bug 722994 comment 19 is relevant here.
+Created attachment 637168
+Patch v2
+
+I tested manually for the "closing multiple tabs warning" and it was giving me an alert twice, when I had two open tabs.
+@Ehsan, should I move the check |if(allWindowPrivate)| to after |if(!showPrompt)| as I did in bug 722994 ? Or is the check dxr.lanedo.com/mozilla-central/toolkit/content/globalOverlay.js.html?string=globalOverlay.js#34 causing some problems ?
+Comment on attachment 637168
+Patch v2
+
+Review of attachment 637168:
+-----------------------------------------------------------------
+
+I think what I wrote below is why you're getting prompted twice.
+
+::: browser/components/nsBrowserGlue.js
+@@ +480,5 @@
+>      while (browserEnum.hasMoreElements()) {
+>        windowcount++;
+>  
+>        var browser = browserEnum.getNext();
+> +      if (!browser.privateWindow)
+
+This check will always be true, since privateWindow is a property of gPrivateBrowsingUI, not the window object itself.
+Created attachment 637581
+Patch v3
+
+Fixed the issue pointed out by Ehsan.
+
+This patch is now only showing alert once during PB mode, which is the desired behaviour.
+https://tbpl.mozilla.org/?tree=Try&rev=253990c38c7e
+Is this ready for review?
+Comment on attachment 637581
+Patch v3
+
+Asking for review since the tree looks green and healthy and it fulfills the desired behaviour afaict.
+Comment on attachment 637581
+Patch v3
+
+Review of attachment 637581:
+-----------------------------------------------------------------
+
+r=me with the below.
+
+::: browser/components/nsBrowserGlue.js
+@@ +1586,4 @@
+>                                                     [requestingURI.host], 1);
+>  
+>        // Don't offer to "always/never share" in PB mode
+> +      if (!chromeWin.gPrivateBrowsingUI.privateWindow) {
+
+You should also test to make sure gPrivateBrowsingUI exists on the chromeWin object.
+Created attachment 637673
+Patch v4
+
+Addressed the comments.
+Comment on attachment 637581
+Patch v3
+
+I think it would be much simpler in general if there was a global private browsing utility function that took a content window and returned whether it's "private" using the docshell tree, rather than jumping through hoops in various places to use gPrivateBrowsingUI.
+
+Something like:
+PrivateBrowsingUtils.isWindowPrivate(window)
+
+isWindowPrivate: function (arbitraryWindow) {
+  return arbitraryWindow.QueryInterface(Ci.nsIInterfaceRequestor)
+     .getInterface(Ci.nsIWebNavigation)
+     .QueryInterface(Ci.nsIDocShellTreeItem)
+     .rootTreeItem.QueryInterface(Ci.nsILoadContext)
+     .usePrivateBrowsing;
+}
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #16)
+> Comment on attachment 637581
+> Patch v3
+> 
+> I think it would be much simpler in general if there was a global private
+> browsing utility function that took a content window and returned whether
+> it's "private" using the docshell tree, rather than jumping through hoops in
+> various places to use gPrivateBrowsingUI.
+> 
+> Something like:
+> PrivateBrowsingUtils.isWindowPrivate(window)
+> 
+> isWindowPrivate: function (arbitraryWindow) {
+>   return arbitraryWindow.QueryInterface(Ci.nsIInterfaceRequestor)
+>      .getInterface(Ci.nsIWebNavigation)
+>      .QueryInterface(Ci.nsIDocShellTreeItem)
+>      .rootTreeItem.QueryInterface(Ci.nsILoadContext)
+>      .usePrivateBrowsing;
+> }
+
+Good idea, filed bug 769467 for that.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/51175fc0de28
+https://hg.mozilla.org/mozilla-central/rev/51175fc0de28
+
+
+nsBrowserGlue uses global private browsing service to make decisions
+
+
+
+Bug 722984 - nsBrowserGlue uses global private browsing service to make decisions; r=ehsan 

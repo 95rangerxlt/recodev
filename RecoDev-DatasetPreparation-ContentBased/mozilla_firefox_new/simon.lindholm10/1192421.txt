@@ -1,0 +1,246 @@
+Created attachment 8645202
+0001-Don-t-clear-the-rule-view-when-changing-selection.patch
+
+So one of my main gripes with the devtools is the flicker in many places of the UI, caused by doing everything asynchronously. Startup is a large part of this, and I'll probably look into whether it's possible to improve it at some point, but more low-hanging fruit is the rule view, which currently goes blank for ~50ms every time the Inspector selection changes.
+
+The attached patch simply avoids clearing the rule view when a new element is selected, instead letting the old element's rules show until the new ones are ready. It works really well for me, but admittedly on a high end machine, and the delay might feel weird on lower end ones or with large stylesheets. Not sure if something is worth doing about that, like adding a spinner or clearing the view after ~100ms. Thoughts appreciated. (Bug 1187777 and bug 1187584 help a bit to lower the delay, but improving further seemed hard.)
+
+Created attachment 8645202
+0001-Don-t-clear-the-rule-view-when-changing-selection.patch
+
+So one of my main gripes with the devtools is the flicker in many places of the UI, caused by doing everything asynchronously. Startup is a large part of this, and I'll probably look into whether it's possible to improve it at some point, but more low-hanging fruit is the rule view, which currently goes blank for ~50ms every time the Inspector selection changes.
+
+The attached patch simply avoids clearing the rule view when a new element is selected, instead letting the old element's rules show until the new ones are ready. It works really well for me, but admittedly on a high end machine, and the delay might feel weird on lower end ones or with large stylesheets. Not sure if something is worth doing about that, like adding a spinner or clearing the view after ~100ms. Thoughts appreciated. (Bug 1187777 and bug 1187584 help a bit to lower the delay, but improving further seemed hard.)
+Comment on attachment 8645202
+0001-Don-t-clear-the-rule-view-when-changing-selection.patch
+
+Review of attachment 8645202:
+-----------------------------------------------------------------
+
+I'm a little worried about making a change like this since we may then have timing issues where a user (or automation) could still be interacting with rules after the selected node has changed.  I'm all for getting rid of the flicker in the rule view (and the last couple patches should definitely help!), but it seems like it may cause less potential intermittents if we are able to reduce the time it takes to go from new selection to a rendered view.
+
+It'd help to have some timing numbers to help break down what's the bulk of the slowness right now.  Is it the RDP request, some jank in the frontend,  templating being slow, etc?  From there we could decide the best way to proceed.  Just my 2 cents, I'll forward the request to Patrick so maybe he will have another opinion.
+That's a fair point. For automation I feel like it shouldn't be much of a problem, this just replaces one invalid intermediate state by another (but then, I don't have experience with intermittents). This patch did get a green try a while ago, FWIW. For actual users it seems mainly a theoretical concern, because 50ms is not enough time to click something in the old UI, and most actions of clicking something should be harmless, but it certainly would be nice not to rely on this... Not sure what to do about it though. There are a lot of addEventListener calls, even spread into other files, and I don't know of any simple way of making them all impossible to trigger... I don't see a real alternative to a patch in this vein though; plain optimizations won't prevent the flicker.
+
+The slowness seems rather spread out. Out of 100ms taken by an update on cnn.com, e10s disabled, on a -O2 --enable-profiling build, and according to the Performance panel of the Browser Toolbox:
+- 30ms is reflow/painting (across the markup view, breadcrumb trail, box highlighter, and rule view, all of which update when changing selection)
+- 30ms is CssRuleView.prototype._populate, mostly DOM operations I think, but it's hard to tell
+- 5ms is the box model highlighter
+- 5ms is PageStyleActor<.getApplied
+- 5ms is DebuggerClient.prototype.poolFor, which is O(N) (the patch I wrote for this didn't seem to help, but I'll look again)
+- 5ms seems to be promise overhead (?), possibly because of non-release mode stack captures
+- ~3ms is RDP overhead, probably worse with e10s
+- 3ms content DOM traversal
+The remainder is miscellaneous cruft and rounding errors. I'll attach a profile.
+
+One optimization that would be nice would be to cache some of the constructed rule view DOMs. Seems hard, though, with all the intertwined state and element-level addEventListener calls.
+Created attachment 8645335
+profile4.json
+
+(each flame chart FPS spike in the later half of the profile corresponds to a selection change)
+I've just tried the patch locally, it feels much nicer indeed.
+
+I'm a bit worried, like Brian, about the effect this will have on users with either slower computers or using the devtools to debug remote devices (try debugging a fxos device via USB for instance, you'll see selecting a new node gets much slower).
+I'm not worried about tests though since we have events that tests should use to know when things have been refreshed.
+Emptying the panel when the previous node is unselected is nice because it lets people know that something is going on and prevent them from doing actions on the old DOM, but that's what causes the flicker. So we need a way to do these 2 things with your patch:
+- block user actions on the old DOM (semi-opaque overlay, or pointer-events:none, or something),
+- let users know that something is being refreshed.
+
+As Brian mentioned, the other thing is that the rule-view is slow, we've been saying this for a while, never finding the time to address it. It's also something worth doing, but won't remove the flicker.
+
+I did a couple of tests with Chrome devtools and found out there's no flicker there, the UI isn't being refreshed entirely but instead individual sections are being updated dynamically, in fact even the scrollbar position doesn't change when you select a new node, ours jump back to the top.
+Created attachment 8646400
+0001-Make-the-rule-view-non-interactive-while-loading-and.patch
+
+This patch, which applies on top of the previous one, adds "pointer-events: none" and blocks Space and Enter keys while the rule view loads. Additionally it clears the content after 250ms, which roughly matches what I saw Chrome do (although I don't know their exact logic).
+
+Remote debugging is a very good point which I did not think of.
+
+Maintaining scrollbar position is something we could easily do; it would just involve removing the line "this.element.scrollTop = 0;" added in the patch. Jumping back to top seems more natural though.
+Created attachment 8646401
+Test code: add an artificial delay
+Comment on attachment 8646400
+0001-Make-the-rule-view-non-interactive-while-loading-and.patch
+
+Review of attachment 8646400:
+-----------------------------------------------------------------
+
+This looks pretty good to me.
+It'd be great if you could come up with a test to make sure this feature doesn't regress in the future (you could add one in browser/devtools/styleinspector/test).
+Please ping me for review (R?) when done, I'll properly test this then.
+
+::: browser/devtools/styleinspector/rule-view.js
+@@ +2350,5 @@
+> +   * Handle the keydown event in the rule view.
+> +   */
+> +  _onKeydown: function(event) {
+> +    if (this.element.classList.has("non-interactive") &&
+> +        (event.code === "Enter" || event.code === " ")) {
+
+Why blocking only these 2 keys here? Blocking everything would make the code simpler.
+I'll add a test of some sort, though it's hard to make it comprehensive given all the raciness involved. Should I fold everything into a single patch, or keep the two patches split?
+
+> Why blocking only these 2 keys here? Blocking everything would make the code simpler.
+
+While I don't know if it's important enough to care, I felt a bit bad for blocking Tab and unrelated shortcuts like Ctrl+L.
+Created attachment 8654735
+0001-Bug-1192421-Part-1-Don-t-clear-the-rule-view-when-ch.patch
+Created attachment 8654736
+0002-Bug-1192421-Part-2-Make-the-rule-view-non-interactiv.patch
+Created attachment 8654737
+0003-Bug-1192421-Part-3-Add-a-test.-r-pbrosset.patch
+Comment on attachment 8654737
+0003-Bug-1192421-Part-3-Add-a-test.-r-pbrosset.patch
+
+Review of attachment 8654737:
+-----------------------------------------------------------------
+
+Looks good to me, just a line to be removed in the test.
+
+::: browser/devtools/styleinspector/test/browser_ruleview_refresh-noflicker.js
+@@ +12,5 @@
+> +add_task(function*() {
+> +  yield addTab(TESTCASE_URI);
+> +
+> +  info("Getting the test node");
+> +  let div = getNode("#testdiv");
+
+This variable isn't used.
+Comment on attachment 8654735
+0001-Bug-1192421-Part-1-Don-t-clear-the-rule-view-when-ch.patch
+
+Review of attachment 8654735:
+-----------------------------------------------------------------
+
+Nice. Not seeing any problems with the code changes here, and my tests were all successful (also tested on remote targets, and with the test patch that adds fake delay).
+Can you push to TRY or do you need me to do it?
+Created attachment 8657230
+0003-Bug-1192421-Part-3-Add-a-test.-r-pbrosset.patch
+
+With less copy-paste.
+
+Try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=d4112108731c
+On top of less bustage, hopefully: https://treeherder.mozilla.org/#/jobs?repo=try&revision=4afdca71c6e9
+Looks green modulo bug 1192800 practically permafailing. Is it okay to land it?
+(In reply to Simon Lindholm from comment #16)
+> Looks green modulo bug 1192800 practically permafailing. Is it okay to land
+> it?
+Seems ok to me.
+https://hg.mozilla.org/integration/fx-team/rev/63ace982aa7e
+https://hg.mozilla.org/integration/fx-team/rev/a6ca8c5bb39b
+https://hg.mozilla.org/integration/fx-team/rev/e894ad983fea
+Backed out for D2 bustages like this
+
+browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-03.js | Test timed out - expected PASS
+
+https://hg.mozilla.org/integration/fx-team/rev/1402b5ada4d3
+https://hg.mozilla.org/integration/fx-team/rev/7144359685df
+https://hg.mozilla.org/integration/fx-team/rev/da9e85e62924
+Created attachment 8659405
+0001-Bug-1192421-Part-0-Fix-a-failing-test.-r-pbrosset.patch
+
+This seems to fix it. Compare https://treeherder.mozilla.org/#/jobs?repo=try&revision=985c5b39f5b2 vs. https://treeherder.mozilla.org/#/jobs?repo=try&revision=11f533918c35. (Though it seems sad that mouse events would be triggered in automation, which is the most reasonable explanation I can think of for why this helps...)
+
+Full try build: https://treeherder.mozilla.org/#/jobs?repo=try&revision=265973b4b2e0
+Comment on attachment 8659405
+0001-Bug-1192421-Part-0-Fix-a-failing-test.-r-pbrosset.patch
+
+Review of attachment 8659405:
+-----------------------------------------------------------------
+
+::: browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-03.js
+@@ +51,5 @@
+>    let hs = view.highlighters;
+>    hs.promises[TYPE] = promise.resolve(HighlighterFront);
+>  
+> +  // Make sure that actual mouse movements don't interfere
+> +  hs.removeFromView();
+
+This is fine here because the test doesn't really simulate mouse events, it just calls event handler callbacks, but I have 2 worries:
+1) it looks a bit weird calling hs's removeFromView (which, essentially, is a destructor) before testing hs's logic. But I can live with it, as long as you elaborate the comment a bit more.
+2) why would your patch cause this? The fix you propose here sounds like a fix to a problem that should exist even without your original patch. It doesn't look a fix for the root cause of the problem introduced by it.
+
+Sorry, I've been working on other things in the meantime, and I don't have the specifics of your original changes in mind anymore, I guess I need to be convinced that this is the right fix for this test.
+How come the "highlighter-hidden" event doesn't get emitted (this is what causes the test to time out, right?)
+> 2) why would your patch cause this?
+
+It's unclear... My guess is that the problem is pre-existing and only didn't surface because of luck with timing and details of style computation and event dispatch. https://treeherder.mozilla.org/#/jobs?repo=try&revision=3fdb2565bdcf with only the first patch looks green, indicating that the problem appeared in the second patch, which does little more than adding "pointer-events: none" during loading.
+
+If any mouse events trigger at all most of logic of the test goes out the window, so it doesn't surprise me that "highlighter-hidden" doesn't trigger at exactly the expected time in that case. (yes, that does seem to be what causes the timeout)
+
+> 1) it looks a bit weird calling hs's removeFromView (which, essentially, is a destructor) before
+> testing hs's logic. But I can live with it, as long as you elaborate the comment a bit more.
+
+"  // Make sure actual mouse movements don't interfere by calling removeFromView,
+  // which will make the highlighter assume it is no longer connected to the
+  // DOM, and remove all added event listeners. (This is somewhat against the
+  // contract of the highlighter, but we're test code, so it's OK.)
+  // It's somewhat unclear why this is needed, see bug 1192421." ?
+Should I take the silence to say that you are skeptical, and I should confirm the hypothesis further?
+
+I was somewhat hoping to avoid that, because debugging issues that only show up intermittently on try is time consuming... But I can do it if really wanted.
+(In reply to Simon Lindholm from comment #23)
+> Should I take the silence to say that you are skeptical, and I should
+> confirm the hypothesis further?
+I'm really sorry for the delay answering. I've been busy the past 2 weeks trying to finish a project, and this bug wasn't on my radar for some reason. I'm also traveling this week so don't expect to have time to try things out.
+I'll keep the NI? flag so I remember to take a closer look at this later.
+Created attachment 8671750
+Bug_1192421_-_1_-_Don't_clear_rule-view_when_chang.diff
+
+Rebased part 1 (after big devtools file move)
+Created attachment 8671751
+Bug_1192421_-_2_-_Make_rule-view_non-interactive_w.diff
+
+Rebased part 2 (after big devtools file move)
+I will try to find some time today to investigate the test issues.
+Created attachment 8671771
+Bug_1192421_-_3_-_New_test_that_verifies_the_rule-.diff
+
+Rebased part 3 after the big devtools file move.
+I spent some time yesterday looking into this and discovered a race condition with the _hideCurrent method in style-inspector-overlay.js, when hiding a highlighter. Indeed, this method was using getHighlighter to get the instance of the highlighter and hide it, but that returns a promise, and so this was causing a race on mouse move.
+However, we didn't need to make _hideCurrent async, because if no highlighter exists, then there's nothing to be hidden, so I changed it from using getHighlighter to just accessing the instance (if it exists) synchronously.
+This seems to have done the trick: https://treeherder.mozilla.org/#/jobs?repo=try&revision=7b5f8da668e4
+I'm going to upload my change, but since I'm not sure which of the original patches caused this in the first place, I'll just fold everything and R+ it (anyway, Simon's 3 original patches were R+'d, and my changes are minor, so r=me and r=test-only on those).
+Created attachment 8672948
+Bug_1192421_-_Don't_clear_rule-view_when_changing_.diff
+
+Folded patch with my extra fix. Retained Simon's username in the patch as he wrote 99% of the patch.
+https://hg.mozilla.org/integration/fx-team/rev/7e23cc4f3656
+https://hg.mozilla.org/mozilla-central/rev/7e23cc4f3656
+Thank you for finding the time to look into and land this! The Inspector feels so much nicer to use now.
+
+One question about your fixes:
+
+>    3.65    _getHighlighter: function(type) {
+>    3.66      let utils = this.highlighterUtils;
+>    3.67  
+>    3.68 -    if (this.promises[type]) {
+>    3.69 -      return this.promises[type];
+>    3.70 +    if (this.highlighters[type]) {
+>    3.71 +      return promise.resolve(this.highlighters[type]);
+>    3.72      }
+>    3.73  
+>    3.74 -    return this.promises[type] = utils.getHighlighterByType(type).then(highlighter => {
+>    3.75 +    return utils.getHighlighterByType(type).then(highlighter => {
+
+Couldn't it be a problem that this instantiates several highlighters of the same type (only the last one of which gets used)?
+Hm, also, if one calls _onMouseMove and _hideCurrent in rapid succession, couldn't this cause the highlighter to remain? Although, that might have been the case even with the previous code... It would be nice to sequentialize the promises, rather than forgetting about all the return values of the ".then"s.
+
+
+[rule view] Flicker when changing selection
+
+
+
+Bug 1192421 - Part 1: Don't clear the rule view when changing selection. r=pbrosset 
+
+Bug 1192421 - Part 2: Make the rule-view non-interactive while loading and hide it after a delay. r=pbrosset 
+
+Bug 1192421 - Part 3: Add a test. r=pbrosset 
+
+Backed out changeset e894ad983fea (bug 1192421) for DT2 bustage 
+
+Backed out changeset a6ca8c5bb39b (bug 1192421) for DT2 bustage 
+
+Backed out changeset 63ace982aa7e (bug 1192421) for DT2 bustage 
+
+Bug 1192421 - Don't clear rule-view when changing selection; r=pbro

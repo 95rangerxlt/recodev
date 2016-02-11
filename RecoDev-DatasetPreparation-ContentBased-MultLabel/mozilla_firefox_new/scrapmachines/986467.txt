@@ -1,0 +1,116 @@
+here is a try server push with the failures:
+https://tbpl.mozilla.org/?tree=Try&rev=29bcc82f7302
+
+you can see it on all linux64-debug, osx*-debug, and some windows and linux32 debug runs!  So this is a common thing, lets fix it or disable it.
+
+why this is failing is we are looking to run the tests per directory instead of a large massive chunk of subdirectories.  This means we cannot depend on tests before us to setup stuff, nor tests after us to cleanup stuff!
+
+here is a try server push with the failures:
+https://tbpl.mozilla.org/?tree=Try&rev=29bcc82f7302
+
+you can see it on all linux64-debug, osx*-debug, and some windows and linux32 debug runs!  So this is a common thing, lets fix it or disable it.
+
+why this is failing is we are looking to run the tests per directory instead of a large massive chunk of subdirectories.  This means we cannot depend on tests before us to setup stuff, nor tests after us to cleanup stuff!
+Created attachment 8396739
+leakfix
+
+Potential fix.
+
+I was able to reproduce the leak when running the directory /toolkit/devtools/server/tests/browser/ on my mac osx debug.
+
+This patch fixes that leak.
+
+Joel, can you run a similar try as in description of the bug ?
+with this patch applied we still get a lot of failures on debug tests across all platforms:
+https://tbpl.mozilla.org/?tree=Try&rev=41aa42bfccbc
+I think now it just burns down to GC being able to free those docShells from memory. I think I have seen a way to force GC in tests..
+Created attachment 8397385
+potential fix for real
+
+So.. yeah, I was able to reproduce the leak with the previous patch too, though like 7/10 times. 
+
+There were a couple of obvious things:
+ - this.childActorPool.delete(window) instead of this.childWindowPool.delete(window) : Which lead me to think that this might be the leaking window/docshell - NOPE
+ - I was calculating my own docshell, while tabActor already had one. Fixed it. Still leaks.
+ - The event handlers for "pageshow" and "pagehide" were never removed as in the tests, at the time of storageActor.destroy, the tabActor.browser is null. Thus it was getting fired one extra time, throwing exceptions. Still not the cause of leak.
+
+Then finally I added extra tests in browser_storage_listings to increase the time taken to execute that test. The leak stopped. Thus I concluded that it is a GC/CC thing only where gecko is not clearing the docshell in time (as the test is too quick).
+
+Thus adding Cu.forceGC() at the test end should work, right ? NOPE
+
+I had to add all three forced collections available on Cu - forceGC, forceCC, forceShrinkingGC and three times on each test end -_- .
+
+I don't really like it, but this is the only way for which I was reliably able to see a leak free run for like 20+ times.
+
+Joel, can you please push that try again with this patch ?
+normal try is green : https://tbpl.mozilla.org/?tree=Try&rev=2326997c8b5f
+You should CC before GC but you should probably use DOMWindowUtils.garbageCollect() instead of forceCC and forceGC... it does both.
+
+Are you certain that you need forceShrinkingGC()?
+(In reply to Michael Ratcliffe [:miker] [:mratcliffe] from comment #6)
+> You should CC before GC but you should probably use
+> DOMWindowUtils.garbageCollect() instead of forceCC and forceGC... it does
+> both.
+
+Ah okay.
+
+> Are you certain that you need forceShrinkingGC()?
+
+I have no idea if I really need it or not.
+<noob in leak detection>
+the most recent patch looks good on try server when run per directory. I am happy to see this shaping up!
+So I talked to some GC experts.
+
+They suggested that Cu.forceShrinkingGC() is all I need.
+
+Also, I tried reducing the number of calls to the forceCollection() method, with trying out all permutations. The only permutation in which I did not see leak in 100 test runs is the one in the patch.
+
+Regarding doing CC before GC, the method is doing normal GC, then CC then hard GC. So I think we should go ahead with this approach rather than finding leaks in edge cases later on.
+
+I was also told that bc tests are somewhat flaky that they easily leak when not running the whole suite together. Most of the times, its not the code's fault.
+Comment on attachment 8397385
+potential fix for real
+
+Review of attachment 8397385:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/storage.js
+@@ +814,5 @@
+>  
+>    destroy: function() {
+>      this.updateTimer.cancel();
+>      this.updateTimer = null;
+> +    this.layoutHelper._topDocShell = null;
+
+Do we need this?
+(In reply to Joe Walker [:jwalker] from comment #10)
+> Comment on attachment 8397385
+> potential fix for real
+> 
+> Review of attachment 8397385:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/devtools/server/actors/storage.js
+> @@ +814,5 @@
+> >  
+> >    destroy: function() {
+> >      this.updateTimer.cancel();
+> >      this.updateTimer = null;
+> > +    this.layoutHelper._topDocShell = null;
+> 
+> Do we need this?
+
+Not sure. I was just being over protective. will remove.
+Created attachment 8398536
+final patch
+
+addressed review comment.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/cbe388a78f24
+https://hg.mozilla.org/mozilla-central/rev/cbe388a78f24
+
+
+browser_storage_listings.js fails in debug mode by leaking 1 docshell until shutdown
+
+
+
+Bug 986467 - Remove the iframes before finishing the tests. r=jwalker 

@@ -1,0 +1,148 @@
+STR:
+* Start Fx with the mixedpuppy@github demo provider.  Log in, delete the Fx cache and disable the network.
+* Hover over one of the "flyout hover test" buttons - note the nice "social provider problem" error page, as expected.
+* Hover over all the visible buttons, causing the flyout panel to move over each. After 1-5ish such hovers, the nice social error page changes to the generic "Firefox can't connect" error page.
+
+Some instrumenting of the code shows the SocialErrorListener just stops getting notified - but I can't repro this with the sidebar itself.  Initially noticed when fixing bug 822794, and whatever fixes this will also be necessary there...
+
+STR:
+* Start Fx with the mixedpuppy@github demo provider.  Log in, delete the Fx cache and disable the network.
+* Hover over one of the "flyout hover test" buttons - note the nice "social provider problem" error page, as expected.
+* Hover over all the visible buttons, causing the flyout panel to move over each. After 1-5ish such hovers, the nice social error page changes to the generic "Firefox can't connect" error page.
+
+Some instrumenting of the code shows the SocialErrorListener just stops getting notified - but I can't repro this with the sidebar itself.  Initially noticed when fixing bug 822794, and whatever fixes this will also be necessary there...
+nsIWebProgress expects an object implementing nsISupportsWeakReference, which we do.  That tells me we need to hold a reference to the listener in our code, which we do not.  Our listeners are getting GC'd at some point.
+Created attachment 704677
+errorlistener.patch
+
+This keeps a reference for each instance of the listener, which should fix this bug.  It also does some refactoring that can allow us to move SocialErrorListener to Social.jsm, which should provider a better route for fixing bug 822794.
+Comment on attachment 704677
+errorlistener.patch
+
+Review of attachment 704677:
+-----------------------------------------------------------------
+
+LGTM!
+
+::: browser/base/content/browser-social.js
+@@ +401,5 @@
+>      iframe.setAttribute("flex", "1");
+>      iframe.setAttribute("origin", Social.provider.origin);
+>      panel.appendChild(iframe);
+> +    if (!this._progressListener) {
+> +      this._progressListener = new SocialErrorListener(this.panel.firstChild,
+
+s/this.panel.firstChild/iframe/ ?
+
+@@ +890,5 @@
+>      socialToolbarItem.appendChild(toolbarButtons);
+>  
+>      for (let frame of createdFrames) {
+>        if (frame.docShell) {
+> +        if (frame._progressListener) {
+
+This seems to rely on using an attribute on the iframe itself to keep the strong ref.  Any reason we don't just do that for *all* frames, and therefore can do it directly in the SocialErrorListener constructor?
+
+@@ +1144,5 @@
+> +                                   .getInterface(Ci.nsIWebProgress)
+> +                                   .addProgressListener(this,
+> +                                                        Ci.nsIWebProgress.NOTIFY_STATE_REQUEST |
+> +                                                        Ci.nsIWebProgress.NOTIFY_LOCATION);
+> +  this.remove = function() {
+
+can't we just store iframe in |this|, and have the |remove| function on the prototype?  Then we can call the error handler directly with this.iframe instead of the hoops to extract it from the nsIWebProgressListener
+(In reply to Mark Hammond (:markh) from comment #3)
+> Comment on attachment 704677
+> errorlistener.patch
+> 
+> Review of attachment 704677:
+> -----------------------------------------------------------------
+
+> @@ +1144,5 @@
+> > +                                   .getInterface(Ci.nsIWebProgress)
+> > +                                   .addProgressListener(this,
+> > +                                                        Ci.nsIWebProgress.NOTIFY_STATE_REQUEST |
+> > +                                                        Ci.nsIWebProgress.NOTIFY_LOCATION);
+> > +  this.remove = function() {
+> 
+> can't we just store iframe in |this|, and have the |remove| function on the
+> prototype?  Then we can call the error handler directly with this.iframe
+> instead of the hoops to extract it from the nsIWebProgressListener
+
+An aversion to circular references.
+Created attachment 704734
+errorlistener.patch
+
+this goes further, moving the error listener into Social.jsm, and adding chat window support.
+Comment on attachment 704734
+errorlistener.patch
+
+Review of attachment 704734:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser-social.js
+@@ +424,1 @@
+>      panel.removeChild(panel.firstChild);
+
+s/panel.firstChild/iframe/
+
+@@ +886,5 @@
+>      socialToolbarItem.appendChild(toolbarButtons);
+>  
+>      for (let frame of createdFrames) {
+>        if (frame.docShell) {
+> +        if (frame.socialErrorListener) {
+
+This should probably be done outside the check for frame.docShell, incase it was previously added but the docShell went away before we got here.
+
+::: browser/modules/Social.jsm
+@@ +309,5 @@
+> +                                   .getInterface(Ci.nsIWebProgress)
+> +                                   .addProgressListener(this,
+> +                                                        Ci.nsIWebProgress.NOTIFY_STATE_REQUEST |
+> +                                                        Ci.nsIWebProgress.NOTIFY_LOCATION);
+> +  this.remove = function() {
+
+remove() should be on the prototype, iframe stored in a member variable and it can then be used directly when calling setErrorMessage.
+Created attachment 704767
+Some error page tests
+
+Some tests for the error listener.  They currently fail in the "panel" tests, but should work correctly with this patch applied.  They also need tests for the chat windows, but that should be easy based on the existing panel tests.  These tests should probably just be folded in with the fixes (including the addition of the chat tests if the chat fixes remain in this bug)
+*** Bug 822794 has been marked as a duplicate of this bug. ***
+Created attachment 705038
+errorlistener.patch
+
+patch addresses feedback and integrates tests.  There is a todo in the tests for bug 833207 which we'll handle in a followup as that may require some api change.
+Comment on attachment 705038
+errorlistener.patch
+
+removing review, am going to add another test.
+Created attachment 705047
+errorlistener.patch
+
+adds chat window test
+https://tbpl.mozilla.org/?tree=Try&rev=83dfbb1ca065
+Could we instead just stop having SocialErrorListener implement nsIWeakReference?
+Sadly it's not possible, addProgressListener requires that the listener implements nsIWeakRef: http://mxr.mozilla.org/mozilla-central/source/uriloader/base/nsDocLoader.cpp#916
+Comment on attachment 705047
+errorlistener.patch
+
+Review of attachment 705047:
+-----------------------------------------------------------------
+
+Looks good.  The .clientTop trick was only necessary for the flyouts (not for the other kinds of frames), and I have a patch in my tree here that I need to unbitrot that can get rid of it. So can you keep the .clientTop hack in the flyout code instead of moving that inside Social.jsm? And I'll remove it soon
+Created attachment 706471
+errorlistener.patch
+
+updated with change for clientTop, carrying forward r+
+Created attachment 706588
+errorlistener.patch
+
+fix a change that got into the last patch, keeping r+ still
+https://tbpl.mozilla.org/?tree=Try&rev=312af8051058
+(In reply to Shane Caraveo (:mixedpuppy) from comment #18)
+> https://tbpl.mozilla.org/?tree=Try&rev=312af8051058
+
+cancelled that, forgot I already did try. (comment #12)
+https://hg.mozilla.org/integration/mozilla-inbound/rev/b0bc8f7cc420
+https://hg.mozilla.org/mozilla-central/rev/b0bc8f7cc420

@@ -1,0 +1,426 @@
+
+
+
+Created attachment 8402967
+patch
+
+This is the sort of approach I'm thinking of taking for filtering console messages, by tagging each ConsoleAPI instance with a consoleID. Does this make sense or is there something else that you'd prefer here Mihai?
+Comment on attachment 8402967
+patch
+
+This looks good but I have the following concerns:
+
+- innerID goes unusued when (outer) ID="jsm". I intended innerID to be used for identifying addons/extensions, etc. Currently we put the filename out of lack of anything better, and we do not use it anywhere.
+
+The consoleID seems like a good innerID candidate. Thoughts?
+
+- How does consoleID work with the DOM console API from pages/widgets of addons? How about nsIScriptErrors and network requests?
+(In reply to Mihai Sucan [:msucan] from comment #2)
+> Comment on attachment 8402967
+> patch
+> 
+> This looks good but I have the following concerns:
+> 
+> - innerID goes unusued when (outer) ID="jsm". I intended innerID to be used
+> for identifying addons/extensions, etc. Currently we put the filename out of
+> lack of anything better, and we do not use it anywhere.
+> 
+> The consoleID seems like a good innerID candidate. Thoughts?
+
+Might work, except for the following...
+
+> - How does consoleID work with the DOM console API from pages/widgets of
+> addons? How about nsIScriptErrors and network requests?
+
+It doesn't right now, one option is for the SDK to just override the console for panels and widgets but for other stuff we could make the DOM console code match the window URL to an add-on and pass the same consoleID along with the ID and innerID.
+
+Script errors can be done the same. network requests I haven't thought about so much yet.
+(In reply to Dave Townsend (:Mossop) from comment #3)
+> (In reply to Mihai Sucan [:msucan] from comment #2)
+> > - How does consoleID work with the DOM console API from pages/widgets of
+> > addons? How about nsIScriptErrors and network requests?
+> 
+> It doesn't right now, one option is for the SDK to just override the console
+> for panels and widgets but for other stuff we could make the DOM console
+> code match the window URL to an add-on and pass the same consoleID along
+> with the ID and innerID.
+
+Overriding is a bit ugly, but I dont know of a better solution now. Also see bug 988636 - Console.jsm will be unified with the DOM console API implementation, hopefully soon.
+(In reply to Mihai Sucan [:msucan] from comment #4)
+> (In reply to Dave Townsend (:Mossop) from comment #3)
+> > (In reply to Mihai Sucan [:msucan] from comment #2)
+> > > - How does consoleID work with the DOM console API from pages/widgets of
+> > > addons? How about nsIScriptErrors and network requests?
+> > 
+> > It doesn't right now, one option is for the SDK to just override the console
+> > for panels and widgets but for other stuff we could make the DOM console
+> > code match the window URL to an add-on and pass the same consoleID along
+> > with the ID and innerID.
+> 
+> Overriding is a bit ugly, but I dont know of a better solution now. Also see
+> bug 988636 - Console.jsm will be unified with the DOM console API
+> implementation, hopefully soon.
+
+Hrm, I'd better hurry up and land this first then! ;)
+
+So thinking more I think it makes sense to keep innerID and consoleID separate. I think of innerID as being the place where the logging is happening and consoleID the thing doing the logging (maybe it should be consoleOwner?). As an example for SDK page-mods we kind of want any logging they do to show up in the webconsole for the page they are attached too, but we also want them to show up in the add-on debugger. So it would make sense for them to log with an innerID for the page and consoleID for the add-on.
+Created attachment 8403603
+patch
+
+Here is an updated and somewhat larger patch. It gives every restartless add-on a custom console that reports through the debug protocol. It also gives the browser actor a global for every restartless add-on that it can use for JS evaluation. The method it uses is a little hacky for my tastes. I don't want to expose a way to get the global from the add-on manager so instead I have it listen for new connections and then pass the global to the actor. This also means that if an add-ons global changes (doesn't happen right now) it can pass the new one along too. I'd love to hear feedback on how nasty you think this is.
+
+Assuming this looks ok on general principal I'll clean it up, maybe add some more tests and then go for review. I know this doesn't support some types of console messages or some SDK cases but I'd rather get the first steps in this patch landed and then iterate on it than try to do everything in one go.
+Comment on attachment 8403603
+patch
+
+Review of attachment 8403603:
+-----------------------------------------------------------------
+
+So the tradeoff with this hack is exposing debugger server internals to the add-on manager. It's unfortunate for sure, but I think it makes sense to hold the add-on manager to a higher standard than the debugger server, if we can't keep them both to the same standard. However I believe there are a few things that we could do to make the interface between the two more future-proof.
+
+One is to keep the loop over add-on actors to the debugger server and expose it with a DebuggerServer.updateAddonActors(fn) (or mapAddonActors) that applies the fn callback to every add-on actor in all current connections. fn would then receive an add-on actor as a parameter so that XPIProvider.jsm could plant the add-on global. It might even make sense to use DevToolsUtils.yieldingEach, although I expect multiple debugger connections and lots of add-on actors to be a very rare case.
+
+The other is the notification mechanism to use for alerting the add-on manager to a new connection. Notification observers aren't available in workers AFAIK so Eddy would have to skip that call in workers. But AFAICT it is just an extra notification to overcome the single-callback limitation of onConnectionChange, which was introduced in bug 912898 as a temporary measure for B2G. Even though we could just chain callbacks (every new listener would keep a reference to the previous callback and call it before returning), I think using an event emitter as I had suggested in that bug would make the most sense. And since only the new connection's add-on actors are of interest to the add-on manager in this case, we should have both DebuggerServer.updateAddonActors and DebuggerServerConnection.updateAddonActors, with the former looping over all connections and calling the latter.
+Created attachment 8404351
+Passing globals around
+
+(In reply to Panos Astithas [:past] from comment #7)
+> Comment on attachment 8403603
+> patch
+> 
+> Review of attachment 8403603:
+> -----------------------------------------------------------------
+> 
+> So the tradeoff with this hack is exposing debugger server internals to the
+> add-on manager. It's unfortunate for sure, but I think it makes sense to
+> hold the add-on manager to a higher standard than the debugger server, if we
+> can't keep them both to the same standard. However I believe there are a few
+> things that we could do to make the interface between the two more
+> future-proof.
+> 
+> One is to keep the loop over add-on actors to the debugger server and expose
+> it with a DebuggerServer.updateAddonActors(fn) (or mapAddonActors) that
+> applies the fn callback to every add-on actor in all current connections. fn
+> would then receive an add-on actor as a parameter so that XPIProvider.jsm
+> could plant the add-on global. It might even make sense to use
+> DevToolsUtils.yieldingEach, although I expect multiple debugger connections
+> and lots of add-on actors to be a very rare case.
+
+I like this but I realised that doing this would allow the same pretty direct exposure of add-on globals to anyone that called that. Instead I've made a setAddonOptions method which passes a set of options through to the actors for an add-on and let's them take it. Other code can still ultimately get it if they go through the actors manually but at least it is obscure enough that AMO reviewers will spot it and deny review, also we could lock that down tighter later if it became a problem.
+
+There is one problem. It turns out that with bug 910184 there are multiple debugger servers so registering on the main server for events doesn't get them from the actual server in use in the add-on debugger. My first guess approach here is to register a hierarchy of servers and have messages emitted passed up to parents and calls to setAddonOptions passed on to children.
+
+Before I go ahead and try to figure out how to test this bit I wanted to grab your thoughts on that?
+Comment on attachment 8404351
+Passing globals around
+
+Review of attachment 8404351:
+-----------------------------------------------------------------
+
+I believe there can be at most two debugger servers running simultaneously in a single process, one for debugging content and the other for debugging chrome and they are pretty much unrelated, in the sense that the chrome debugger server does not treat debugging the content debugger differently in runtime. Since you are only interested in the browser debugger, wouldn't interacting with it directly work? You should be able to get a reference to it via BrowserToolboxProcess.debuggerServer and just listen for connection events on that one.
+Actually, since BrowserToolboxProcess.debuggerServer won't be available until BrowserToolboxProcess is initialized, we could have a BrowserToolboxProcess.addConnectionListener that would maintain a listener list until initialization and then pass it on to BrowserToolboxProcess.debuggerServer.
+(In reply to Dave Townsend (:Mossop) from comment #6)
+> Created attachment 8403603
+> patch
+
+f+. The patch looks good wrt. console-related changes. Maybe you can put the new AddonConsoleActor in webconsole.js ? I would favor the console stuff to be close to each other when we have to make changes to one actor.
+Created attachment 8407200
+DebuggerServer and ToolboxProcess changes
+
+Ok this looks a bit saner. Is there any good way of testing the ToolboxProcess stuff?
+Comment on attachment 8407200
+DebuggerServer and ToolboxProcess changes
+
+Review of attachment 8407200:
+-----------------------------------------------------------------
+
+The changes we discussed look solid, but I've found a few other issues that need attention. It should be a quick r+ with those out of the way.
+
+::: browser/devtools/framework/ToolboxProcess.jsm
+@@ +16,5 @@
+>  Cu.import("resource://gre/modules/devtools/Loader.jsm");
+>  let require = devtools.require;
+>  let Telemetry = require("devtools/shared/telemetry");
+> +let EventEmitter = require("devtools/toolkit/event-emitter");
+> +let { all } = require("sdk/core/promise");
+
+We are moving to Promise.jsm, please use that instead.
+
+@@ +124,4 @@
+>      }
+>  
+>      if (!this.debuggerServer.initialized) {
+> +      let { DebuggerServer: mainServer } = devtools.require("devtools/server/main");
+
+I think this is a leftover from the previous version of the patch? I don't see mainServer used anywhere.
+
+::: toolkit/devtools/server/actors/root.js
+@@ -334,5 @@
+> -        this.conn.removeActorPool(this._addonActorPool);
+> -      }
+> -      this._addonActorPool = addonActorPool;
+> -      this.conn.addActorPool(this._addonActorPool);
+> -
+
+I don't think moving this bit inside BrowserAddonList is a good idea. Can you explain the reasoning behind it?
+
+This code is craving for some comments, but luckily the ones in onListTabs still apply. See also the comments in root.js for a longer explanation. The gist of it is that the pattern used here guarantees that no actors will be created before any client asks for them, and actors remain alive until a subsequent listTabs/listAddons request. 
+
+The former is obviously useful, but the reasoning for the latter is this: say that a client is debugging an add-on, which gets uninstalled. Uninstalling the add-on will trigger an addonListChanged notification, which the client should follow up with a new listAddons request. But between the time the add-on is uninstalled and the listAddons response is received, the client may still make more requests to the actor of the uninstalled add-on. This pattern ensures that the client will not have server actors unexpectedly disappearing from it.
+(In reply to Panos Astithas [:past] from comment #13)
+> ::: toolkit/devtools/server/actors/root.js
+> @@ -334,5 @@
+> > -        this.conn.removeActorPool(this._addonActorPool);
+> > -      }
+> > -      this._addonActorPool = addonActorPool;
+> > -      this.conn.addActorPool(this._addonActorPool);
+> > -
+> 
+> I don't think moving this bit inside BrowserAddonList is a good idea. Can
+> you explain the reasoning behind it?
+> 
+> This code is craving for some comments, but luckily the ones in onListTabs
+> still apply. See also the comments in root.js for a longer explanation. The
+> gist of it is that the pattern used here guarantees that no actors will be
+> created before any client asks for them, and actors remain alive until a
+> subsequent listTabs/listAddons request. 
+> 
+> The former is obviously useful, but the reasoning for the latter is this:
+> say that a client is debugging an add-on, which gets uninstalled.
+> Uninstalling the add-on will trigger an addonListChanged notification, which
+> the client should follow up with a new listAddons request. But between the
+> time the add-on is uninstalled and the listAddons response is received, the
+> client may still make more requests to the actor of the uninstalled add-on.
+> This pattern ensures that the client will not have server actors
+> unexpectedly disappearing from it.
+
+Ok I didn't see the need to keep the actors alive after the add-on had gone away. But I think bug 992244 has introduced a bug with the tab and addon lists. In both cases multiple calls to getList will return the same actor if the tab/add-on hasn't changed. But they create a new pool for each call and destroy the previous one calling disconnect on all the previously returned actors, even though we are sending the same actors this time. I think just but not cleaning up the old actors this is fixed and I can do that here.
+(In reply to Dave Townsend [:mossop] from comment #14)
+> (In reply to Panos Astithas [:past] from comment #13)
+> > ::: toolkit/devtools/server/actors/root.js
+> > @@ -334,5 @@
+> > > -        this.conn.removeActorPool(this._addonActorPool);
+> > > -      }
+> > > -      this._addonActorPool = addonActorPool;
+> > > -      this.conn.addActorPool(this._addonActorPool);
+> > > -
+> > 
+> > I don't think moving this bit inside BrowserAddonList is a good idea. Can
+> > you explain the reasoning behind it?
+> > 
+> > This code is craving for some comments, but luckily the ones in onListTabs
+> > still apply. See also the comments in root.js for a longer explanation. The
+> > gist of it is that the pattern used here guarantees that no actors will be
+> > created before any client asks for them, and actors remain alive until a
+> > subsequent listTabs/listAddons request. 
+> > 
+> > The former is obviously useful, but the reasoning for the latter is this:
+> > say that a client is debugging an add-on, which gets uninstalled.
+> > Uninstalling the add-on will trigger an addonListChanged notification, which
+> > the client should follow up with a new listAddons request. But between the
+> > time the add-on is uninstalled and the listAddons response is received, the
+> > client may still make more requests to the actor of the uninstalled add-on.
+> > This pattern ensures that the client will not have server actors
+> > unexpectedly disappearing from it.
+> 
+> Ok I didn't see the need to keep the actors alive after the add-on had gone
+> away. But I think bug 992244 has introduced a bug with the tab and addon
+> lists. In both cases multiple calls to getList will return the same actor if
+> the tab/add-on hasn't changed. But they create a new pool for each call and
+> destroy the previous one calling disconnect on all the previously returned
+> actors, even though we are sending the same actors this time. I think just
+> but not cleaning up the old actors this is fixed and I can do that here.
+
+I split this off into bug 997315
+Created attachment 8407819
+Debugger server patch
+
+Blair, can you review the Add-on Manager bit.
+Comment on attachment 8407819
+Debugger server patch
+
+Review of attachment 8407819:
+-----------------------------------------------------------------
+
+::: toolkit/mozapps/extensions/internal/XPIProvider.jsm
+@@ +35,5 @@
+>                                    "resource://gre/modules/Task.jsm");
+>  XPCOMUtils.defineLazyModuleGetter(this, "OS",
+>                                    "resource://gre/modules/osfile.jsm");
+> +XPCOMUtils.defineLazyModuleGetter(this, "BrowserToolboxProcess",
+> +                                  "resource://app/modules/devtools/ToolboxProcess.jsm");
+
+Shouldn't this be resource:/// ?
+
+AFAIK, resource://app/ still only works in certain circumstances.
+(In reply to Blair McBride [:Unfocused] from comment #17)
+> Comment on attachment 8407819
+> patch
+> 
+> Review of attachment 8407819:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/mozapps/extensions/internal/XPIProvider.jsm
+> @@ +35,5 @@
+> >                                    "resource://gre/modules/Task.jsm");
+> >  XPCOMUtils.defineLazyModuleGetter(this, "OS",
+> >                                    "resource://gre/modules/osfile.jsm");
+> > +XPCOMUtils.defineLazyModuleGetter(this, "BrowserToolboxProcess",
+> > +                                  "resource://app/modules/devtools/ToolboxProcess.jsm");
+> 
+> Shouldn't this be resource:/// ?
+> 
+> AFAIK, resource://app/ still only works in certain circumstances.
+
+They both should be identical but you're right that in general we use resource:/// so I'll flip it to that.
+
+http://mxr.mozilla.org/mozilla-central/source/netwerk/protocol/res/nsResProtocolHandler.cpp#129
+https://hg.mozilla.org/integration/fx-team/rev/5a9d701731a1
+Aaaand backed out due to Win8 debug only mochitest failures :s
+
+https://hg.mozilla.org/integration/fx-team/rev/932ab5554cb0
+And back in like a yo-yo since it was probably a bad slave.
+
+https://hg.mozilla.org/integration/fx-team/rev/af6a5461089d
+https://hg.mozilla.org/mozilla-central/rev/af6a5461089d
+Created attachment 8408981
+Add add-on console actor
+
+This adds the console actor for add-ons and tests that they work. It also adds a console to the bootstrap scope for every add-on (Blair, please review that part).
+
+Because the add-on manager only passes add-on globals to the BrowserAddonActors used by toolbox processes and the test doesn't use that we have to test logging with objects which makeDebuggeeValue can get a global for.
+Comment on attachment 8408981
+Add add-on console actor
+
+Review of attachment 8408981:
+-----------------------------------------------------------------
+
+::: toolkit/mozapps/extensions/internal/XPIProvider.jsm
+@@ +4121,4 @@
+>          this.bootstrapScopes[aId][name] = BOOTSTRAP_REASONS[name];
+>  
+>        // Add other stuff that extensions want.
+>        const features = [ "Worker", "ChromeWorker" ];
+
+Surprised we don't already have a test ensuring these are defined in the bootstrap scope - want to add a basic one, while you're testing the presence of the console object?
+
+I know there's a thorough test from the devtools point of view, but if we're messing with Addons Manager code we generally don't run devtools tests. So just a simple sanity check to ensure the console object *exists* would save potential headaches.
+
+@@ +4126,5 @@
+>        for (let feature of features)
+>          this.bootstrapScopes[aId][feature] = gGlobalScope[feature];
+>  
+> +      // Define a console for the add-on
+> +      let { ConsoleAPI } = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
+
+Seems like a waste to re-import this for every iteration in a loop on startup - better to lazy-load this once at the top of the file, like other modules.
+this may have caused a regression with the browser toolbox. See bug 998912.
+I think this bug is safe, it does not seem to be the cause of bug 998912.
+Comment on attachment 8408981
+Add add-on console actor
+
+Review of attachment 8408981:
+-----------------------------------------------------------------
+
+Looks good.
+
+::: toolkit/devtools/server/actors/webconsole.js
+@@ +1397,5 @@
+>  
+> +
+> +/**
+> + * The WebConsoleActor implements capabilities needed for the Web Console
+> + * feature.
+
+nit: this comment needs to be updated.
+
+@@ +1423,5 @@
+> +
+> +  /**
+> +   * The add-on that this console watches.
+> +   */
+> +  addon: null,
+
+Shouldn't we clear this.addon in the disconnect() method?
+Created attachment 8411150
+Add-on console actor patch
+
+This adds a test verifying that a few of the globals in the bootstrap script exist and have the expected type.
+https://hg.mozilla.org/integration/fx-team/rev/61b922c31b12
+Comment on attachment 8411150
+Add-on console actor patch
+
+>+  /**
+>+   * Destroy the current AddonConsoleActor instance.
+>+   */
+>+  disconnect: function ACA_disconnect()
+>+  {
+>+    WebConsoleActor.prototype.disconnect.call(this);
+>+    this.addon = null;
+>+  }
+Missing a comma after the }
+If someone is looking to backout, I pushed with an added comma to see if it'll fix test failures: https://hg.mozilla.org/try/rev/0f7f74b4b708
+
+https://tbpl.mozilla.org/?tree=Try&rev=7e1f0d777fce
+https://hg.mozilla.org/integration/fx-team/rev/e5a01f84acc0
+
+Backed out as tests were still failing:
+
+X: TEST-UNEXPECTED-FAIL | resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/server/actors/webconsole.js | ReferenceError: update is not defined at resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/server/actors/webconsole.js:1428 - See following stack:
+
+Mdt: TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/canvasdebugger/test/browser_canvas-actor-test-01.js | Got an error: update is not defined
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/canvasdebugger/test/browser_canvas-actor-test-02.js | Got an error: this.conn.allocID is not a function
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/canvasdebugger/test/browser_canvas-actor-test-02.js | Found an unexpected tab at the end of test run: http://example.com/browser/browser/devtools/canvasdebugger/test/doc_simple-canvas.html
+
+M5: TEST-UNEXPECTED-FAIL | /tests/toolkit/devtools/apps/tests/test_webapps_actor.html | Test timed out.
+Created attachment 8414513
+fix changes from bug 997239
+Comment on attachment 8414513
+fix changes from bug 997239
+
+Here are fixes since bug 997239 changed things. A fuller fix might involve adding an "addAddonActor" similar to "addTabActor" but I don't think that is worth it for now.
+Comment on attachment 8414513
+fix changes from bug 997239
+
+Review of attachment 8414513:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/webconsole.js
+@@ +58,5 @@
+> + *        The object being updated.
+> + * @param aNewAttrs Object
+> + *        The new attributes being set on the target.
+> + */
+> +function update(aTarget, aNewAttrs) {
+
+This is the same as the one in script.js, right? We should really move it to DevToolsUtils.js and require() it in both places from there.
+https://hg.mozilla.org/integration/fx-team/rev/d3d8ce8abf98
+Created attachment 8415906
+SDK parts
+https://hg.mozilla.org/mozilla-central/rev/d3d8ce8abf98
+Commits pushed to master at https://github.com/mozilla/addon-sdk
+
+https://github.com/mozilla/addon-sdk/commit/ef5321b5ca560e25d269b34be440926f73f7baad
+Bug 993029: Tag the SDK console with the add-on ID.
+
+https://github.com/mozilla/addon-sdk/commit/b462dcb9a5e6ff3dc0ee3d48183c1357b176a85c
+Merge pull request #1479 from Mossop/bug993029
+
+Bug 993029: Tag the SDK console with the add-on ID. r=gozala
+
+
+Create an add-on console actor that will be displayed in the console tab of the add-on debugger
+
+
+
+Bug 993029: Add a way for the add-on manager to pass add-on globals to the debug actors. r=panos, r=Unfocused 
+
+Backing out bug 993029 due to Win8 debug test failures. CLOSED TREE 
+
+Bug 993029: Add a way for the add-on manager to pass add-on globals to the debug actors. r=panos, r=Unfocused 
+
+Bug 993029: Create an add-on console actor that will be displayed in the console tab of the add-on debugger. r=msucan, r=Unfocused 
+
+Backed out changeset 61b922c31b12 (bug 993029) 
+
+Bug 993029: Create an add-on console actor that will be displayed in the console tab of the add-on debugger. r=msucan, r=Unfocused, r=past 

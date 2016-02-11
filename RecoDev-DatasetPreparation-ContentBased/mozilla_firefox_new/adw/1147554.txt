@@ -1,0 +1,127 @@
+Talos found a regression:
+https://groups.google.com/forum/#!searchin/mozilla.dev.tree-alerts/non-main$20startup/mozilla.dev.tree-alerts/F_acfMLTUpo/lj2JyrWzS3wJ
+
+
+I retriggered this a few times:
+https://treeherder.mozilla.org/#/jobs?repo=fx-team&fromchange=2921b421255b&
+tochange=a9f983fdb8a4&filter-searchStr=Windows%207%2032-bit%20fx-team%20talos%20xperf
+
+and this changeset is the culprit:
+https://hg.mozilla.org/integration/fx-team/pushloghtml?changeset=b5bfda73ba54
+
+the test is part of xperf:
+https://wiki.mozilla.org/Buildbot/Talos/Tests#xperf
+
+Most likely this is something that is using more memory during startup.
+
+Talos found a regression:
+https://groups.google.com/forum/#!searchin/mozilla.dev.tree-alerts/non-main$20startup/mozilla.dev.tree-alerts/F_acfMLTUpo/lj2JyrWzS3wJ
+
+
+I retriggered this a few times:
+https://treeherder.mozilla.org/#/jobs?repo=fx-team&fromchange=2921b421255b&
+tochange=a9f983fdb8a4&filter-searchStr=Windows%207%2032-bit%20fx-team%20talos%20xperf
+
+and this changeset is the culprit:
+https://hg.mozilla.org/integration/fx-team/pushloghtml?changeset=b5bfda73ba54
+
+the test is part of xperf:
+https://wiki.mozilla.org/Buildbot/Talos/Tests#xperf
+
+Most likely this is something that is using more memory during startup.
+:jaws, can you comment on this and indicate whether or not this is something that is intended or there is no easy way to get the memory out of startup.
+There may be something that can be done here, but I'm not familiar enough with the Reading List backend to know what could be done. Redirecting to Drew/Mark.
+try push with reading list enabled,
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=a91336806929
+
+try push with reading list disabled,
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=f4c7955ec28e
+Since reading list was enabled, browser-readinglist.js now loads ReadingList.jsm immediately, i.e., on startup, and ReadingList.jsm creates a SQLite database and sets up its schema when it's imported, if the database hasn't already been created, and then maintains an open connection to it.  So I'd guess that's what this is about.
+
+I bet ReadingList.jsm could be smarter by not creating the DB or connection until absolutely necessary.  So if no reading list UI is actually visible on startup, then we could defer the connection (hopefully) until some UI does become visible.  browser-readinglist.js for example simply adds a listener after importing ReadingList.jsm.  For that alone, there's no reason to open the DB at that point.
+Shouldn't be too hard to do what comment 4 suggests.
+Hi Drew, can you provide a point value.
+Compare-talos of the different try pushes from above,
+http://compare-talos.mattn.ca/?oldRevs=f4c7955ec28e&newRev=a91336806929&server=graphs.mozilla.org&submit=true
+Some regressions on mozilla-aurora are raised: http://alertmanager.allizom.org:8080/alerts.html?rev=cb0db44ce60e&showAll=1&testIndex=0&platIndex=0 on windows and ubuntu platforms. The tests regressed are:
+1) Tp5 No Network Row Major MozAfterPaint 
+2) SVG-ASAP
+3) Tp5 Optimized
+4) Tp5 Optimized (Private Bytes)
+5) Ts, Paint
+Created attachment 8586370
+patch
+
+This should do it.
+Comment on attachment 8586370
+patch
+
+Review of attachment 8586370:
+-----------------------------------------------------------------
+
+This looks fine, but I'm wondering if it will actually solve the problem given the URLBar will force the connection to be opened so it knows whether to display a "+" or "-" - so we should do whatever magic is necessary to ensure it actually solves the regression (which I assume just means a try push, then that talos comparison page, then someone who can interpret the results ;)
+If we still have the problem with this patch, a (possibly overcomplicated) option might be to have the "connection ready" thing have 2 phases - if there's no DB file on disk, don't create it, and return null/false for all methods that attempt to fetch/check and item.  Then create the DB as soon as the first write operation comes in.  This means that for users without any readinglist items the DB is never created and the URL bar will still work fine without it existing.
+Argh, good point!  Here's a try push with the posted patch:
+
+https://hg.mozilla.org/try/rev/70c91b958dc0
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=591d9798f7cf
+Sorry, right one:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=70c91b958dc0
+(In reply to Mark Hammond [:markh] from comment #11)
+> If we still have the problem with this patch, a (possibly overcomplicated)
+> option might be to have the "connection ready" thing have 2 phases - if
+> there's no DB file on disk, don't create it, and return null/false for all
+> methods that attempt to fetch/check and item.  Then create the DB as soon as
+> the first write operation comes in.  This means that for users without any
+> readinglist items the DB is never created and the URL bar will still work
+> fine without it existing.
+
+Note that bug 1136570 is planning on pre-populating the list, so all users would have items in their DB. That is, unless we ask bug 1136570 to only insert the items in to the disk the first time RL is opened/written-to.
+Thanks for that info, Jared.  I bet the reading list store could provide a hook to pre-populate its DB when the DB is created, rather than having a consumer pre-populate it on startup.
+
+As for the patch here, one xperf run shows an improvement of 11.93% (i.e., -11.93%): http://compare-talos.mattn.ca/?oldRevs=5fde3c10ff01&newRev=70c91b958dc0&server=graphs.mozilla.org&submit=true
+
+Tp5 No Network Row Major MozAfterPaint (Non-Main Startup File IO Bytes) (tp5n_nonmain_startup_fileio_paint)
+11.93%
+
+I've retriggered the run a few times to see if the improvement changes.
+(In reply to Drew Willcoxon :adw from comment #16)
+> Tp5 No Network Row Major MozAfterPaint (Non-Main Startup File IO Bytes)
+> (tp5n_nonmain_startup_fileio_paint)
+> 11.93%
+
+Er, should be a negative sign in front of that number, copy and paste fail.
+Awesome - assuming the retrigger agrees it sounds like we should just ship this and worry about future optimizations if a similar problem comes up again (ie, hopefully never ;)
+After five total runs, the "Tp5 No Network Row Major MozAfterPaint (Non-Main Startup File IO Bytes) (tp5n_nonmain_startup_fileio_paint)" results are -13.71% (an improvement).
+
+There were improvements to other tests too, but a 8.92% regression in "Tp5 No Network Row Major MozAfterPaint (Non-Main Normal Network IO Bytes) (tp5n_nonmain_normal_netio_paint)".  There was a 99.06% improvement in "Tp5 No Network Row Major MozAfterPaint (Main Startup Network IO Bytes) (tp5n_main_startup_netio_paint)".  I don't know what to make of that.  Except those two sound related -- "non-main normal" vs. "main startup".  This made the "non-main normal" a little worse but the "main startup" much better.  Since the patch defers opening the DB from startup to some later time, I guess that makes sense?  Not sure why it's classified as "network" though -- actually why it's apparently classified as both "network" and "file".
+
+http://compare-talos.mattn.ca/?oldRevs=5fde3c10ff01&newRev=70c91b958dc0&server=graphs.mozilla.org&submit=true
+
+Anyway, I'll land it.
+https://hg.mozilla.org/integration/fx-team/rev/a1e2aa2e30b2
+Accidentally included a couple of lines that I was experimenting with and didn't mean to include.  Follow-up fix to revert:
+
+https://hg.mozilla.org/integration/fx-team/rev/516efc52a1ab
+https://hg.mozilla.org/mozilla-central/rev/2b2933df8bb3
+https://hg.mozilla.org/releases/mozilla-aurora/rev/dbd796117a42
+https://hg.mozilla.org/releases/mozilla-beta/rev/acc50d404648
+
+follow-up:
+https://hg.mozilla.org/mozilla-central/rev/4e8fd80f0e7a
+https://hg.mozilla.org/releases/mozilla-aurora/rev/4559bc36b41c
+https://hg.mozilla.org/releases/mozilla-beta/rev/9104d1f928a7
+
+
+13% win7 non main startup file IO bytes on fx-team (v.39) on March 22 from push b5bfda73ba54
+
+perf, regression
+
+Bug 1147554 - Lazily create desktop reading list's database connection. r=markh 
+
+Bug 1147554 - Lazily create desktop reading list's database connection (follow-up: revert erroneous chage). r=me 
+
+Bug 1147554 - Lazily create desktop reading list's database connection. r=markh 
+
+Bug 1147554 - Lazily create desktop reading list's database connection (follow-up: revert erroneous chage). r=me 

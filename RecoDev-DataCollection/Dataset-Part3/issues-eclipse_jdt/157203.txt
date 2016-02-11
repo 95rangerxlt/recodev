@@ -1,0 +1,246 @@
+When previewing changes for a refactoring whose changes are TextChanges, sometimes spurious changes are displayed in the preview/diff UI due to the presence of empty regions in the source or target.  
+
+For instance, given a ReplaceEdit that inserts a line, the source's region is empty and the target's is not.  But in the diff page, it looks like a line is inserted in the source AND the following line from the source's context is deleted.  This is confusing.  
+
+I think the issue comes down to TextEditBasedChange#getContent() when dealing with the expandRegionToFullLine argument.  If the incoming region is empty, then expanding to full line introduces a new line in the content, whereas a non-empty region always has line(s) to work with.  Thus, the fix is to remove one line of context when expanding an empty region, so the two sides (current and preview) balance out in total number of lines displayed.
+
+When previewing changes for a refactoring whose changes are TextChanges, sometimes spurious changes are displayed in the preview/diff UI due to the presence of empty regions in the source or target.  
+
+For instance, given a ReplaceEdit that inserts a line, the source's region is empty and the target's is not.  But in the diff page, it looks like a line is inserted in the source AND the following line from the source's context is deleted.  This is confusing.  
+
+I think the issue comes down to TextEditBasedChange#getContent() when dealing with the expandRegionToFullLine argument.  If the incoming region is empty, then expanding to full line introduces a new line in the content, whereas a non-empty region always has line(s) to work with.  Thus, the fix is to remove one line of context when expanding an empty region, so the two sides (current and preview) balance out in total number of lines displayed.
+The attachment feature seems broken so here it is:
+
+--- /C/temp/a/TextEditBasedChange.java	2006-09-13 11:42:44.554336400 -0500
++++ /C/temp/b/TextEditBasedChange.java	2006-09-13 12:23:00.144202700 -0500
+@@ -206,8 +206,15 @@
+ 				int startLine= Math.max(document.getLineOfOffset(region.getOffset()) - surroundingLines, 0);
+
+ 				int endLine;
+
+ 				if (region.getLength() == 0) {
+
++					// no lines are in the region, so remove one from the context,
++					// or else spurious changes show up that look like deletes from the source
++					if (surroundingLines == 0) {
++						// empty: show nothing
++						return document.get(region.getOffset(), region.getLength());						
++					}
++					
+ 					endLine= Math.min(
+
+-						document.getLineOfOffset(region.getOffset()) + surroundingLines,
+
++						document.getLineOfOffset(region.getOffset()) + surroundingLines - 1,
+ 						document.getNumberOfLines() - 1);
+
+ 				} else {
+
+ 					endLine= Math.min(
+And here's a JUnit test:
+
+package refactoringTest;
+
+import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.NullProgressMonitor;
+import org.eclipse.jface.text.Document;
+import org.eclipse.jface.text.IRegion;
+import org.eclipse.ltk.core.refactoring.DocumentChange;
+import org.eclipse.ltk.core.refactoring.TextEditChangeGroup;
+import org.eclipse.text.edits.*;
+
+import junit.framework.TestCase;
+
+/**
+ * Ensure that the diffs between text edits do not include
+ * spurious context lines when source or target regions are
+ * empty.  Otherwise, the current content and preview content
+ * have differing affected ranges and spurious changes appear.
+ * @author eswartz
+ *
+ */
+public class TestTextDiffContent extends TestCase {
+	private DocumentChange documentChange;
+
+	private Document document;
+
+	private ReplaceEdit edit1;
+
+	private ReplaceEdit edit2;
+
+	private TextEditChangeGroup change1;
+
+	private TextEditChangeGroup change2;
+
+	private ReplaceEdit edit3;
+
+	private TextEditChangeGroup change3;
+	
+	private static final String MODIFIED_SOURCE_CONTENTS =
+		"// my file\n"+
+		"\n"+
+		"CMyClass::CMyClass()\n"+
+		"\t{\n"+
+		"\tGoodCall();\n"+
+		"\tDumbCall();\n"+
+		"\t// [[[ begin\n"+
+		"\tMagicCall();\n"+
+		"\t// ]]] end\n"+
+		"\t}\n"+
+		"\n"+
+		"// other stuff\n";
+
+	@Override
+	protected void setUp() throws Exception {
+		super.setUp();
+		document = new Document(MODIFIED_SOURCE_CONTENTS);
+		documentChange = new DocumentChange("Changes to document", document);
+
+		// store one unified change for the document
+		MultiTextEdit multiEdit = new MultiTextEdit();
+		documentChange.setEdit(multiEdit);
+
+		int offset;
+		TextEditGroup group;
+		/////
+		
+		offset = MODIFIED_SOURCE_CONTENTS.indexOf("\t}\n");
+		edit1 = new ReplaceEdit(
+				offset, 0, 
+				"\tFinalCall();\n");
+			
+		group = new TextEditGroup("Change 1");
+		group.addTextEdit(edit1);
+		change1 = new TextEditChangeGroup(documentChange, group);
+		documentChange.addTextEditChangeGroup(change1);
+		multiEdit.addChild(edit1);
+		
+		/////
+		offset = 0;
+		edit2 = new ReplaceEdit(
+				offset, 0, 
+				"// add comment\n");
+			
+		group = new TextEditGroup("Change 2");
+		group.addTextEdit(edit2);
+		change2 = new TextEditChangeGroup(documentChange, group);
+		documentChange.addTextEditChangeGroup(change2);
+		multiEdit.addChild(edit2);
+		
+		/// 
+		offset = MODIFIED_SOURCE_CONTENTS.indexOf("\tDumb");
+		int endOffset = MODIFIED_SOURCE_CONTENTS.indexOf("\t// [[[ begin", offset);
+		edit3 = new ReplaceEdit(
+				offset, endOffset - offset, "");
+
+		group = new TextEditGroup("Change 3");
+		group.addTextEdit(edit3);
+		change3 = new TextEditChangeGroup(documentChange, group);
+		documentChange.addTextEditChangeGroup(change3);
+		multiEdit.addChild(edit3);
+
+	}
+	
+	private String getSource(IRegion region, int context) throws CoreException {
+		return documentChange.getCurrentContent(region, true, context, new NullProgressMonitor());
+	}
+	private String getPreview(TextEditChangeGroup group, int context) throws CoreException {
+		return documentChange.getPreviewContent(
+				new TextEditChangeGroup[] { group },
+				group.getRegion(), true, context, new NullProgressMonitor());
+	}
+	
+	public void testEmptySourceRangeNoContext() throws Exception {
+		String src = getSource(edit1.getRegion(), 0);
+		String preview = getPreview(change1, 0);
+		assertEquals("", src);
+		assertEquals("\tFinalCall();", preview);
+		
+	}
+	public void testEmptySourceRangeNoContext2() throws Exception {
+		String src = getSource(edit2.getRegion(), 0);
+		String preview = getPreview(change2, 0);
+		assertEquals("", src);
+		assertEquals("// add comment", preview);
+		
+	}
+	public void testEmptySourceRangeContext() throws Exception {
+		String src = getSource(edit1.getRegion(), 2);
+		String preview = getPreview(change1, 2);
+		assertEquals("\tMagicCall();\n" + 
+				"\t// ]]] end\n" + 
+				"\t}\n", 
+				src);
+		assertEquals("	MagicCall();\n" + 
+				"	// ]]] end\n" + 
+				"	FinalCall();\n" + 
+				"	}\n", 
+			preview);
+	}
+	public void testEmptySourceRangeContext2() throws Exception {
+		String src = getSource(edit2.getRegion(), 2);
+		String preview = getPreview(change2, 2);
+		assertEquals("// my file\n",
+				src);
+		assertEquals("// add comment\n"+
+				"// my file\n",
+			preview);
+	}
+	
+	public void testEmptyTargetRangeNoContext() throws Exception {
+		String src = getSource(edit3.getRegion(), 0);
+		String preview = getPreview(change3, 0);
+		assertEquals("\tDumbCall();", src);
+		assertEquals("", preview);
+		
+	}
+	public void testEmptyTargetRangeContext() throws Exception {
+		String src = getSource(edit3.getRegion(), 2);
+		String preview = getPreview(change3, 2);
+		assertEquals("\t{\n"+"\tGoodCall();\n"+
+				"\tDumbCall();\n"+ 
+				"\t// [[[ begin\n"+
+				"\tMagicCall();",
+				src);
+		assertEquals("\t{\n"+"\tGoodCall();\n"+ 
+				"\t// [[[ begin\n"+
+				"\tMagicCall();",
+				preview);
+		
+	}
+
+}
+Created attachment 50072
+Patch to org.eclipse.ltk.core.refactoring.TextEditBasedChange.java
+
+Patch (use strip prefix=2 and apply directly)
+Created attachment 50073
+JUnit test for bug fix
+
+JUnit test for the fix
+Thanks a lot for the patches. Released with minor modifications:
+- TextEditBasedChange: just return "" when range.getLength() is 0
+- Test: adapted to naming conventions
+- added copyright
+
+Ed: The fix and the tests look good. However, I would like to see the defective preview as well, if possible. Do you happen to have steps to reproduce the problem in plain Eclipse?
+.
+Created attachment 50254
+Diff viewer for file node content
+
+Adding more info
+Created attachment 50255
+Incorrect diff for contained unit node
+
+Adding more detail
+Created attachment 50257
+Sample plugin providing refactoring wizard
+
+This exposes an action on a project called "RefactoringTest" which runs a wizard that shows the refactoring.  It adds/modifies files in the project, so start with an empty simple project.
+BTW, is there any chance this fix can be migrated back into the 3.2 maintenance build?  For now, AFAIK, we're targeting a 3.2-based release for next year.  
+
+The only workaround we have for this in 3.2 (aside from shipping a patched ltk ui plugin) is to implement an extension to DocumentChange which makes getCurrentContent() and getPreviewContent() turn off the context information.  It works but it's kind of ugly.
+We have shipped with this bug in JDT/UI since 2004. However, TextEditBasedChange is API since 3.2. The fix is simple, but it's not a regression, and the only known issue is that the preview looks bad.
+
+Martin, what do you think?
+not for 3.2.2

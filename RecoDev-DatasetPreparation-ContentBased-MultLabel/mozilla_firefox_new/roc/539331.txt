@@ -1,0 +1,127 @@
+Seems to be consistent since roc's checkins, but I can apparently reproduce it locally before then. Investigating further...
+
+Seems to be consistent since roc's checkins, but I can apparently reproduce it locally before then. Investigating further...
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_sanitizeDialog.js | Timed out
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_tabfocus.js | Timed out
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_tabs_owner.js | 4 tabs are open - Got 6, expected 4
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_tabs_owner.js | newly opened tab is selected - Got [object XULElement @ 0xab94e78 (native @ 0x9a72aa0)], expected [object XULElement @ 0xa300050 (native @ 0x9a4aa48)]
+> TEST-UNEXPECTED-FAIL | plugin process 28366 | automationutils.processLeakLog() | missing output line for total leaks!
+
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263354695.1263363466.31094.gz
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263353394.1263361760.13126.gz
+
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_sanitizeDialog.js | Timed out
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_tabfocus.js | Timed out
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_tabs_owner.js | 4 tabs are open - Got 6, expected 4
+> TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_tabs_owner.js | newly opened tab is selected - Got [object XULElement @ 0xa015590 (native @ 0x9a60198)], expected [object XULElement @ 0x8d015c0 (native @ 0xa0cfe10)]
+
+Are The browser_tabfocus.js failure and the browser_tabs_owner.js failure caused by this?
+Oops, the latter log is here:
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263328560.1263338301.13901.gz
+I think the problem is that the test just takes a while to run. It fires many assertions because during reflow nsGridRowLeafLayout::ComputeChildSizes calls nsGfxScrollFrameInner::GetActualScrollbarSizes, which calls GetUsedBorder on a dirty frame not currently being reflowed, which asserts. That's because we calculate the scrollbar widths and heights by comparing the scrollport to the scrollframe's padding-rect.
+
+We can instead compute the scrollbar widths and heights directly from the scrollbar boxes ... but only if we exclude the possibility of the scrollbars having margins. I think that's OK.
+(In reply to comment #3)
+> I think the problem is that the test just takes a while to run.
+
+if that's the case, bug 529860 could help confirming it, enlarging the time for this test.
+
+Gavin, any possibility to review my b-c tests harness changes?
+Created attachment 421429
+fix
+
+This fixes the timeout for me, by making the assertions go away, by making GetActualScrollbarSizes only look at the scrollbar frame mRects.
+
+We might possibly still have intermittent problems with the test taking too long. It needs a higher timeout limit or else should be broken up into smaller tests.
+Linux mozilla-central debug test everythingelse on 2010/01/13 04:51:47
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263387107.1263392695.3409.gz
+Comment on attachment 421429
+fix
+
+r=mats
+Pushed http://hg.mozilla.org/mozilla-central/rev/a3af8424d938
+I backed this out, it seemed to cause a mochitest failure:
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263433832.1263434805.21151.gz
+
+75172 ERROR TEST-UNEXPECTED-FAIL | /tests/layout/xul/base/test/test_bug393970.xul | Cells (1,2) and (2,2) line up horizontally (with overflow-x: hidden; overflow-y: scroll;) - got 721, expected 716
+75174 ERROR TEST-UNEXPECTED-FAIL | /tests/layout/xul/base/test/test_bug393970.xul | Cells (1,3) and (2,3) line up horizontally (with overflow-x: hidden; overflow-y: scroll;) - got 991, expected 976
+75184 ERROR TEST-UNEXPECTED-FAIL | /tests/layout/xul/base/test/test_bug393970.xul | Cells (1,2) and (2,2) line up horizontally (with overflow-x: scroll; overflow-y: scroll;) - got 721, expected 716
+75186 ERROR TEST-UNEXPECTED-FAIL | /tests/layout/xul/base/test/test_bug393970.xul | Cells (1,3) and (2,3) line up horizontally (with overflow-x: scroll; overflow-y: scroll;) - got 991, expected 976
+Created attachment 421616
+Part 2
+
+Applies on top of the first patch.
+
+1) create nsIScrollableFrame::GetScrollbarVisibility, which can be called anytime
+2) save/restore mHasHorizontal/VerticalScrollbar when reflowing child content, so GetScrollbarVisibility works even during reflow of HTML (nsXULScrollFrame is already OK)
+3) nsGridRowLeafLayout::ConsiderChildSizes calls GetScrollbarVisibility and GetDesiredScrollbarSizes to approximate GetActualScrollbarSizes in a way that's safe during reflow of the scrolled content
+4) Changes various sites that call GetActualScrollbarSizes just to check visibility to use GetScrollbarVisibility instead.
+Sorry, ignore the patch description in comment #10, that was accidental autocomplete
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263508774.1263510171.18227.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/14 14:39:34  
+s: moz2-linux-slave20
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_sanitizeDialog.js | Timed out
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263521091.1263522678.26349.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/14 18:04:51  
+s: moz2-linux-slave20
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/browser_sanitizeDialog.js | Timed out
+Oops, I had a comment that somehow failed to make it to Bugzilla:
+
+The test failed because the first patch broke scrollable grid rowgroups.
+
+While we reflow the scrolled rowgroup, nsGridRowLeafLayout::ComputeChildSizes looks up the ancestor chain to discover the current state of the scrollbars in the ancestors. Before reflowing the scrolled content, nsXULScrollFrame sets its mScrollPort to reflect its current assumptions about scrollbar presence/absence, but it does NOT adjust the geometry of the scrollbars until the content has been completely reflowed. So before this patch we would return the correct GetActualScrollbarSizes even during reflow of nsXULScrollFrames, but with this patch we don't return the current GetActualScrollbarSizes when it's called during reflow.
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263547186.1263549166.14504.gz
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263571322.1263574112.6793.gz
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263585828.1263588366.9511.gz
+Comment on attachment 421616
+Part 2
+
+Nice cleanup!  r=mats
+
+Maybe GetActualScrollbarSizes should assert that:
+!box || !(box->GetStateBits() & NS_FRAME_FIRST_REFLOW)
+with "box" == mVScrollbarBox,mHScrollbarBox
+I don't think we need to assert that. If the box hasn't been reflowed, its size will be 0,0, which is what GetActualScrollbarSizes should return.
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263664510.1263667061.9046.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/16 09:55:10
+s: moz2-linux-slave02
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263660598.1263662898.27091.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/16 08:49:58
+s: moz2-linux-slave41
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263682786.1263685672.12683.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/16 14:59:46
+s: moz2-linux-slave09
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263779176.1263780957.19414.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/17 17:46:16
+s: moz2-linux-slave06
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263796342.1263798788.17263.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/17 22:32:22
+s: moz2-linux-slave06
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263832804.1263835973.15836.gz
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263842483.1263845966.29214.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/18 11:21:23
+s: moz2-linux-slave16
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263841161.1263845857.27730.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/18 10:59:21
+s: moz2-linux-slave13
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263811141.1263813273.11718.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/18 02:39:01
+s: moz2-linux-slave13
+http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1263847601.1263851206.22285.gz
+Linux mozilla-central debug test mochitest-other on 2010/01/18 12:46:41
+s: moz2-linux-slave05
+http://hg.mozilla.org/mozilla-central/rev/75bf0842156c
+http://hg.mozilla.org/mozilla-central/rev/51292fe9e5a9
+
+
+browser_sanitizeDialog.js is failing
+
+
+
+Bug 539331 - browser_sanitizeDialog.js is failing [r=mats] 
+
+Backing out fix for bug 539331 due to test failures 
+
+Bug 539331 - browser_sanitizeDialog.js is failing, r=matspal 
+
+Bug 539331 - browser_sanitizeDialog.js is failing part 2, r=matspal 

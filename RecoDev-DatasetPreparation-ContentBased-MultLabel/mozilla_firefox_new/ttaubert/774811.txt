@@ -1,0 +1,86 @@
+Here's the profile:
+http://people.mozilla.com/~bgirard/cleopatra/?report=285fcf510fa6aaeac977e741adcd35b88e6a3710
+
+Here's the profile:
+http://people.mozilla.com/~bgirard/cleopatra/?report=285fcf510fa6aaeac977e741adcd35b88e6a3710
+57ms of this is encoding the png. 52ms is glReadPixels reading back the webgl canvas
+The easiest thing to fix here would be to encode the png in a separate event from the grabbing the data.
+Maybe we can extract the webgl frame from the last resolved webgl frame. I imagine this might not be something we can do if the screenshoting isn't the same view as the layer widget.
+We filed bug 744100 to do async screenshots
+I don't think async screenshots is feasible until we can get off main thread painting (something I've been wanting for awhile now) so let's consider some more immediate solutions such as what jeff suggested.
+After canvas.drawWindow() we call canvas.mozFetchAsStream(callback), with the callback invoked on the next tick. The first argument for the callback is an nsIInputStream that we copy to a file using NetUtil.asyncCopy().
+
+I'm not sure we can split this into more steps... The imgIEncoder used by nsHTMLCanvasElement::ExtractData() encodes the data it reads on the fly, right?
+(In reply to Tim Taubert [:ttaubert] from comment #6)
+> After canvas.drawWindow() we call canvas.mozFetchAsStream(callback), with
+> the callback invoked on the next tick. The first argument for the callback
+> is an nsIInputStream that we copy to a file using NetUtil.asyncCopy().
+> 
+> I'm not sure we can split this into more steps... The imgIEncoder used by
+> nsHTMLCanvasElement::ExtractData() encodes the data it reads on the fly,
+> right?
+
+No. The entire encoding is done in canvas.mozFetchAsStream(). The part to split is canvas.drawWindow() and canvas.mozFetchAsStream()
+(In reply to Jeff Muizelaar [:jrmuizel] from comment #7)
+> No. The entire encoding is done in canvas.mozFetchAsStream(). The part to
+> split is canvas.drawWindow() and canvas.mozFetchAsStream()
+
+Oops, yeah I get it now :| Thanks!
+Created attachment 645872
+simple patch calling canvas.mozFetchAsStream() on the next tick
+Comment on attachment 645872
+simple patch calling canvas.mozFetchAsStream() on the next tick
+
+Note this changes meaning of the fx_thumbnails_capture_time_ms histogram so you should remove it...though you can do that in a followup bug once you verify that this patch does significantly reduce pauses
+(In reply to Taras Glek (:taras) from comment #10)
+> Note this changes meaning of the fx_thumbnails_capture_time_ms histogram so
+> you should remove it...though you can do that in a followup bug once you
+> verify that this patch does significantly reduce pauses
+
+Actually, it doesn't. We've always measured the capture_time_ms before we start encoding and fetching data.
+Comment on attachment 645872
+simple patch calling canvas.mozFetchAsStream() on the next tick
+
+>-    canvas.mozFetchAsStream(aCallback, this.contentType);
+>+    // Fetch the canvas data on the next event loop tick.
+>+    Services.tm.currentThread.dispatch(function () {
+>+      canvas.mozFetchAsStream(aCallback, this.contentType);
+>+    }, Ci.nsIThread.DISPATCH_NORMAL);
+
+Looks like this.contentType isn't going to exist in that function.
+Created attachment 646040
+simple patch calling canvas.mozFetchAsStream() on the next tick
+
+(In reply to Dão Gottwald [:dao] from comment #12)
+> >+    // Fetch the canvas data on the next event loop tick.
+> >+    Services.tm.currentThread.dispatch(function () {
+> >+      canvas.mozFetchAsStream(aCallback, this.contentType);
+> >+    }, Ci.nsIThread.DISPATCH_NORMAL);
+> 
+> Looks like this.contentType isn't going to exist in that function.
+
+Oops, thanks for catching that. The tests didn't complain about it, probably because they're just falling back to PNG as the default.
+Comment on attachment 646040
+simple patch calling canvas.mozFetchAsStream() on the next tick
+
+>+    // Fetch the canvas data on the next event loop tick.
+
+Add some explanation here ("...on the next event loop tick because...", "...on the next event loop tick in order to..."). A reference to bug 744100 might be handy too.
+
+>+    let contentType = this.contentType;
+>+    Services.tm.currentThread.dispatch(function () {
+>+      canvas.mozFetchAsStream(aCallback, contentType);
+>+    }, Ci.nsIThread.DISPATCH_NORMAL);
+
+    Services.tm.currentThread.dispatch(function () {
+      canvas.mozFetchAsStream(aCallback, this.contentType);
+    }.bind(this), Ci.nsIThread.DISPATCH_NORMAL);
+https://hg.mozilla.org/integration/fx-team/rev/966051493a76
+https://hg.mozilla.org/mozilla-central/rev/966051493a76
+
+
+Thumbnail_capture causes 125ms of jank during load of webgl aquarium.
+
+
+
+Bug 774811 - Thumbnail_capture causes 125ms of jank during load of webgl aquarium; r=dao 

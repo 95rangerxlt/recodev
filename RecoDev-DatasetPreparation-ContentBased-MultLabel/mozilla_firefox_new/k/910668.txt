@@ -1,0 +1,315 @@
+TabState._getSelectedPageStyle() should be moved to a JSM like PageStyle.jsm and we should start adding support to asynchronously collect this data in a content script.
+
+This is currently hidden in _updateTextAndScrollDataForTab() but I think this should be singled out as it's quite unrelated.
+
+TabState._getSelectedPageStyle() should be moved to a JSM like PageStyle.jsm and we should start adding support to asynchronously collect this data in a content script.
+
+This is currently hidden in _updateTextAndScrollDataForTab() but I think this should be singled out as it's quite unrelated.
+Created attachment 808909
+pagestyle
+
+This moves collection and restoration to a separate module.
+Comment on attachment 808909
+pagestyle
+
+Review of attachment 808909:
+-----------------------------------------------------------------
+
+Thanks for attacking this!
+
+::: browser/components/sessionstore/src/PageStyle.jsm
+@@ +14,5 @@
+> +    return PageStyleInternal.collect(docShell, content);
+> +  },
+> +
+> +  restore: function (docShell, content, pageStyle) {
+> +    return PageStyleInternal.restore(docShell, content, pageStyle);
+
+nit: nothing to return here.
+
+@@ +22,5 @@
+> +// Signifies that author style level is disabled for the page.
+> +const NO_STYLE = "_nostyle";
+> +
+> +let PageStyleInternal = {
+> +  collect: function (docShell, content) {
+
+nit: please add some documentation for this function.
+
+@@ +24,5 @@
+> +
+> +let PageStyleInternal = {
+> +  collect: function (docShell, content) {
+> +    let markupDocumentViewer =
+> +      docShell.contentViewer.QueryInterface(Components.interfaces.nsIMarkupDocumentViewer);
+
+nit: Ci.nsIMarkupDocumentViewer
+
+@@ +53,5 @@
+> +    }
+> +    return "";
+> +  },
+> +
+> +  restore: function (docShell, content, pageStyle) {
+
+nit: please add some documentation for this function.
+
+@@ +57,5 @@
+> +  restore: function (docShell, content, pageStyle) {
+> +    let disabled = pageStyle == NO_STYLE;
+> +
+> +    let markupDocumentViewer =
+> +      docShell.contentViewer.QueryInterface(Components.interfaces.nsIMarkupDocumentViewer);
+
+nit: Ci.nsIMarkupDocumentViewer
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ -2977,5 @@
+>          aContent.scrollTo(match[1], match[2]);
+>        }
+> -      Array.forEach(aContent.document.styleSheets, function(aSS) {
+> -        aSS.disabled = aSS.title && aSS.title != selectedPageStyle;
+> -      });
+
+We probably need to call PageStyle.restore() from here for every frame because otherwise we'd skip the check I marked below.
+
+@@ -2982,3 @@
+>        for (var i = 0; i < aContent.frames.length; i++) {
+>          if (aData.children && aData.children[i] &&
+>            hasExpectedURL(aContent.document, aData.url)) {
+
+^^^ this check.
+
+@@ -2991,5 @@
+>      // away before the loading completed (except for in-page navigation)
+>      if (hasExpectedURL(aEvent.originalTarget, aBrowser.__SS_restore_data.url)) {
+>        var content = aEvent.originalTarget.defaultView;
+>        restoreTextDataAndScrolling(content, aBrowser.__SS_restore_data, "");
+> -      aBrowser.markupDocumentViewer.authorStyleDisabled = selectedPageStyle == "_nostyle";
+
+We of course would still need to keep that line to disable style sheets altogether if needed. That's a little ugly to split that in two...
+
+Alternatively, under the check I marked above we could also fill a list of frames that we want to restore the pageStyle for. That list could then be passed to PageStyle and this would then work like it does now.
+
+@@ +4595,5 @@
+>      if (!tabData.entries[tabIndex]) {
+>        return false;
+>      }
+>  
+> +    let selectedPageStyle = PageStyle.collect(browser.docShell, browser.contentWindow);
+
+I think we can get the contentWindow from the docShell, no need to pass both.
+Created attachment 810892
+prepare-frames
+
+This patch collects the list of frames to restore.
+Created attachment 810894
+pagestyle v2
+
+I fixed the problem with hasExpectedURL and addressed the other comments.
+Created attachment 810897
+pagestyle-remote
+
+For collection from a content script.
+Comment on attachment 810892
+prepare-frames
+
+Review of attachment 810892:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +2922,5 @@
+> +   *
+> +   * @param browser the browser being restored
+> +   * @return an array of [frame, data] pairs
+> +   */
+> +  prepareFramesToRestore: function (browser) {
+
+Should this be named collectFramesToRestore()?
+
+@@ +2929,5 @@
+> +    }
+> +
+> +    let frameList = [];
+> +
+> +    function prepareFrame(content, data) {
+
+prepareFrame() seems like a bad name. How about collectFrame()? addFrameToList()? Something. Would be great to hint that we're also adding its subframes.
+
+@@ +2932,5 @@
+> +
+> +    function prepareFrame(content, data) {
+> +      frameList.push([content, data]);
+> +
+> +      for (var i = 0; i < content.frames.length; i++) {
+
+Nit: let
+
+@@ +2941,5 @@
+> +      }
+> +    }
+> +
+> +    // don't restore text data and scrolling state if the user has navigated
+> +    // away before the loading completed (except for in-page navigation)
+
+The comment doesn't really make sense anymore.
+Comment on attachment 810894
+pagestyle v2
+
+Review of attachment 810894:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/PageStyle.jsm
+@@ +15,5 @@
+> +  collect: function (docShell) {
+> +    return PageStyleInternal.collect(docShell);
+> +  },
+> +
+> +  restoreFrames: function (docShell, frameList, pageStyle) {
+
+Maybe just restore() when the other method is called collect()?
+
+@@ +32,5 @@
+> +  collect: function (docShell) {
+> +    let markupDocumentViewer =
+> +      docShell.contentViewer.QueryInterface(Ci.nsIMarkupDocumentViewer);
+> +    if (markupDocumentViewer.authorStyleDisabled)
+> +      return NO_STYLE;
+
+nit: please add brackets
+
+@@ +46,5 @@
+> +   * @param   content is a frame reference
+> +   * @returns the title style sheet determined to be enabled (empty string if none)
+> +   */
+> +  collectFrame: function (content) {
+> +    const forScreen = /(?:^|,)\s*(?:all|screen)\s*(?:,|$)/i;
+
+nit: newline
+
+@@ +48,5 @@
+> +   */
+> +  collectFrame: function (content) {
+> +    const forScreen = /(?:^|,)\s*(?:all|screen)\s*(?:,|$)/i;
+> +    for (let i = 0; i < content.document.styleSheets.length; i++) {
+> +      let ss = content.document.styleSheets[i];
+
+We should save content.document.styleSheets to a variable.
+
+@@ +51,5 @@
+> +    for (let i = 0; i < content.document.styleSheets.length; i++) {
+> +      let ss = content.document.styleSheets[i];
+> +      let media = ss.media.mediaText;
+> +      if (!ss.disabled && ss.title && (!media || forScreen.test(media)))
+> +        return ss.title
+
+nit: brackets
+
+@@ +52,5 @@
+> +      let ss = content.document.styleSheets[i];
+> +      let media = ss.media.mediaText;
+> +      if (!ss.disabled && ss.title && (!media || forScreen.test(media)))
+> +        return ss.title
+> +    }
+
+nit: \n
+
+@@ +56,5 @@
+> +    }
+> +    for (let i = 0; i < content.frames.length; i++) {
+> +      let selectedPageStyle = this.collectFrame(content.frames[i]);
+> +      if (selectedPageStyle)
+> +        return selectedPageStyle;
+
+nit: brackets :)
+
+@@ +57,5 @@
+> +    for (let i = 0; i < content.frames.length; i++) {
+> +      let selectedPageStyle = this.collectFrame(content.frames[i]);
+> +      if (selectedPageStyle)
+> +        return selectedPageStyle;
+> +    }
+
+nit: \n
+
+@@ +70,5 @@
+> +   * DOM window and data is the session restore data associated with
+> +   * it.
+> +   * @param pageStyle the title of the style sheet to apply
+> +   */
+> +  restoreFrames: function (docShell, frameList, pageStyle) {
+
+We could make that name a little more explicit, like restoreFrameStyles()?
+
+@@ +78,5 @@
+> +      docShell.contentViewer.QueryInterface(Ci.nsIMarkupDocumentViewer);
+> +    markupDocumentViewer.authorStyleDisabled = disabled;
+> +
+> +    for (let [frame, data] of frameList) {
+> +      Array.forEach(frame.document.styleSheets, function(aSS) {
+
+for (let ss of frame.document.styleSheets) {
+Comment on attachment 810894
+pagestyle v2
+
+Review of attachment 810894:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4638,4 @@
+>      if (selectedPageStyle)
+>        tabData.pageStyle = selectedPageStyle;
+>      else if (tabData.pageStyle)
+>        delete tabData.pageStyle;
+
+I think we can get rid of the else-branch because tabData will always be just a new object and pageStyle wouldn't be set already. And we could add brackets :)
+> @@ +70,5 @@
+> > +   * DOM window and data is the session restore data associated with
+> > +   * it.
+> > +   * @param pageStyle the title of the style sheet to apply
+> > +   */
+> > +  restoreFrames: function (docShell, frameList, pageStyle) {
+> 
+> We could make that name a little more explicit, like restoreFrameStyles()?
+
+I think that this function (in PageStyleInternals) should have the same name as the one in PageStyle, so I called it restore() based on your other request.
+
+> @@ +78,5 @@
+> > +      docShell.contentViewer.QueryInterface(Ci.nsIMarkupDocumentViewer);
+> > +    markupDocumentViewer.authorStyleDisabled = disabled;
+> > +
+> > +    for (let [frame, data] of frameList) {
+> > +      Array.forEach(frame.document.styleSheets, function(aSS) {
+>
+> for (let ss of frame.document.styleSheets) {
+
+I remember I tried doing this a while ago and it didn't work. frame.document.styleSheets is a WebIDL StyleSheetList, which doesn't seem to behave enough like an array for |for...of| to work.
+(In reply to Bill McCloskey (:billm) from comment #9)
+> I think that this function (in PageStyleInternals) should have the same name
+> as the one in PageStyle, so I called it restore() based on your other
+> request.
+
+Ok, that's fine as well.
+
+> I remember I tried doing this a while ago and it didn't work.
+> frame.document.styleSheets is a WebIDL StyleSheetList, which doesn't seem to
+> behave enough like an array for |for...of| to work.
+
+My bad, it doesn't implement the iterator interface so it's ok to leave as is.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/3ecc91f4f6db
+https://hg.mozilla.org/integration/mozilla-inbound/rev/c01e8964c7d7
+https://hg.mozilla.org/integration/mozilla-inbound/rev/3562db42166b
+https://hg.mozilla.org/mozilla-central/rev/3ecc91f4f6db
+https://hg.mozilla.org/mozilla-central/rev/c01e8964c7d7
+https://hg.mozilla.org/mozilla-central/rev/3562db42166b
+
+
+[Session Restore] Collect selected page style from content script
+
+
+
+Bug 910668 - Add code to collect frames to restore (r=ttaubert) 
+
+Bug 910668 - Move pagestyle collection to a module (r=ttaubert) 
+
+Bug 910668 - Collect pagestyle from a content script (r=ttaubert) 

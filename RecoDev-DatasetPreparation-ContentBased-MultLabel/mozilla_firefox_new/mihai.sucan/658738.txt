@@ -1,0 +1,471 @@
+I was looking at http://tinderbox.mozilla.org/Firefox/1305941364.1305945463.28696.gz for unrelated reasons, and noticed that at the end of the test there are about 500 DOMWINDOW objects around, and only a few docshells.  So I grabbed the log and looked at the urls of the windows being destroyed _after_ the hidden window.  The top offenders of the 500 or so windows left at that point are:
+
+  339 about:blank
+   96 chrome://browser/content/browser.xul
+   84 about:addons
+
+I tried a quick test of just opening and closing windows locally and the browser.xul windows go away.
+
+Oh, during that whole test run about 186 chrome://browser/content/browser.xul windows go away.
+
+And windows are going away through the run as we go, so it's not like _all_ windows leak.  Just a bunch of them.  Looking at the log, we seem to have both inner and outer browser.xul windows around at the end there.
+
+The big question: is this just test code holding on to windows?  Or is this test code calling code that would normally run in our UI and holds on to windows?
+
+Again, all the windows are _closed_ (no docshell) but the inner and outer window objects are hanging around at shutdown.
+
+It'd be nice if someone familiar with the browser tests took a look at which tests are opening the windows that leak or something.  Do we have any other ways of finding their allocation points?
+
+I was looking at http://tinderbox.mozilla.org/Firefox/1305941364.1305945463.28696.gz for unrelated reasons, and noticed that at the end of the test there are about 500 DOMWINDOW objects around, and only a few docshells.  So I grabbed the log and looked at the urls of the windows being destroyed _after_ the hidden window.  The top offenders of the 500 or so windows left at that point are:
+
+  339 about:blank
+   96 chrome://browser/content/browser.xul
+   84 about:addons
+
+I tried a quick test of just opening and closing windows locally and the browser.xul windows go away.
+
+Oh, during that whole test run about 186 chrome://browser/content/browser.xul windows go away.
+
+And windows are going away through the run as we go, so it's not like _all_ windows leak.  Just a bunch of them.  Looking at the log, we seem to have both inner and outer browser.xul windows around at the end there.
+
+The big question: is this just test code holding on to windows?  Or is this test code calling code that would normally run in our UI and holds on to windows?
+
+Again, all the windows are _closed_ (no docshell) but the inner and outer window objects are hanging around at shutdown.
+
+It'd be nice if someone familiar with the browser tests took a look at which tests are opening the windows that leak or something.  Do we have any other ways of finding their allocation points?
+Created attachment 534189
+Log as a zip file to make sure it doesn't go away
+
+Though I bet any Moth log will show this.
+Oh, and Gavin, Dao, please cc whoever might be the right people for this?
+This is totally unacceptable and we will fix. Assigning to me.
+So to be clear, since I realized some stuff from comment 0 was a bit fuzzy:
+
+1)  I can't reproduce the problem locally running a debug build for about a minute opening and closing random windows and tabs.  Things go away as they should when I do that.
+
+2)  About half the browser.xul windows the Moth tests opened were around at browserchrome test shutdown.  The other half went away before that.
+(In reply to comment #0)
+> The big question: is this just test code holding on to windows?
+
+That's very likely the case. Browser chrome tests all run in the same window. A good portion of them will open new windows, do stuff and close them again.
+> A good portion of them will open new windows, do stuff and close them again.
+
+Yes, but do they then hold references to those windows in perpetuity?
+They might add a load event listener and not remove it.
+Sure.  The question is whether that's happening or whether we have something going on that could bite in normal browsing too.
+It's certainly happening.
+OK, can we stop it happening and see whether the behavior goes away?
+I'm perhaps jumping ahead, but is it possible to add a test (or modify the test harness?) so that when this is fixed is stays fixed? EG, something makes noise and turns orange if a test (or real bug!) causes a window to leak to shutdown.
+The hidden window is always alive until shutdown.  So we'd need to do something smart....
+We can assert that, after a GC, there are no longer any windows that don't have a Components object (since we remove the Components object when the window is closed).  That's the heuristic that Leak Monitor uses.  Unfortunately, we haven't gotten back to cleanly meeting that even for simple testcases since Firefox 2.
+Out of 748 tests, I found 53 tests where addEventListener occurs more often than removeEventListener. This is a naive way to count and very likely inaccurate, but the scale seems reasonable.
+Created attachment 535361
+candidate list
+Created attachment 537771
+remove event listeners in tests
+[Checked in: Comment 17]
+Comment on attachment 537771
+remove event listeners in tests
+[Checked in: Comment 17]
+
+http://hg.mozilla.org/mozilla-central/rev/2e45e66a9200
+Doesn't look like this made a difference.
+Created attachment 538233
+clean out each test's scope
+[Checked in: Comment 27]
+
+this seems to get the number of windows alive at the end of the test run down from 542 (http://tbpl.mozilla.org/?rev=5795ed49996d, http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1307606151.1307609559.14438.gz) to 287 (http://tbpl.mozilla.org/?tree=Try&rev=6ae034cb75f8, http://tinderbox.mozilla.org/showlog.cgi?log=Try/1307607473.1307610961.20131.gz)
+(In reply to comment #19)
+> Created attachment 538233 [details] [review]
+> clean out each test's scope
+> 
+> this seems to get the number of windows alive at the end of the test run
+> down from 542 to 287
+
+I should add that I don't actually expect the const -> var changes in this patch (so that 'delete' can kill the references) to contribute to the lower DOM window count. It's just something I wanted to rule out as a factor.
+Comment on attachment 538233
+clean out each test's scope
+[Checked in: Comment 27]
+
+Can you put the destroy()/nulling of .scope in nextTest (after the duration stuff), rather than in the waitForWindowsState callback?
+Hmm.  Is it expected that the test scopes will hang around like that?
+(In reply to comment #22)
+> Hmm.  Is it expected that the test scopes will hang around like that?
+
+The test array is kept around for the duration of the run, so yes.
+Can we pop things out of that array instead?  Seems cleaner....
+The test objects keep track of the test results, so no. This patch clears the stuff that needs to be/can be cleared, I'm not sure I understand why you think it's "unclean".
+Just generally, clearing properties seems like something that someone could forget to do in other circumstances.  In this case it sounds like that's a non-issue.
+Comment on attachment 538233
+clean out each test's scope
+[Checked in: Comment 27]
+
+http://hg.mozilla.org/mozilla-central/rev/443c7cd5bdf8
+Created attachment 538468
+URIs
+Apparently mobile-browser-chrome was depending on things not being cleaned up, since that patch took it from two permaoranges to fifteen.
+(In reply to comment #29)
+> Apparently mobile-browser-chrome was depending on things not being cleaned
+> up, since that patch took it from two permaoranges to fifteen.
+
+Sounds like these mobile tests are just broken, as the scopes get cleared after the tests have declared that they're finished.
+(In reply to comment #30)
+> (In reply to comment #29)
+> > Apparently mobile-browser-chrome was depending on things not being cleaned
+> > up, since that patch took it from two permaoranges to fifteen.
+> 
+> Sounds like these mobile tests are just broken, as the scopes get cleared
+> after the tests have declared that they're finished.
+
+Apparently it's still 2 failures with my patch: http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1307717565.1307718056.14042.gz
+Yep, I can't read: between the suite just being turned on on -inbound (after the regressing patch landed) and the merges in both directions and the total failure rate, I missed by one push, and it was the merge after you. Sorry for the distraction.
+Created attachment 538835
+reset TabContextMenu.contextTab when manually calling TabContextMenu.updateContextMenu
+[Checked in: Comment 33]
+
+http://hg.mozilla.org/mozilla-central/rev/bbbc80a2bd8c
+Created attachment 538848
+script for building the URI list
+
+putting this here since I already lost it once
+Dão, I know some dependent bugs have landed here, can you summarize where we're at and what's left to do? Thanks!
+The dependent bugs have helped here and there, but on balance the window count is actually growing as people land more tests.
+
+I just disabled sessionstore tests on Try and the number went from ~330 to 194. The URIs affected by this are about:blank (130 -> 66) and chrome://browser/content/browser.xul (79 -> 13). I now need to figure out if sessionstore code or the tests are to blame.
+Created attachment 541165
+script for building the URI list
+Created attachment 541166
+URIs
+Created attachment 544020
+URIs
+Created attachment 544046
+schedule final GC
+[Checked in: Comment 43]
+
+This shaves off some noise. about:blank still fluctuates slightly and pluginInstallerWizard.xul remains random as ever.
+The installtrigger windows may be http://hg.mozilla.org/mozilla-central/annotate/4df47729b74d/browser/base/content/browser.js#l740 , though that does try to take care of releasing the references when the notifications are removed, so I'm not sure why they'd be leaking until the end of the run.
+(In reply to comment #40)
+> Created attachment 544046 [details] [review]
+> schedule final GC
+> 
+> This shaves off some noise. about:blank still fluctuates slightly and
+> pluginInstallerWizard.xul remains random as ever.
+
+Should probably do CC and MP in addition to the precise GC. (Look at what about:memory does.)
+Comment on attachment 544046
+schedule final GC
+[Checked in: Comment 43]
+
+http://hg.mozilla.org/mozilla-central/rev/58101c64c83c
+Created attachment 544169
+URIs
+
+http://example.com/browser/toolkit/components/console/hudservice/tests/browser/test-error.html is new, introduced by the TM merge (6840fbf4dcdd).
+Don't leak test-console.html in browser_webconsole_bug_580001_closing_after_completion.js:
+http://hg.mozilla.org/mozilla-central/rev/7cbeab4cc868
+Interestingly, this also seems to have removed test-error.html from the list.
+Created attachment 544183
+URIs
+(In reply to comment #43)
+> Comment on attachment 544046 [details] [review]
+> schedule final GC (checked in)
+> 
+> http://hg.mozilla.org/mozilla-central/rev/58101c64c83c
+
+I filed bug 669617 for an apparently-new intermittent mochitest-chrome crash that occurred on the push following this one; I don't know if it's related in any way but the timing looks a bit suspicious.
+The four places.xul instances originate from these tests:
+
+browser_410196_paste_into_tags.js
+browser_416459_cut.js
+browser_library_batch_delete.js
+browser_library_left_pane_commands.js
+The number of docshells is now 55 (previously 7) starting with <http://hg.mozilla.org/mozilla-central/rev/a447e63943e1>.
+... which was backed out (along with the patch it was a bustage fix for).
+(In reply to comment #11)
+> I'm perhaps jumping ahead, but is it possible to add a test (or modify the
+> test harness?) so that when this is fixed is stays fixed? EG, something
+> makes noise and turns orange if a test (or real bug!) causes a window to
+> leak to shutdown.
+
+Has anyone ideas on how to achieve this?
+
+The list is slowly growing every few days, which makes this bug an uphill battle that I'd have to keep fighting for multiple months.
+In Bug 633670 I'm going to implement some code to test to see that a window has been GCd.  Plan is to work on this at the beginning of next week.
+We can make new leaks turn b-c orange even before all the dependencies are fixed. For example, we could make it turn orange if the number of leaked windows changes.
+Created attachment 547413
+more GC/CC
+[Checked in: Comment 62]
+
+Cuts away more about:blank and pluginInstallerWizard.xul (down to 1). Calling garbageCollect only once also helps, but not quite as much.
+The most effective way to clear memory is to fire several memory-pressure notifications separated by trips to the event loop, perhaps with some schedulePreciseGC tossed in.  See my comments in bug 654041.
+
+Ideally, the mochitest shutdown sequence would make it possible to see how many windows remain after each memory-pressure notification.  This way, we can file bugs when windows take multiple GCs/CCs to clean up (which often means we're one additional edge away from a leak).
+(In reply to comment #55)
+> The most effective way to clear memory is to fire several memory-pressure
+> notifications separated by trips to the event loop, perhaps with some
+> schedulePreciseGC tossed in.  See my comments in bug 654041.
+
+I don't think we're interested in flushing caches here.
+(In reply to comment #56)
+> 
+> I don't think we're interested in flushing caches here.
+
+Then do multiple GC+CC runs via the event loop.
+(In reply to comment #57)
+> (In reply to comment #56)
+> > 
+> > I don't think we're interested in flushing caches here.
+> 
+> Then do multiple GC+CC runs via the event loop.
+
+Doesn't seem to make a difference.
+Comment on attachment 547413
+more GC/CC
+[Checked in: Comment 62]
+
+I'm kind of lost as to what the goal is here. Have we determined that the window leaks that this patch "fixes" are not real issues that come up outside of the test harness (e.g. a problem with our GC/CC heuristics)? Test-harness only changes that hide them are only useful if we can say with confidence that they're not "real" issues, and I'm not sure that we can do that.
+The goal is to get the relatively minor "requires multiple GCs/CCs to clean up" bugs out of our way so we can start ratcheting down on *something*.
+
+I'd like these bugs to be noted in the log.  But they probably shouldn't turn the tree orange, because they would be intermittently caught (due to heuristics such as GC timing, CC timing, and conservative scanning).
+
+Also, winutils.garbageCollect triggers a CC, while schedulePreciseGC does not. So we clearly need at least one of the added calls.
+Comment on attachment 547413
+more GC/CC
+[Checked in: Comment 62]
+
+OK, that makes sense. The comment before this code should probably be adjusted - this doesn't really result in a "more accurate" window count, just a different one (omitting windows that would have eventually been picked up anyways - i.e. we're hiding less serious issues so that we can focus on more serious ones).
+Comment on attachment 547413
+more GC/CC
+[Checked in: Comment 62]
+
+http://hg.mozilla.org/mozilla-central/rev/b3149b080c65
+Created attachment 548179
+URIs
+Created attachment 548180
+URIs
+about:addons leak was due to an undeclared variable:
+http://hg.mozilla.org/mozilla-central/rev/040446311029
+Created attachment 549675
+URIs
+Created attachment 550047
+URIs
+Created attachment 551409
+URIs
+
+Something somewhere made a huge difference. about:blank went from 100 to 31, browser.xul from 78 to 8.
+
+test-console.html and test-console-api.html are new, regressed by <http://hg.mozilla.org/mozilla-central/pushloghtml?changeset=eef25ec2d58e>.
+> Something somewhere made a huge difference. about:blank went from 100 to 31,
+> browser.xul from 78 to 8.
+
+Something in http://hg.mozilla.org/mozilla-central/pushloghtml?changeset=0fbdefb0a9b5
+(In reply to Dão Gottwald [:dao] from comment #69)
+> > Something somewhere made a huge difference. about:blank went from 100 to 31,
+> > browser.xul from 78 to 8.
+> 
+> Something in
+> http://hg.mozilla.org/mozilla-central/pushloghtml?changeset=0fbdefb0a9b5
+
+<http://hg.mozilla.org/integration/fx-team/pushloghtml?changeset=6f1affa4bb5e>, so I guess bug 651643.
+(In reply to Dão Gottwald [:dao] from comment #70)
+> (In reply to Dão Gottwald [:dao] from comment #69)
+> > > Something somewhere made a huge difference. about:blank went from 100 to 31,
+> > > browser.xul from 78 to 8.
+> > 
+> > Something in
+> > http://hg.mozilla.org/mozilla-central/pushloghtml?changeset=0fbdefb0a9b5
+> 
+> <http://hg.mozilla.org/integration/fx-team/pushloghtml?changeset=6f1affa4bb5e>,
+> so I guess bug 651643.
+
+After trying to verify this, I found out that bug 666475 did it.
+(In reply to Dão Gottwald [:dao] from comment #71)
+> (In reply to Dão Gottwald [:dao] from comment #70)
+> > (In reply to Dão Gottwald [:dao] from comment #69)
+> > > > Something somewhere made a huge difference. about:blank went from 100 to 31,
+> > > > browser.xul from 78 to 8.
+> > > 
+> > > Something in
+> > > http://hg.mozilla.org/mozilla-central/pushloghtml?changeset=0fbdefb0a9b5
+> > 
+> > <http://hg.mozilla.org/integration/fx-team/pushloghtml?changeset=6f1affa4bb5e>,
+> > so I guess bug 651643.
+> 
+> After trying to verify this, I found out that bug 666475 did it.
+
+Err, I mixed up the logs.
+Created attachment 553428
+script for building the URI list
+Created attachment 554470
+leak statistics (before backout)
+
+I wrote a little script to narrow down which tests are leaking DOMWindows and docShells. It parses the build log, records created DOMWindows and docShells per test and counts them as "leaked" if they get removed after the test suite shutdown.
+
+I compared the builds log from before and after the backout of bug 662812. I hope that can help a bit finding the leak sources.
+Created attachment 554471
+leak statistics (after backout)
+(In reply to Tim Taubert [:ttaubert] from comment #74)
+> Created attachment 554470
+> leak statistics (before backout)
+> 
+> I wrote a little script to narrow down which tests are leaking DOMWindows
+> and docShells. It parses the build log, records created DOMWindows and
+> docShells per test and counts them as "leaked" if they get removed after the
+> test suite shutdown.
+
+Note that some windows aren't leaked, they just exist as part of the browser window that all tests run in. This is probably the case for browser_bug597218.js, for instance, which I guess causes panorama to load its iframe.
+Created attachment 554493
+leak statistics (before backout)
+
+assigned urls to the leaked windows
+Created attachment 554494
+leak statistics (after backout)
+
+assigned urls to the leaked windows
+(In reply to Dão Gottwald [:dao] from comment #76)
+> Note that some windows aren't leaked, they just exist as part of the browser
+> window that all tests run in. This is probably the case for
+> browser_bug597218.js, for instance, which I guess causes panorama to load
+> its iframe.
+
+Yeah, I already noticed that. Thanks for the hint!
+Created attachment 554804
+URIs
+Created attachment 559090
+URIs
+Created attachment 562034
+URIs
+
+Since the previous update, places.xul and bookmarkProperties.xul disappeared, the browser.xul count grew by 1.
+Created attachment 563078
+URIs
+(In reply to Dão Gottwald [:dao] from comment #83)
+> Created attachment 563078 [details]
+> URIs
+
+For the record, this is still up to date.
+Dão, what's the status of this bug?  Looks like there are a few dependent bugs still, but not that many.  Are you working on them?  Maybe this should be downgraded to a MemShrink:P2?
+Well, how important is it for the tree to turn orange when we introduce a big new leak bug?  Getting the leaks to zero is the most straightforward way to do that, but not the only way.
+I don't really care if this is a P1 -- I think bug 633670 and/or bug 683953 should be, though, so we can stop monitoring this manually.
+
+The biggest remaining offender is bug 675412, by the way, which seems to be stalled.
+Created attachment 583272
+URIs
+
+We've gone from 127 to 615 windows. Most of the new ones are about:addons instances.
+(In reply to Dão Gottwald [:dao] from comment #88)
+> Created attachment 583272
+> URIs
+> 
+> We've gone from 127 to 615 windows. Most of the new ones are about:addons
+> instances.
+
+I've narrowed down the regression range to cbb0233c7ba8 (good) and be0fffc6b0d1 (bad).
+http://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=cbb0233c7ba8&tochange=be0fffc6b0d1
+The hotfix addon work is in that range.
+I confirmed from mozilla-inbound tinderbox logs that https://tbpl.mozilla.org/?branch=mozilla-inbound&rev=0ab6831c77bc is good (before the regression) based on the Win debug log at https://tbpl.mozilla.org/php/getParsedLog.php?id=8074372&tree=Mozilla-Inbound .  Still looking for the nearest non-deleted debug mochitest-other tinderbox log after the push khuey suspects (which is https://hg.mozilla.org/integration/mozilla-inbound/pushloghtml?changeset=e5d8d2fb987d ).
+
+Maybe we should have a separate bug on the regression, though?
+(In reply to Kyle Huey [:khuey] (khuey@mozilla.com) from comment #90)
+> The hotfix addon work is in that range.
+
+Further narrowed down to 61a46d539c69 (good) and be0fffc6b0d1 (bad):
+
+> be0fffc6b0d1 Michael Wu — Bug 710029 - Assorted build system tweaks for B2G/Gonk. r=khuey
+> 26cce2f95d49 Brian Hackett — Fix lingering uses of int32 types, no bug.
+> c5026431768d Doug Sherk — Bug 711579: fix WGL context creation without robustness r=Bas
+> b895916227b2 Doug Sherk — Bug 711226: separate desktop and ES 2.0 symbol loading r=bjacob Symbols were amalgamated into a single table which worked up until recently. This patch separates them so that there is a common list, then two separate ones for desktop and OpenGL ES 2.0.
+> 9939bcd259a3 Doug Sherk — Bug 708207: implement WebGL's getShaderPrecisionFormat r=bjacob
+> de66e7bd2b98 Brian Hackett — Add interface for accessing PC counter information from chrome code, bug 687134. r=sfink,waldo
+> 5db46b0c2f14 Jonas Sicking — Back out fb4d12d2a2da, bug 701772, due to leaks.
+> fbf296760b0f Steffen Wilberg — Bug 710064: Make the 'Update Add-ons Automatically' checkbox state depend on the extensions.update.enabled pref, in addition to the existing extensions.update.autoUpdateDefault pref. r=mossop
+
+Bug 710064 / http://hg.mozilla.org/mozilla-central/rev/fbf296760b0f added a pref observer to extensions.js without ever removing it, so I guess that's the culprit.
+(In reply to David Baron [:dbaron] from comment #91)
+> I confirmed from mozilla-inbound tinderbox logs that
+> https://tbpl.mozilla.org/?branch=mozilla-inbound&rev=0ab6831c77bc is good
+> (before the regression) based on the Win debug log at
+> https://tbpl.mozilla.org/php/getParsedLog.php?id=8074372&tree=Mozilla-
+> Inbound .  Still looking for the nearest non-deleted debug mochitest-other
+> tinderbox log after the push khuey suspects (which is
+> https://hg.mozilla.org/integration/mozilla-inbound/
+> pushloghtml?changeset=e5d8d2fb987d ).
+> 
+> Maybe we should have a separate bug on the regression, though?
+
+filed bug 712614
+(In reply to Dão Gottwald [:dao] from comment #88)
+
+> We've gone from 127 to 615 windows. Most of the new ones are about:addons
+> instances.
+
+Can we add a leaked-window threshold check (eg, < 130) to prevent further slips like this? Experience from previous "drive X to 0" efforts seems to be that it (1) takes a long time to actually reach 0 and (2) in the meantime more regressions will slip in.
+Created attachment 587055
+URIs
+
+194 times browser.xul (instead of 8)
+Created attachment 587629
+URIs
+(In reply to Justin Dolske [:Dolske] from comment #94)
+> Can we add a leaked-window threshold check (eg, < 130) to prevent further
+> slips like this? Experience from previous "drive X to 0" efforts seems to be
+> that it (1) takes a long time to actually reach 0 and (2) in the meantime
+> more regressions will slip in.
+
+I just uploaded a new patch to bug 683953 which implements a threshold and makes the tree go orange if we leak more than that. Unfortunately, the counts vary heavily on different platforms, see bug 683953 comment #13 for some stats.
+(In reply to Tim Taubert [:ttaubert] from comment #97)
+> Unfortunately, the
+> counts vary heavily on different platforms
+
+not a big deal, having a threshold per platform is better than not having one.
+Created attachment 589056
+URIs
+Created attachment 589821
+URIs
+Created attachment 591119
+URIs
+http://hg.mozilla.org/mozilla-central/rev/b2d50f779d6c
+Bug 658738 - split browser_394759.js into three tests
+Created attachment 598580
+URIs
+Would it be possible (maybe via adding something to nsIWindowUtils) to track the number of DOM windows that exist, so that the test harness can directly implicate each test as it runs? At some point tests would default to not leaking, but old tests could possibly be grandfathered in with some sort of limited opt-out?
+Created attachment 604090
+URIs
+Ed, I'm curious what spurred this large list of new bugs.  Are these new leaks, or have they just not been filed before?
+They are the tests that are regularly causing us to go over the threshold and thus cause bug 754804. They just haven't been filed until now. Dão has been driving the shutdown leaks threshold related bugs for a while now, thought he could do with a second pair of hands :-)
+I think this has outlived its usefulness as a tracking bug let alone as a bug where actual work happens. New leaky tests can be (and have been) dealt with in other bugs that don't need to block this one.
+
+
+[meta] We seem to be leaking hundreds of windows until shutdown during browser-chrome tests
+
+meta, mlk
+
+Bug 658738 - remove event listeners in browser chrome tests 
+
+Bug 658738 - clean out each test's scope. r=gavin 
+
+Bug 658738 - reset TabContextMenu.contextTab when manually calling TabContextMenu.updateContextMenu 
+
+Bug 658738 - really remove event listener from the browser 
+
+Bug 658738 - observe browser-delayed-startup-finished instead of replacing delayedStartup 
+
+Bug 658738 - split browser_394759.js into three tests 
+
+Bug 658738 - browser_inspector_iframeTest.js cleanup 
+
+Bug 658738 - Correctly remove observer 
+
+Bug 658738 - Schedule final GC before finishing the browser-chrome test suite. r=gavin 
+
+Bug 658738 - Don't leak test-console.html in browser_webconsole_bug_580001_closing_after_completion.js 
+
+test cleanup for bug 658738 
+
+Bug 671421 - Fix undefined Cu issue following landing of bug 658738 r=gavin.sharp 
+
+Bug 658738 - Trigger additional GC+CC runs. r=gavin 
+
+Bug 658738 - Declare variable in browser_bug586574.js in order to not leak the assigned DOM node 
+
+Bug 658738 - reduce MAX_LEAK_COUNT to match the status quo 

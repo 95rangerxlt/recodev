@@ -1,0 +1,158 @@
+We need to stop adding "#-moz-resolution" to favicon URIs that aren't ".ico" files. Adding "#-moz-resolution" causes some seriously bad behavior:
+
+- It can cause an additional network fetch and always results in an additional cache entry.
+
+- It causes the image to be decoded twice.
+
+- It causes the image to be stored in memory twice, and just keeping the tab around will keep the second copy from getting freed, even if it's a background tab.
+
+- #-moz-resolution has no effect on non-".ico" images, so it doesn't even do anything useful!
+
+In practice I observed that having a 30 megapixel image document in a background tab uses about 150MB for the favicon, *even if the tab has never been in the foreground* (for example, if you've restored an old session).
+
+This is so serious that I think we need to uplift this fix as far as it can go.
+
+We need to stop adding "#-moz-resolution" to favicon URIs that aren't ".ico" files. Adding "#-moz-resolution" causes some seriously bad behavior:
+
+- It can cause an additional network fetch and always results in an additional cache entry.
+
+- It causes the image to be decoded twice.
+
+- It causes the image to be stored in memory twice, and just keeping the tab around will keep the second copy from getting freed, even if it's a background tab.
+
+- #-moz-resolution has no effect on non-".ico" images, so it doesn't even do anything useful!
+
+In practice I observed that having a 30 megapixel image document in a background tab uses about 150MB for the favicon, *even if the tab has never been in the foreground* (for example, if you've restored an old session).
+
+This is so serious that I think we need to uplift this fix as far as it can go.
+While adding a .ico-only check sounds a sane hack for rapid uplift, it seems like this points at deeper flaws. Seems like a location hash should _never_ trigger an extra fetch or cache entry, and I'd have expected other image formats to simply ignore -moz-resolution if they don't do anything with it.
+
+There might be an existing bug on the 150MB thing. I recall a similar issue with tabs holding large GIFs -- we always try to load favicons even for non-restored tabs, and that sucks for startup.
+Created attachment 8549341
+Only add #-moz-resolution to favicon URIs that end in ".ico"
+
+Here's the patch. I think these are the only two places that need to be changed.
+|browser/base/content/newtab/search.js| also appends -moz-resolution, but only
+to the search icons, which I'm pretty confident are not large images, and it
+also seems to use blob URIs so the extension hack won't work.
+(In reply to Justin Dolske [:Dolske] from comment #1)
+> While adding a .ico-only check sounds a sane hack for rapid uplift, it seems
+> like this points at deeper flaws.
+
+It does. We're planning on removing -moz-resolution totally for this reason. (Downscale-during-decode will replace it, with none of the downsides.) Bug 1118926 tracks this.
+That should happen in the Firefox 38 or 39 time frame, BTW.
+Comment on attachment 8549341
+Only add #-moz-resolution to favicon URIs that end in ".ico"
+
+Review of attachment 8549341:
+-----------------------------------------------------------------
+
+Just a couple of nits (applies to both files).
+
+::: toolkit/content/widgets/autocomplete.xml
+@@ +1105,5 @@
+>          <parameter name="aWidth"/>
+>          <parameter name="aHeight"/>
+>          <body>
+>            <![CDATA[
+> +          if (/[.]ico$/i.test(aURL)) {
+
+aURL.endsWith() is preferred over a regexp (faster, clearer).
+
+@@ +1111,5 @@
+> +            let height = Math.round(aHeight * aWin.devicePixelRatio);
+> +            return aURL + (aURL.contains("#") ? "&" : "#") +
+> +                   "-moz-resolution=" + width + "," + height;
+> +          } else {
+> +            return aURL;
+
+This would feel a bit cleaner if you turned it into an early return.
+Oh, and for prosperity: We'd talked over the options on IRC, and agreed this was the best option. Other options included:
+* Removing -moz-resolution entirely *before* the alternative landed (not nice for high-DPI on desktop)
+* Remove -moz-resolution everywhere but desktop (removes memory impact on b2g, keeps it on desktop)
+* Keep everything as-is until alternative is landed (not good for b2g)'
+
+The solution we ended up with is simple and safe to uplift, and plays nice with both b2g and high-DPI desktop.
+Created attachment 8550689
+Only add #-moz-resolution to favicon URIs that end in ".ico"
+
+Thanks for the review, Blair! (And for that summary of our discussion, which
+will be helpful in 6 months when we try to remember what the heck we were doing
+here. =)
+
+I've addressed your comments in this version of the patch.
+Pushed:
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/496125bde79a
+Just to double-check: we're fine with breaking HIDPI favicons on sites that serve ICO files but without the .ICO extension? Generally the file extension shouldn't be relied upon and the content-type should be used instead. Or is it the case that we already require the ".ico" extension at a lower level?
+(In reply to Matthew N. [:MattN] from comment #9)
+> Just to double-check: we're fine with breaking HIDPI favicons on sites that
+> serve ICO files but without the .ICO extension? Generally the file extension
+> shouldn't be relied upon and the content-type should be used instead. Or is
+> it the case that we already require the ".ico" extension at a lower level?
+
+I am fine with that, yes. I knew I was doing that. =)
+
+Once we have downscale-during-decode for ICO, such cases will work again, but I think displaying ICO files which do not have the correct extension at a lower resolution is a small price to pay for avoiding the waste of over 150MB of memory in some cases.
+https://hg.mozilla.org/mozilla-central/rev/496125bde79a
+Comment on attachment 8550689
+Only add #-moz-resolution to favicon URIs that end in ".ico"
+
+Approval Request Comment
+[Feature/regressing bug #]: Something far back in the mists of time.
+[User impact if declined]: Potentially huge memory wastage (on the order of hundreds of megabytes in some cases).
+[Describe test coverage new/current, TBPL]: On central, by the time the uplift would be performed it will have been there for 4 days and we'll have had a chance to see if there are any issues.
+[Risks and why]: Quite low risk.
+[String/UUID change made/needed]: None.
+Comment on attachment 8550689
+Only add #-moz-resolution to favicon URIs that end in ".ico"
+
+Landing that code now:
+* AFAIK, there is no issue introduced by this bug
+* Aurora will have it tomorrow
+* beta 3 will go to build tomorrow (Thursday)
+https://hg.mozilla.org/releases/mozilla-aurora/rev/d52b454d4cca
+https://hg.mozilla.org/releases/mozilla-beta/rev/d00b4a85897c
+This patch breaks if there's a querystring after the file extension, eg. <link rel="shortcut icon" href="/favicon.ico?1" type="image/vnd.microsoft.icon" />
+(In reply to Greg Edwards from comment #15)
+> This patch breaks if there's a querystring after the file extension, eg.
+> <link rel="shortcut icon" href="/favicon.ico?1"
+> type="image/vnd.microsoft.icon" />
+
+Since this bug was already resolved, you should file a new bug blocking this one to get that addressed: https://bugzilla.mozilla.org/enter_bug.cgi?product=Firefox&component=General&blocked=1121802
+(In reply to Greg Edwards from comment #15)
+> This patch breaks if there's a querystring after the file extension, eg.
+> <link rel="shortcut icon" href="/favicon.ico?1"
+> type="image/vnd.microsoft.icon" />
+
+What does "break" mean? If you mean that we still apply -moz-resolution in that case, that's fine. We're just at the previous status quo in that case.
+
+This is just a temporary hack until downscale-during-decode applies to ICO files. It's not important that it work 100% of the time, because it's not something we need to support in the long term.
+
+On the other hand, if it's actually causing rendering issues or something similar, then please do file a bug about that.
+It means it reverts to low resolution. I've found a hack which works in the meantime: append '.ico' to the end of the querystring. So the link would work something like:
+
+<link rel="shortcut icon" href="/favicon.ico?v=1&ext=.ico" type="image/vnd.microsoft.icon" />
+
+This also makes it possible to re-enable -moz-resolution for URLs not ending in .ico, eg. image serving scripts.
+(In reply to Greg Edwards from comment #18)
+> It means it reverts to low resolution. I've found a hack which works in the
+> meantime: append '.ico' to the end of the querystring. So the link would
+> work something like:
+> 
+> <link rel="shortcut icon" href="/favicon.ico?v=1&ext=.ico"
+> type="image/vnd.microsoft.icon" />
+> 
+> This also makes it possible to re-enable -moz-resolution for URLs not ending
+> in .ico, eg. image serving scripts.
+
+Hmm, yes, that's true. We should've been examining the URI spec and not the entire URI. (For some reason I thought we *were* doing that, but I looked at the patch and we're indeed just treating the URI as a string.)
+
+We could fix that in a followup, but your hack seems like a reasonable short-term workaround. Once we have downscale-during-decode support for .ico files, #-moz-resolution will be removed anyway, so the workaround should only be needed for a short time.
+
+
+Only add #-moz-resolution to favicon URIs that end in ".ico"
+
+
+
+Bug 1121802 - Only add #-moz-resolution to favicon URIs that end in ".ico". r=Unfocused 

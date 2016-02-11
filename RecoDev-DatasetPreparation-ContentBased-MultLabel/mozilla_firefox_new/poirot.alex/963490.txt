@@ -1,0 +1,694 @@
+This is dangerous:
+
+http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webapps.js#906
+
+Explanation from vingtetun in bug #960933:
+
+"Because we can change those without any advertisements and not all apps displayed on the screen use those. Those are also Gaia internal APIs and can we expect to be able to change them without breaking anything. And lastly if someone else rewrite a system app then it may break."
+
+This is dangerous:
+
+http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webapps.js#906
+
+Explanation from vingtetun in bug #960933:
+
+"Because we can change those without any advertisements and not all apps displayed on the screen use those. Those are also Gaia internal APIs and can we expect to be able to change them without breaking anything. And lastly if someone else rewrite a system app then it may break."
+(changing component. I know it's directly related to the app manager, but it helps us to track bugs)
+We discussed with vivien on irc and came up with a more generic way of tracking frames, without depending on gaia:
+http://pastebin.mozilla.org/4087373
+
+I haven't tested this code, but it gives you the idea and important notification and interfaces names necessary to retrieve frame manifest urls.
+
+Please consider using this in the layer patch. Using that for the webapps actor is yet another thing,
+as this code is going to trigger event on new kind of frames, like the rocket bar.
+The code works like a charm with a few tweaks. Should we use it in the webappsActor, and make the method available to other devtools components like the devtools layers? That would fix the watchApps part of bug #962577.
+This bug isn't necessary to fix devtools layers.
+
+To prevent the layers to face the two webapps actors limitation:
+ - certified apps,
+ - random behavior of getAppActor when having activities and stuff like that
+
+We shouldn't be going through getAppActor request!
+Instead you should address bug 962577 to allow the layers to fetch app console actor directly,
+just with a frame or a message manager argument. It will only require an unharmfull refactoring of actors/webapps.js code
+
+Getting back to this bug, about stoppping listening to gaia events.
+It is way more work to get it right. You are on the right path, we should start sharing the following code out of devtools.js:
+http://mxr.mozilla.org/mozilla-central/source/b2g/chrome/content/devtools.js#127
+with the webapps actor. We can do a first simple iteration and ensure that we continue to target *only the main app frame*. (right now the code in devtools.js can potentially target any frame [activities, rocketbar, popups, ...)
+Then we can try to figure out how to properly target all kind of frames. But it will require new UI in the app manager, and that's a significant task that brings various UX questions.
+After talking with Alexandre we decided that bugs 963490 and 962577 needed better titles.
+
+Renaming this bug to "Refactor webapps actor's watchApps".
+
+Currently, the watchApps method is broken because it relies on Gaia's internal events "appwillopen" and "appterminated". Instead, it should use service observers as suggested in Comment #2, but the suggested code has the issue of being also triggered for in-app frames (e.g. activities and popups) which shouldn't happen in the webapps actor, because it only cares about app frames.
+Stealing this bug just before jan grabs it!
+This has to be synced with the work I'm doing for the mulet, bug 963239.
+Created attachment 8372156
+wip patch
+
+Needs some manual test on device and also automated test to cover at least Frames.jsm.
+Comment on attachment 8372156
+wip patch
+
+Review of attachment 8372156:
+-----------------------------------------------------------------
+
+This is great, thanks! Please rebase after bug #966210, and use `frames.list()` instead of the querySelectors in `init`.
+
+::: b2g/chrome/content/devtools.js
+@@ +120,5 @@
+>        this._apps.delete(manifestURL);
+>      }
+>    },
+>  
+> +  onFrameCreated: function (frame) {
+
+I think you still need to bail out if `this._client` is not defined (i.e. the devtools overlay is disabled).
+
+@@ +130,2 @@
+>  
+> +  onFrameDestroyed: function (frame) {
+
+Ditto (when `this._client` is not defined, we know that everything has been cleaned up, i.e. no need to call `untrackApp()`).
+Created attachment 8386122
+patch
+
+Rebased version, as devtools.js changed quite a bit.
+It now listen -shown message manager event instead of -pending
+as Jan figured out that -pending one were dispatched too early,
+before we can actually start sending messages to the content scripts!
+Comment on attachment 8386122
+patch
+
+Review of attachment 8386122:
+-----------------------------------------------------------------
+
+I'm really happy to see this moving along.
+
+(In reply to Alexandre Poirot (:ochameau) from comment #9)
+> Rebased version, as devtools.js changed quite a bit.
+
+Thanks for rebasing and addressing my nits!
+
+> It now listen -shown message manager event instead of -pending
+> as Jan figured out that -pending one were dispatched too early,
+> before we can actually start sending messages to the content scripts!
+
+Actually, http://hg.mozilla.org/mozilla-central/rev/93443ede8152 already switched from `remote-browser-pending` to `remote-browser-shown` as a drive-by fix.
+
+However, `inprocess-browser-shown` is triggered before the BrowserElementChild.js frame script starts to load, as you can see at http://dxr.mozilla.org/mozilla-central/source/content/base/src/nsFrameLoader.cpp#1728, which is too early for bug #983610, so I filed bug #983618 for that.
+
+::: b2g/chrome/content/devtools.js
+@@ +90,5 @@
+>      for (let frame of this._targets.keys()) {
+>        this.untrackFrame(frame);
+>      }
+>  
+> +    Frames.removeObserver(this);
+
+Re my `if (!this._client) return;` nit on the last review, are you sure that this won't cause any races, i.e. that `onFrame{Creat,Destroy}ed` won't ever be called after `this._client` is deleted on line 97?
+
+If there is any risk of races, please add `!this._client` bail-out checks to `{,un}trackFrame`.
+
+@@ +144,1 @@
+>        return;
+
+Nit: Even though I hate it, local style is to add curly braces even for single-line if statements.
+
+@@ +147,4 @@
+>  
+> +  onFrameDestroyed: function (frame) {
+> +    if (!frame.appManifestURL)
+> +      return;
+
+Please remove this bail-out check, `this.untrackFrame()` is safe to call for any frame.
+
+@@ -160,5 @@
+> -        // get a ref to the app <iframe>
+> -        frameLoader.QueryInterface(Ci.nsIFrameLoader);
+> -        // Ignore notifications that aren't from a BrowserOrApp
+> -        if (!frameLoader.ownerIsBrowserOrAppFrame) {
+> -          return;
+
+I think you might want to keep this bail-out introduced by Mark Hammond in http://hg.mozilla.org/mozilla-central/rev/cdcdbc0df8bf to keep current behavior, unless the existence of frame.appManifestURL necessarily means that the frameLoader owner really is a browser or app frame.
+
+::: b2g/components/Frames.jsm
+@@ +89,5 @@
+> +
+> +    let systemAppFrame = SystemApp._frame;
+> +    list.push(systemAppFrame);
+> +
+> +    // List all app frames hosted in the system app. i.e. the homescreen,
+
+OCD-nit: Dot after "system app" should be a comma.
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +914,5 @@
+> +  onFrameCreated: function (frame) {
+> +    let manifestURL = frame.appManifestURL;
+> +    // Only track app frames
+> +    if (!manifestURL)
+> +      return;
+
+See previous comment about `frameLoader.ownerIsBrowserOrAppFrame`.
+
+Also: Curly braces, sadly.
+Created attachment 8411887
+patch
+(In reply to Jan Keromnes [:janx] from comment #10)
+> Comment on attachment 8386122
+
+> > It now listen -shown message manager event instead of -pending
+> > as Jan figured out that -pending one were dispatched too early,
+> > before we can actually start sending messages to the content scripts!
+> 
+> Actually, http://hg.mozilla.org/mozilla-central/rev/93443ede8152 already
+> switched from `remote-browser-pending` to `remote-browser-shown` as a
+> drive-by fix.
+> 
+> However, `inprocess-browser-shown` is triggered before the
+> BrowserElementChild.js frame script starts to load, as you can see at
+> http://dxr.mozilla.org/mozilla-central/source/content/base/src/nsFrameLoader.
+> cpp#1728, which is too early for bug #983610, so I filed bug #983618 for
+> that.
+
+So, after bug 983618 investigations, am I good with remote-browser-shown/inprocess-browser-shown?
+
+> 
+> ::: b2g/chrome/content/devtools.js
+> @@ +90,5 @@
+> >      for (let frame of this._targets.keys()) {
+> >        this.untrackFrame(frame);
+> >      }
+> >  
+> > +    Frames.removeObserver(this);
+> 
+> Re my `if (!this._client) return;` nit on the last review, are you sure that
+> this won't cause any races, i.e. that `onFrame{Creat,Destroy}ed` won't ever
+> be called after `this._client` is deleted on line 97?
+> 
+> If there is any risk of races, please add `!this._client` bail-out checks to
+> `{,un}trackFrame`.
+
+There is no possible race. _client is nullified after the call to Frames.removeObserver which synchronously unregister developerHUD so that none of onFrameCreated/onFrameDestroyed can be called after the call to removeObserver.
+Also note that Frames implementation makes it so that each listener can throw without preventing to call all following listeners in the queue.
+
+> @@ -160,5 @@
+> > -        // get a ref to the app <iframe>
+> > -        frameLoader.QueryInterface(Ci.nsIFrameLoader);
+> > -        // Ignore notifications that aren't from a BrowserOrApp
+> > -        if (!frameLoader.ownerIsBrowserOrAppFrame) {
+> > -          return;
+> 
+> I think you might want to keep this bail-out introduced by Mark Hammond in
+> http://hg.mozilla.org/mozilla-central/rev/cdcdbc0df8bf to keep current
+> behavior, unless the existence of frame.appManifestURL necessarily means
+> that the frameLoader owner really is a browser or app frame.
+
+Yep, appManifestURL == ownerIsBorwserOrAppFrame:
+http://mxr.mozilla.org/mozilla-central/source/content/html/content/src/nsGenericHTMLFrameElement.cpp#459
+But we may want to followup on this patch and check for ownerIsBorwserOrAppFrame instead of appManifestURL. That to allow targetting browser frames!
+
+> 
+> ::: b2g/components/Frames.jsm
+> @@ +89,5 @@
+> > +
+> > +    let systemAppFrame = SystemApp._frame;
+> > +    list.push(systemAppFrame);
+> > +
+> > +    // List all app frames hosted in the system app. i.e. the homescreen,
+> 
+> OCD-nit: Dot after "system app" should be a comma.
+
+Actually, I meant to describe the following code, that doesn't include the system app. I tuned the phrasing by using colon. Hopefully it is clear this time.
+Comment on attachment 8411887
+patch
+
+Review of attachment 8411887:
+-----------------------------------------------------------------
+
+(In reply to Alexandre Poirot (:ochameau) from comment #12)
+> So, after bug 983618 investigations, am I good with
+> remote-browser-shown/inprocess-browser-shown?
+
+Yes, since the problem turned out not to be the race condition I thought was happening.
+
+> > Re my `if (!this._client) return;` nit on the last review, are you sure that
+> > this won't cause any races, i.e. that `onFrame{Creat,Destroy}ed` won't ever
+> > be called after `this._client` is deleted on line 97?
+> > 
+> > If there is any risk of races, please add `!this._client` bail-out checks to
+> > `{,un}trackFrame`.
+> 
+> There is no possible race. _client is nullified after the call to
+> Frames.removeObserver which synchronously unregister developerHUD so that
+> none of onFrameCreated/onFrameDestroyed can be called after the call to
+> removeObserver.
+> Also note that Frames implementation makes it so that each listener can
+> throw without preventing to call all following listeners in the queue.
+
+Excellent, thanks for explaining!
+
+> > @@ -160,5 @@
+> > > -        // get a ref to the app <iframe>
+> > > -        frameLoader.QueryInterface(Ci.nsIFrameLoader);
+> > > -        // Ignore notifications that aren't from a BrowserOrApp
+> > > -        if (!frameLoader.ownerIsBrowserOrAppFrame) {
+> > > -          return;
+> > 
+> > I think you might want to keep this bail-out introduced by Mark Hammond in
+> > http://hg.mozilla.org/mozilla-central/rev/cdcdbc0df8bf to keep current
+> > behavior, unless the existence of frame.appManifestURL necessarily means
+> > that the frameLoader owner really is a browser or app frame.
+> 
+> Yep, appManifestURL == ownerIsBorwserOrAppFrame:
+> http://mxr.mozilla.org/mozilla-central/source/content/html/content/src/
+> nsGenericHTMLFrameElement.cpp#459
+> But we may want to followup on this patch and check for
+> ownerIsBorwserOrAppFrame instead of appManifestURL. That to allow targetting
+> browser frames!
+
+Interesting. I think you meant that appManifestURL implies ownerIsBorwserOrAppFrame, rather than their being equivalent, but I'm nit-picking.
+
+The follow-up sounds like a good idea!
+
+> > ::: b2g/components/Frames.jsm
+> > @@ +89,5 @@
+> > > +
+> > > +    let systemAppFrame = SystemApp._frame;
+> > > +    list.push(systemAppFrame);
+> > > +
+> > > +    // List all app frames hosted in the system app. i.e. the homescreen,
+> > 
+> > OCD-nit: Dot after "system app" should be a comma.
+> 
+> Actually, I meant to describe the following code, that doesn't include the
+> system app. I tuned the phrasing by using colon. Hopefully it is clear this
+> time.
+
+This pleases my OCD, thank you. :)
+Created attachment 8442239
+patch
+
+Let's try to land this patch now that I get a better picture of the
+other frame related patch from bug 977043.
+
+Reviewing this patch is going to be a team job:
+- vivien, can you look at Frames.jsm and the overall idea of listening
+to frames creation/destruction to watch for apps opening/closing?
+- ryan, can you review the app actor modification?
+- jan, what about looking at dev hud tweaks?
+
+This patch will fix the devices panel behavior when using using sheets.
+(there is some test apps called Sheet apps 1, 2 and 3)
+Without this patch, we were dispatching appClose when a sheet was closed,
+so that the app appeared as closed as soon as we closed a sheet.
+And it should also fix the webapps actor on Mulet.
+
+Try:
+https://tbpl.mozilla.org/?tree=Try&rev=08ae39442a27
+Comment on attachment 8442239
+patch
+
+Review of attachment 8442239:
+-----------------------------------------------------------------
+
+Hooray for this! All systems go on my side, thanks Alex :)
+Comment on attachment 8442239
+patch
+
+Review of attachment 8442239:
+-----------------------------------------------------------------
+
+Mostly nits but I'm worried about the possible start/stop/start case where the maps may be wrong.
+
+::: b2g/components/Frames.jsm
+@@ +6,5 @@
+> +
+> +this.EXPORTED_SYMBOLS = ['Frames'];
+> +
+> +const Cu = Components.utils;
+> +const Cc = Components.classes;
+
+Unused. Let's remove that.
+
+@@ +15,5 @@
+> +
+> +const listeners = [];
+> +
+> +function frames() {
+> +  let systemAppFrame = SystemAppProxy._frame;
+
+I wonder if we want a SystemAppProxy.getFrame() method instead of accessing this "private" property ?
+
+@@ +21,5 @@
+> +    return [];
+> +  }
+> +
+> +  let list = [];
+> +  list.push(systemAppFrame);
+
+let list = [systemAppFrame]; ?
+
+@@ +30,5 @@
+> +  // are also hosted in system app, but they are not using mozapp attribute.
+> +  let frames = systemAppFrame.contentDocument.querySelectorAll("iframe[mozapp]");
+> +  for (let i = 0; i < frames.length; i++) {
+> +    list.push(frames[i]);
+> +  }
+
+Maybe instead of SystemAppProxy.getFrame(), we can expose a SystemAppProxy.getAppFrames(), that returns the exact same thing ?
+
+@@ +40,5 @@
+> +  // Save a map of (MessageManager => Frame) to be able to dispatch
+> +  // the FrameDestroyed event with a frame reference.
+> +  _frames: new Map(),
+> +
+> +  // Also save current number of iframe opened by app
+
+iframe/iframes ?
+
+@@ +41,5 @@
+> +  // the FrameDestroyed event with a frame reference.
+> +  _frames: new Map(),
+> +
+> +  // Also save current number of iframe opened by app
+> +  _mozapps: new Map(),
+
+s/mozapps/apps ?
+
+@@ +57,5 @@
+> +    });
+> +  },
+> +
+> +  stop: function () {
+> +    Services.obs.removeObserver(this, 'remote-browser-shown', false);
+
+There is only 2 parameters to nsIObserverService.removeObserver ;)
+
+@@ +59,5 @@
+> +
+> +  stop: function () {
+> +    Services.obs.removeObserver(this, 'remote-browser-shown', false);
+> +    Services.obs.removeObserver(this, 'inprocess-browser-shown', false);
+> +    Services.obs.removeObserver(this, 'message-manager-disconnect', false);
+
+Don't you want to also clean up apps/frames, since it can be out of sync because the observers won't fired anymore ?
+
+Otherwise I fear that if someone call Frames.start() again, the maps may be strange.
+
+@@ +65,5 @@
+> +
+> +  observe: function (subject, topic, data) {
+> +    switch(topic) {
+> +
+> +      // listen for frame creation in OOP (device) as well as in parent process (b2g desktop)
+
+nit: listen/Listen
+
+@@ +68,5 @@
+> +
+> +      // listen for frame creation in OOP (device) as well as in parent process (b2g desktop)
+> +      case 'remote-browser-shown':
+> +      case 'inprocess-browser-shown':
+> +        let frameLoader = subject;
+
+nit: add a line break after this line, to make the following comment more visible.
+
+@@ +81,5 @@
+> +        this.onMessageManagerDestroyed(mm);
+> +        break;
+> +    }
+> +  },
+> +
+
+What about making the onFrameCreated/onMessageManager methods more symetrics ?
+
+For example you can have:
+onMessageManagerCreated(mm, frame)
+onMessageManagerDestroyed(mm)
+
+What do you think ?
+
+@@ +84,5 @@
+> +  },
+> +
+> +  onFrameCreated: function (frame) {
+> +    let mm = frame.QueryInterface(Ci.nsIFrameLoaderOwner).frameLoader.messageManager;
+> +    this._frames.set(mm, frame);
+
+If you do what I suggested earlier and remove |mm| because of that, I would also suggest to had a line break to after this._frames.set(mm, frame).
+
+This way the beginning of this method and the other one are very symetric and this will be obvious.
+One starts by addding the mm/frame to the map. The other reads it.
+
+Then both retrieves the mozapp attribute, one increment it, the other decrement it. Both updates the counter.
+
+Then a new line break :) (those are free!)
+
+@@ +87,5 @@
+> +    let mm = frame.QueryInterface(Ci.nsIFrameLoaderOwner).frameLoader.messageManager;
+> +    this._frames.set(mm, frame);
+> +    let mozapp = frame.getAttribute("mozapp");
+> +    let count = (this._mozapps.get(mozapp) || 0) + 1;
+> +    this._mozapps.set(mozapp, count);
+
+nit: based on my previous comment I will have a line break here as well.
+
+@@ +88,5 @@
+> +    this._frames.set(mm, frame);
+> +    let mozapp = frame.getAttribute("mozapp");
+> +    let count = (this._mozapps.get(mozapp) || 0) + 1;
+> +    this._mozapps.set(mozapp, count);
+> +    let isFirstAppFrame = count == 1;
+
+nit: add () around count === 1. Easier to read for my old eyes.
+
+@@ +91,5 @@
+> +    this._mozapps.set(mozapp, count);
+> +    let isFirstAppFrame = count == 1;
+> +    listeners.forEach(function (listener) {
+> +      try {
+> +        listener.onFrameCreated(frame, isFirstAppFrame);
+
+Since we are only dealing with AppFrame, I wonder if the interface of the listeners should not be:
+onAppFrameCreated/onAppFrameDestroyed instead of onFrameCreated/onFrameDestroyed ?
+
+@@ +103,5 @@
+> +    let frame = this._frames.get(mm);
+> +    if (!frame) {
+> +      // We receive an event for a non mozapp message manager
+> +      return;
+> +    }
+
+nit: add a line break after a return block.
+
+@@ +107,5 @@
+> +    }
+> +    this._frames.delete(mm);
+> +    let mozapp = frame.getAttribute("mozapp");
+> +    let count = (this._mozapps.get(mozapp) || 0) - 1;
+> +    this._mozapps.set(mozapp, count);
+
+nit: add a line break here.
+
+@@ +108,5 @@
+> +    this._frames.delete(mm);
+> +    let mozapp = frame.getAttribute("mozapp");
+> +    let count = (this._mozapps.get(mozapp) || 0) - 1;
+> +    this._mozapps.set(mozapp, count);
+> +    let isLastAppFrame = count == 0;
+
+nit: add a () around count === 0.
+
+@@ +125,5 @@
+> +
+> +  list: frames,
+> +
+> +  addObserver: function (listener) {
+> +    listeners.push(listener);
+
+Do you need to deduplicate |listener| here if it has already been added ? Or do you possibly want to fire messages twice (or more) ?
+
+Deduplicating means it will be closer to the semantic of even listener (https://developer.mozilla.org/en-US/docs/Web/API/EventTarget.addEventListener#Multiple_identical_event_listeners)
+
+@@ +132,5 @@
+> +    }
+> +  },
+> +
+> +  removeObserver: function (listener) {
+> +    let idx = listeners.indexOf(listener);
+
+If you don't deduplicate above, it may be strange, as you may remove from the list the first listener, while the intent was to removed the second. It's not critical but it may be strange if someone relies on the initialization order.
+
+@@ +133,5 @@
+> +  },
+> +
+> +  removeObserver: function (listener) {
+> +    let idx = listeners.indexOf(listener);
+> +    if (idx != -1) {
+
+!==
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +11,1 @@
+>  
+
+I didn't reviewed this file as I believe the other reviews are meant for that.
+Comment on attachment 8442239
+patch
+
+Review of attachment 8442239:
+-----------------------------------------------------------------
+
+I only reviewed webapps.js.  Aside from some confusing names, it seems okay.
+
+But, I'd like to see this again after you update in response to Vivien's comments, so r- for now.
+
+::: b2g/components/Frames.jsm
+@@ +3,5 @@
+> + * You can obtain one at http://mozilla.org/MPL/2.0/. */
+> +
+> +'use strict';
+> +
+> +this.EXPORTED_SYMBOLS = ['Frames'];
+
+I think it would be better to use a more specific name for this symbol and this file.  Maybe |AppFrames|?  There are many types of frames in the world, so just |Frames| seems too general here.
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +17,5 @@
+>  let {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+>  
+> +XPCOMUtils.defineLazyModuleGetter(this, "Frames", "resource://gre/modules/Frames.jsm");
+> +
+> +let HAS_FRAMES = Services.prefs.getPrefType("browser.homescreenURL") == Ci.nsIPrefBranch.PREF_STRING;
+
+Change to |HAS_APP_FRAMES|.
+
+Is this just a random pref that happens to be set when there are app frames?
+
+@@ +844,5 @@
+>    },
+>  
+>    _appFrames: function () {
+> +    // Try to filter on b2g and mulet
+> +    if (HAS_FRAMES) {
+
+So the pref check above is just a weird way to say "b2g || mulet"?
+
+@@ +896,4 @@
+>        }
+>      }
+> +    if (!appFrame && frames.length > 0) {
+> +      appFrame = frames[0];
+
+Is it actually expected that you sometimes do not have a "main" frame?  Why?
+Comment on attachment 8442239
+patch
+
+Review of attachment 8442239:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +17,5 @@
+>  let {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+>  
+> +XPCOMUtils.defineLazyModuleGetter(this, "Frames", "resource://gre/modules/Frames.jsm");
+> +
+> +let HAS_FRAMES = Services.prefs.getPrefType("browser.homescreenURL") == Ci.nsIPrefBranch.PREF_STRING;
+
+Alex explained on IRC that this is a kind of "Is Gaia here?" check.
+
+Maybe something should be added to Gaia to serve as a canonical "Gaia is here" property.  This is currently awkward since there doesn't seem to be anything right now, I guess?  I am not sure what would be best here, as I am not a Gaia expert.
+
+If we can't think of a canonical way to do it, what about testing for presence of the system app frame?  That is still a bit strange, but seems better to me than checking this pref.  Also, according to bug 1014487, this pref may be removed anyway.
+Created attachment 8446181
+patch
+
+I tried to addressed all your comments.
+Renamed to AppFrames and stop using pref to figure out if we can use this component.
+Instead use a smarter lazy getter.
+
+https://tbpl.mozilla.org/?tree=Try&rev=23c3a7d99f74
+Comment on attachment 8446181
+patch
+
+Review of attachment 8446181:
+-----------------------------------------------------------------
+
+webapps.js seems good.
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +887,5 @@
+>  
+> +    // Connects to the main app frame, whose `name` attribute
+> +    // is set to 'main' by gaia. If for any reason, gaia doesn't set any
+> +    // frame as main, no frame matches, then we connect arbitrary
+> +    // to the first app frame...
+
+You never replied last time, so I'll ask again. :) Is there a case where Gaia is expected to not a set a "main" frame, or are you just being safe here?
+(In reply to J. Ryan Stinnett [:jryans] from comment #20)
+> ::: toolkit/devtools/server/actors/webapps.js
+> @@ +887,5 @@
+> >  
+> > +    // Connects to the main app frame, whose `name` attribute
+> > +    // is set to 'main' by gaia. If for any reason, gaia doesn't set any
+> > +    // frame as main, no frame matches, then we connect arbitrary
+> > +    // to the first app frame...
+> 
+> You never replied last time, so I'll ask again. :) Is there a case where
+> Gaia is expected to not a set a "main" frame, or are you just being safe
+> here?
+
+Sorry, thanks for the reminder!
+Yes, it appears that name="main" isn't set for anything that isn't a "regular app", for example: keyboard.
+I don't know any other such case, but I wouldn't be surprise these is some another.
+Comment on attachment 8446181
+patch
+
+Review of attachment 8446181:
+-----------------------------------------------------------------
+
+The part I looked at (AppFrames.jsm, SystemAppProxy.jsm, moz.build) looks good.
+
+::: b2g/components/AppFrames.jsm
+@@ +46,5 @@
+> +  observe: function (subject, topic, data) {
+> +    switch(topic) {
+> +
+> +      // Listen for frame creation in OOP (device) as well as in parent process (b2g desktop)
+> +      case 'remote-browser-shown':
+
+There is a mix of ' and " in this file ;)
+Comment on attachment 8446181
+patch
+
+Review of attachment 8446181:
+-----------------------------------------------------------------
+
+Still r+ :)
+Created attachment 8446645
+patch
+
+Fixed quotes and used only '.
+Created attachment 8447974
+patch
+
+Rebased - https://tbpl.mozilla.org/?tree=Try&rev=d26228c9dca5
+Comment on attachment 8447974
+patch
+
+Review of attachment 8447974:
+-----------------------------------------------------------------
+
+All green, carrying review over the rebase.
+https://hg.mozilla.org/integration/fx-team/rev/c94f041648c6
+https://hg.mozilla.org/mozilla-central/rev/c94f041648c6
+
+
+Refactor webapps actor's watchApps and make it accessible outside the actor
+
+
+
+Bug 963490 - Implement a b2g component to easily interact with all frames. r=vingtetun, r=janx, r=jryans 

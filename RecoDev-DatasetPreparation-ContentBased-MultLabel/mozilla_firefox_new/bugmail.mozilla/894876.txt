@@ -1,0 +1,150 @@
+The about:newtab drag and drop tests do a lot of magic:
+
+> function simulateDrop(aDropIndex, aDragIndex) {
+>   let draggedSite;
+>   let {gDrag: drag, gDrop: drop} = getContentWindow();
+>   let event = createDragEvent("drop", "http://example.com/#99\nblank");
+> 
+>   if (typeof aDragIndex != "undefined")
+>     draggedSite = getCell(aDragIndex).site;
+> 
+>   if (draggedSite)
+>     drag.start(draggedSite, event);
+> 
+>   whenPagesUpdated();
+>   drop.drop(getCell(aDropIndex), event);
+> 
+>   if (draggedSite)
+>     drag.end(draggedSite);
+> }
+
+What they don't do is actually test drag and drop by initiating a synthetic drag session and causing actual drag/drop events to be fired. Let's fix that.
+
+The about:newtab drag and drop tests do a lot of magic:
+
+> function simulateDrop(aDropIndex, aDragIndex) {
+>   let draggedSite;
+>   let {gDrag: drag, gDrop: drop} = getContentWindow();
+>   let event = createDragEvent("drop", "http://example.com/#99\nblank");
+> 
+>   if (typeof aDragIndex != "undefined")
+>     draggedSite = getCell(aDragIndex).site;
+> 
+>   if (draggedSite)
+>     drag.start(draggedSite, event);
+> 
+>   whenPagesUpdated();
+>   drop.drop(getCell(aDropIndex), event);
+> 
+>   if (draggedSite)
+>     drag.end(draggedSite);
+> }
+
+What they don't do is actually test drag and drop by initiating a synthetic drag session and causing actual drag/drop events to be fired. Let's fix that.
+Created attachment 777074
+part 1 - Add support for GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent()
+
+In order to properly complete a drag/drop operation on Linux, we need to support GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent(). The gdk d&d component will receive a button release event and end the drag session.
+Created attachment 777077
+part 2 - Let about:newtab d&d test actually initiate and complete a drag session
+
+Use synthetic mouse events and fire (roughly) mousedown, mousemove, and mouseup to initiate and complete a 'real' drag session to test d&d behavior for about:newtab.
+Try is green:
+
+https://tbpl.mozilla.org/?tree=Try&rev=b25ff8ae671f
+Comment on attachment 777074
+part 1 - Add support for GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent()
+
+># HG changeset patch
+># User Tim Taubert <ttaubert@mozilla.com>
+># Date 1374066565 -7200
+># Node ID 9f5aa5d704dddfd1b08f9c61fabdd1f191e85e1a
+>Bug 894876 - part 1 - Add support for GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent()
+>
+>diff --git a/widget/gtk2/nsWindow.cpp b/widget/gtk2/nsWindow.cpp
+>--- a/widget/gtk2/nsWindow.cpp
+>+++ b/widget/gtk2/nsWindow.cpp
+>@@ -6222,10 +6222,27 @@ nsWindow::SynthesizeNativeMouseEvent(nsI
+>   if (!mGdkWindow) {
+>     return NS_OK;
+>   }
+> 
+>   GdkDisplay* display = gdk_window_get_display(mGdkWindow);
+>   GdkScreen* screen = gdk_window_get_screen(mGdkWindow);
+>   gdk_display_warp_pointer(display, screen, aPoint.x, aPoint.y);
+> 
+>+  if (aNativeMessage == GDK_BUTTON_RELEASE) {
+>+    GdkEvent *event;
+>+    event = gdk_event_new((GdkEventType)aNativeMessage);
+>+    event->button.button = 1;
+>+    event->button.window = mGdkWindow;
+>+    event->button.time = GDK_CURRENT_TIME;
+>+
+>+#if (MOZ_WIDGET_GTK == 3)
+>+    // Get device for event source
+>+    GdkDisplay *display = gdk_display_get_default();
+>+    GdkDeviceManager *device_manager = gdk_display_get_device_manager(display);
+>+    event->button.device = gdk_device_manager_get_client_pointer(device_manager);
+>+#endif
+>+
+>+    gdk_event_put(event);
+>+  }
+>+
+>   return NS_OK;
+> }
+Comment on attachment 777077
+part 2 - Let about:newtab d&d test actually initiate and complete a drag session
+
+Review of attachment 777077:
+-----------------------------------------------------------------
+
+::: browser/base/content/test/newtab/head.js
+@@ +314,2 @@
+>   */
+> +function simulateDrop(aSourceIndex, aDestIndex) {
+
+I like how the source comes before the destination now. This is a good improvement.
+Comment on attachment 777074
+part 1 - Add support for GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent()
+
+>   gdk_display_warp_pointer(display, screen, aPoint.x, aPoint.y);
+> 
+>+  if (aNativeMessage == GDK_BUTTON_RELEASE) {
+>+    GdkEvent *event;
+>+    event = gdk_event_new((GdkEventType)aNativeMessage);
+
+Usually Gecko style is to initialize at the declaration, but this GdkEvent is leaked, so please use a stack variable as in nsDragService.cpp.
+
+The event from the warp_pointer will be processed when GDK next reads the X events, but the release event will be the next event processed, and so the motion event will be processed after the release event.
+I think it might be best to skip the warp_pointer for anything except motion events.  A test will need to dispatch a motion event separately and wait for that before sending a release if it wants to get motion events right.
+Please at least add a comment explaining these event ordering issues to help anyone trying to debug a test.
+Created attachment 779130
+part 1 - Add support for GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent(), v2
+Comment on attachment 779130
+part 1 - Add support for GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent(), v2
+
+I would have guessed that (x|y)(|_root) fields would have also needed to be set appropriately on the button event, but what's in this patch looks good.
+https://hg.mozilla.org/integration/fx-team/rev/105fa6fdce30
+https://hg.mozilla.org/integration/fx-team/rev/c089c7694bb4
+Part 2 backed out for causing timeouts:
+
+https://hg.mozilla.org/integration/fx-team/rev/2da93943c857
+https://hg.mozilla.org/mozilla-central/rev/105fa6fdce30
+Part 2 has been backed out. Part 1 can stay in the tree.
+Pushed again:
+
+https://hg.mozilla.org/integration/fx-team/rev/9b02a97c167f
+https://hg.mozilla.org/mozilla-central/rev/9b02a97c167f
+
+
+[New Tab Page] Fix drag/drop tests
+
+
+
+Bug 894876 - part 1 - Add support for GDK_BUTTON_RELEASE in nsWindow::SynthesizeNativeMouseEvent(); r=karlt 
+
+Bug 894876 - part 2 - Let about:newtab d&d test actually initiate and complete a drag session; r=jaws 
+
+Backed out changeset c089c7694bb4 (bug 894876) 
+
+Bug 894876 - part 2 - Let about:newtab d&d test actually initiate and complete a drag session; r=jaws 

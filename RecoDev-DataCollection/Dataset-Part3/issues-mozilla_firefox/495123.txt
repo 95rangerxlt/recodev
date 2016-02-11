@@ -1,0 +1,357 @@
+Steps to Reproduce:
+1. Set Firefox to "Show my windows and tabs from last time".
+2. Open a blank tab and close all other tabs.
+3. Close and restart Firefox.
+
+Expected result:
+A blank window is restored which would allow me to reopen a previously closed tab.
+
+Actual result:
+No window data was saved at all, leading to the error message "this._initialState.windows[0] is undefined" at startup.
+
+The issue seems to be that even though the code causing a blank window not to be reopenable isn't supposed to run at shutdown due to the following condition
+
+>    if (this._loadState == STATE_RUNNING) { // window not closed during a regular shut-down 
+
+it is (i.e. the comment is actually wrong). Reason is that nsTryToClose closes all windows during quit-application-requested, while we set the _loadState to STATE_QUITTING only once we get quit-application-granted.
+
+Steps to Reproduce:
+1. Set Firefox to "Show my windows and tabs from last time".
+2. Open a blank tab and close all other tabs.
+3. Close and restart Firefox.
+
+Expected result:
+A blank window is restored which would allow me to reopen a previously closed tab.
+
+Actual result:
+No window data was saved at all, leading to the error message "this._initialState.windows[0] is undefined" at startup.
+
+The issue seems to be that even though the code causing a blank window not to be reopenable isn't supposed to run at shutdown due to the following condition
+
+>    if (this._loadState == STATE_RUNNING) { // window not closed during a regular shut-down 
+
+it is (i.e. the comment is actually wrong). Reason is that nsTryToClose closes all windows during quit-application-requested, while we set the _loadState to STATE_QUITTING only once we get quit-application-granted.
+Let me rephrase the issue:
+1. Set Firefox to "Show my windows and tabs from last time".
+2. Open a blank tab and close all other tabs.
+3. Open a new window and load your homepage.
+4. Close the window from step 3, then close the window from step 2 (in this order). Closing the second window will quit Firefox.
+5. Restart Firefox.
+
+Actual result:
+The window from step 3 is restored.
+
+Expected result:
+The (blank) window from step 2 should be restored.
+Need a regressionwindow - don't think this blocks, though:
+
+ - function-wise, restoring the blank window isn't as useful as the window that actually had a tab in it
+
+ - privacy-wise, you wouldn't set Firefox to always show your windows and tabs from last time
+I can't reproduce this on OS X on 1.9.1, either by quitting the app with cmd+q in the second half of step 4, or by closing the window from step 2 with cmd+w and them quitting the app with cmd+q.
+(In reply to comment #2)
+> Need a regressionwindow - don't think this blocks, though:
+
+The original regression is due to bug 386002, it however wasn't notable until bug 490040 was fixed.
+
+>  - function-wise, restoring the blank window isn't as useful as the window that
+> actually had a tab in it
+
+Except that there was a reason I closed a blank window last: I was done with everything and expect to start with a clean browser next time (except for maybe being able to return to a recently closed tab - which is no longer possible: dataloss).
+
+(In reply to comment #3)
+> I can't reproduce this on OS X
+
+This bug only applies to platforms where closing the last window closes Firefox.
+(In reply to comment #4)
+> The original regression is due to bug 386002,
+
+Correction: It's rather fallout from bug 386810 which moved the quit-application-granted notification to a point where, when the last window is closed with globalOverlay's closeWindow, the window is closed first.
+
+http://bonsai.mozilla.org/cvsview2.cgi?diff_mode=context&whitespace_mode=show&file=globalOverlay.js&branch=1.41&root=/cvsroot&subdir=mozilla/toolkit/content&command=DIFF_FRAMESET&rev1=1.33&rev2=1.34
+
+AFAICT the proper way of fixing this would be to return |goQuitApplication()| from closeWindow...
+Created attachment 380213
+fix
+
+So, in order to get quit-application-granted before closing the last window, we have to call nsIAppStartup:quit ourselves.
+
+Easiest case is when closeWindow should close the window - we just use goQuitApplication instead which does the required checks and quits.
+
+Calling closeWindow(false, ...) OTOH requires callers to do that themselves, however (which for SessionStore mostly matters in the case where the last window is a "navigator:browser" one) which results in code I'd prefer not having...
+
+Considering our internal callers, we'd actually get away with just ignoring that parameter in this case and always call goQuitApplication when there's only one window left. Only thing that'd have to be adjusted is calling closeWindow after docShell.permitUnload() in WindowIsClosing.
+
+Not sure what we could do on the branch, though. Maybe what this patch proposes?
+I don't think this blocks as per comment 2, nominate the patch if you get it (and tests so we don't break this again?) Also make sure we don't regress bug 490040?
+Created attachment 380232
+alternative fix
+I don't really feel comfortable with either of these approaches on the branch at this point. I'm not sure the risk they introduce in the relatively poorly tested shutdown paths is offset by the benefit of the bug fix.
+Created attachment 380258
+branch patch? (doesn't pass tests)
+
+What about taking such a fix on the branch and attachment 380232 on the trunk? This keeps bug 490040 fixed as filed, while reverting its heuristic for detecting windows not to be remembered. The fix is minimally invasive and should be easily testable (except that I don't have the time for adjusting them)...
+Comment on attachment 380258
+branch patch? (doesn't pass tests)
+
+I think this fix is better than the others for the branch at this point, since it's isolated to session restore code, but I don't understand offhand why it fixes this bug (or why this bug was exposed by bug 490040).
+(In reply to comment #11)
+> (or why this bug was exposed by bug 490040).
+
+I suppose because it made saving closed windows conditional on there being activity in the single tab... but it's still not clear to me how that's related to the event ordering stuff discussed earlier in this bug (and modified by the earlier patches).
+
+I guess there are two code paths that trigger saving data for a closed window, and bug 490040 made us rely on one that was broken by bug 386002? The original patches try to fix the brokenness from bug 386002, but the most recent patch instead just makes us avoid it again - is that right?
+(In reply to comment #12)
+> I guess there are two code paths that trigger saving data for a closed window,
+> and bug 490040 made us rely on one that was broken by bug 386002? The original
+> patches try to fix the brokenness from bug 386002, but the most recent patch
+> instead just makes us avoid it again - is that right?
+
+Yes, there's additional code executed when a window is closed while we're still running - and inside that code path, bug 490040 started discarding all windows containing only a single blank tab. Due to bug 386002 we also hit this code path during shutdown, when we don't want to discard anything.
+
+So the first patch makes sure that nsSessionStore gets into quitting mode before the remaining open windows are closed, thus avoiding that code path, whereas the second patch makes it more specific as to which windows will be discarded (only those from which the last tab was detached - which is the only case bug 490040 was supposed to apply to).
+Comment on attachment 380258
+branch patch? (doesn't pass tests)
+
+hrm, I thought I'd r+ed this already :(
+
+I think we need some good test coverage here, though even then I'm not sure we should take this on branch past this point. I think I prefer this patch to the other even for the trunk, though.
+I won't be able to complete this anytime soon.
+
+Paul: Could you take this onto your plate (making the branch patch pass the tests and maybe also get the better fix into Toolkit)?
+*** Bug 505980 has been marked as a duplicate of this bug. ***
+*** Bug 507476 has been marked as a duplicate of this bug. ***
+*** Bug 500315 has been marked as a duplicate of this bug. ***
+(In reply to comment #15)
+> Paul: Could you take this onto your plate (making the branch patch pass the
+> tests and maybe also get the better fix into Toolkit)?
+
+I've been pretty focused on some other stuff, but I'll try to find time this week to do some work on this. I'll be on vacation next week, so I'll make sure I update before then.
+
+Gavin, still set on not taking the more complete approach here?
+So the tests for bug 490040 are failing mostly because ._dontRemember is only set when a tab is closed. The test cases for 490040 set a window state and then close it, so they'll never get ._dontRemember set. They were expecting the tab count to be checked when the window was closed.
+
+So as it stands with this change, we're going to remember windows whose state was set via setWindowState regardless of the actual state (as long as no tabs are closed in that window).
+
+From comment #13 that sounds like what you want, but is it really?
+
+Example of a window we probably don't want to restore: http://hg.mozilla.org/mozilla-central/file/7fb86c108ae7/browser/components/sessionstore/test/browser/browser_490040.js#l119
+*** Bug 516605 has been marked as a duplicate of this bug. ***
+*** Bug 467248 has been marked as a duplicate of this bug. ***
+I'm using the patch since published and still wonder why isn't implemented. If it weren't for it I would have stopped using Firefox 3.5 long ago.
+(In reply to comment #23)
+> I'm using the patch since published and still wonder why isn't implemented.
+
+perhaps because it fails tests?
+For what is worth:
+
+For me, Firefox 3.5.x sometimes restores the wrong pages when I finish my session with a blank page. These are pages that I visited, but that were not part of my last session. At least in one occasion, Firefox restored wrong pages after finishing my session with several full (with websites) tabs.
+*** Bug 531378 has been marked as a duplicate of this bug. ***
+Created attachment 435452
+Screen capture of the 'embarrasing' message
+I get the restoring closed tabs problem when I close Firefox and choose Save and Quit.  All manually closed tabs reappear when browser is opened next time.  
+
+If I close and chose Quit (not Quit and Save), some of the tabs appear when the browser is reopened.  They are a mixture of the closed and left open tabs.
+
+Both of these behaviors are repeatable.  I am running Personas lite for a while, just noticed this problem lately.
+is 
+  this._initialState.windows[0] is undefined
+from comment 0 still a valid telltale/requisite for this issue?
+Reproduceable on:
+Mozilla/5.0 (Windows NT 6.1; rv:2.0b12pre) Gecko/20110220 Firefox/4.0b12pre
+
+With the following STRs:
+1. Set Firefox to "Show my windows and tabs from last time" (Preferences->General Tab)
+2. Open only one blank page
+3. Close Firefox (FIle->Exit) and launch it again
+
+Expected results:
+3. On re-launch Firefox should display the blank page (tab)
+
+Actual results:
+3. Firefox homepage is displayed
+I just experienced this. Closed firefox (using X), went to bed, woke up to the "update has been installed, restart?" dialog, pressed restart, nothing happens, kill hung firefox.exe, start firefox: it updates, no app/tabs.
+
+Quick workaround: Kill firefox before it replaces sessionstore.bak, then replace sesionstore.js with a copy of sessionstore.bak which you have modified "_closedWindows" into "windows".
+
+Now running: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:11.0a1) Gecko/20111116 Firefox/11.0a1
+(In reply to James May [:fowl] from comment #31)
+> Quick workaround: Kill firefox before it replaces sessionstore.bak, then
+> replace sesionstore.js with a copy of sessionstore.bak which you have
+> modified "_closedWindows" into "windows".
+
+I encountered this today.
+Many thanks James for the workaround, saved a lot of state for me!
+This still happens with Firefox 19. STR as in comment 1.
+Bug 467248 (duped here) has caused by brother to lose his whole session multiple times in the last year including this week on a brand new profile. Since there are clear STR and a WIP (old) patch in this bug, can we find someone to finish this up? I'm bumping the importance to critical because of the dataloss.
+Yes, it's still a bug and we should fix that but I don't agree that it's critical. After all, this happens only if you open a new tab with "about:blank" on purpose. Our default new tab page is "about:newtab" which does not cause this issue.
+It's critical by definition because of dataloss.
+
+The STR in this bug isn't the only way to trigger the bug but many bugs got duped here because the fix will supposedly also solve them.  In the case of my brother, he hit bug 467248 on a new computer with a profile a day or two old (without a sync or migration) and he has the new tab page enabled.
+*** Bug 886926 has been marked as a duplicate of this bug. ***
+(In reply to Tim Taubert [:ttaubert] from comment #35)
+> After all, this happens only if you open a new tab with
+> "about:blank" on purpose. Our default new tab page is "about:newtab" which
+> does not cause this issue.
+
+Not true. This happens with about:newtab as well:
+I close down all tabs, until only about:newtab is shown. 
+(I have browser.tabs.closeWindowWithLastTab set to false, which simplifies that). Then I close Firefox.
+
+The next time I start up, some random popup appears which I closed hours before exiting the previous session.
+
+Closing that tab (replacing it by about:newtab) and restarting Firefox doesn't help: At the next startup it appears again. I used to delete sessionstore.js and .bak in that case...
+
+Of course the easier workaround is to close Firefox with one tab showing a web page (which means neither about:blank nor about:newtab nor about:home) in the last window before exiting.
+*** Bug 914059 has been marked as a duplicate of this bug. ***
+*** Bug 919112 has been marked as a duplicate of this bug. ***
+*** Bug 921387 has been marked as a duplicate of this bug. ***
+It sounds like there is more reports about this issue.
+A similar recent regression has appeared in Firefox 24 with bug 918276.
+*** Bug 923367 has been marked as a duplicate of this bug. ***
+I've been experiencing this issue for quite a while now, on 64-bit Ubuntu (12.04).
+
+In summary, whenever I close all my windows and tabs except for one single about:blank or about:newtab page, then close firefox, upon reopening firefox I just get multiple (sometimes very many) seemingly randomly selected popup windows from previous sessions, and no main firefox window.  I don't know how the popups are selected, I haven't noticed a pattern.
+
+For a while it seemed that the problem only arose when the last closed page was about:blank, but recently the behaviour started affecting about:newtab as well.  I'm not sure exactly when it started happening with about:newtab, but it was during the past month or so, more or less.  It's quite likely that I've updated firefox at least once during that period, so I'm guessing the problem was extended to the about:newtab case in one of the firefox versions recently released in Ubuntu 12.04.
+
+I understand that developers and users may have differing views regarding what is urgent, but as a user I can say that this is extremely annoying, and it's not an edge case that doesn't happen often (anymore) -- it now happens with about:newtab, which many people use.  And I think it's quite common for people to close all tabs before shutting down firefox.
+*** Bug 841632 has been marked as a duplicate of this bug. ***
+This should be fixed in Nightly after bug 853779 has been merged to central. In the meantime it would be great if someone could verify that this works as expected:
+
+http://ftp.mozilla.org/pub/mozilla.org/firefox/tinderbox-builds/fx-team-linux/1381864971/
+http://ftp.mozilla.org/pub/mozilla.org/firefox/tinderbox-builds/fx-team-linux64/1381864971/
+http://ftp.mozilla.org/pub/mozilla.org/firefox/tinderbox-builds/fx-team-macosx64/1381864971/
+http://ftp.mozilla.org/pub/mozilla.org/firefox/tinderbox-builds/fx-team-win32/1381864971/
+
+Thanks!
+I tried the nightly, and the problem persists.  While testing this I also noticed that the problem only occurs when I close the last tab using the "x" on the tab.  If I use the home button, or manually navigate to "about:newtab" or "about:blank", then close firefox, everything is fine.
+Did you try today's Nightly or one of the builds from the links I posted above? The fix has not yet landed in Nightly.
+I used the linux 64 build from your post (http://ftp.mozilla.org/pub/mozilla.org/firefox/tinderbox-builds/fx-team-linux64/1381864971/).
+Ok, thanks for checking. Maybe those bugs aren't related and this needs a separate fix.
+No worries.  For the record I even tried with a clean profile, changing only the "close window with last tab" and "show windows and tabs from last time" settings.  I'm happy to try again if another potential patch is proposed.
+
+I think there have been a few separate problems, with similar symptoms.  I think the key, in my case at least, is that the problem only arises when closing the last tab using the "x".  The session store behaves properly when navigating to the newtab/blank page, but it seems that closing the last tab is not considered a navigation action, somehow.
+Yes, bug 495123 and bug 918276 are different, I think.
+This one is about Firefox restoring some various tabs closed in the past and the 2nde one is about Firefox loading the session restore tab after quitting only with about:blank open.
+I can confirm that the linux 64-bit build in comment 46 does not fix this bug. :(
+Wow, the level of incompetence is amazing around here.
+Can confirm this still happens and extremely annoying.
+
+Build identifier: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:26.0) Gecko/20100101 Firefox/26.0 on Win-7 64
+Found another way to reproduce the bug.
+1. Open a new tab.
+2. Close all others.
+3. Restart Firefox.
+Expected:
+The empty tab is open.
+Actual:
+Random windows are opened with old pages.
+I'm confirming steps reported by Tomer Altman.
+Upon restart, instead of showing an empty tab, Firefox keeps opening homepage even though it should restore previous session with a single empty tab.
+The above steps were tested in 27.0.1
+Actually it is not opening a random page. It is only selected (or all) pages which opened as popups.
+
+Popup does not have a tab and a close button to close it so we always close it using close button of window. this causes the remember last session trigger and save the url in previous session's pages and next time we open the FF, it will open it. to avoid this from happening, a popup should have either:
+
+- Marked as opened in popup, which then saving to last session should not occur (a simple way to find out, is check if tab button is visible)
+- Or don't open pages in popup at all.
+
+To workaround this I configured my FF to do second one. popup pages look ugly and distorted but still it is better than opening firefox and having lots of windows open in random sizes and positions with pages ranged from bank logout, shopping cart confirmation, credit transfer requests, etc.
+Created attachment 8388081
+0001-Bug-495123-Save-an-empty-window-state-if-it-s-the-la.patch
+
+The current behavior when closing a single "blank" window last is definitely problematic. We shouldn't just restore popups until we find a non-popup window. I think that restoring any window out of the "closed windows" bucket is very unexpected. In this case we should indeed save the "blank" window's state and restore that when starting up next.
+
+In the case of closing a "blank" window as part of a series of closing windows - when closing one window after the other until Firefox quits (Win/Linux only) - however I think we should continue to not save state for "blank" windows, contrary to what is being said in comment #1. Comment #1 was from a time where we didn't restore the whole series of closed windows when closing them one by one.
+
+This patch also addresses bug 581937 comment #15 and would also discard windows with x blank tabs instead of just windows with a single blank tab.
+Comment on attachment 8388081
+0001-Bug-495123-Save-an-empty-window-state-if-it-s-the-la.patch
+
+Review of attachment 8388081:
+-----------------------------------------------------------------
+
+r+ with changes to some of the comments:
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +1058,5 @@
+>        // recently something was closed.
+>        winData.closedAt = Date.now();
+>  
+> +      // Save the window if it is the last window, has multiple tabs or a
+> +      // single saveable tab, and it's not private.
+
+I'd prefer something like "Save non private windows if they have multiple tabs, a single saveable tab, or are the last window." - I think it captures the Boolean logic less ambiguously.
+
+@@ +1069,3 @@
+>  
+> +        // When closing windows one after the other until Firefox quits, we
+> +        // will re-open those closed in series before writing to disk. If
+
+We don't actually "re-open" the windows before writing, we just move the data so that they will be restored. Can you reword this please?
+https://hg.mozilla.org/integration/fx-team/rev/8ee507d0a33b
+sorry had to backout for test failures like https://tbpl.mozilla.org/php/getParsedLog.php?id=36660427&tree=Fx-Team
+Had to fix a few URLs in tabview tests due to the fix for bug 581937 comment #15.
+
+https://hg.mozilla.org/integration/fx-team/rev/9d43ace17862
+https://hg.mozilla.org/mozilla-central/rev/9d43ace17862
+*** Bug 1005663 has been marked as a duplicate of this bug. ***
+Why is already wontfix for 30?  Is this too risky to uplift? We're having a lot of session restore issues so if this in any way helps with those and is low risk, we could take it in this week's beta to get more users on it before shipping.
+(In reply to Lukas Blakk [:lsblakk] from comment #67)
+> Why is already wontfix for 30?  Is this too risky to uplift? We're having a
+> lot of session restore issues so if this in any way helps with those and is
+> low risk, we could take it in this week's beta to get more users on it
+> before shipping.
+
+Good question! When I landed this I figured it might be too risky to uplift but looking at the patch again I think we should do it, it had enough time on Nightly and Aurora to be almost sure it doesn't cause any regressions or other unwanted behavior.
+Comment on attachment 8388081
+0001-Bug-495123-Save-an-empty-window-state-if-it-s-the-la.patch
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): No idea, long-standing bug.
+User impact if declined: We might resurrect random closed windows at next startup when quitting with a blank window.
+Testing completed (on m-c, etc.): Landed in 31 and is now on Aurora without any known regressions.
+Risk to taking this patch (and alternatives if risky): Low risk.
+String or IDL/UUID changes made by this patch: None.
+https://hg.mozilla.org/releases/mozilla-beta/rev/f29ab60028d4
+https://hg.mozilla.org/releases/mozilla-b2g30_v1_4/rev/f29ab60028d4
+
+###########[Verification day-20140521]############
+
+Reproduced with Latest Nightly from 2014-05-21 with STR from comment 1.
+Verified as fixed on latest Nightly 32.0a1(Build Id: 20140520030202) on Ubuntu 14.04 x64
+Mozilla/5.0 (X11; Linux x86_64; rv:32.0) Gecko/20100101 Firefox/32.0
+The above comment is wrong,sorry for that. I couldn't find older builds to reproduce this,but with latest Nighty(Build Id: 20140520030202) it works as expected, this bug is not present.
+(In reply to YaoMingWang from comment #73)
+> The above comment is wrong,sorry for that. I couldn't find older builds to
+> reproduce this,but with latest Nighty(Build Id: 20140520030202) it works as
+> expected, this bug is not present.
+
+Based on the status flags this should be broken in Firefox 29 (release) and fixed in Firefox 30 through 32 (latest Beta through Nightly, respectively). Could you quickly verify this to be the case?
+*** Bug 1018678 has been marked as a duplicate of this bug. ***
+Verified as fixed with latest Aurora (Build ID : 20140602004003 ) and Nightly (Build ID : 20140601030204 ) en-US builds and Firefox 30 beta 9 (Build ID : 20140529161749 ) zh-TW build on Ubuntu 14.04:
+User Agent : Mozilla/5.0 (X11; Linux x86_64; rv:30.0) Gecko/20100101 Firefox/30.0 ,
+Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0,
+Mozilla/5.0 (X11; Linux x86_64; rv:32.0) Gecko/20100101 Firefox/32.0.
+Bug is not solved when the last window was a private browsing window.
+
+1. Have last tab in main window be the "initial tab" like before.
+2. Open a private browsing window.
+3. Close the main window.
+4. Close the private browsing window.
+5. Re-open Firefox.
+
+Expected:
+Browser opens correctly.
+
+Actual:
+The bug still exists, a random pop-up window from the history appears.
+Tomer, open a new bug (paste the number here) and provide more info especially before step #1. I'm not able to reproduce with FF33.
+I can't seem to be able to consistently reproduce the bug. If I see it again, I'll open a new bug and link to this one for reference.
+FF 30.0 (win 7, 64bit)
+
+I thought this was fixed but it just happened again, not private window.
+
+NOT FIXED.
+Please file a new bug and the exact steps to reproduce, and exactly what problem you saw.

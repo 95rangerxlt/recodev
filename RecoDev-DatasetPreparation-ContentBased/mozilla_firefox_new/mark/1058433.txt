@@ -1,0 +1,262 @@
+As part of bug 771630, we need the permission manager to record a timestamp for when permissions are added/changed, and the ability to clear all permissions changed after a specified time.  This will involve:
+
+* A change to the sqlite schema used to store permissions (and thus a schema migration), and relevant tests for the migration.
+
+* Store/update modification date - this should not require any interface changes, but instead just storing now() at the relevant times.
+
+* New method (and this an interface change) to remove all since a specified date.
+
+* Tests for all the above.
+
+Marking as no QA for this specific bug - the tests should be comprehensive and the QA can be done as part of the bug 771630.
+
+As part of bug 771630, we need the permission manager to record a timestamp for when permissions are added/changed, and the ability to clear all permissions changed after a specified time.  This will involve:
+
+* A change to the sqlite schema used to store permissions (and thus a schema migration), and relevant tests for the migration.
+
+* Store/update modification date - this should not require any interface changes, but instead just storing now() at the relevant times.
+
+* New method (and this an interface change) to remove all since a specified date.
+
+* Tests for all the above.
+
+Marking as no QA for this specific bug - the tests should be comprehensive and the QA can be done as part of the bug 771630.
+Created attachment 8481013
+0001-Bug-1058433-nsPermissionManager-now-records-the-mod-.patch
+
+This patch has nsPermissionManager store the modified time for permissions and adds a way to remove all permissions modified since a specified date.
+
+This is somewhat similar to the patch in bug 506446 (which I previously had bsmedberg and ehsan offer feedback on - so they lose again ;) but is *much* simpler as it doesn't try and solve 2 problems in one.  Of note:
+
+* The only interface change is a new method on nsIPermissionManager.  ns[I]Permission does *not* record the modification date, and no public methods allow one to be specified.
+
+* To keep things simpler, child processes will generally *not* see accurate modification times - which works fine as the child process never read/writes the DB, nor does it support the time-based removal of permissions.  Thus, the modified time doesn't need to be added to the IPC:: permission repr etc.
+
+* Schema upgrade is implemented, causing all modification times to be set to now().  Similarly, the "import" file format doesn't support modification times - ones read there also get now().  The schema upgrade has tests.
+
+* There are tests for the core functionality of removal since a time.
+
+* The removal function could possibly do with some optimization - it enumerates the in-memory copy of the prefs (hence no index on the new field) and removes the items one at a time.  Given how this is used (ie, by explicit user action from our UI) I'm not particularly concerned by this, but obviously YMMV.
+Comment on attachment 8481013
+0001-Bug-1058433-nsPermissionManager-now-records-the-mod-.patch
+
+I think I can live with this approach.  f=me on the approach (didn't review for correctness.)
+Comment on attachment 8481013
+0001-Bug-1058433-nsPermissionManager-now-records-the-mod-.patch
+
+I also didn't do a careful code review, but I am fine with the approach. Not sure who you want for actual code review here.
+Created attachment 8482851
+Add a modificationTime to permissions
+
+This patch stores a modificationTime for permissions in the moz_hosts table and in the PermissionEntry object.  As permissions are created or updated, this time is set to now.  There is a new API, .removeSince(), which removes all permissions created since the specified date.
+
+Note that this value is *not* maintained correctly in the child processes - they will typically see a modification date of now(), regardless of what the modification time is stored for the permission.  This seems OK as the child process never reads or writes to the DB, and nor does it allow permissions to be removed since the specified date, and it means we don't need to add this field to the IPC::Permission (sp?) object and send it across the IPC channel.
+
+This patch is the same as the previous one, but with a comment in the test clarified.
+
+Jonas, you drew the short straw for review as you previously reviewed other similar changes to the permission manager, but please feel free to suggest an alternative reviewer.
+
+Try at https://tbpl.mozilla.org/?tree=Try&rev=6a25abe3e3bf
+Comment on attachment 8482851
+Add a modificationTime to permissions
+
+Try failed:
+
+TEST-UNEXPECTED-FAIL | /builds/slave/test/build/tests/xpcshell/tests/extensions/cookie/test/unit/test_permmanager_removesince.js | test failed (with xpcshell return code: -11), see following log:
+Assertion failure: aOp == PL_DHASH_LOOKUP || mRecursionLevel == 0, at /builds/slave/try-lx-d-000000000000000000000/build/xpcom/glue/pldhash.cpp:557
+
+Clearing review request while I nail that...
+Created attachment 8483489
+0001-Bug-1058433-nsPermissionManager-now-records-the-mod-.patch
+
+Very similar to the previous patch (so see the previous description), but the enumerator to find all perms modified since the specified date has changed to keep all found items in an array before removing them.
+
+Green try at https://tbpl.mozilla.org/?tree=Try&rev=e1ca42d0ac6a
+Comment on attachment 8483489
+0001-Bug-1058433-nsPermissionManager-now-records-the-mod-.patch
+
+bsmedberg suggested I throw this to Ehsan instead.
+Comment on attachment 8483489
+0001-Bug-1058433-nsPermissionManager-now-records-the-mod-.patch
+
+Review of attachment 8483489:
+-----------------------------------------------------------------
+
+r=me with the below addressed.
+
+::: build/automation.py.in
+@@ +304,5 @@
+>      # Open database and create table
+>      permDB = sqlite3.connect(os.path.join(profileDir, "permissions.sqlite"))
+>      cursor = permDB.cursor();
+>  
+> +    cursor.execute("PRAGMA user_version=4");
+
+Don't you need a similar change in testing/mozbase/mozprofile/mozprofile/permissions.py and perhaps its corresponding test?
+
+::: extensions/cookie/nsPermissionManager.cpp
+@@ +549,5 @@
+> +        NS_ENSURE_SUCCESS(rv, rv);
+> +
+> +        // We leave the modificationTime at zero for all existing records; using
+> +        // now leave a chance the user says "remove all from the last hour"
+> +        // and find all permissions are gone.
+
+I can't parse this sentence... (the "using now" part.)  I'm sure there's a typo I can't quite figure out. :)
+
+@@ +776,5 @@
+>    }
+>  
+>    // do the work for adding, deleting, or changing a permission:
+>    // update the in-memory list, write to the db, and notify consumers.
+>    int64_t id;
+
+Can you please add a MOZ_ASSERT here that ensures that if you are in the child process, aModificationTime is *always* zero?
+
+@@ +1360,5 @@
+> +  nsPermissionManager::PermissionHashKey* entry, void* arg)
+> +{
+> +  nsGetEnumeratorData *data = static_cast<nsGetEnumeratorData *>(arg);
+> +
+> +  for (uint32_t i = 0; i < entry->GetPermissions().Length(); ++i) {
+
+Nit: size_t
+
+@@ +1361,5 @@
+> +{
+> +  nsGetEnumeratorData *data = static_cast<nsGetEnumeratorData *>(arg);
+> +
+> +  for (uint32_t i = 0; i < entry->GetPermissions().Length(); ++i) {
+> +    nsPermissionManager::PermissionEntry& permEntry = entry->GetPermissions()[i];
+
+Nit: please make permEntry const
+
+@@ +1367,5 @@
+> +    if (data->since > permEntry.mModificationTime) {
+> +      continue;
+> +    }
+> +
+> +    nsPermission *perm = new nsPermission(entry->GetKey()->mHost,
+
+Nit: start goes with the type.
+
+@@ +1391,5 @@
+> +  nsGetEnumeratorData data(&array, &mTypeArray, aModificationTime);
+> +
+> +  mPermissionTable.EnumerateEntries(AddPermissionsModifiedSinceToList, &data);
+> +
+> +  for (int32_t i=0; i<array.Count(); ++i) {
+
+Nit: space around operators please.
+
+@@ +1395,5 @@
+> +  for (int32_t i=0; i<array.Count(); ++i) {
+> +    nsAutoCString host;
+> +    bool isInBrowserElement;
+> +    nsAutoCString type;
+> +    uint32_t appId;
+
+Please initialize appId and isInBrowserElement here.  _Technically_, GetAppId and GetIsInBrowserElement are XPCOM methods that might fail...
+
+::: extensions/cookie/test/unit/test_permmanager_removesince.js
+@@ +40,5 @@
+> +  // add another item - this second one should get nuked.
+> +  pm.addFromPrincipal(principal1, "test/remove-since-2", 1);
+> +
+> +  // add 2 items for the second principal - both will be removed.
+> +  pm.addFromPrincipal(principal2, "test/remove-since", 1);
+
+It would be nice if you slept a few milliseconds before adding this, so that we would be testing both removal from (hopefully) the exact time since, and times after it.
+Created attachment 8487114
+test_permmanager_removesince.js
+
+Thanks for the speedy review!
+
+(In reply to :Ehsan Akhgari (not reading bugmail, needinfo? me!) from comment #8)
+
+I addressed all the other feedback, but here is where it gets "interesting" (or maybe better described as "sad")
+
+> ::: extensions/cookie/test/unit/test_permmanager_removesince.js
+> @@ +40,5 @@
+> > +  // add another item - this second one should get nuked.
+> > +  pm.addFromPrincipal(principal1, "test/remove-since-2", 1);
+> > +
+> > +  // add 2 items for the second principal - both will be removed.
+> > +  pm.addFromPrincipal(principal2, "test/remove-since", 1);
+> 
+> It would be nice if you slept a few milliseconds before adding this, so that
+> we would be testing both removal from (hopefully) the exact time since, and
+> times after it.
+
+So, Windows.
+
+The JS test's Date.Now() and nsPermissionManager.cpp's PR_Now() appear to have different implementations.  What I can semi-reliably see on (particularly debug) Windows is the JS code grabbing a timestamp, then calling the c++ which grabs a timestamp - but the JS timestamp is ~2 milliseconds *after* what the c++ code sees.  I didn't drill-down far enough in the now() implementations to explain exactly why, but dump/fprintf_stderr insist it is true in the cases where the test occasionally fails on Windows.
+
+So I've had to add another sleep after JS grabs the timestamp - which defeats the above suggestion - the test now ensures the JS and C++ never see the exact same now().
+
+I've attached the modified test file for review, just to ensure I'm not missing something obvious.
+
+Windows only try at https://tbpl.mozilla.org/?tree=Try&rev=4468956bdf9a - all other platforms were green the first try-push.
+Perhaps you should use mozilla::Timestamp.
+(In reply to :Ehsan Akhgari (not reading bugmail, needinfo? me!) from comment #10)
+> Perhaps you should use mozilla::Timestamp.
+
+I'm not sure that helps.  Apart from the warning about performance in TimeStamp.h, there doesn't seem a way to reasonably correlate the time returned with the system clock.  XPCComponents.cpp does define a TimeStamp using now() function, but that is documented as returning "number of milliseconds from process startup" and isn't any good to us.
+
+Date.now() from JS ends up using PRMJ_Now() - http://mxr.mozilla.org/mozilla-central/source/js/src/prmjtime.cpp#54, which itself uses gettimeofday().  It doesn't make sense to me to duplicate this code, nor to create an artifical dependency back to JS just for this reason - even if we did, we can't guarantee we are testing with an *identical* now value anyway.
+
+So all in all, I don't see that as a worthwhile way forward - am I missing something?
+Oh, sorry for being too terse.  :-)
+
+My suggestion was to use mozilla::TimeStamp inside Gecko, and in the test, use window.performance.now() which is also implemented using mozilla::TimeStamp <http://mxr.mozilla.org/mozilla-central/source/dom/base/nsPerformance.cpp#451>.  That way, you will have the same high resolution timer on both sides.
+(In reply to :Ehsan Akhgari (not reading bugmail, needinfo? me!) from comment #12)
+> Oh, sorry for being too terse.  :-)
+> 
+> My suggestion was to use mozilla::TimeStamp inside Gecko
+
+But I still don't understand how to convert a mozilla::TimeStamp value to a value in milliseconds suitable for storing in the DB - IIUC, TimeStamp uses an arbitrary epoch.
+
+>, and in the test,
+> use window.performance.now() which is also implemented using
+> mozilla::TimeStamp
+> <http://mxr.mozilla.org/mozilla-central/source/dom/base/nsPerformance.
+> cpp#451>.  That way, you will have the same high resolution timer on both
+> sides.
+
+That would work fine if the value was just kept in memory, but we need a real time value that has a relationship to the wall-time we can store in the DB.
+(In reply to Mark Hammond [:markh] from comment #13)
+> (In reply to :Ehsan Akhgari (not reading bugmail, needinfo? me!) from
+> comment #12)
+> > Oh, sorry for being too terse.  :-)
+> > 
+> > My suggestion was to use mozilla::TimeStamp inside Gecko
+> 
+> But I still don't understand how to convert a mozilla::TimeStamp value to a
+> value in milliseconds suitable for storing in the DB - IIUC, TimeStamp uses
+> an arbitrary epoch.
+
+You don't.  :-)  TimeStamp doesn't expose its origin intentionally.  The idea is that you subtract two TimeStamps, to get a TimeDuration, on which you can call ToMilliseconds() and ToMicroseconds().  This class is fairly well documented in <http://mxr.mozilla.org/mozilla-central/source/xpcom/ds/TimeStamp.h?force=1>.
+
+> >, and in the test,
+> > use window.performance.now() which is also implemented using
+> > mozilla::TimeStamp
+> > <http://mxr.mozilla.org/mozilla-central/source/dom/base/nsPerformance.
+> > cpp#451>.  That way, you will have the same high resolution timer on both
+> > sides.
+> 
+> That would work fine if the value was just kept in memory, but we need a
+> real time value that has a relationship to the wall-time we can store in the
+> DB.
+
+Ah, hmm.  So, that is pretty buggy, since the values that we'd store in the DB would be invalid if, for example, the system clock changes.  Right?  But that is how we store other time information here...  So perhaps it's as bad as the rest of this code.  Feel free to leave the test as is.  :(
+Thanks!
+
+https://hg.mozilla.org/integration/fx-team/rev/449fb0bd623f
+https://hg.mozilla.org/mozilla-central/rev/449fb0bd623f
+
+
+nsIPermissionManager should record the time a permission was added/modified, and offer a way to reset those changed after a specified date
+
+
+
+Bug 1058433 - nsPermissionManager now records the mod-time of a permission and allows removal of ones modified since a specified time. r=ehsan 

@@ -1,0 +1,135 @@
+Once bug 1169343 lands, we'll have a UI for listing all workers in a tab. The final step is then to open a toolbox for a worker when the user clicks on one.
+
+Before we can open a toolbox for workers, we need to implement a new instance of Target for workers.
+
+Once this bug lands, people should have something they can play with! :-) However, note that the following things won't work yet: the console, the scratchpad, and debugging service workers.
+
+Debugging service workers will be on top of my list after this bug lands.
+
+Once bug 1169343 lands, we'll have a UI for listing all workers in a tab. The final step is then to open a toolbox for a worker when the user clicks on one.
+
+Before we can open a toolbox for workers, we need to implement a new instance of Target for workers.
+
+Once this bug lands, people should have something they can play with! :-) However, note that the following things won't work yet: the console, the scratchpad, and debugging service workers.
+
+Debugging service workers will be on top of my list after this bug lands.
+Created attachment 8622591
+Implement WorkerTarget
+
+This patch defines a new target for workers. This allows us to open up a toolbox for a worker as if it were an ordinary tab.
+Created attachment 8623646
+Emit newSource events on ThreadClient instead of DebuggerClient
+
+newSource events are currently emitted on the DebuggerClient, even though the corresponding notification is sent by the thread actor, not the root actor.
+
+This is not a problem when dealing with just tabs, because there is only one thread actor in that case. Add workers to the mix, however, and now you have to deal with multiple thread actors, each of which can generate their own newSource notifications.
+
+If we emit newSource events for both thread actors on DebuggerClient, the UI cannot distinguish between new sources in the tab and new sources in a worker. The result is that worker sources are displayed in the sources list for the tab, and vice versa.
+
+To work around this problem, the newSource event should be emitted on ThreadClient, not DebuggerClient.
+Comment on attachment 8623646
+Emit newSource events on ThreadClient instead of DebuggerClient
+
+Review of attachment 8623646:
+-----------------------------------------------------------------
+
+The code changes look good to me. Very small patch anyway.
+But I don't know the implications for the debugger very well. Your explanations in comment 2 seem clear enough though, and if this leads to a green try build, fine with me.
+r=me
+Try push for the newSource events:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=331b45025d66
+The try push shows failures for xpcshell tests that I forgot to address. Here is a try push for a new patch that addresses that:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=2428fd8c3ae0
+https://hg.mozilla.org/integration/fx-team/rev/152f968b6b13
+Try push for the WorkerTarget patch:
+https://treeherder.mozilla.org/#/jobs?repo=fx-team&revision=152f968b6b13
+That was the wrong patch. Ugh, I'm getting too old for this:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=07c37eee723d
+Hi James, I realize you're going to be very busy at Whistler this week, but if you can spare the time, could you please review this patch? This is the final patch we need to land the worker debugging prototype!
+https://hg.mozilla.org/mozilla-central/rev/152f968b6b13
+Eddy - why is this no longer fixed?
+(In reply to Jeff Griffiths (:canuckistani) from comment #11)
+> Eddy - why is this no longer fixed?
+
+Only one patch landed.  There is still another to review.
+Created attachment 8627217
+Fix a bug in WorkerActorList.checkListening
+
+I found a small bug in the checkListening function on WorkerActorList. The WorkerDebugger API does not allow the same object to be added as a listener twice. Consequently, we should only call checkListening if either the value of the listener changed from null to a function, or vice versa, or the value of shouldNotify changes from false to true, or vice versa. Otherwise, the WorkerDebugger may be added as a listener twice, which causes an exception.
+
+This is a small patch, so opening a separate bug for it is probably overkill. I could have merged it with the WorkerTarget patch and put up a new version of that patch, but I don't know if James already started reviewing it. Just to be safe, I will add the fix as a separate patch in this bug.
+Comment on attachment 8622591
+Implement WorkerTarget
+
+Review of attachment 8622591:
+-----------------------------------------------------------------
+
+Looks good, though there are still things you are going to implemented later it seems?
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +476,5 @@
+>      this._tabClient.removeListener("workerListChanged", this._onWorkerListChanged);
+>    },
+>  
+>    _updateWorkerList: function () {
+> +    if (!this._tabClient.listWorkers) {
+
+Any way to use traits instead of feature detection? I don't necessarily think this is bad, but a trait might be useful in other places. Is there already a "supportsWorkerDebugging" trait?
+
+::: browser/devtools/framework/target.js
+@@ +863,5 @@
+> +    return false;
+> +  },
+> +
+> +  getTrait: function (name) {
+> +    return undefined;
+
+how come both `hasActor` and `getTrait` are basically unimplemented? Would this make any tool that uses this to think the trait is unsupported?
+
+::: toolkit/devtools/client/dbg-client.jsm
+@@ +1373,5 @@
+>    this.addListener("close", this._onClose);
+>    this.addListener("freeze", this._onFreeze);
+>    this.addListener("thaw", this._onThaw);
+> +
+> +  this.traits = {};
+
+Why is this added here? I don't see it used anywhere
+Comment on attachment 8627217
+Fix a bug in WorkerActorList.checkListening
+
+Review of attachment 8627217:
+-----------------------------------------------------------------
+
+r+wc
+
+::: toolkit/devtools/server/actors/worker.js
+@@ +194,5 @@
+>        throw new Error("onListChanged must be either a function or null.");
+>      }
+>  
+> +    if (this._onListChanged === null && onListChanged !== null ||
+> +        this._onListChanged !== null && onListChanged === null) {
+
+A comment explaining this logic would be nice. Mainly you want to only call `this._checkListening` if the handler changed?
+
+What about this instead?
+
+if (this._onListChanged && onListChanged) {
+  this._onListChanged = null;
+  this._checkListening();
+}
+
+this._onListChanged = onListChanged;
+this._checkListening();
+
+We make sure to remove the current event handler if one exists and we are changing it to another one. I think it reads a little better, but it's up to you.
+New try push for the WorkerTarget patch, with comments by jlong addressed:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=c21f2976dc18
+Try push for the checkListening patch, with comments by jlong addressed:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=21350c27cd28
+I'm seeing strange failures for the WorkerTarget patch in the webplatform tests and several others. It's unlikely that this is caused by my patch, especially since the previous try run was green, but to be safe, here's another try run:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=92ff88ed25dc
+https://hg.mozilla.org/integration/fx-team/rev/57d4c7b97b2d
+I'm still seeing webplatform tests, but apparently we don't run those on m-i, so according to KWierso we can risk trying to land this :-)
+https://hg.mozilla.org/mozilla-central/rev/57d4c7b97b2d

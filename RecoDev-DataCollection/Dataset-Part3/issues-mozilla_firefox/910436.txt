@@ -1,0 +1,143 @@
+Created attachment 796870
+helper-app
+
+This is an other incarnation of a common bug. We try to use a DOMWindow in chrome, which of course doesn't exists. I took a short look if it would be possible to use at least a ChromeWindow instead of no window at all for the context. But because this is using ContentParent instead of TabParent this association is impossible?
+
+Created attachment 796870
+helper-app
+
+This is an other incarnation of a common bug. We try to use a DOMWindow in chrome, which of course doesn't exists. I took a short look if it would be possible to use at least a ChromeWindow instead of no window at all for the context. But because this is using ContentParent instead of TabParent this association is impossible?
+Comment on attachment 796870
+helper-app
+
+Review of attachment 796870:
+-----------------------------------------------------------------
+
+I'm curious what is the callstack here that leads to this call to think how we could get the window from it.. Not having the parent window to the openWindow call seems like something we'll need to fix to properly support the case for more than 1 window..
+
+Checking what's Paolo's opinion on the patch..
+Comment on attachment 796870
+helper-app
+
+We show the dialog in response to a "nsIHelperAppLauncherDialog.show" call:
+
+http://mxr.mozilla.org/mozilla-central/source/uriloader/exthandler/nsExternalHelperAppService.cpp#1576
+
+The window context comes from nsExternalHelperAppService::DoContent, which is
+called in the pipeline for handling content that cannot be shown internally by
+the browser. I'm not sure why this parameter is unavailable in e10s.
+
+The requirement here is to show the dialog attached to the window that
+originated the request, even if the user switched to another window before the
+request was handled. Note that a download request may start at any time, for
+example following an automatic page refresh in a background window.
+Thanks. I see what Tom means now. The call to DoContent in the e10s case with a null context is here:
+http://mxr.mozilla.org/mozilla-central/source/uriloader/exthandler/ExternalHelperAppParent.cpp#63
+
+Init is called here: http://mxr.mozilla.org/mozilla-central/source/dom/ipc/ContentParent.cpp#2203
+
+And ContentParent is a per-process singleton so the message is not tied to any particular window.
+
+I wonder if when sending the message from the child, we could include the window ID or some other identifying info somehow, and ContentParent can iterate through its list of TabParents to match it and find a proper window..
+Sorry for not providing a proper explanation for this change, but Felipe is spot on. It seems like we really want this per TabChild, but like most of the networking stack this lives in the ContentChild.
+Created attachment 799069
+move helper app to PBrowser
+
+I haven't really tested this patch yet. I am also not sure how much we win from using the owner window of the frame element.
+Comment on attachment 799069
+move helper app to PBrowser
+
+Review of attachment 799069:
+-----------------------------------------------------------------
+
+Brian, this is somewhat networky? Can you review this?
+Comment on attachment 796870
+helper-app
+
+clearing up this review as it looks like we can go with the other approach
+Comment on attachment 799069
+move helper app to PBrowser
+
+Looks like most people who worked on this originally aren't available anymore. I am trying to find someone to review this.
+Comment on attachment 799069
+move helper app to PBrowser
+
+Review of attachment 799069:
+-----------------------------------------------------------------
+
+Looks good to me, though I don't really understand the difference between PBrowser and PContent, so maybe someone more familiar with that difference should also take a look.
+
+::: uriloader/exthandler/ExternalHelperAppParent.cpp
+@@ +62,5 @@
+>    NS_GetFilenameFromDisposition(mContentDispositionFilename, mContentDispositionHeader, mURI);
+>    mContentDisposition = NS_GetContentDispositionFromHeader(mContentDispositionHeader, this);
+> +
+> +
+> +  nsCOMPtr<nsIInterfaceRequestor> window = nullptr;
+
+No need to explicitly initialize this -- COMPtrs are null by default.
+
+::: uriloader/exthandler/nsExternalHelperAppService.cpp
+@@ +586,5 @@
+>      // this data to the parent.  In the HTTP case, this is unfortunate, since
+>      // we're actually passing data from parent->child->parent wastefully, but
+>      // the Right Fix will eventually be to short-circuit those channels on the
+>      // parent side based on some sort of subscription concept.
+> +     mozilla::dom::TabChild *child = mozilla::dom::GetTabChildFrom(window);
+
+Incorrect indentation
+Comment on attachment 799069
+move helper app to PBrowser
+
+I'm not sure that this is a good change. In particular, we're now in the situation where killing the related TabParent will destroy the IPC actor. This sounds like you could click a link that brings up a download dialog, choose to open with an application, then close the tab, and if the download isn't finished then it would be aborted. If I'm right, a better way to go about this would be to send the PBrowser actor as a parameter in the constructor, rather than reparenting the protocol.
+The same thing would happen if you close all tabs that run in one process (currently not really a problem, because there is just one). I think next week I will take a look at having this stuff run in chrome, which would also avoid the data transferfrom chrome->content->chrome.
+Created attachment 801641
+helper-app-2
+
+Different solution. Here I just pass a PBrowser, so that the lifetime is not bound by it and we just use it to construct with the right window.
+Comment on attachment 801641
+helper-app-2
+
+Review of attachment 801641:
+-----------------------------------------------------------------
+
+::: uriloader/exthandler/ExternalHelperAppParent.cpp
+@@ +62,5 @@
+>    NS_GetFilenameFromDisposition(mContentDispositionFilename, mContentDispositionHeader, mURI);
+>    mContentDisposition = NS_GetContentDispositionFromHeader(mContentDispositionHeader, this);
+> +
+> +  nsCOMPtr<nsIInterfaceRequestor> window;
+> +  if (TabParent *tabParent = static_cast<TabParent*>(aBrowser)) {
+
+No need to null-check; the actor isn't declared nullable in the protocol.
+
+::: uriloader/exthandler/ExternalHelperAppParent.h
+@@ +3,5 @@
+>  /* This Source Code Form is subject to the terms of the Mozilla Public
+>   * License, v. 2.0. If a copy of the MPL was not distributed with this
+>   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+>  
+> +#include "mozilla/dom/PBrowserParent.h"
+
+This can be forward declared instead.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/966df39694c2
+Had to back it out: http://hg.mozilla.org/integration/mozilla-inbound/rev/f9068e71ea04. Something weird with xpcshell tests.
+Created attachment 804094
+helper app v3
+Comment on attachment 804094
+helper app v3
+
+Review of attachment 804094:
+-----------------------------------------------------------------
+
+::: uriloader/exthandler/ExternalHelperAppParent.cpp
+@@ +62,5 @@
+>    NS_GetFilenameFromDisposition(mContentDispositionFilename, mContentDispositionHeader, mURI);
+>    mContentDisposition = NS_GetContentDispositionFromHeader(mContentDispositionHeader, this);
+> +
+> +  nsCOMPtr<nsIInterfaceRequestor> window;
+> +  if (TabParent *tabParent = static_cast<TabParent*>(aBrowser)) {
+
+Please null-check the PBrowserParent pointer before casting.
+http://hg.mozilla.org/integration/mozilla-inbound/rev/9700eb116b60
+https://hg.mozilla.org/mozilla-central/rev/9700eb116b60

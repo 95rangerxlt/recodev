@@ -1,0 +1,1798 @@
+Need to put my in-progress impl of mozStorage-based nsGlobalHistory somewhere.
+
+Need to put my in-progress impl of mozStorage-based nsGlobalHistory somewhere.
+Created attachment 163460
+nsGlobalHistory2.cpp
+Created attachment 163461
+nsGlobalHistory2.h
+vlad, is the plan to merge the toolkit/xpfe history impls as you do this? 
+There's really no reason they shouldn't use the same history impl....
+Created attachment 193505
+Initial GlobalHistory replacement
+
+This is my implementation of GlobalHistory using Storage. I've only started
+going through Vlad's previous implementation (I didn't know about it when I
+started writing this) to see what I should merge.
+
+Basic stuff (AddURI, etc.): Mostly new, mostly done
+Autocomplete: basically copied old implementation, 100% done
+RDF: Partially copied old one, updated a lot, 80% done
+Find: All new, 85% done
+
+A significant amount of the code is a new extensable "find" system which is
+much more general and powerful than the old one, and lets you build up
+interesting queries. Most of the RDF tree building then uses this system.
+
+The "group" token identifies which subfolder generation module to use, the
+"then" token lets you build up subqueries of folders
+
+Old-style view by date:
+  find:datasource=history&group=AgeInDays
+Old-style view by date and then host:
+  find:datasource=history&group=AgeInDays&then&group=Host
+5-10 days ago, broken out by day, then by "smart domain":
+  find:datasource=history&match=AgeInDays&method=greaterequal&text=5
+       &match=AgeInDays&method=lessequal&text=10&group=AgeInDays
+       &then&group=SmartDomain
+
+"Smart domain" is a new thing I wrote for grouping hosts that we should discuss
+somewhere else.
+
+Comments on this query format would be appreciated.
+
+So, this is totally not what you want to hear since you've done the C++ work,
+but, have you thought about writing this in JS?  (I'm on a sort of mini-crusade
+to get as many things into JS as can be in JS, for ease of coding, avoiding C++
+shoot-self-in-foot bugs, and maintainability...)
+
+I'll read over the impl in the next few days and see if I can offer any
+suggestions :)
+I hadn't thought about writing it in JS.
+
+I don't think either autocomplete and searching would be appropriate for JS, and
+this is most of the code. Both of these are potentially slow and performance
+critical.
+
+Some of the code add page/do we have this page stuff I guess could be done
+reasonably in JS instead. But, uh, I've already done most of the C++ work
+(especially for these features).
+Created attachment 201860
+Complete patch with new implementation
+
+This implementation does not have RDF support, so the history side bar and the go menu are broken.
+Comment on attachment 201860
+Complete patch with new implementation
+
+>--- browser/components/Makefile.in	23 Aug 2005 16:38:27 -0000	1.42
+>+++ browser/components/Makefile.in	4 Nov 2005 16:45:42 -0000
+>@@ -61,9 +61,13 @@ DIRS = \
+> 	migration \
+> 	history \
+> 	preferences \
+> 	shell \
+> 	sidebar \
+> 	build \
+> 	$(NULL)
+> 
+>+ifdef MOZ_PLACES
+>+DIRS += places
+>+endif
+>+
+
+This isn't quite right.  The "build" directory links all of the components into a dll, so it needs to come last.
+
+>--- browser/components/build/Makefile.in	23 Jun 2005 02:25:04 -0000	1.30
+>+++ browser/components/build/Makefile.in	4 Nov 2005 16:45:42 -0000
+>@@ -55,16 +55,36 @@ SHARED_LIBRARY_LIBS = \
+> 	$(DIST)/lib/$(LIB_PREFIX)bookmarks_s.$(LIB_SUFFIX) \
+> 	$(DIST)/lib/$(LIB_PREFIX)migration_s.$(LIB_SUFFIX) \
+> 	$(NULL)
+> 
+> ifneq (,$(filter windows mac cocoa gtk2, $(MOZ_WIDGET_TOOLKIT)))
+> SHARED_LIBRARY_LIBS += $(DIST)/lib/$(LIB_PREFIX)shellservice_s.$(LIB_SUFFIX)
+> endif
+> 
+>+ifdef MOZ_PLACES
+>+# note: this requires mork because the auto complete code used as the base class
+>+# for the new auto complete result implementation includes the implementation of
+>+# the mork results
+
+We should really just move nsIAutoCompleteMdbResult to its own idl file, this can wait though.
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/public/nsIAutoCompleteStorageResult.idl	4 Nov 2005 16:45:42 -0000
+>+/* noscript */
+>+[uuid(82db085c-ef95-41fb-bb85-129233a8a017)]
+>+interface nsIAutoCompleteStorageMatch : nsISupports
+
+>+/* noscript */
+>+[uuid(874f5288-e4e3-4e06-8b76-accd7c439e71)]
+>+interface nsIAutoCompleteStorageResult : nsIAutoCompleteBaseResult
+
+Is there a particular reason these interfaces are noscript?
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/public/nsINavHistory.idl	4 Nov 2005 16:45:42 -0000
+>+[scriptable, uuid(acae2b2d-5fcd-4419-b1bc-b7dc92a1836c)]
+>+interface nsINavHistoryResultNode : nsISupports
+>+{
+>+  /**
+>+   * Indentifies the parent result node in the result set. This is null for
+>+   * top level nodes.
+>+   */
+>+  readonly attribute nsINavHistoryResultNode parent;
+>+
+>+  /**
+>+   * Identifies the type of this node.
+>+   */
+>+  const PRUint32 RESULT_TYPE_URL = 0;
+>+  const PRUint32 RESULT_TYPE_VISIT = 1;
+>+  const PRUint32 RESULT_TYPE_HOST = 2;
+>+  const PRUint32 RESULT_TYPE_DAY = 3;
+>+  readonly attribute PRInt32 type;
+
+"type" should be a PRUint32, if the constants are PRUint32.
+
+>+  /**
+>+   * Total number of times the URL has ever been accessed. For hosts, this
+>+   * is the total of the children under it, NOT the total times the host has
+>+   * been accessed (this would require an additional query, so is not given
+>+   * by default when most of the time it is never needed).
+>+   */
+
+So just to clarify, if I access the following pages:
+
+http://google.com/
+http://images.google.com/
+http://maps.google.com/
+
+the ResultNode for the host "google.com" will have an accessCount of 3?
+
+>+  /**
+>+   * For host nodes, this is the children of the host, which is another set
+>+   * of nsINavHistoryResultNode objects. I suggest using childCount/getChild
+>+   * instead, which is pre-typed and avoids creating an extra array object.
+>+   */
+
+This is just a nit, but first-person commentary in the interface documentation is a little unusual.  And, why do we need the nsIArray-based accessor at all?
+
+>+[scriptable, uuid(25b45a94-3323-4c7b-910a-315f2c59bfb4)]
+>+interface nsINavHistoryResult : nsISupports
+>+{
+>+  /**
+>+   * This gives you the children of the nodes. It is preferrable to use this
+>+   * interface over the array one, since it avoids creating an nsIArray object
+>+   * and the interface is already the correct type.
+>+   */
+
+Similar comment as above -- why do we need the nsIArray accessor?
+
+>+  //void copyTreeStateFrom(in nsINavHistoryResult aPrevious);
+
+Why is this commented out?  If it's just not implemented yet, it might be better to leave it in the interface and just throw NS_ERROR_NOT_IMPLEMENTED from the implementation.
+
+>+[scriptable, uuid(849e2184-3dee-416f-91cd-6a619ca49d1c)]
+>+interface nsINavHistoryObserver : nsISupports
+>+{
+>+  readonly attribute boolean wantAllDetails;
+
+I wonder if it would be more flexible to have a bitmask that says which notifications you want to see (with a bit for notify-during-batch).  Just a thought; this is ok for now.
+
+>+
+>+  /**
+>+   * A page has been added that was visited at a given time. It's very possible
+>+   * that this page already existed in history, but that they just visited it
+
+nit: who is "they"?
+
+>+  /**
+>+   * This page and all of its visits are being deleted. Note: the page may not
+>+   * necessarily have actually exited for this function to be called.
+
+s/exited/existed/
+
+>+  /**
+>+   * A page has had some attribute on it changed. Note that for TYPED and
+>+   * HIDDEN, the page may not necessarily have been added yet.
+>+   */
+>+  const PRUint32 ATTRIBUTE_TITLE = 0; // aString = new title
+>+  const PRUint32 ATTRIBUTE_HIDDEN = 1; // aString = empty
+>+  const PRUint32 ATTRIBUTE_TYPED = 2; // aString = empty
+>+  void onPageChanged(in nsIURI aURI, in PRUint32 aWhat, in AString aString);
+>+};
+
+Maybe use "value" instead of "aString" as the param name?
+
+>+[scriptable, uuid(884819a6-1860-4a71-8fd7-89d962c1d984)]
+>+interface nsINavHistoryQuery : nsISupports
+>+{
+>+  /**
+>+   * Time range for results (INCLUSIVE). Set to 0 to ignore and return any
+>+   * page. Note: PRTime is in MICROseconds since 1970. Javascript date objects
+>+   * are expressed in MILLIseconds since 1970.
+
+You might clarify "January 1, 1970".
+
+>+   *
+>+   * The has* functions return whether the corresponding time is non-zero and
+>+   * should be considered for the query.
+>+   */
+>+  attribute PRTime beginTime;
+>+  PRBool hasBeginTime();
+>+  attribute PRTime endTime;
+>+  PRBool hasEndTime();
+
+It looks like hasBeginTime and hasEndTime should probably be readonly attributes instead of methods, assuming that there's not a lot of work involved in producing the result.
+
+>+
+>+  /**
+>+   * These are helper functions for setting begin and end time for a specific
+>+   * day.
+>+   *   year: 4 digit year, i.e. "2005"
+>+   *   month: 0-11 month index
+>+   *   day: 1-31 day number
+>+   * These days are inclusive, so setting begin and end with these functions
+>+   * to the same day gives you all visits during that day.
+>+   */
+>+  void setBeginDate(in PRInt32 year, in PRInt32 month, in PRInt32 day);
+>+  void setEndDate(in PRInt32 year, in PRInt32 month, in PRInt32 day);
+
+Should these be unsigned types?
+
+>+
+>+  /**
+>+   * Text search terms. Currently unused.
+>+   */
+>+  attribute AString searchTerms;
+>+  boolean hasSearchTerms();
+
+Same comment as above about using a readonly attribute.
+
+>+  boolean hasDomain();
+
+Here too.
+
+>+[scriptable, uuid(C51F54CB-5E89-4B20-A37C-1343888935B7)]
+>+interface nsINavHistory : nsISupports
+>+{
+>+  /**
+>+   * This removes all history information for the given URI.
+>+   */
+>+  //void removePage(in nsIURI aURI);
+>+
+>+  //void addPageToSession(in nsIURI aURI);
+
+Why are these commented out?
+
+>+
+>+  /**
+>+   * Returns true if this URI would be added to the history. You don't have to
+>+   * worry about calling this, addPageToSession/addURI will always check before
+>+   * actually adding the payge. This function is public because some components
+
+typo (s/payge/page/).
+
+>+  /**
+>+   * Causes observers to be notified of a beginUpdateBatch when a lot of things
+>+   * are about to change. Can be called recursively, observers will only be
+
+I think it would be clearer to say that these can be nested.
+
+>+  /**
+>+   * Returns the number of results for the query, without returning any
+>+   * information. This is more efficient than executing the query.
+>+   */
+>+  //PRInt32 countResultsForQuery(nsAString aQuery);
+>+
+>+  /**
+>+   * Returns all transitions (followed links) made FROM the specified URL
+>+   */
+>+  //void getOutTransitions(in nsIURI aURI, out PRUint32 count,
+>+  //                       [array size_is(length)] out SOMETHING);
+>+
+>+  /**
+>+   * Returns all transitions (followed links) that led TO the specified URL
+>+   */
+>+  //void getInTransitions(in nsIURI aURI, out PRUint32 count,
+>+  //                      [array size_is(length)] out SOMETHING);
+>+
+>+  /**
+>+   * Statistics for a given URL
+>+   */
+>+  //nsIHistoryStats getPageStats(in nsIURI aURI);
+>+};
+
+all of these -- why are they commented out?
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/src/Makefile.in	4 Nov 2005 16:45:42 -0000
+>+MODULE = places
+>+LIBRARY_NAME  = places_s
+>+FORCE_STATIC_LIB = 1
+>+LIBXUL_LIBRARY = 1
+
+I'm not sure whether LIBXUL_LIBRARY is appropriate here.  I suspect not, since this library wouldn't be included in the base xulrunner distribution.
+
+I'm up to nsAutoCompleteStorageResult.cpp; checkpointing here.
+Note that you need the patch for bug 310636 to compile this.
+> >+/* noscript */
+> >+[uuid(82db085c-ef95-41fb-bb85-129233a8a017)]
+> >+interface nsIAutoCompleteStorageMatch : nsISupports
+> 
+> >+/* noscript */
+> >+[uuid(874f5288-e4e3-4e06-8b76-accd7c439e71)]
+> >+interface nsIAutoCompleteStorageResult : nsIAutoCompleteBaseResult
+> 
+> Is there a particular reason these interfaces are noscript?
+
+Because the Mork ones that I based this off of were. It looks like those were noscript because they had some mork structures as parameters. I will remove this.
+
+> >+  /**
+> >+   * Total number of times the URL has ever been accessed. For hosts, this
+> >+   * is the total of the children under it, NOT the total times the host has
+> >+   * been accessed (this would require an additional query, so is not given
+> >+   * by default when most of the time it is never needed).
+> >+   */
+> 
+> So just to clarify, if I access the following pages:
+> 
+> http://google.com/
+> http://images.google.com/
+> http://maps.google.com/
+> 
+> the ResultNode for the host "google.com" will have an accessCount of 3?
+
+Yes, if the accessCount of each of those is 1. This is the sum of the values of the children (in other words, how many times you've visited any page at this domain).
+
+> Similar comment as above -- why do we need the nsIArray accessor?
+
+We probably don't. I think this had a more important use in a previous incarnation.
+
+> typo (s/payge/page/).
+
+Sorreyye, I slypped into olde Engliyshe.
+
+Comment on attachment 201860
+Complete patch with new implementation
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/src/nsAutoCompleteStorageResult.cpp	4 Nov 2005 16:45:42 -0000
+>+NS_INTERFACE_MAP_BEGIN(nsAutoCompleteStorageResult)
+>+  NS_INTERFACE_MAP_ENTRY(nsIAutoCompleteResult)
+>+  NS_INTERFACE_MAP_ENTRY(nsIAutoCompleteBaseResult)
+>+  NS_INTERFACE_MAP_ENTRY(nsIAutoCompleteStorageResult)
+>+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIAutoCompleteResult)
+>+NS_INTERFACE_MAP_END
+>+
+>+NS_IMPL_ADDREF(nsAutoCompleteStorageResult)
+>+NS_IMPL_RELEASE(nsAutoCompleteStorageResult)
+>+
+
+I'd just use:
+
+NS_IMPL_ISUPPORTS3(nsAutoCompleteStorageResult, nsIAutoCompleteResult, nsIAutoCompleteBaseResult, nsIAUtoCompleteStorageEntry)
+
+but either is ok.
+
+
+>+NS_IMETHODIMP
+>+nsAutoCompleteStorageResult::GetMatchAt(PRUint32 matchIndex,
+>+                                        nsIAutoCompleteStorageMatch **_retval)
+>+{
+>+  NS_ENSURE_TRUE(matchIndex >= 0 && matchIndex < (PRUint32)mResults.Count(),
+>+                 NS_ERROR_ILLEGAL_VALUE);
+
+It's an unsigned int, it's always >= 0.
+
+>+  nsIAutoCompleteStorageMatch* match = mResults.ObjectAt(matchIndex);
+>+  NS_ADDREF(match);
+>+  *_retval = match;
+
+No need to use a temporary:
+
+NS_ADDREF(**_retval = mResults.ObjectAt(matchIndex));
+
+>+NS_IMETHODIMP
+>+nsAutoCompleteStorageResult::GetValueAt(PRInt32 aIndex, nsAString & _retval)
+>+{
+>+  NS_ENSURE_TRUE(aIndex >= 0 && aIndex < mResults.Count(), NS_ERROR_ILLEGAL_VALUE);
+>+
+>+  nsIAutoCompleteStorageMatch* match = mResults.ObjectAt(aIndex);
+>+  if (!match)
+>+    return NS_OK;
+
+This doesn't seem at all like an "ok" condition, unless the results array can have holes in it.  If your insertion code doesn't allow that to happen, then just put an NS_ASSERTION here that it's non-null.
+
+>+NS_IMETHODIMP
+>+nsAutoCompleteStorageResult::GetCommentAt(PRInt32 aIndex, nsAString & _retval)
+>+{
+
+Same for this method.
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/src/nsAutoCompleteStorageResult.h	4 Nov 2005 16:45:42 -0000
+>+struct nsAutoCompleteStorageMatch : public nsIAutoCompleteStorageMatch
+>+{
+
+Preferred style is to use "class" instead of "struct".
+
+>+public:
+>+  nsAutoCompleteStorageMatch(const nsAString& aValue,
+>+                             const nsAString& aComment,
+>+                             PRInt32 aPrivatePriority) :
+>+    mValue(aValue), mComment(aComment), mPrivatePriority(aPrivatePriority)
+>+  {
+>+  }
+>+  nsAutoCompleteStorageMatch() {}
+
+I don't see any callers that need a default constructor.
+
+>+  virtual ~nsAutoCompleteStorageMatch() {}
+
+Unless you expect to be subclassed, make this destructor private and non-virtual.
+
+>+class nsAutoCompleteStorageResult : public nsIAutoCompleteStorageResult
+>+{
+>+public:
+>+  NS_DECL_ISUPPORTS
+>+  NS_DECL_NSIAUTOCOMPLETERESULT
+>+
+>+  nsAutoCompleteStorageResult();
+>+  virtual ~nsAutoCompleteStorageResult();
+
+Same here, if applicable.
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/src/nsNavHistory.cpp	4 Nov 2005 16:45:42 -0000
+>+NS_IMPL_ISUPPORTS6(nsNavHistory,
+>+                   nsINavHistory,
+>+                   nsIGlobalHistory2,
+>+                   nsIBrowserHistory,
+>+                   nsIObserver,
+>+                   nsISupportsWeakReference,
+>+                   nsIAutoCompleteSearch)
+>+
+>+PRInt32 ComputeAutoCompletePriority(const nsAString& aUrl, PRInt32 aVisitCount,
+>+                                    PRBool aWasTyped);
+>+nsresult GetReversedHostname(nsIURI* aURI, nsString* host);
+
+It's a little odd that this takes a pointer to a string while everything else takes a reference.
+
+>+nsString GetReversedHostname(const nsString& aForward);
+>+nsString GetSubstringFromNthDot(const nsString& aInput, int aStartingSpot,
+>+                                int aN, PRBool aIncludeDot);
+
+Most functions take an nsString passed by reference rather than returning one, but I'm not sure if that's just convention from IDL or if there's some overhead in returning one this way.  It should be ok, I think.
+
+>+int GetTLDCharCount(const nsString& aHost);
+>+int GetTLDType(const nsString& aHostTail);
+
+These (and other declarations) should use PRInt32 instead of int, probably.
+
+Also, for any of these helper functions which aren't to be inlined, it's a bit more efficient to declare them |static|.
+
+>+inline nsString ReverseString(const nsString& aInput)
+>+{
+>+  nsString output;
+>+  for (int i = aInput.Length() - 1; i >= 0; i --)
+>+    output.Append(aInput[i]);
+>+  return output;
+>+}
+>+inline nsCString parameterString(int paramIndex)
+>+{
+>+  char indexString[32];
+>+  sprintf(indexString, "?%d", paramIndex + 1);
+>+  return nsCString(indexString);
+
+You can use nsPrintfCString and avoid the temporary buffer:
+
+return nsPrintfCString("?%d", paramIndex + 1);
+
+>+inline int CompareIntegers(PRUint32 a, PRUint32 b)
+>+{
+>+  if (a < b)
+>+    return -1;
+>+  else if (a > b)
+>+    return 1;
+>+  return 0;
+>+}
+
+I don't think the sorting comparator strictly has to return -1, 0, or 1 (reading the description in nsQuickSort.h).  You could probably just use "a - b".
+
+>+const int nsNavHistory::kGetInfoIndex_PageID = 0;
+>+const int nsNavHistory::kGetInfoIndex_URL = 1;
+>+const int nsNavHistory::kGetInfoIndex_Title = 2;
+>+const int nsNavHistory::kGetInfoIndex_VisitCount = 3;
+>+const int nsNavHistory::kGetInfoIndex_VisitDate = 4;
+>+const int nsNavHistory::kGetInfoIndex_RevHost = 5;
+>+
+>+const int nsNavHistory::kAutoCompleteIndex_URL = 0;
+>+const int nsNavHistory::kAutoCompleteIndex_Title = 1;
+>+const int nsNavHistory::kAutoCompleteIndex_VisitCount = 2;
+>+const int nsNavHistory::kAutoCompleteIndex_Typed = 3;
+
+Would these work better as enums?
+
+>+
+>+static NS_DEFINE_CID(kStringBundleServiceCID, NS_STRINGBUNDLESERVICE_CID);
+>+static NS_DEFINE_CID(kmozStorageServiceCID, MOZ_STORAGE_SERVICE_CID);
+>+static NS_DEFINE_CID(kmozStorageConnectionCID, MOZ_STORAGE_CONNECTION_CID);
+>+
+
+It's usually better to use the contract id, if there is one.
+
+>+nsresult
+>+nsNavHistory::Init()
+>+{
+>+  // we'd like to get this pref when we need it, but at that point, we can't
+>+  // get the pref service.
+
+Can you elaborate on this? (if not in the code, just here in the bug)
+
+>+nsresult
+>+nsNavHistory::InitDB()
+>+{
+>+  rv = mDBConn->ExecuteSimpleSQL(
+>+      NS_LITERAL_CSTRING("CREATE TABLE moz_history (id INTEGER PRIMARY KEY, url LONGVARCHAR, title LONGVARCHAR, rev_host LONGVARCHAR, visit_count INTEGER DEFAULT 0, hidden INTEGER DEFAULT 0 NOT NULL, typed INTEGER DEFAULT 0 NOT NULL)"));
+>+  //NS_ENSURE_SUCCESS(rv, rv);
+
+What does this do if the table already exists? (and the CREATE INDEX statements, too)
+
+>+nsresult
+>+nsNavHistory::InitMemDB()
+>+{
+>+  PRBool hasMore = PR_FALSE;
+>+  rv = mMemDBConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING("BEGIN TRANSACTION"));
+
+Is there a reason this doesn't use the mozStorage transaction api?
+
+
+>+nsresult
+>+nsNavHistory::InternalAddNewPage(nsIURI* aURI, const PRUnichar* aTitle,
+>+                                 PRBool aHidden, PRBool aTyped,
+>+                                 int aVisitCount, PRInt64* aPageID)
+>+{
+>+  // host (reversed with trailing period)
+>+  nsString revHost;
+>+  rv = GetReversedHostname(aURI, &revHost);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+  rv = dbInsertStatement->BindWStringParameter(2, PromiseFlatString(revHost).get());
+
+nsString is flat, you shouldn't need to PromiseFlatString.
+
+>+nsresult nsNavHistory::BindURI(mozIStorageStatement* statement, int index,
+>+                               nsIURI* aURI) const
+>+{
+>+  nsCAutoString utf8URISpec;
+>+  nsresult rv = aURI->GetSpec(utf8URISpec);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  statement->BindUTF8StringParameter(index, utf8URISpec);
+
+You probably meant to assign the return code to rv here.
+>+  NS_ENSURE_SUCCESS(rv, rv);
+
+>+PRBool nsNavHistory::IsURIStringVisited(const nsACString& aURIString)
+>+{
+>+#ifdef IN_MEMORY_LINKS
+>+  // check the memory DB
+>+  if (!mMemDBConn)
+>+    InitMemDB();
+>+  nsresult rv = mMemDBGetPage->BindUTF8StringParameter(0, aURIString);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+
+This is probably not what you want for a function that returns PRBool.  Maybe
+
+NS_ENSURE_SUCCESS(rv, PR_FALSE);   or the construct you use in the other codepath
+
+I'm up to CanAddURI, checkpointing.
+could we maybe address the review comments on the storage APIs _before_ adding callers? :-/ (bug 273050, bug 261861)
+Comment on attachment 201860
+Complete patch with new implementation
+
+>+nsresult
+>+nsNavHistory::CanAddURI(nsIURI* aURI, PRBool* canAdd)
+>+{
+>+  nsresult rv;
+>+
+>+  // first check the most common cases (HTTP, HTTPS) to allow in to avoid most
+>+  // of the work
+
+You could avoid a ton of work in this method if you just GetScheme and then do EqualsLiteral comparisons.
+
+>+NS_IMETHODIMP nsNavHistory::GetNewQuery(nsINavHistoryQuery **_retval)
+>+{
+>+  *_retval = new nsNavHistoryQuery();
+>+  (*_retval)->AddRef();
+
+Check for out-of-memory (return NS_ERROR_OUT_OF_MEMORY).
+
+>+NS_IMETHODIMP
+>+nsNavHistory::ExecuteQuery(nsINavHistoryQuery *aQuery,
+>+                           const PRInt32 *aGroupingMode, PRUint32 aGroupCount,
+>+                           PRInt32 aSortingMode, PRBool aAsVisits,
+>+                           nsINavHistoryResult** _retval)
+>+{
+>+  printf("Executing query, sorting mode = %d\n", aSortingMode);
+>+  return ExecuteQueries((const nsINavHistoryQuery**)&aQuery, 1u,
+
+Use NS_CONST_CAST instead of a C-style cast, and there's no need to explicitly use "u" for passing 1 as PRUint32.
+
+>+NS_IMETHODIMP
+>+nsNavHistory::ExecuteQueries(const nsINavHistoryQuery** aQueries,
+>+                             PRUint32 aQueryCount,
+>+                             const PRInt32 *aGroupingMode, PRUint32 aGroupCount,
+>+                             PRInt32 aSortingMode, PRBool aAsVisits,
+>+                             nsINavHistoryResult** _retval)
+>+{
+>+  // conditions we want on all history queries, this just selects history
+>+  // entries that are "active"
+>+  const nsCString commonConditions("h.visit_count > 0 AND h.hidden <> 1");
+
+Use NS_NAMED_LITERAL_CSTRING, it's faster (string length is computed at compile time).
+
+>+
+>+  // Query string: Output parameters should be in order of kGetInfoIndex_*
+>+  nsCString queryString;
+>+  nsCString groupBy;
+
+Generally you should use nsCAutoString for temporary stack-based strings.
+
+>+  if (aAsVisits) {
+>+    // if we want visits, this is easy, just combine all possible matches
+>+    // between the history and visits table and do our query.
+>+    queryString = "SELECT h.id, h.url, h.title, h.visit_count, v.visit_date, h.rev_host"
+>+      " FROM moz_history h JOIN moz_historyvisit v ON h.id = v.page_id WHERE ";
+>+    groupBy = "";
+
+Use AssignLiteral rather than =, or wrap the literal string in NS_LITERAL_CSTRING (again, length known at compile time).  Same goes for other places in this method where you assign or append literal strings.
+
+
+>+  int numParameters = 0;
+>+  nsCString conditions;
+>+  for (int i = 0; i < (int)aQueryCount; i ++) {
+
+PRInt32, and nsCAutoString.
+
+>+    nsCString queryClause;
+>+    int clauseParameters = 0;
+>+    rv = QueryToSelectClause(NS_CONST_CAST(nsINavHistoryQuery*, aQueries[i]),
+>+                             numParameters, &queryClause, &clauseParameters);
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+    if (queryClause.Length()) {
+
+if (!queryClause.IsEmpty()) would be clearer.  Same applies to the rest of this method.
+
+>+  // run query and put into result object. BE SURE TO DELETE THIS OBJECT ON
+>+  // FAILURE. One can't use nsCOMPtr on this concrete class, and I need
+>+  // function on it that aren't in the interface.
+>+  nsNavHistoryResult* result = new nsNavHistoryResult(this, mBundle);
+
+nsRefPtr is your friend here.
+
+>+NS_IMETHODIMP
+>+nsNavHistory::AddObserver(nsINavHistoryObserver* aObserver)
+>+{
+>+  if (mObservers.IndexOfObject(aObserver) >= 0)
+>+    return NS_ERROR_INVALID_ARG; // already registered
+>+  mObservers.AppendObject(aObserver);
+
+nit: check for failure (PR_FALSE) return from AppendObject.  Probably should translate to NS_ERROR_OUT_OF_MEMORY.
+
+>+NS_IMETHODIMP
+>+nsNavHistory::BeginUpdateBatch()
+>+{
+>+  mBatchesInProgress ++;
+>+  if (mBatchesInProgress == 1) {
+
+nit:   if (++mBatchesInProgress == 1) {
+
+>+// nsNavHistory::EndUpdateBatch
+>+
+>+NS_IMETHODIMP
+>+nsNavHistory::EndUpdateBatch()
+>+{
+>+  if (mBatchesInProgress == 0)
+>+    return NS_ERROR_FAILURE;
+>+  mBatchesInProgress --;
+>+  if (mBatchesInProgress == 0) {
+
+Same here.
+
+>+NS_IMETHODIMP
+>+nsNavHistory::GetCount(PRUint32 *aCount)
+>+{
+>+  NS_WARNING("Don't use history.count: it is slow and useless. Try hasHistoryEntries.");
+
+Can we just not implement it then?
+
+>+NS_IMETHODIMP
+>+nsNavHistory::RemovePagesFromHost(const nsACString& aHost, PRBool aEntireDomain)
+>+{
+>+  nsresult rv;
+>+  UpdateBatchScoper batch(*this); // sends Begin/EndUpdateBatch to obsrvrs.
+>+  mozStorageTransaction transaction(mDBConn, PR_FALSE);
+>+
+>+  // Local files don't have any host name. We don't want to delete all files in
+>+  // history when we get passed an empty string, so force 
+>+  if (aHost.Length() == 0)
+
+IsEmpty, as above.
+
+>+    aEntireDomain = PR_FALSE;
+>+
+>+  // translate "(local files)" to an empty host name
+>+  // be sure to use the TitleForDomain to get the localized name
+>+  nsString host16 = NS_ConvertUTF8toUTF16(aHost);
+>+  nsString localFiles = TitleForDomain(NS_LITERAL_STRING(""));
+>+  if (host16.Equals(localFiles))
+>+    host16 = NS_LITERAL_STRING("");
+
+nsAutoString, etc.
+
+>+NS_IMETHODIMP
+>+nsNavHistory::SetPageTitle(nsIURI *aURI,
+>+                           const nsAString & aTitle)
+>+{
+>+  nsresult rv;
+>+
+>+  nsCOMPtr<mozIStorageStatement> dbModStatement;
+>+  rv = mDBConn->CreateStatement(
+>+      NS_LITERAL_CSTRING("UPDATE moz_history SET title = ?1 WHERE url = ?2"),
+>+      getter_AddRefs(dbModStatement));
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  // title
+>+  dbModStatement->BindWStringParameter(0, PromiseFlatString(aTitle).get());
+
+Can this use BindStringParameter?
+
+>+NS_IMETHODIMP
+>+nsNavHistory::Observe(nsISupports *aSubject, const char *aTopic,
+>+                    const PRUnichar *aData)
+>+{
+>+  if (nsCRT::strcmp(aTopic, "quit-application") == 0) {
+>+    gPrefService->SavePrefFile(nsnull);
+>+    VacuumDB();
+>+  } else if (nsCRT::strcmp(aTopic, "nsPref:changed") == 0) {
+
+I think there's a #define for this observer topic (maybe for quit-application too, not sure)... if so, it's preferable to use those, just to avoid the possibility of typos.
+
+Up to AutoCompleteTypedSearch.
+Comment on attachment 201860
+Complete patch with new implementation
+
+>+nsresult nsNavHistory::AutoCompleteTypedSearch(
+>+                                           nsIAutoCompleteStorageResult* result)
+>+{
+>+  // note: need to test agains hidden = 1 since it can also be undefined
+
+typo: "against",  and what is "it"?
+
+>+  // (meaning not hidden)
+>+  nsCOMPtr<mozIStorageStatement> dbSelectStatement;
+>+  nsresult rv = mDBConn->CreateStatement(
+>+      NS_LITERAL_CSTRING("SELECT url,title FROM moz_history WHERE typed = 1 AND hidden <> 1 ORDER BY visit_count DESC LIMIT 1000"),
+>+      getter_AddRefs(dbSelectStatement));
+
+Should we cache this statement somewhere?
+
+>+  nsCOMPtr<mozIStorageValueArray> dbRow = do_QueryInterface(
+>+    dbSelectStatement);
+
+Don't need to QI here, mozIStorageValueArray is a base class of mozIStorageStatement (same applies to elsewhere in this patch).
+
+>+  while ((dbSelectStatement->ExecuteStep(&hasMore) == NS_OK) && hasMore) {
+
+Generally NS_SUCCEEDED(foo) is preferred to (foo == NS_OK)
+
+>+    nsString entryURL, entryTitle;
+
+nsAutoString for stack-based strings (I won't point out every instance from here on out).
+
+>+    dbRow->GetAsString(0, entryURL);
+>+    dbRow->GetAsString(1, entryTitle);
+>+
+>+    // note: we never take ownership of this object, we just create it and
+>+    // hand it to the array, which will addref it for its own use.
+>+    nsAutoCompleteStorageMatch* entry = new nsAutoCompleteStorageMatch(
+>+      entryURL, entryTitle, 0);
+
+Check for out-of-memory.
+
+>+    result->AppendMatch(entry);
+
+and failure here, which should also indicate OOM, but currently doesn't.
+
+>+// nsNavHistory::AutoCompleteFullHistorySearch
+>+//
+>+//    A rute-force search of the entire history. This matches the given input
+
+typo: "brute-force"
+
+>+//    with every possible history entry, and sorts them by liklihood.
+
+"likelihood"
+
+>+nsresult
+>+nsNavHistory::AutoCompleteFullHistorySearch(const nsAString& aSearchString,
+>+                                            nsIAutoCompleteStorageResult* result)
+>+{
+
+>+  // sort and populate the result
+>+  resultArray.Sort(AutoCompleteSortComparison, NS_STATIC_CAST(void*, this));
+
+You should never need to STATIC_CAST an object to void*.
+
+>+nsresult
+>+nsNavHistory::AutoCompleteRefineHistorySearch(
+>+                                  const nsAString& aSearchString,
+>+                                  nsIAutoCompleteStorageResult* aPreviousResult,
+>+                                  nsIAutoCompleteStorageResult* aNewResult)
+>+{
+>+    nsresult rv = aPreviousResult->GetMatchAt(i, getter_AddRefs(entry));
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+    if (!entry)
+>+      return NS_ERROR_FAILURE;
+
+Can GetMatchAt actually return NS_OK but give you a null entry?  Seems lilke no.
+
+>+void
+>+nsNavHistory::AutoCompleteCutPrefix(nsAString* aURL,
+
+It's better to make this take nsString*, since you only call it with nsAutoString parameters.
+
+>+PRBool
+>+nsNavHistory::AutoCompleteCompare(const nsAString& aHistoryURL,
+>+                                  const nsAString& aUserURL,
+>+                                  const AutoCompleteExclude& aExclude)
+>+{
+>+  nsString cutHistoryURL(aHistoryURL);
+>+  AutoCompleteCutPrefix(&cutHistoryURL, &aExclude);
+>+
+>+  return Substring(cutHistoryURL, 0, aUserURL.Length()).Equals(aUserURL);
+
+You might also want to consider StringBeginsWith() for constructs like this.
+
+>+nsresult
+>+nsNavHistory::QueryToSelectClause(nsINavHistoryQuery* aQuery, // const
+>+                                  int aStartParameter,
+>+                                  nsCString* aClause,
+>+                                  int* aParamCount)
+>+{
+>+  PRBool hasIt;
+>+
+>+  *aClause = "";
+
+aClause->Truncate(0);
+
+>+  // end time
+>+  if (NS_SUCCEEDED(aQuery->HasEndTime(&hasIt)) && hasIt) {
+>+    if (aClause->Length())
+
+(!aClause->IsEmpty())  (same elsewhere)
+
+>+nsresult
+>+nsNavHistory::BindQueryClauseParameters(mozIStorageStatement* statement,
+>+                                        int aStartParameter,
+>+                                        nsINavHistoryQuery* aQuery, // const
+>+                                        int* aParamCount)
+>+{
+>+  // domain
+>+  if (NS_SUCCEEDED(aQuery->HasDomain(&hasIt)) && hasIt) {
+>+    nsString domain;
+>+    aQuery->GetDomain(domain);
+>+    nsString revDomain = GetReversedHostname(domain);
+
+A comment somewhere on the whole reversed-hostname scheme would help quite a bit.
+
+>+      revDomain.Truncate(revDomain.Length() - 1);
+>+      revDomain.Append(NS_LITERAL_STRING("/"));
+
+revDomain.Append(PRUnichar('/'))
+
+>+      statement->BindStringParameter(aStartParameter + *aParamCount, revDomain);
+
+You're not error-checking this Bind call, even though you're checking the other ones in this function.
+
+>+// nsNavHistory::RecursiveGroup
+>+//
+>+//    aSource and aDest must be different!
+
+Add an NS_ASSERTION for this.
+
+>+
+>+void
+>+nsNavHistory::RecursiveGroup(const nsCOMArray<nsNavHistoryResultNode>& aSource,
+>+                             const PRInt32* aGroupingMode, PRUint32 aGroupCount,
+>+                             nsCOMArray<nsNavHistoryResultNode>* aDest)
+>+{
+>+  NS_ASSERTION(aGroupCount > 0, "Invalid group count");
+>+  NS_ASSERTION(aDest->Count() == 0, "Destination array is not empty");
+>+
+>+  switch (aGroupingMode[0]) {
+>+    case GROUP_BY_DAY:
+>+      GroupByDay(aSource, aDest);
+>+      break;
+>+    case GROUP_BY_HOST:
+>+      GroupByHost(aSource, aDest);
+>+      break;
+>+    case GROUP_BY_DOMAIN:
+>+      GroupByDomain(aSource, aDest);
+>+      break;
+>+    default:
+>+      // unknown grouping mode, just copy and give up (no recursion)
+
+If this should never happen, assert or at least warn.
+
+>+      aDest->InsertObjectsAt(aSource, 0);
+>+      return;
+>+  }
+>+
+>+  if (aGroupCount > 1) {
+>+    // Sort another level: We need to copy the array since we want the output
+>+    // to be our levels' destionation arrays.
+
+"level's destination arrays" ?
+
+>+// nsNavHistory::GroupByDay
+>+
+>+
+>+void
+>+nsNavHistory::GroupByDay(const nsCOMArray<nsNavHistoryResultNode>& aSource,
+>+                         nsCOMArray<nsNavHistoryResultNode>* aDest)
+>+{
+>+ 
+
+  ???
+
+>+}
+
+>+void
+>+nsNavHistory::GroupByHost(const nsCOMArray<nsNavHistoryResultNode>& aSource,
+>+                          nsCOMArray<nsNavHistoryResultNode>* aDest)
+>+{
+>+  nsDataHashtable<nsStringHashKey, nsNavHistoryResultNode*> hosts;
+>+  hosts.Init(256);
+
+You could do this based on aSource.Count(), right?
+
+>+  for (int i = 0; i < aSource.Count(); i ++)
+>+  {
+>+    const nsString& curHostName = aSource[i]->mHost;
+>+    nsNavHistoryResultNode* curHostGroup = nsnull;
+>+    if (hosts.Get(curHostName, &curHostGroup)) {
+>+      // already have an entry for this host, use it
+>+      curHostGroup->mChildren.AppendObject(aSource[i]);
+>+    } else {
+>+      // need to create an entry for this host
+>+      curHostGroup = new nsNavHistoryResultNode();
+
+check for OOM
+
+>+      curHostGroup->mType = nsNavHistoryResultNode::RESULT_TYPE_HOST;
+>+      curHostGroup->mHost = curHostName;
+>+      curHostGroup->mTitle = TitleForDomain(curHostName);
+>+      curHostGroup->mChildren.AppendObject(aSource[i]);
+>+
+>+      hosts.Put(curHostName, curHostGroup);
+>+      aDest->AppendObject(curHostGroup);
+
+Same.
+
+Both of those comments apply to GroupByDomain as well.
+
+Up to FilterResultSet.
+Comment on attachment 201860
+Complete patch with new implementation
+
+>+nsresult
+>+nsNavHistory::FilterResultSet(const nsCOMArray<nsNavHistoryResultNode>& aSet,
+>+                              nsCOMArray<nsNavHistoryResultNode>* aFiltered,
+>+                              const nsString& aSearch)
+>+{
+>+  nsStringArray terms;
+>+  ParseSearchQuery(aSearch, &terms);
+>+
+>+  // if there are no search terms, just return everything (i.e. do nothing)
+>+  if (terms.Count() == 0) {
+>+    aFiltered->InsertObjectsAt(aSet, 0);
+
+Does this assume that aFiltered is passed in as an empty array?  If so, it might be clearer to use AppendObjects().
+
+>+nsresult
+>+nsNavHistory::RowToResult(mozIStorageValueArray* aRow, PRBool aAsVisits,
+>+                          nsNavHistoryResultNode** aResult)
+>+{
+>+  *aResult = result;
+>+  (*aResult)->AddRef();
+
+You can replace these two lines with:
+
+result.swap(*aResult);
+
+and then make sure to set *aResult = nsnull at the top of the function.  This will save a bit of refcounting.
+
+>+nsString nsNavHistory::TitleForDomain(const nsString& domain)
+>+{
+>+  if (domain.Length() > 0)
+>+    return domain;
+>+
+>+  // use the localized one instead
+>+  nsXPIDLString value;
+>+  nsresult rv = mBundle->GetStringFromName(
+>+      NS_LITERAL_STRING("localhost").get(), getter_Copies(value));
+>+  if (NS_SUCCEEDED(rv))
+>+    return value;
+>+  else
+>+    return NS_LITERAL_STRING("(local files)");
+
+I spoke to Darin about returning strings... it turns out that returning a type other than the actual object returned (even if it's a subclass) can invoke the copy constructor.  We should try to avoid that.  I'd recommend that this call site, and any others where you might be returning varying types of string objects, be changed to take the result string as a parameter.
+
+>+nsresult nsNavHistory::ImportFromMork()
+>+{
+
+>+  NS_ASSERTION((err == 0), "unable to create mdb env");
+>+  NS_ENSURE_TRUE(err == 0, NS_ERROR_FAILURE);
+
+Try to be consistent about parentheses.
+
+>+  mdb_bool canopen = 0;
+>+  mdbYarn outfmt = { nsnull, 0, 0, 0, 0, nsnull };
+>+
+>+  nsIMdbHeap* dbHeap = 0;
+>+  mdb_bool dbFrozen = mdbBool_kFalse; // not readonly, we want modifiable
+>+  nsCOMPtr<nsIMdbFile> oldFile; // ensures file is released
+>+  err = mdbFactory->OpenOldFile(env, dbHeap, PromiseFlatCString(filePath).get(),
+
+filePath is already flat.
+
+>+                                dbFrozen, getter_AddRefs(oldFile));
+>+  if ((err !=0) || !oldFile) {
+>+    printf("Some error, not importing.\n");
+
+This error reporting should probably be cleaned up, it's ok for now though.
+
+>+  nsIMdbThumb* thumb = nsnull;
+
+Use a nsCOMPtr here.
+
+>+  nsIMdbStore* store;
+>+  if ((err == 0) && done) {
+>+    err = mdbFactory->ThumbToOpenStore(env, thumb, &store);
+>+  }
+
+And here.
+
+>+  nsIMdbTable* table;
+>+  err = store->GetTable(env, &oid, &table);
+
+And here.
+
+>+  nsIMdbTableRowCursor* cursor;
+>+  table->GetTableRowCursor(env, -1, &cursor);
+
+And here.
+
+>+  nsIMdbRow* currentRow;
+
+Here too.
+
+
+>+// ComputeAutoCompletePriority
+>+//
+>+//    Favour websites and webpaths more than webpages by boosting
+
+Nothing against the British spelling, but we don't use it anywhere else that I'm aware of.
+
+>+nsresult
+>+GetReversedHostname(nsIURI* aURI, nsString* host)
+>+{
+>+  nsCString forward8;
+>+  nsresult rv = aURI->GetHost(forward8);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  // can't do reversing in UTF8, better use 16-bit chars
+
+If you're just converting because you need to preserve UTF-8 character sequences, you might be able to use UTF8CharEnumerator in nsUTF8Utils.h instead.  This can be fixed later though if you want.
+
+>+// GetReversedHostname
+>+
+>+nsString
+>+GetReversedHostname(const nsString& aForward)
+>+{
+>+  nsString backward = ReverseString(aForward);
+>+  backward.Append(NS_LITERAL_STRING("."));
+
+Append(PRUnichar('.'))
+
+>+// IsNumericHostName
+>+//
+>+//    For host-based groupings, numeric IPs should not be collapsed by the
+>+//    last part of the domain name, but should stand alone. This code determines
+>+//    if this is the case so we don't collapse "10.1.2.3" to "3". It would be
+>+//    nice to use the URL parsing code, but it doesn't give us this information,
+>+//    this is usually done by the OS in response to DNS lookups.
+>+//
+>+//    This implementation is not perfect, we just check for all numbers and
+>+//    digits, and three periods. You could come up with crazy internal host
+>+//    names that would fool this logic, but I bet there are no real examples.
+
+There are indeed other ways to encode numeric IPs... you can use hex, I think, and there are also IPv6 literal addresses to deal with.
+
+>+int
+>+GetTLDType(const nsString& aHostTail)
+>+{
+>+  static nsDataHashtable<nsStringHashKey, int> tldTypes;
+
+You might need to clear this at xpcom-shutdown, ask Darin.
+
+>+  if (tldTypes.Count() == 0) {
+>+    // need to populate table
+>+
+>+    tldTypes.Init(256);
+>+
+>+    tldTypes.Put(NS_LITERAL_STRING("com"), 1);
+...
+
+Are you really planning to put every country tld in here?  This seems difficult to maintain.  Do we not already have code somewhere to handle this, like for cookies?
+
+>+// GetSubstringFromNthDot
+>+//
+>+//    Similar to GetSubstringToNthDot except searches backward
+>+//      GetSubstringFromNthDot("foo.bar", length, 1, PR_FALSE) -> "bar"
+>+//
+>+//    It is legal to pass in a starting position < 0 so you can just
+>+//    use Length()-1 as the starting position even if the length is 0.
+>+
+>+nsString GetSubstringFromNthDot(const nsString& aInput, int aStartingSpot,
+>+                                int aN, PRBool aIncludeDot)
+>+{
+
+You can just have this function return a |const nsSubstring| and avoid creating nsString objects.
+
+>+/* attribute nsINavHistoryResultNode parent */
+>+NS_IMETHODIMP nsNavHistoryResultNode::GetParent(nsINavHistoryResultNode** parent)
+>+{
+>+  *parent = mParent;
+
+This needs to addref.
+
+>+/* nsINavHistoryResultNode getChild(in PRInt32 index); */
+>+NS_IMETHODIMP nsNavHistoryResultNode::GetChild(PRInt32 aIndex,
+>+                                               nsINavHistoryResultNode** _retval)
+>+{
+>+  if (aIndex < 0 || aIndex >= mChildren.Count())
+>+    return NS_ERROR_INVALID_ARG;
+>+  *_retval = mChildren[aIndex];
+>+  (*_retval)->AddRef();
+
+Use NS_ADDREF.
+
+>+/* attribute nsIArray children; */
+>+NS_IMETHODIMP nsNavHistoryResultNode::GetChildren(nsIArray** aChildren)
+>+{
+>+  nsCOMPtr<nsIMutableArray> mutableArray;
+>+  nsresult rv = NS_NewArray(getter_AddRefs(mutableArray), mChildren);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  nsCOMPtr<nsIArray> array = do_QueryInterface(mutableArray, &rv);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+
+You don't have to QI, it's a base class (same comments apply to elsewhere in the patch).
+
+>+void
+>+nsNavHistoryResult::SetTreeSortingIndicator()
+>+{
+>+  nsCOMPtr<nsITreeColumns> columns;
+>+  nsresult rv = mTree->GetColumns(getter_AddRefs(columns));
+>+  if (NS_FAILED(rv)) return;
+>+
+>+  static nsString sortDirectionKey(NS_LITERAL_STRING("sortDirection"));
+
+NS_NAMED_LITERAL_STRING, and don't make it static (static nsString stuff doesn't work).
+
+>+    element->SetAttribute(sortDirectionKey, NS_LITERAL_STRING(""));
+
+EmptyString()
+
+>+int PR_CALLBACK nsNavHistoryResult::SortComparison_TitleLess(
+>+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b, void* closure)
+>+{
+
+This function can be |static|, as can the rest of your sort callbacks.
+
+>+  nsNavHistoryResult* result = NS_STATIC_CAST(nsNavHistoryResult*, closure);
+>+  PRInt32 value = -1; // default to returning "true" on failure
+>+  result->mCollation->CompareString(
+>+      nsICollation::kCollationCaseInSensitive, a->mTitle, b->mTitle, &value);
+>+  if (value == 0) {
+>+    // resolve by URL
+>+    value = a->mUrl.Compare(PromiseFlatCString(b->mUrl).get());
+
+already flat
+
+>+int PR_CALLBACK nsNavHistoryResult::SortComparison_URLLess(
+>+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b, void* closure)
+>+{
+>+  if (a->mType != b->mType) {
+>+    // we really shouldn't be comparing different row types
+>+    NS_NOTREACHED("Comparing different row types!");
+>+    return 0;
+>+  }
+
+NS_ASSERTION() would be better, if the calling code must not allow this to happen.
+
+>+void
+>+nsNavHistoryResult::RebuildAllListRecurse(
+>+    const nsCOMArray<nsNavHistoryResultNode>& aSource)
+>+{
+>+  for (int i = 0; i < aSource.Count(); i ++) {
+>+    PRUint32 allCount = mAllElements.Count();
+>+    if (mCollapseDuplicates && allCount > 0 && aSource[i]->mID != 0 &&
+>+        AllElementAt(allCount - 1)->mID == aSource[i]->mID) {
+>+      // ignore duplicate, that elements' flat index is the index of its dup
+>+      // note, we don't collapse ID=0 elements since that is all parent nodes
+
+Can you make this comment a little clearer?
+
+>+void
+>+nsNavHistoryResult::BuildVisibleSection(
+>+    const nsCOMArray<nsNavHistoryResultNode>& aSources, nsVoidArray* aVisible)
+>+{
+>+  for (int i = 0; i < aSources.Count(); i ++) {
+>+    nsNavHistoryResultNode* cur = aSources[i];
+>+    if (mCollapseDuplicates && aVisible->Count() > 0 && aSources[i]->mID != 0) {
+>+      nsNavHistoryResultNode* prev =
+>+        (nsNavHistoryResultNode*)(*aVisible)[aVisible->Count() - 1];
+
+NS_STATIC_CAST
+
+>+void
+>+nsNavHistoryResult::InsertVisibleSection(const nsVoidArray& aAddition,
+>+                                         int aInsertHere)
+>+{
+>+  NS_ASSERTION(aInsertHere >= 0 && aInsertHere <= mVisibleElements.Count(),
+>+               "Invalid insertion point");
+
+I think nsVoidArray will assert this for you
+
+>+int
+>+nsNavHistoryResult::DeleteVisibleChildrenOf(int aIndex)
+>+{
+>+  // compute the index of the element just after the end of the deleted region
+>+  int outerLevel = parentNode->mIndentLevel;
+>+  int nextOuterIndex = mVisibleElements.Count();
+>+  for (int i = aIndex + 1; i < mVisibleElements.Count(); i ++) {
+>+    if (VisibleElementAt(i)->mIndentLevel <= outerLevel) {
+>+      nextOuterIndex = i;
+>+      break;
+>+    }
+>+  }
+>+
+>+  // Mark those elements as invisible and remove them.
+>+  for (int i = aIndex + 1; i < nextOuterIndex; i ++)
+>+    VisibleElementAt(i)->mVisibleIndex = -1;
+
+Can't this be combined with the previous loop?  Also, this will break on MSVC (it will put "i" in the function scope, and complain that it's declared again).
+
+>+/* void getRowProperties (in long index, in nsISupportsArray properties); */
+>+NS_IMETHODIMP nsNavHistoryResult::GetRowProperties(PRInt32 index, nsISupportsArray *properties)
+>+{
+>+    return NS_ERROR_NOT_IMPLEMENTED;
+
+Are you planning to do anything for this?  If not, it's fine to just return NS_OK without putting anything in the array.  Same for the other Properties getters.
+
+>+NS_IMETHODIMP nsNavHistoryResult::IsContainer(PRInt32 index, PRBool *_retval)
+>+{
+>+  if (index < 0 || index >= mVisibleElements.Count())
+>+    return NS_ERROR_INVALID_ARG;
+>+  *_retval = (VisibleElementAt(index)->mChildren.Count() > 0);
+
+This will make it so that empty contains don't appear to be containers at all.  Is that what you want?
+
+>+// nsNavHistoryResult::GetCellText (nsITreeView)
+>+
+>+NS_IMETHODIMP nsNavHistoryResult::GetCellText(PRInt32 rowIndex,
+>+                                              nsITreeColumn *col,
+>+                                              nsAString& _retval)
+>+{
+>+        nsresult rv = mBundle->GetStringFromName(
+>+            NS_LITERAL_STRING("noTitle").get(), getter_Copies(value));
+>+        if (NS_SUCCEEDED(rv))
+>+          _retval = value;
+>+        else
+>+          _retval = NS_LITERAL_STRING("(no title)");
+
+I think it's ok to let GetStringFromName be entirely fatal here (not provide a fallback).
+
+>+    case Column_Date:
+>+    {
+>+      if (elt->mType == nsINavHistoryResultNode::RESULT_TYPE_HOST ||
+>+          elt->mType == nsINavHistoryResultNode::RESULT_TYPE_DAY) {
+>+        // hosts and days shouldn't have a value for the date column. Actually,
+>+        // you could argue this point, but looking at the results, seeing the
+>+        // most recently visited date is not what I expect, and gives me no
+>+        // information I know how to use.
+>+        _retval = NS_LITERAL_STRING("");
+
+EmptyString()
+
+>+    case Column_VisitCount:
+>+    {
+>+      char buffer[32];
+>+      sprintf(buffer, "%d", elt->mAccessCount);
+>+      _retval = NS_ConvertUTF8toUTF16(buffer);
+
+_retval = NS_ConvertUTF8toUTF16(nsPrintfCString("%d", elt->mAccessCount));
+
+>+NS_IMETHODIMP nsNavHistoryResult::ToggleOpenState(PRInt32 index)
+>+{
+>+  if (mTree)
+>+    mTree->InvalidateRow(index);
+
+I think RowCountChanged does this for you.
+
+>+nsNavHistoryResult::ColumnType
+>+nsNavHistoryResult::SortTypeToColumnType(PRUint32 aSortType,
+>+                                         PRBool* aDescending)
+
+It looks like the only callers of this do pass a value for aDescending; you could probably make it a required parameter.
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/src/nsNavHistory.h	4 Nov 2005 16:45:42 -0000
+>+class nsNavHistoryQuery : public nsINavHistoryQuery
+>+{
+>+public:
+>+  nsNavHistoryQuery();
+>+  virtual ~nsNavHistoryQuery() {}
+
+Should be able to be private / nonvirtual.
+
+>+class nsNavHistoryResultNode : public nsINavHistoryResultNode
+>+{
+>+public:
+>+  nsNavHistoryResultNode();
+>+  virtual ~nsNavHistoryResultNode() {}
+
+Same.
+
+>+class nsNavHistoryResult : public nsINavHistoryResult,
+>+                           public nsITreeView
+>+{
+>+public:
+>+  nsNavHistoryResult(nsNavHistory* aHistoryService,
+>+                     nsIStringBundle* aHistoryBundle);
+>+  virtual ~nsNavHistoryResult();
+
+Same.
+
+>+  // This is a COM ptr that MUST BE AddRef'ed and Release'd MANUALLY.
+>+  // nsNavHistory has nsISupports as an ambiguous base class, so nsCOMPtr
+>+  // won't work.
+>+  nsNavHistory* mHistoryService;
+
+nsRefPtr<nsNavHistory> is what you want here.
+
+>+class nsNavHistory : nsSupportsWeakReference,
+>+                     public nsINavHistory,
+>+                     public nsIObserver,
+>+                     public nsIBrowserHistory,
+>+                     public nsIAutoCompleteSearch
+>+{
+>+public:
+>+  nsNavHistory();
+>+  virtual ~nsNavHistory();
+
+Same as above re: dtor
+
+>+
+>+  NS_DECL_ISUPPORTS
+>+
+>+  NS_DECL_NSINAVHISTORY
+>+  NS_DECL_NSIGLOBALHISTORY2
+>+  NS_DECL_NSIBROWSERHISTORY
+>+  NS_DECL_NSIOBSERVER
+>+  NS_DECL_NSIAUTOCOMPLETESEARCH
+>+
+>+  NS_METHOD Init();
+
+Don't bother with NS_METHOD, just use nsresult.
+
+>+  // Current time optimization
+>+  PRTime mLastNow;
+>+  PRBool mNowValid;
+>+  nsCOMPtr<nsITimer> mExpireNowTimer;
+>+  PRTime GetNow();
+>+  static void expireNowTimerCallback(nsITimer* aTimer, void* aClosure);
+
+The norm for declaraing members is to declare all the methods first, then the data members all together.
+
+Whew!  I think that's about it.
+Created attachment 202186
+Patch addressing bryner's review
+
+This patch is a slightly revised version of the original. Note that it requires the patch for bug 310636. This patch does NOT include a patch for configure. You will need to generate if from configure.in using autoconf. To get the new functionality give "--enable-places" to configure.
+Created attachment 202747
+UI treeview for testing
+
+Apply this patch and make in browser. Then load chrome://browser/content/places/places-test.xul
+
+You may have to click on some UI control to get the list to populate.
+Created attachment 203140
+Patch for storage changes
+
+The names of some of the storage API functions changed slightly. This simple patch brings navHistory into sync.
+Created attachment 203427
+Enhancement to serialize/deserialize a query to a string
+Comment on attachment 203427
+Enhancement to serialize/deserialize a query to a string
+
+>--- /dev/null	1 Jan 1970 00:00:00 -0000
+>+++ browser/components/places/src/nsNavHistoryQuery.cpp	17 Nov 2005 18:43:52 -0000
+>@@ -0,0 +1,558 @@
+>+inline void AppendAmpersandIfNonempty(nsACString& aString)
+>+{
+>+  if (! aString.IsEmpty())
+>+    aString += NS_LITERAL_CSTRING("&");
+
+Append('&') is a little cheaper
+
+>+}
+>+inline nsCString Int32AsCString(PRInt32 i)
+>+{
+>+  nsCString tmp;
+
+use nsCAutoString to avoid a heap allocation
+
+>+inline nsCString Int64AsCString(PRInt64 i)
+>+{
+>+  nsCString tmp;
+
+here too
+
+>+NS_IMETHODIMP
+>+nsNavHistory::QueryStringToQueries(const nsACString& aQueryString,
+>+                                   nsINavHistoryQuery*** aQueries,
+>+                                   PRUint32* aResultCount,
+>+                                   nsINavHistoryQueryOptions** aOptions)
+>+{
+>+  *aResultCount = queries.Count();
+>+  if (queries.Count() == 0) {
+>+    // need to special-case 0 queries since we don't allocate an array
+>+    *aQueries = nsnull;
+>+    return NS_OK;
+>+  }
+>+
+>+  // convert COM array to raw
+>+  *aQueries = NS_STATIC_CAST(nsINavHistoryQuery**,
+>+                       NS_Alloc(sizeof(nsINavHistoryQuery*) * queries.Count()));
+
+Use nsMemory::Alloc, just for consistency.
+
+>+  if (! *aQueries)
+>+    return NS_ERROR_OUT_OF_MEMORY;
+>+  for (PRInt32 i = 0; i < queries.Count(); i ++) {
+>+    (*aQueries)[i] = NS_STATIC_CAST(nsINavHistoryQuery*, queries[i]);
+
+You shouldn't need a STATIC_CAST here.
+
+>+NS_IMETHODIMP
+>+nsNavHistory::QueriesToQueryString(const nsINavHistoryQuery **aQueries,
+>+                                   PRUint32 aQueryCount,
+>+                                   nsINavHistoryQueryOptions* aOptions,
+>+                                   nsACString& aQueryString)
+>+{
+>+  nsresult rv;
+>+  NS_NAMED_LITERAL_CSTRING(equals, "=");
+
+Again, probably easier to just use Append('=')
+
+>+      AppendAmpersandIfNonempty(aQueryString);
+>+      aQueryString += NS_LITERAL_CSTRING(QUERYKEY_BEGIN_TIME);
+>+      aQueryString += equals;
+>+      aQueryString += Int64AsCString(beginTime);
+
+I suspect that it's going to be more efficient to just use AppendInt(beginTime) here rather than relying on the inline function.... likewise in the other places you append a PRInt64/32.  They're logically the same, but I bet it's not going to be optimized as efficiently by the compiler, and I don't really see the benefit of constructing the temporary string.
+
+>+// hack because there's no convenient templatized array, caller should check
+>+// mItems for NULL in case of memory allocation error
+>+class GroupingQueryList
+>+{
+>+public:
+>+  PRInt32* mItems;
+>+  PRInt32 mMaxGroups;
+>+  PRInt32 mGroupCount;
+>+  GroupingQueryList() : mMaxGroups(32), mGroupCount(0)
+
+Make mMaxGroups be a static const instead of a member variable?
+
+>+  nsCOMPtr<nsINavHistoryQuery> query(new nsNavHistoryQuery());
+
+This can OOM too.
+
+>+  if (! aQueries->AppendObject(query))
+>+    return NS_ERROR_OUT_OF_MEMORY;
+
+>+  for (int i = 0; i < aTokens.Count(); i ++) {
+
+PRInt32
+
+>+    } else if (kvp->key.EqualsLiteral(QUERYKEY_DOMAIN)) {
+>+
+>+      // domain string
+>+      nsCString unescapedDomain = kvp->value;
+
+nsCAutoString
+
+
+>+    } else if (kvp->key.EqualsLiteral(QUERYKEY_GROUP)) {
+>+
+>+      // grouping: be careful not to overflow our buffer if there are a lot
+>+      PRUint32 grouping;
+>+      if (PR_sscanf(kvp->value.get(), "%u", &grouping) == 1) {
+>+        groups.Add(grouping);
+
+how about  kvp->value.ToInteger()?  same for sorting mode.
+
+looks ok otherwise.
+Created attachment 203534
+Enhance result by exposing query options and other info
+
+This exposes query parameters and options in the result and adds support ofr treeIndexForNode.
+Comment on attachment 203534
+Enhance result by exposing query options and other info
+
+>--- browser/components/places/src/nsNavHistory.cpp	17 Nov 2005 22:00:52 -0000	1.10
+>+++ browser/components/places/src/nsNavHistory.cpp	18 Nov 2005 18:09:09 -0000
+>@@ -1084,7 +1086,8 @@
+> 
+>   PRInt32 numParameters = 0;
+>   nsCAutoString conditions;
+>-  for (PRUint32 i = 0; i < aQueryCount; i ++) {
+>+  PRUint32 i;
+>+  for (i = 0; i < aQueryCount; i ++) {
+
+I don't see a reason for this change.
+
+>@@ -3797,6 +3826,52 @@
+>+NS_IMETHODIMP
+>+nsNavHistoryResult::TreeIndexForNode(nsINavHistoryResultNode* aNode,
+>+                                     PRUint32* aResult)
+>+{
+>+  nsNavHistoryResultNode* node;
+>+  nsresult rv = aNode->QueryInterface(kNavHistoryResultNodeIID, (void**)&node);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  if (node->mVisibleIndex < 0)
+>+    *aResult = nsINavHistoryResult::INDEX_INVISIBLE;
+>+  else
+>+    *aResult = node->mVisibleIndex;
+>+  return NS_OK;
+
+This leaks a reference to aNode.  Why not just
+
+nsCOMPtr<nsNavHistoryResultNode> node = do_QueryInterface(aNode);
+
+? (and get rid of the NS_DEFINE_IID)
+
+>+NS_IMETHODIMP
+>+nsNavHistoryResult::GetSourceQuery(nsINavHistoryQuery*** aQueries,
+>+                                   PRUint32* aQueryCount,
+>+                                   nsINavHistoryQueryOptions** aOptions)
+>+{
+...
+>+  *aOptions = mSourceOptions;
+>+  NS_ADDREF(*aOptions);
+
+This will crash if mSourceOptions is null (which it looks like it may be, judging by the ctor).  NS_IF_ADDREF?
+
+>@@ -4627,6 +4702,26 @@
+>+// copy constructor used by Clone()
+>+nsNavHistoryQueryOptions::nsNavHistoryQueryOptions(
+>+                                          const nsNavHistoryQueryOptions& 
+other)
+...
+>+    mGroupings = new PRInt32[other.mGroupCount];
+>+    if (mGroupings) {
+
+This is a problem with doing any allocations in the ctor - there's no way to signal out-of-memory.  I'd suggest creating an Init() method that can return an nsresult.
+
+r=me with those fixed.
+Created attachment 203605
+Alphabetized headers, moved nsNavHistoryResult into separate file
+Created attachment 203606
+Alphabetizes headers, moves nsNavHistoryResult/Node into new file
+Comment on attachment 203606
+Alphabetizes headers, moves nsNavHistoryResult/Node into new file
+
+Add a newline to the end of the new file
+Created attachment 204054
+Time to allow queries to have times be specified relative to something
+Comment on attachment 204054
+Time to allow queries to have times be specified relative to something
+
+>--- public/nsINavHistory.idl	22 Nov 2005 19:51:48 -0000	1.8
+>+++ public/nsINavHistory.idl	23 Nov 2005 19:27:25 -0000
+>@@ -300,31 +300,39 @@
+> interface nsINavHistoryQuery : nsISupports
+> {
+>   /**
+>-   * Time range for results (INCLUSIVE). Set to 0 to ignore and return any
+>-   * page. Note: PRTime is in MICROseconds since 1 Jan 1970. Javascript date
+>-   * objects are expressed in MILLIseconds since 1 Jan 1970.
+>+   * Time range for results (INCLUSIVE). The *TimeReference is one of the
+>+   * constants TIME_RELATIVE_* which indicates how to interpret the
+>+   * corresponding time value.
+>+   *   TIME_RELATIVE_EPOCH (default):
+>+   *     The time is relative to Jan 1 1970 GMT, (this is a normal PRTime)
+>+   *   TIME_RELATIVE_TODAY:
+>+   *     The time is relative to this morning at midnight. Normally used for
+>+   *     queries relative to today. For example, a "past week" query would be
+>+   *     today-6 days -> today+1 day
+>+   *   TIME_RELATIVE_NOW:
+>+   *     The time is relative to right now.
+>    *
+>-   * The has* functions return whether the corresponding time is non-zero and
+>-   * should be considered for the query.
+>-   */
+>+   * Note: PRTime is in MICROseconds since 1 Jan 1970. Javascript date objects
+>+   * are expressed in MILLIseconds since 1 Jan 1970.
+>+   *
+>+   * As a special case, a 0 time relative to TIME_RELATIVE_EPOCH indicates that
+>+   * the time is not part of the query. This is the default, so an empty query
+>+   * will match any time. The has* functions return whether the corresponding
+>+   * time is considered.
+>+   */
+>+  const long TIME_RELATIVE_EPOCH = 0;
+>+  const long TIME_RELATIVE_TODAY = 1;
+>+  const long TIME_RELATIVE_NOW = 2;
+>+
+
+All of the other constants in these interfaces use PRUint32, can you do that her?
+
+
+>--- src/Makefile.in	19 Nov 2005 05:05:52 -0000	1.7
+>+++ src/Makefile.in	23 Nov 2005 19:27:25 -0000
+>@@ -76,6 +76,7 @@
+>           nsNavHistoryResult.cpp \
+>           nsNavBookmarks.cpp \
+>           $(NULL)
+>+          #nsBookmarksHTML.cpp \
+> 
+> include $(topsrcdir)/config/rules.mk
+> 
+
+Don't check this in.
+
+
+>--- src/nsNavHistory.cpp	23 Nov 2005 02:22:17 -0000	1.15
+>+++ src/nsNavHistory.cpp	23 Nov 2005 19:27:25 -0000
+>@@ -912,6 +912,42 @@
+> }
+> 
+> 
+>+// nsNavHistory::NormalizeTime
+>+//
+>+//    Converts a nsINavHistoryQuery reference+offset time into a PRTime
+>+//    relative to the epoch.
+>+
+>+PRTime
+>+nsNavHistory::NormalizeTime(PRInt32 aRelative, PRTime aOffset)
+>+{
+>+  PRTime result;
+>+  LL_ADD(result, ref, aOffset);
+
+It's no longer necessary to use the LL_ macros since all of our platforms support int64 types.
+
+>--- src/nsNavHistory.h	22 Nov 2005 19:51:49 -0000	1.15
+>+++ src/nsNavHistory.h	23 Nov 2005 19:27:25 -0000
+>@@ -96,15 +96,15 @@
+> protected:
+> 
+>   PRTime mBeginTime;
+>+  PRInt32 mBeginTimeReference;
+>   PRTime mEndTime;
+>+  PRInt32 mEndTimeReference;
+>   nsString mSearchTerms;
+>   PRBool mOnlyBookmarked;
+>   PRBool mDomainIsHost;
+>   nsString mDomain;
+>   PRInt32 mGroupingMode;
+>   PRInt32 mSortingMode;
+>-  PRBool mAsVisits;
+>-  PRBool mExpandPlaces;
+
+mAsVisits is unused, but leave mExpandPlaces.
+
+>--- src/nsNavHistoryQuery.cpp	22 Nov 2005 19:16:43 -0000	1.4
+>+++ src/nsNavHistoryQuery.cpp	23 Nov 2005 19:27:25 -0000
+>@@ -166,6 +168,16 @@
+>       aQueryString += NS_LITERAL_CSTRING(QUERYKEY_BEGIN_TIME);
+>       aQueryString.Append('=');
+>       AppendInt64(aQueryString, beginTime);
+>+
+>+      // reference
+>+      PRInt32 reference;
+>+      query->GetBeginTimeReference(&reference);
+>+      if (reference != nsINavHistoryQuery::TIME_RELATIVE_EPOCH) {
+>+        AppendAmpersandIfNonempty(aQueryString);
+>+        aQueryString += NS_LITERAL_CSTRING(QUERYKEY_BEGIN_TIME_REFERENCE);
+>+        aQueryString.Append('=');
+
+You could combine these, like so:
+
+aQueryString.AppendLiteral(QUERYKEY_BEGIN_TIME_REFERENCE "=");
+
+>@@ -180,6 +192,16 @@
+>       aQueryString += NS_LITERAL_CSTRING(QUERYKEY_END_TIME);
+>       aQueryString.Append('=');
+>       AppendInt64(aQueryString, endTime);
+>+
+>+      // reference
+>+      PRInt32 reference;
+>+      query->GetEndTimeReference(&reference);
+>+      if (reference != nsINavHistoryQuery::TIME_RELATIVE_EPOCH) {
+>+        AppendAmpersandIfNonempty(aQueryString);
+>+        aQueryString += NS_LITERAL_CSTRING(QUERYKEY_END_TIME_REFERENCE);
+>+        aQueryString.Append('=');
+
+Same.
+
+>@@ -416,6 +438,18 @@
+>         NS_WARNING("Begin time format in query is invalid, ignoring");
+>       }
+> 
+>+    } else if (kvp->key.EqualsLiteral(QUERYKEY_BEGIN_TIME_REFERENCE)) {
+>+
+>+      // begin time reference
+>+      PRInt32 ref;
+>+      if (PR_sscanf(kvp->value.get(), "%d", &ref) == 1) {
+
+Maybe use kvp->value.ToInteger() ?
+
+>@@ -428,6 +462,18 @@
+>         NS_WARNING("Begin time format in query is invalid, ignoring");
+>       }
+> 
+>+    } else if (kvp->key.EqualsLiteral(QUERYKEY_END_TIME_REFERENCE)) {
+>+
+>+      // end time reference
+>+      PRInt32 ref;
+>+      if (PR_sscanf(kvp->value.get(), "%d", &ref) == 1) {
+
+Same.
+
+>@@ -537,9 +583,7 @@
+> nsresult
+> ParseQueryTimeString(const nsCString& aString, PRTime* aTime)
+> {
+>-  // since we only support large number microseconds, disallow any small numbers
+>-  // that people might try to use for year or month numbers.
+>-  if (PR_sscanf(aString.get(), "%lld", aTime) != 1 || *aTime < 3000)
+>+  if (PR_sscanf(aString.get(), "%lld", aTime) != 1)
+>     return NS_ERROR_INVALID_ARG;
+>   return NS_OK;
+> }
+
+Can't here though, there's no ToInt64.
+Created attachment 204062
+Make results inherit from result nodes
+Comment on attachment 204062
+Make results inherit from result nodes
+
+r=ben@mozilla.org
+Marking as fixed, further echancements will be their own bugs.
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

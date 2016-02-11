@@ -1,0 +1,135 @@
+New items don't appear in the tree view as they are created.
+
+STR:
+1. Open Places Organizer
+2. Select a folder
+3. Focus the content tree
+4. Click the New separator button
+
+The separator doesn't appear unless you either select its to-be-its-place in the tree or reopen the folder.
+
+I think that is the root cause for the command-updating issues I reported in bug  366027.
+
+New items don't appear in the tree view as they are created.
+
+STR:
+1. Open Places Organizer
+2. Select a folder
+3. Focus the content tree
+4. Click the New separator button
+
+The separator doesn't appear unless you either select its to-be-its-place in the tree or reopen the folder.
+
+I think that is the root cause for the command-updating issues I reported in bug  366027.
+I wonder if we are getting from:
+
+nsNavBookmarks::InsertSeparator()
+to
+nsNavHistoryFolderResultNode::OnSeparatorAdded()
+
+or, if we are, if bail out before the InsertChildAt() call?
+
+asaf, I'll debug and see what's going on and report back.
+short version:  there seems to be a painting problem with the places tree on mac os x (cocoa cairo).  this is not a problem on windows.
+
+long version:
+
+at first, I was unable to even any separators in the content pane of the places dialog.  I debugged and found that separators only show up when you are not sorted.  From nsNavHistoryResultTreeViewer::BuildVisibleSection()
+
+
+    // don't display separators when sorted
+    if (cur->IsSeparator()) {
+      if (aContainer->GetSortType() != nsINavHistoryQueryOptions::SORT_BY_NONE) {
+        cur->mViewIndex = -1;
+        continue;
+      }
+    }
+
+
+In the place dialog, under the view menu, there is a menu item.  note, choosing to view unsorted doesn't work and will throw a js error.  
+
+content.getResult().sortAll(Ci.nsINavHistoryQueryOptions.SORT_BY_NONE);
+
+there is no sortAll().  (I'll log a bug.)
+
+as asaf points out, sort is broken in the organizer
+
+but, the title column is tri-state, so you can click it a third time to get unsorted (or a bookmark sort) of the bookmarks and your separators will appear.
+
+see nsNavHistoryResultTreeViewer::CycleHeader
+
+once in unsorted mode, you will see separators (plus the default favicon, another bug on windows, and a blank spot on mac, I'll log bug.)
+
+asaf points out that we might want to disable the "insert sep" command when we are sorted.  I'll log a bug.
+
+asaf reports that when he resize the dialog, the added items show up, which is why we think this is a possible cocoa cairo widget bug.
+
+josh, to reproduce this, you'd need a trunk build with --enable-places-bookmarks.
+> In the place dialog, under the view menu, there is a menu item.  note, choosing
+> to view unsorted doesn't work and will throw a js error.  
+>
+> content.getResult().sortAll(Ci.nsINavHistoryQueryOptions.SORT_BY_NONE);
+>
+> there is no sortAll().  (I'll log a bug.)
+
+asaf beat me too it, see bug #366594
+Not a cocoa-cairo issue, apparently (FWIW, I also see this in carbon-without-cairo builds). My guess is that this issue is hidden on windows because resize is fired much more frequently there (almost always when a new visible dom node is added).
+Mess:
+
+1) When I create a folder under Bookmarks Toolbar when the _left pane_ of the organizer is focused, we get into 
+
+nsNavHistoryContainerResultNode::InsertChildAt
+
+which, at the end does
+  if (mExpanded && result->GetView())
+    result->GetView()->ItemInserted(this, aNode, aIndex);
+
+But the result object here has no view for some reason, so we never call ItemInserted.
+
+2) Note this is not the cause for the previous issue:
+NS_IMETHODIMP nsNavHistoryResultTreeViewer::SetTree(nsITreeBoxObject* tree)
+
+  if (! tree && hasOldTree && mResult) {
+     // detach from result when we are detaching from the tree. This breaks the
+     // reference cycle between us and the result.
+     mResult->SetViewer(nsnull);
+  }
+  return NS_OK;
+}
+
+This, I think, also sets the new view to null (see load method in tree.xml and SetView in nsTreeBodyFrame). We should probably check here whether the result's view is |this|. Either way, mView for the result object in 1) is still null even if I comment out out this code (and AFAICT, SetViewer is never called for it).
+
+3) I don't see nsNavHistoryContainerResultNode::InsertChildAt on the stack at all when adding a folder while the content tree is focused.
+
+Created attachment 255787
+allow bookmark queries that exclude queries to incrementally update
+
+A band-aid patch for this problem.
+
+Even though the folder in the organizer content pane is open, it's not incrementally updating because we currently disallow incremental updates for any node that is a result of a query that had an exclusion. The reason this is done is so that bookmark indexes will stay valid in the context of the result set. (these indexes are generated inside nsNavBookmarksService::QueryFolderChildren at query-time)
+
+This patch removes exclude-queries from the filter inside nsNavHistoryFolderResultNode::StartIncrementalUpdates, which allows the organizer content tree to incrementally update. Exclude-queries is primarily intended for building history views, where the query is against the moz_places table directly. A scenario where this patch might cause problems is if a user bookmarked a place URI (hm, i'll go try this...).
+
+So, this patch allows open bookmark folders that excludeQueries to incrementally update. However, when not incrementally updating, a container *should* rebuild it's contents, and this is not happening in the content pane. I'm still looking into this.
+Comment on attachment 255787
+allow bookmark queries that exclude queries to incrementally update
+
+per discussion in #places.
+Created attachment 255837
+patch
+mozilla/browser/components/places/content/places.js 1.76
+
+See also bug 371074.
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

@@ -1,0 +1,167 @@
+It is really not clear why/how it happens to be slower but, it happens to be faster to wait for a request to finish, before piping another one via Debuggerclient APIs.
+It's not clear mostly because DebuggerClient and DebuggerTransport are already queuing requests in order to send/receive them one by one!!
+
+I identified this slowness while working on bug 1123788, where fetching icons one by one is faster than piling up requests.
+
+Here is a very simple xpcshell test exposing this slowness:
+const run_test = Test(function*() {
+  initTestDebuggerServer();
+  const connection = DebuggerServer.connectPipe();
+  const client = Async(new DebuggerClient(connection));
+
+  yield client.connect();
+
+  let N = 100;
+
+  let a = new Date().getTime();
+  for(var i = 0; i < N; i++) {
+    let response = yield client.request({
+      to: "root",
+      type: "echo"
+    });
+  }
+  let s = "Sequential: "+(new Date().getTime()-a)+"\n";
+  dump(s);
+
+  let promises = []
+  for(var i = 0; i < N; i++) {
+    promises.push(client.request({
+      to: "root",
+      type: "echo"
+    }));
+  }
+  yield promise.all(promises)
+         .then(() => {
+          dump(s + "Parallel: "+(new Date().getTime()-a)+"\n");
+         });
+
+  yield client.close();
+});
+
+"Sequential: 170"
+"Parallel: 345"
+
+
+Now, I have no idea where it ends up being slower...
+
+It is really not clear why/how it happens to be slower but, it happens to be faster to wait for a request to finish, before piping another one via Debuggerclient APIs.
+It's not clear mostly because DebuggerClient and DebuggerTransport are already queuing requests in order to send/receive them one by one!!
+
+I identified this slowness while working on bug 1123788, where fetching icons one by one is faster than piling up requests.
+
+Here is a very simple xpcshell test exposing this slowness:
+const run_test = Test(function*() {
+  initTestDebuggerServer();
+  const connection = DebuggerServer.connectPipe();
+  const client = Async(new DebuggerClient(connection));
+
+  yield client.connect();
+
+  let N = 100;
+
+  let a = new Date().getTime();
+  for(var i = 0; i < N; i++) {
+    let response = yield client.request({
+      to: "root",
+      type: "echo"
+    });
+  }
+  let s = "Sequential: "+(new Date().getTime()-a)+"\n";
+  dump(s);
+
+  let promises = []
+  for(var i = 0; i < N; i++) {
+    promises.push(client.request({
+      to: "root",
+      type: "echo"
+    }));
+  }
+  yield promise.all(promises)
+         .then(() => {
+          dump(s + "Parallel: "+(new Date().getTime()-a)+"\n");
+         });
+
+  yield client.close();
+});
+
+"Sequential: 170"
+"Parallel: 345"
+
+
+Now, I have no idea where it ends up being slower...
+There's a bug in your test above.  You forgot to reset the start time after the "Sequential" run.
+
+Regardless, the parallel version is still slower, especially as N gets much larger.
+
+I have fix for this, attaching soon.
+Created attachment 8556738
+MozReview Request: bz://1127435/jryans
+
+/r/3139 - Bug 1127435 - Use separate client queues per actor. r=ochameau
+
+Pull down this commit:
+
+hg pull review -r fc46ca9973426e5e1398dc60e5b50046c0bb58d1
+We were iterating one giant queue of all requests:
+
+* For each new request
+* After each in flight request completed
+
+That's quite silly, since we really only queue per actor, not globally.
+
+The parallel case is now faster (as it should be) for all values of N.
+
+Try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=4c27c9970eab
+Comment on attachment 8556738
+MozReview Request: bz://1127435/jryans
+
+This version is not quite right...  The debugger seems to rely on the implicit total order of requests.
+Comment on attachment 8556738
+MozReview Request: bz://1127435/jryans
+
+/r/3139 - Bug 1127435 - Use separate client queues per actor. r=ochameau
+
+Pull down this commit:
+
+hg pull review -r d8f2c51cb8a58fd73c8d913546edee5903a6885d
+Try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=36be772afd7b
+https://reviewboard.mozilla.org/r/3139/#review2691
+
+Looks good, but I'm wondering if we have an issue with protocol.js actors and Client classes.
+Looking at the existing code, and the code with this patch, it seems like we have issues when we start queuing requests for these actors/clients.
+I'm not sure this patch makes things worse or just alike, could you check this before landing?
+
+::: toolkit/devtools/client/dbg-client.jsm
+(Diff revision 2)
+> -  _sendRequests: function () {
+> +  _sendOrQueueRequest(request) {
+
+What?\!
+Yet another JS syntax :-o
+
+::: toolkit/devtools/client/dbg-client.jsm
+(Diff revision 2)
+>      }
+
+I'm wondering how do things work when we have a protocol.js or a Client class in this.\_clients (where we return early)?
+It looks like we are not calling sendRequest/attemptNextRequest in these cases...
+https://reviewboard.mozilla.org/r/3139/#review2791
+
+I agree this code is hard to follow, so I can understand why you would be worried!
+
+The changes here only impact requests that use dbg-client's own queueing system by calling it's |send| method.
+
+protocol.js fronts don't use[1] this, they call the transport directly.
+
+For the clients block, this only concerns clients using the "generic actor event" support (that you added! :P).  This is to handle one-off events *from* the actor, so there would not be any requests queued in the client.
+
+[1]: https://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/protocol.js#1146
+https://hg.mozilla.org/integration/fx-team/rev/de4682147093
+Wrong link in comment 9, corrected link:
+
+https://hg.mozilla.org/integration/fx-team/rev/54414d565677
+https://hg.mozilla.org/mozilla-central/rev/54414d565677
+Comment on attachment 8556738
+MozReview Request: bz://1127435/jryans
+Created attachment 8619241
+MozReview Request: Bug 1127435 - Use separate client queues per actor. r=ochameau

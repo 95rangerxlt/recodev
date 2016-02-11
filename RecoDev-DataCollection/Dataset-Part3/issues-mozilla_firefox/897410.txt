@@ -1,0 +1,185 @@
+As of https://tbpl.mozilla.org/?tree=UX&rev=82bb645b4c13, all our mochitest-bc tests are orange because there are some devtools test that are sensitive to errors showing up when they're run. I've gotten word on devtools that they would be OK with disabling these tests if that was required, but I'd really like to understand why this is happening rather than wallpapering over it.
+
+A very similar error has been around for quite a while on m-c as well as UX:
+
+"markupDocumentViewer is undefined" {file: "chrome://global/content/viewZoomOverlay.js" line: 63}
+
+However, we're now hitting the same error on line 48 of viewZoomOverlay.js, which is the zoom getter, whereas line 63 is the zoom setter. As of yet, I have no idea what's been triggering this; the pushlog for the merge doesn't seem to contain any obvious candidates at first glance:
+
+https://hg.mozilla.org/projects/ux/pushloghtml?startID=272&endID=273
+
+As of https://tbpl.mozilla.org/?tree=UX&rev=82bb645b4c13, all our mochitest-bc tests are orange because there are some devtools test that are sensitive to errors showing up when they're run. I've gotten word on devtools that they would be OK with disabling these tests if that was required, but I'd really like to understand why this is happening rather than wallpapering over it.
+
+A very similar error has been around for quite a while on m-c as well as UX:
+
+"markupDocumentViewer is undefined" {file: "chrome://global/content/viewZoomOverlay.js" line: 63}
+
+However, we're now hitting the same error on line 48 of viewZoomOverlay.js, which is the zoom getter, whereas line 63 is the zoom setter. As of yet, I have no idea what's been triggering this; the pushlog for the merge doesn't seem to contain any obvious candidates at first glance:
+
+https://hg.mozilla.org/projects/ux/pushloghtml?startID=272&endID=273
+So the error is triggered the first time we open customization mode, for browser_URLBarSetURI.js, and then just keeps reappearing. Presumably this is because our zoom control attempts to read the document's zoom settings. Mike, as the zoom control is your baby, can you look at this pushlog and see if there's anything in there that you think could influence that code?
+Hang on... maybe this is bug 895340? Does that sound plausible?
+Confirmed by locally backing out, this was "caused" by bug 895340, which really means this error was always there - we just didn't realize. Mike told me he was looking into it. :-)
+Bugzilla is hard, properly assigning this time.
+Created attachment 780332
+Patch v1: add a NULL check to zoom level getter and setter for markupDocumentViewer
+
+Drew, does this also look OK to you? We wanted to land this asap to resolve the oranges...
+
+I'll also ping you on IRC when you're around!
+Created attachment 780345
+don't call into the zoom manager if we don't (yet) have a docshell.
+
+I think I would prefer this, as I think we're the only consumer who can call this on startup and whatnot... If you disagree, I'm also happy to r+ the getter portion of your patch for now, but I don't think we should touch the setter part until Drew has had a look. Oh, and I've fixed an unrelated observer that was never getting removed, AFAICT...
+Comment on attachment 780345
+don't call into the zoom manager if we don't (yet) have a docshell.
+
+Review of attachment 780345:
+-----------------------------------------------------------------
+
+LGTM, but we need to keep a close eye on it; I think it'd be smart to mention this bug in your comment.
+
+::: browser/components/customizableui/src/CustomizableWidgets.jsm
+@@ +327,5 @@
+>        let zoomResetButton = node.childNodes[1];
+>        let window = aDocument.defaultView;
+>        function updateZoomResetButton() {
+> +        let zoomFactor = 100;
+> +        if (window.gBrowser.docShell) {
+
+This could use a comment
+(In reply to Mike de Boer [:mikedeboer] from comment #7)
+> Comment on attachment 780345
+> don't call into the zoom manager if we don't (yet) have a docshell.
+> 
+> Review of attachment 780345:
+> -----------------------------------------------------------------
+> 
+> LGTM, but we need to keep a close eye on it; I think it'd be smart to
+> mention this bug in your comment.
+> 
+> ::: browser/components/customizableui/src/CustomizableWidgets.jsm
+> @@ +327,5 @@
+> >        let zoomResetButton = node.childNodes[1];
+> >        let window = aDocument.defaultView;
+> >        function updateZoomResetButton() {
+> > +        let zoomFactor = 100;
+> > +        if (window.gBrowser.docShell) {
+> 
+> This could use a comment
+
+Commented; fix pushed, pushed the observer bit as a separate cset for backout ease and history tracking, yada yada.
+
+Actual fix:
+https://hg.mozilla.org/projects/ux/rev/cd2ff8dd3bb8
+
+Observer issue:
+https://hg.mozilla.org/projects/ux/rev/e6ff8814ce58
+
+Drew: pretty sure we'd still like your feedback here! :-)
+I think I prefer Mike's original patch (seems odd to push this error handling to this specific caller). Though I might suggest throwing a more informative error from the setter rather than just silently failing.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #9)
+> I think I prefer Mike's original patch (seems odd to push this error
+> handling to this specific caller). Though I might suggest throwing a more
+> informative error from the setter rather than just silently failing.
+
+So, couple of things.
+
+First, I forgot to mention in the bug (but did on IRC!) that I filed bug 897428 about the setter. It's been throwing errors around on m-c when mochitests are run for a while now, unnoticed or at least unfiled, and without actually causing issues. I pinpointed a merge and hope Drew / someone can confirm my suspicion that that part was triggered by the async zoom refactoring. That's not a UX-caused issue, and it should be properly fixed in some way (which may end up being the same as Mike's patch, but that wasn't necessary to unbust our tree and so I initially didn't want to run with that without review from someone who knows the code better than I do).
+
+Regarding the getter, generally I agree with your point but I wanted to go this path because:
+- This is not a problem on m-c. This error doesn't occur there at all. Only our caller was triggering it, apparently.
+- Neither Mike nor I could reproduce the issue outside of the mochitests. It's trivial to trigger the error when running for example: ./mach mochitest-browser browser/base/content/test/browser_URLBarSetURI.js (which opens customization mode and checks the URL in the URL bar doesn't have username/password info after closing it). But in normal opening/using the browser, I haven't been able to trigger the error condition (no docshell on the tabbrowser) at all, even if putting the zoom control in the toolbar, or having session restore immediately (re)open customization mode.
+- Because neither of us could reproduce this in ordinary use, neither of us really really really knows the zoom code, or why the tabbrowser would ever not have any docshell at all, but this was busting our build (but not m-c) I wanted to initially fix this as locally as possible. An alternative would have been disabling the relevant devtools test (msucan told me in #devtools that these tests (which fail if there are unrelated JS errors while they run) are the least reliable they have and that disabling them shouldn't be much of an issue). Neither is really a permanent fix; I just wanted to unbust our tree as the error had always been there - just unnoticed - and didn't cause real problems.
+
+I left this bug open because I'd like to still understand what's going on and/or perhaps fix it 'better', but that's why I went with the other patch initially. I hope that makes sense. I'd still really like to hear from Drew / anyone else who knows this code about what's up here! :-)
+(In reply to :Gijs Kruitbosch from comment #10)
+> First, I forgot to mention in the bug (but did on IRC!) that I filed bug
+> 897428 about the setter. It's been throwing errors around on m-c when
+> mochitests are run for a while now, unnoticed or at least unfiled, and
+> without actually causing issues.
+
+FWIW, it isn't the setter that is throwing the errors; it's the getter. Throwing an error from the setter is a valid point, imho.
+
+> Regarding the getter, generally I agree with your point but I wanted to go
+> this path because:
+> - This is not a problem on m-c. This error doesn't occur there at all. Only
+> our caller was triggering it, apparently.
+
+It only yielded an error, thus failing test in our case. I inspected Mochitest logs for m-c and the error is thrown there a gazillion of times, but doesn't make tests fail.
+
+Main point for us here was to patch up UX for the time being, indeed. And we succeeded :) I will file my (updated) patch in bug 897428.
+As Gijs pointed out on IRC, the errors do originate from the setter, in which case I have to adjust my opinion towards silent fail instead.
+
+http://mxr.mozilla.org/mozilla-central/source/toolkit/content/viewZoomOverlay.js#63
+(In reply to :Gijs Kruitbosch from comment #10)
+
+Seems fine as a temporary measure, but the "mysteriously lacks a docShell" error seems likely related to async callbacks being invoked after things get torn down, so I just want us to fix that in a more structured way.
+I posted this in bug 897428 comment 2:
+
+(In reply to Drew Willcoxon :adw from comment #2)
+> Yes, it's bug 880226.  As Gavin says in bug 897410 comment 13, the problem
+> is browser-fullZoom.js doing things with a browser (passing it to
+> ZoomManager) after it's been closed or modified.  I think the right fix is
+> to make the isCurrent getter in the token objects returned by
+> FullZoom._getBrowserToken guard against this case by returning false, but
+> there are still some things I don't understand about where and why it
+> happens and the state of browsers and their properties that I'm trying to
+> understand first.
+
+So I think the right fix is to fix FullZoom (which I'm working on in bug 897428), not the patch here, but of course the patch here is certainly fine in the meantime.
+Comment on attachment 780345
+don't call into the zoom manager if we don't (yet) have a docshell.
+
+This is more complicated than I thought when I first glanced at it.
+
+>       function updateZoomResetButton() {
+>+        let zoomFactor = 100;
+>+        if (window.gBrowser.docShell) {
+>+          zoomFactor = Math.floor(window.ZoomManager.zoom * 100);
+>+        }
+>         zoomResetButton.setAttribute("label", CustomizableUI.getLocalizedProperty(
+>-          buttons[1], "label", [Math.floor(window.ZoomManager.zoom * 100)]
+>+          buttons[1], "label", [zoomFactor]
+>         ));
+>       };
+> 
+>       // Register ourselves with the service so we know when the zoom prefs change.
+>       Services.obs.addObserver(updateZoomResetButton, "browser-fullZoom:zoomChange", false);
+>       Services.obs.addObserver(updateZoomResetButton, "browser-fullZoom:zoomReset", false);
+>       Services.obs.addObserver(updateZoomResetButton, "browser-fullZoom:locationChange", false);
+
+So updateZoomResetButton is called as a result of these three notifications.
+
+The zoomChange notification probably isn't the problem.  It ends up being broadcasted asyncly only when the zoom is changed by scrolling the mouse.  There are tests that do that, but I think they should all be fixed now; they all wait for the zoom to be changed before continuing, so they shouldn't be interfering with devtools tests, which I presume don't change the zoom that way.
+
+zoomReset is only ever broadcasted syncly, so it isn't the problem.
+
+locationChange, though.  I didn't know other people were relying on that notification.  That's scary because it serves a specific purpose (in tests only) and wasn't designed to be generally useful.  It's always broadcasted asyncly with no check for whether the browser associated with the location change is still alive.  The patch in bug 897428 won't help at all.
+
+So I guess there are three options:
+
+1. Stick with the patch here.
+2. Make CustomizableWidgets not rely on locationChange.
+3. Beef up locationChange to make it safe(r) for general use.
+2. seems best, but I don't know what that involves exactly.
+locationChange is broadcasted when a tab is selected in a tabbrowser and as a result of a browser.js progress listener on every browser, so CustomizableWidgets could listen for those same events.
+
+But since CustomizableWidgets in the UX branch adds those other two notifications (that aren't present in non-UX branches), it clearly has a need for them, and so relying on the already present locationChange notification does make sense in that context.  So option 3 might be the best.  Although I guess option 3 would boil down to what the patch here is doing.  Only difference would be to stick a "is browser alive?" bool into the notification that observers would then check, instead of observers doing the is-alive check themselves.
+
+A fourth option would be to broadcast a new notification like locationChange, but only when the browser is still alive, so it's always safe.
+browser-fullZoom:locationChange just seems like a footgun - it's a less reliable indicator of state that can be tracked in other supported ways. I think CustomizableWidgets should deal without it, and we should remove it (or make it much more obviously test-only).
+Well, it's designed to be used by tests, specifically all the tests I had to update for async FullZoom, where it's not a footgun at all.
+
+I designed it specifically to be broadcasted in all cases after location change, whether the associated browser was still alive or not, in order to prevent test hangs, but maybe it turns out that none of the tests are ruined by broadcasting it only when the browser is still alive.  I'll take a look.
+"or make it much more obviously test-only" (e.g. by renaming it) is fine too.
+I added this listener in bug 881131, because the new zoom control needs to adjust the current zoom level indicator when a tab is switched. This listener *seemed* appropriate and in the same domain, cuz viewZoomOverlay.
+See bug 902924 for a patch that I wrote to remove the onLocationChange observer. I couldn't figure out if I should have uploaded that patch here or not, hence the new bug.
+The locationchange observer was removed by the patch in in bug 902924. Should this bug still stay open?
+Great fix, thanks Jared.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #20)
+> "or make it much more obviously test-only" (e.g. by renaming it) is fine too.
+
+I filed bug 904256 to rename the notification.
+https://hg.mozilla.org/mozilla-central/rev/cd2ff8dd3bb8
+https://hg.mozilla.org/mozilla-central/rev/e6ff8814ce58

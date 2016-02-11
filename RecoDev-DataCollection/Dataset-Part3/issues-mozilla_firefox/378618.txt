@@ -1,0 +1,168 @@
+FUEL 0.1 was just checked in:
+https://bugzilla.mozilla.org/show_bug.cgi?id=372069
+
+But this caused an increase in reference leaks:
+http://tinderbox.mozilla.org/Firefox/
+
+The source for this issue needs to be located and resolved.
+
+FUEL 0.1 was just checked in:
+https://bugzilla.mozilla.org/show_bug.cgi?id=372069
+
+But this caused an increase in reference leaks:
+http://tinderbox.mozilla.org/Firefox/
+
+The source for this issue needs to be located and resolved.
+It caused leaks in both the RLk and Lk tests; both tests are measuring leaked objects, not leaked references; the underlying problem may be a reference counting bug, a cycle, or some other type of leak.
+I'm pasting the log of leaked objects here so that a) we don't lose track of it and b) we can verify that when this is fixed these specific leaks are fixed.
+
+--NEW-LEAKS-----------------------------------leaks------leaks%
+nsPrefService                                    40          -
+nsXPCWrappedJSClass                              44          -
+xptiInterfaceInfo                                20          -
+nsGenericFactory                                 20          -
+nsConsoleService                                 80          -
+nsXPCWrappedJS                                   52          -
+nsLocalFile                                     248     100.00%
+nsJSID                                           72     100.00%
+nsHashtable                                     132      50.00%
+XPCWrappedNative                               1568      27.27%
+XPCWrappedNativeProto                           644       9.52%
+nsStringBuffer                                  104       8.33%
+Created attachment 262803
+changes to cleanup some leaks
+
+First pass at cleaning up some leaks in the XPCOM code. Just some basic stuff, but it does reduce the number of leaks (using XPCOM_MEM_LEAK_LOG to check). Also passes the unit tests.
+Comment on attachment 262803
+changes to cleanup some leaks
+
+This patch definitely helps - it'd be good to land this so that we can see the actual results in Tinderbox (and see if there's any significant leaks remaining).
+Comment on attachment 262803
+changes to cleanup some leaks
+
+r=dbaron, although I'm probably not the best reviewer for this stuff
+landed patch
+
+/cvsroot/mozilla/browser/fuel/src/fuelApplication.js,v  <--  fuelApplication.js
+new revision: 1.3; previous revision: 1.2
+
+Still some remaining XPCWrappedNative, XPCWrappedNativeProto, and nsJSID.  (The first are the things to look at.)
+Just some stats for this step:
+Before FUEL     After FUEL + patch
+===========     ==================
+RLk:4.71KB      RLk:4.88KB
+Lk:1.99MB       Lk:1.99MB
+MH:31.1MB       MH:23.1MB
+A:631K          A:615K
+
+
+I'll look into the XPCWrappedNative and XPCWrappedNativeProto stuff next. It probably happens somewhere in the component registration code.
+Did this get pulled back out?
+I have been unable to access FUEL in Gran Paradiso Alpha 4, where FUEL is advertised as being included?
+
+I'm using the Windows: Gran Paradiso Setup Alpha 4.exe
+(In reply to comment #9)
+> Did this get pulled back out?
+> I have been unable to access FUEL in Gran Paradiso Alpha 4, where FUEL is
+> advertised as being included?
+> 
+> I'm using the Windows: Gran Paradiso Setup Alpha 4.exe
+> 
+
+See bug 379139
+Created attachment 263168
+more leak cleanup
+
+This patch adds code to deleteCategoryEntry when the component is unregistering itself. It reduces the leak report and passes the unit tests.
+landed patch
+
+/cvsroot/mozilla/browser/fuel/src/fuelApplication.js,v  <--  fuelApplication.js
+new revision: 1.5; previous revision: 1.4
+
+Created attachment 265014
+More leak cleanup in factory
+
+This patch removes a singleton member in the factory. The registration with "service," should be enough to ensure singleton usage. The patch removes a leak on a XPCWrappedNative object.
+/cvsroot/mozilla/browser/fuel/src/fuelApplication.js,v  <--  fuelApplication.js
+new revision: 1.6; previous revision: 1.5
+
+moving any remaining work to a6, this seems almost completely done now.
+Created attachment 267613
+Free the singleton in the factory
+
+patch in attachment 265014 didn't work because "JavaScript global property" always uses createInstance - even on a service. This patch keeps the singleton check in the factory, but still frees the singleton.
+
+I put it in the factory because unregisterSelf doesn't seem to get called. Also, it encapsulate it better.
+unregisterSelf would only be called at uninstallation time for the component, which is an unlikely event for the FUEL component in this case.
+
+canUnload should get called at shutdown, though, if you wanted to free the singleton there.
+Comment on attachment 267613
+Free the singleton in the factory
+
+I applied this patch and it causes some problems because 'Ci' isn't defined.
+
+But so far it works great with XULRunner ;)
+Created attachment 267778
+Same as previous singleton patch with syntax fixes
+
+This patch is the same as attachment 267613, but fixes the undefined "Ci" and adds QueryInterface to the factory
+Comment on attachment 267778
+Same as previous singleton patch with syntax fixes
+
+heh, that QueryInterface function introduces another 'Ci'.
+Created attachment 267781
+fixed new syntax error from last patch
+
+fixed the new bad "Ci". Makes me think the QI isn't even being called. But it seems right to have it.
+
+Also, using an observer in the factory reduces more leaks (and larger leaks) than freeing the singleton in "canUnload"
+Comment on attachment 267781
+fixed new syntax error from last patch
+
+Talked to Mark on IRC about this. I'm a little bit nervous about having the factory implement nsIObserver (which means it's held on to by the observer service), mostly because that is, as far as I know, uncharted territory, and has the potential to cause weird lifetime issues. I suggested perhaps modifying the "JavaScript global property" code to accept "service," prefixed contract IDs the same way nsIAppStartupNotifier does, but that's a bit more involved, so this is fine for now, if it fixes the leaks. Still worth filing a followup to investigate the prefixed contract ID approach, I think.
+Created attachment 268041
+another approach to the singleton leak
+
+this patch also cleans up the singleton leak, but does so without using nsIObserverService in the factory. It also cleans up 2 more leaked objects than the previous patch - thanks gavin
+Comment on attachment 268041
+another approach to the singleton leak
+
+Thanks, I like this a lot better :)
+checked into trunk
+
+/cvsroot/mozilla/browser/fuel/src/fuelApplication.js,v  <--  fuelApplication.js
+new revision: 1.8; previous revision: 1.7
+
+So, this is what got fixed with the latest patch:
+
+--FIXED-LEAKS---------------------------------leaks------leaks%
+XPCWrappedNative                               1512      -3.57%
+nsJSID                                           36     -50.00%
+TOTAL                                          1548
+
+If we compare to the initial leaks, we've fixed almost all of the XPCWrappedNative leaks (+1568 -> -1512), but only half of the nsJSID leaks (+72 -> -36).
+
+(In reply to comment #22)
+> I suggested perhaps modifying the "JavaScript global property" code to accept
+> "service," prefixed contract IDs the same way nsIAppStartupNotifier does, but
+> that's a bit more involved, so this is fine for now, if it fixes the leaks.
+> Still worth filing a followup to investigate the prefixed contract ID
+> approach, I think.
+
+Was this filed? I think this would indeed be a better solution than the factory magic.
+pushing to b1 for the last bits to get fixed
+Over in bug 385237, I figured out that the cause of a content pref service leak is the nsIFactory that creates the service.  Some testing leads me to conclude that the factories in every JS component are likely to be leaking, which may be the cause of (some of) the leaks reported in the bugs to which I am adding this comment (bug 337050, bug 378618, bug 381239, and bug 380873/bug 380931).
+
+Take a look at bug 385237, comment 2 for more details, and note that the fix for bug 180380 makes all the XPCWrappedNative and XPCWrappedNativeProto leaks (which were what the content pref service was leaking) go away and may similarly fix (some of) the leaks reported in this bug.
+
+> > I suggested perhaps modifying the "JavaScript global property" code to accept
+> > "service," prefixed contract IDs
+> 
+> Was this filed? I think this would indeed be a better solution than the factory
+> magic.
+> 
+
+Filed bug 386535.
+
+Mark, what's left to do here?
+bug 180380 took care of the remaining XPCWrapped* leaks

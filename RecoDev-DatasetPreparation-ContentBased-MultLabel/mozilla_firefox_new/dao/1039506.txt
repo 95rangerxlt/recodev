@@ -1,0 +1,129 @@
+The file tabbrowser.xml defines a method `_getTabForContentWindow` that is used by the component to find the browser matching a content window (see 
+
+http://dxr.mozilla.org/mozilla-central/source/browser/base/content/tabbrowser.xml#360
+
+).
+
+The implementation of this method doesn't scale up, as it involves scanning the entire set of tabs at every single call. I believe that we could easily rewrite it to be much more efficient. This is a pretty simple bug that can be fixed with 5 to 10 lines of code plus documentation, as follows:
+
+1. create a field `_tabForContentWindow` containing a `WeakMap`, which will serve to record the tab for each contentWindow;
+2. at the end of method `addTab`, call `this._tabForContentWindow.set(b.contentWindow, t)` to record that `t` is the tab for the content document;
+3. in method `_getTabForContentWindow`, return `this._tabForContentWindow.get(aWindow)` to get the content window.
+
+The garbage-collector will automatically take care of the rest.
+
+The file tabbrowser.xml defines a method `_getTabForContentWindow` that is used by the component to find the browser matching a content window (see 
+
+http://dxr.mozilla.org/mozilla-central/source/browser/base/content/tabbrowser.xml#360
+
+).
+
+The implementation of this method doesn't scale up, as it involves scanning the entire set of tabs at every single call. I believe that we could easily rewrite it to be much more efficient. This is a pretty simple bug that can be fixed with 5 to 10 lines of code plus documentation, as follows:
+
+1. create a field `_tabForContentWindow` containing a `WeakMap`, which will serve to record the tab for each contentWindow;
+2. at the end of method `addTab`, call `this._tabForContentWindow.set(b.contentWindow, t)` to record that `t` is the tab for the content document;
+3. in method `_getTabForContentWindow`, return `this._tabForContentWindow.get(aWindow)` to get the content window.
+
+The garbage-collector will automatically take care of the rest.
+Created attachment 8457461
+make _getTabForContentWindow use _getTabForBrowser
+
+I think we should just use _getTabForBrowser here. Of course for this to be a performance improvement bug 1039500 needs to be fixed.
+Comment on attachment 8457461
+make _getTabForContentWindow use _getTabForBrowser
+
+Review of attachment 8457461:
+-----------------------------------------------------------------
+
+A few nits, but if you're sure that this works, this looks better than what I had in mind.
+
+::: browser/base/content/tabbrowser.xml
+@@ +363,5 @@
+>          <![CDATA[
+> +          let browser = aWindow.QueryInterface(Ci.nsIInterfaceRequestor)
+> +                               .getInterface(Ci.nsIWebNavigation)
+> +                               .QueryInterface(Ci.nsIDocShell)
+> +                               .chromeEventHandler;
+
+Nit: I'd split this line in two.
+`let docShell = ...`
+`let browser = docShell.chromeEventHandler`
+or something such.
+
+Also, the documentation of nsIDocShell doesn't mention that `chromeEventHandler` is the browser. Can you document this assumption?
+That assumption seems obvious based on chromeEventHandler being assigned to browser. Not sure what I'd document here other than "chromeEventHandler is the browser", which seems entirely redundant.
+Well, a quick search through DXR wasn't sufficient to inform me that `chromeEventHandler` is assigned to `browser`. I'm sure a longer search would eventually yield the information, but I think it's still worth mentioning somewhere in the documentation, either in tabbrowser.xml, or in nsIDocShell, or wherever it fits best.
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo") from comment #4)
+> Well, a quick search through DXR wasn't sufficient to inform me that
+> `chromeEventHandler` is assigned to `browser`.
+
+I meant the very code I'm adding here, so we'd end up with this:
+
+// nsIDocShell.chromeEventHandler is the browser element
+let browser = ...chromeEventHandler;
+
+... where that comment seems meaningless / redundant.
+
+As for adding to the documentation in nsIDocShell.idl, I think that would belong in a separate bug.
+Ah, right, we were discussing past each other. Of course, the assumption is evident by looking at the code, but what's not evident is why it's true, or the fact that it is always true. That's what I wanted documented.
+By the way, I don't think "is very slow" is a fair characterization. This should only be a problem in pathological cases, i.e. with lots of tabs.
+Comment on attachment 8457461
+make _getTabForContentWindow use _getTabForBrowser
+
+Review of attachment 8457461:
+-----------------------------------------------------------------
+
+LGTM but how does this affect e10s? Does the previous code work with e10s? I suspect that the QI to nsIDocShell would probably fail?
+(In reply to Tim Taubert [:ttaubert] from comment #8)
+> Comment on attachment 8457461
+> make _getTabForContentWindow use _getTabForBrowser
+> 
+> Review of attachment 8457461:
+> -----------------------------------------------------------------
+> 
+> LGTM but how does this affect e10s? Does the previous code work with e10s? I
+> suspect that the QI to nsIDocShell would probably fail?
+
+It seems to return a wrapper that isn't useful here (chromeEventHandler is null). Is it possible and are there plans to make this work? I didn't find any e10s-related ifdefs or comments in other code using this method to get from a content window to the browser element.
+This is kinda unfortunate. If you have a CPOW for a content window, calling the old code would have actually returned the right tab. The new code will not work because .chromeEventHandler in the content process is the content script global, which will not be in the weakmap. So you'll just get null.
+
+It would be better for e10s to have a separate weakmap from content windows to tabs (or maybe to <browser> elements).
+
+Eventually, we'll want to kill this function entirely, but I suspect we might be relying on it to work now with CPOWs.
+Actually, I guess a weakmap from content windows to tabs wouldn't work because of navigation.
+
+Is it important that this function be fast? I would hope that we've eliminated most of the uses of it for e10s.
+(In reply to Bill McCloskey (:billm) from comment #11)
+> Is it important that this function be fast?
+
+I don't think so.
+
+> I would hope that we've eliminated most of the uses of it for e10s.
+
+I think that's the case.
+(In reply to Bill McCloskey (:billm) from comment #11)
+> Is it important that this function be fast?
+
+My patch in bug 1015721 uses it (via getBrowserForDocument) for each wheel event, but only when e10s is not used.
+Created attachment 8462964
+patch v2, take fast path when not using remote browsers
+https://hg.mozilla.org/integration/fx-team/rev/a51c22a0fbf0
+test failures:
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/general/browser_aboutHome.js | Test timed out
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/modules/test/browser_ContentSearch.js | Test timed out
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/a11y/accessible/tests/mochitest/states/test_link.html | Test timed out
+(In reply to Dão Gottwald [:dao] from comment #16)
+> test failures: [...]
+
+Ignore that, I commented in the wrong bug.
+https://hg.mozilla.org/mozilla-central/rev/a51c22a0fbf0
+
+
+tabbrowser's _getTabForContentWindow is very slow with lots of tabs
+
+perf
+
+Bug 1039506 - speed up _getTabForContentWindow. r=ttaubert 

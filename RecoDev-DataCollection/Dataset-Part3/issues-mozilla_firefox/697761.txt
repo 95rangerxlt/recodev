@@ -1,0 +1,110 @@
+When running the tests in browser/devtools/debugger/test/browser, the test harness does not report any leaks, but there are a few --DOMWINDOW messages in the output after the tests finish. We should find and fix the leaky code.
+
+When running the tests in browser/devtools/debugger/test/browser, the test harness does not report any leaks, but there are a few --DOMWINDOW messages in the output after the tests finish. We should find and fix the leaky code.
+Created attachment 573145
+v1
+
+I did find a few potential leak problems with the debugger pane (add/remove event listeners should mirror the bubble flag), and the shutdown() function not being called when the debugger UI is unloaded. The shutdown also had an extra gClient.close() call which issued a 'TypeError: self._transport is null' exception.
+
+The attached patch fixes those, however, this does not remove all the --DOMWINDOW messages. I suspect they aren't caused by the debugger itself.
+
+--DOMWINDOW == 5 (0x124b9f478) [serial = 12] [outer = 0x0] [url = chrome://mochikit/content/browser-harness.xul]
+--DOMWINDOW == 4 (0x11dc27878) [serial = 3] [outer = 0x0] [url = chrome://browser/content/hiddenWindow.xul]
+--DOMWINDOW == 3 (0x11d122878) [serial = 1] [outer = 0x0] [url = chrome://browser/content/browser.xul]
+--DOMWINDOW == 2 (0x11d123878) [serial = 2] [outer = 0x0] [url = about:blank]
+--DOMWINDOW == 1 (0x124ba0478) [serial = 13] [outer = 0x0] [url = about:blank]
+--DOMWINDOW == 0 (0x11dc28478) [serial = 4] [outer = 0x0] [url = chrome://browser/content/hiddenWindow.xul]
+
+These exact messages exist when running other tests (same 0..5 --DOMWINDOW lines, same serials, same urls), so the problem may reside elsewhere.
+Comment on attachment 573145
+v1
+
+Review of attachment 573145:
+-----------------------------------------------------------------
+
+The leaks may indeed not be our fault, but these are good catches regardless! My plan is to run some unrelated tests in m-c without the debugger mega-patch, and then with the mega-patch applied, and see if there is a difference.
+
+::: browser/devtools/debugger/debugger.js
+@@ +414,4 @@
+>  SourceScripts.onChange = SourceScripts.onChange.bind(SourceScripts);
+>  
+>  window.addEventListener("DOMContentLoaded", initDebugger, false);
+> +window.addEventListener("unload", shutdownDebugger, false);
+
+I haven't looked at the modularization patch in detail yet, but can't we coordinate the debugger shutdown without relying on the order unload event handlers get called? Since we want the client to close after the UI has been cleared, I believe invoking shutdown from DP_close would be cleaner. Or even inlining shutdown to DP_close, depending on how you refactored things in the modularization patch.
+(In reply to Panos Astithas [:past] from comment #2)
+> I haven't looked at the modularization patch in detail yet, but can't we
+> coordinate the debugger shutdown without relying on the order unload event
+> handlers get called? Since we want the client to close after the UI has been
+> cleared, I believe invoking shutdown from DP_close would be cleaner. Or even
+> inlining shutdown to DP_close, depending on how you refactored things in the
+> modularization patch.
+
+The modularization isn't the cause for moving the shutdown() from the DebuggerPane DP_close call to an event in the debugger.js. 
+If I were to do a I do a simple this.frame.contentWindow.shutdown() I would get leaks in the mochitests, whereas with the event I don't. This is not caused by what the shutdown function itself does, because I tried with a simple empty function and the leaks persist. Furthermore, it doesn't matter where I call shutdown(), either before or after removing frame events in DP_close, or after testing if (this.iframe), it leaks nonetheless.
+Created attachment 573570
+v2
+
+I got those leaks too, after running the patch. There is also a failed test, in browser_dbg_panesize.js. After some instrumentation it became apparent that when calling shutdown directly from close, the iframe has already been destroyed in some cases and the function does not run at all, hence the leaks.
+
+I also noticed that shutdown is registered to be called in the bubbling phase of the event, unlike close, which is called in the capture phase. This clears up my ordering concern and I'm happy with it as it is now. I just made sure we remove the event handlers in debugger.js as we do in DebuggerUI.jsm for extra safety.
+
+The leaks haven't changed with this patch as you noticed, I still get docshells 0-5 and domwindows 0-11 after the test harness finishes.
+Comment on attachment 573570
+v2
+
+Review of attachment 573570:
+-----------------------------------------------------------------
+
+Looks good, but we need to see why the failing browser_dbg_panesize.js test. I mostly believe it's not related to this patch per-se, but some leftovers from dependencies. Will get back to this once the queue is at a healthier size (at least Bug 692405 is resolved).
+(In reply to Victor Porof from comment #5)
+> Comment on attachment 573570 [diff] [details] [review]
+> v2
+> 
+> Review of attachment 573570 [diff] [details] [review]:
+> -----------------------------------------------------------------
+> 
+> Looks good, but we need to see why the failing browser_dbg_panesize.js test.
+> I mostly believe it's not related to this patch per-se, but some leftovers
+> from dependencies. Will get back to this once the queue is at a healthier
+> size (at least Bug 692405 is resolved).
+
+The test was failing when shutdown was called from close directly, not from the unload event as in the attached patch. Perhaps I wasn't clear. This patch causes no problems, but also no evident wins either, so we should indeed get back to it after the rest of the queue is taken care of.
+(In reply to Panos Astithas [:past] from comment #6)
+> This patch causes no problems, but also no evident wins either.
+
+Oh, ok then! We could apply this patch after Bug 692405 to fix these problems (even if no wins are obvious, it's still a matter of correcting the event listeners and the shutdown not being called). We can open a separate bug for this patch and get back to the presumable leaks later.
+It's definitely a useful patch, but I don't see a need to rush it in. Since we are going to be looking into this issue in the next few days (if we are to be done by next week), we'll either fix all leaks in a more extensive patch, or conclude it's not our fault and just land this one.
+Ok, makes sense.
+Making the comparison between patched and unpatched m-c required a merge from fx-team that I'll push upstream soon.
+
+Running the tests in browser/devtools/scratchpad/test/ and dom/tests/browser/ shows the same leaks in both fx-team and remote-debug. Furthermore, in bug 671101 comment 6 smaug mentions that he gets 5 (I think he doesn't count docshell 0) docshells leaking in an unpatched m-c.
+
+It definitely looks like it's not our fault.
+(In reply to Panos Astithas [:past] from comment #10)
+> Making the comparison between patched and unpatched m-c required a merge
+> from fx-team that I'll push upstream soon.
+
+https://hg.mozilla.org/users/dcamp_campd.org/remote-debug/rev/cf45a7055bd7
+(In reply to Panos Astithas [:past] from comment #10)
+> It definitely looks like it's not our fault.
+
+Further evidence in support of the above:
+
+--DOMWINDOW == 11 (0x113f97c78) [serial = 14] [outer = 0x1136ef000] [url = about:blank]
+--DOMWINDOW == 10 (0x113aca478) [serial = 10] [outer = 0x10d140c00] [url = about:blank]
+--DOMWINDOW == 9 (0x10d140c78) [serial = 6] [outer = 0x0] [url = about:blank]
+--DOMWINDOW == 8 (0x113aca078) [serial = 9] [outer = 0x10d13c400] [url = about:blank]
+--DOMWINDOW == 7 (0x10d13c478) [serial = 5] [outer = 0x0] [url = about:blank]
+--DOMWINDOW == 6 (0x1136ef078) [serial = 7] [outer = 0x0] [url = about:blank]
+--DOMWINDOW == 5 (0x113f04078) [serial = 12] [outer = 0x0] [url = chrome://mochikit/content/browser-harness.xul]
+--DOMWINDOW == 4 (0x10bedd878) [serial = 3] [outer = 0x0] [url = chrome://browser/content/hiddenWindow.xul]
+--DOMWINDOW == 3 (0x108d93c78) [serial = 1] [outer = 0x0] [url = chrome://browser/content/browser.xul]
+--DOMWINDOW == 2 (0x108d94c78) [serial = 2] [outer = 0x0] [url = about:blank]
+--DOMWINDOW == 1 (0x113f05078) [serial = 13] [outer = 0x0] [url = about:blank]
+--DOMWINDOW == 0 (0x10bede478) [serial = 4] [outer = 0x0] [url = chrome://browser/content/hiddenWindow.xul]
+
+The leaked windows are part of the test harness, which leads me to believe that one of bugs 675412, 669240 and 658738 might fix them.
+After reading hundreds of leak-related bugs I think the debugger is not to blame here, so I'm marking this as fixed. If new evidence in support of the contrary emerges, we'll reopen.
+
+https://hg.mozilla.org/users/dcamp_campd.org/remote-debug/rev/e472054763dd

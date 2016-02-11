@@ -1,0 +1,194 @@
+Places does not import microsummaries set on legacy-bookmarks.
+
+Places does not import microsummaries set on legacy-bookmarks.
+on this topic, does Fx 2 properly handle import / export of microsummaries (I think so, but I haven't checked.)
+dietrich tells me that it does.
+
+so this is about fixing the Fx 3 import of Fx2 microsummaries in legacy bookmarks.html
+Created attachment 259746
+wip patch
+This should be done using the microsummaries service, don't set annotations directly.
+
+This bug depends on moving the import & export code to browser/.
+Created attachment 263962
+wip patch mk II
+
+Updated for moved importer/exporter code to browser/, changed to use the microsummary service (requires patch, see bug 379913).
+Comment on attachment 263962
+wip patch mk II
+
+
+>+    // import microsummary
+>+    // Note: expiration and generated title are ignored, and will be
+>+    // recalculated by the microsummary service
+
+in that case, do we even need to bother importing/exporting these?
+
+hm, i wonder if a bookmarks.html w/o those fields is imported correctly into pre-places bookmarks. if so, we shouldn't bother with them at all.
+Comment on attachment 263962
+wip patch mk II
+
+
+>+
+>+    // write out expiration
+>+    nsAutoString micsumExpiration;
+>+    rv = mAnnotationService->GetAnnotationString(placeURI, ANNO_MICSUM_EXPIRATION, micsumExpiration);
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+    rv = aOutput->Write(kMicsumExpirationEquals, sizeof(kMicsumExpirationEquals)-1, &dummy);
+>+    if (NS_FAILED(rv)) return rv;
+>+    char* utf8Expiration = ToNewUTF8String(micsumExpiration); 
+>+    aOutput->Write(utf8Expiration, sizeof(utf8Expiration), &dummy);
+>+    rv = aOutput->Write(kQuoteStr, sizeof(kQuoteStr)-1, &dummy);
+>+    if (NS_FAILED(rv)) return rv;
+>+    nsMemory::Free(utf8Expiration);
+
+this fails, needs to be GetAnnotationInt64, per the microsummary service.
+
+also, can you please add tests for these changes here:
+
+http://lxr.mozilla.org/mozilla/source/browser/components/places/tests/unit/test_bookmarks_html.js#158
+
+a microsummarized bookmark is already in the test data, just needs the anno checks to be done.
+Created attachment 264545
+wip patch mk III
+
+* Updates for latest changes in places/microsummaries interfaces.
+* Adds tests
+* Removes export of expiration and generated title
+
+Expiration and generated title change every 1/2 hour, so they don't make sense to import/export.
+
+There is a crasher bug that is preventing the tests from running correctly.  I'll file a separate bug for that.
+Crasher bug filed as bug 380468.
+Just to clarify why I removed import/export of expiration and generated titles:
+
+Expiration is variable, but defaults to 30 mins and we probably won't see a whole lot of change in that (imo).  That means that any exports/imports farther apart than 30 mins will have most microsummaries already expired anyway.  And even in cases when export/import are close together (e.g., profile migrations), it is harmless--the microsummary service just fetches the summary and that's it.
+
+As for the generated title, the same logic as for expiration follows.  I'm not as sure about this one, though, because it might be useful for anyone looking at bookmarks.html with an editor.
+
+Note that Firefox 2 only requires the generator uri to be set (I tested it with an exported bookmarks.html from minefield+this patch).
+I should also add...
+
+There is currently no interface in nsMicrosummaryService.idl to get or set the expiration.  That would need to be added, or we'd need to munge the annos directly.
+
+There is an interface to get (but not to set) the summarized content, but it is asynchronous only, which would be sort of messy to deal with during export.
+Created attachment 264819
+wip patch mk IV
+
+This version imports the generated title.  It does not export it, however.
+Er, you don't seem to export the generator URI (you do have kMicsumGenURIEqual defined though).
+Comment on attachment 264819
+wip patch mk IV
+
+>@@ -831,21 +847,41 @@ BookmarkContentSink::HandleLinkBegin(con
+
+>+  // recalculated by the microsummary service
+>+  if (!micsumGenURI.IsEmpty()) {
+>+    nsCOMPtr<nsIURI> micsumGenURIObject;
+>+    NS_NewURI(getter_AddRefs(micsumGenURIObject), micsumGenURI);
+>+    nsCOMPtr<nsIURI> hrefObject;
+>+    NS_NewURI(getter_AddRefs(hrefObject), href);
+
+wrap the code in NS_SUCCEEDED() for each uri creation, NS_NewURI will fail for bogus input.
+
+>+    nsCOMPtr<nsIMicrosummary> microsummary;
+>+    mMicrosummaryService->CreateMicrosummary(hrefObject, micsumGenURIObject,
+>+                                             getter_AddRefs(microsummary));
+>+    mMicrosummaryService->SetMicrosummary(frame.mPreviousId, microsummary);
+>+ 	
+>+    // create generated title anno
+>+    rv = mAnnotationService->SetItemAnnotationString(frame.mPreviousId, GENERATED_TITLE_ANNO,
+>+                                                     generatedTitle, 0,
+>+                                                     nsIAnnotationService::EXPIRE_NEVER);
+>+    NS_ASSERTION(NS_SUCCEEDED(rv), "Creating microsummary generated title failed");
+>+  }
+
+>@@ -1595,16 +1632,40 @@ nsPlacesImportExportService::WriteItem(n
+
+>+  // microsummary
+>+  nsCOMPtr<nsIMicrosummary> microsummary;
+>+  rv = mMicrosummaryService->GetMicrosummary(itemId, getter_AddRefs(microsummary));
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+  if (microsummary) {
+>+    nsCOMPtr<nsIMicrosummaryGenerator> generator;
+>+    rv = microsummary->GetGenerator(getter_AddRefs(generator));
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+    nsCOMPtr<nsIURI> genURI;
+>+    rv = generator->GetUri(getter_AddRefs(genURI));
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+    nsCAutoString spec;
+>+    rv = genURI->GetSpec(spec);
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+    // write out generator URI
+>+    rv = aOutput->Write(kMicsumGenURIEquals, sizeof(kMicsumGenURIEquals)-1, &dummy);
+>+    if (NS_FAILED(rv)) return rv;
+>+    rv = WriteEscapedUrl(spec, aOutput);
+>+    if (NS_FAILED(rv)) return rv;
+>+    rv = aOutput->Write(kQuoteStr, sizeof(kQuoteStr)-1, &dummy);
+>+    if (NS_FAILED(rv)) return rv;
+
+prefer NS_ENSURE_SUCCESS
+
+>diff -r 9307bf9f27cf browser/components/places/src/nsPlacesImportExportService.h
+>--- a/browser/components/places/src/nsPlacesImportExportService.h	Mon May 14 16:03:22 2007 -0700
+>+++ b/browser/components/places/src/nsPlacesImportExportService.h	Mon May 14 20:39:45 2007 -0700
+>@@ -23,16 +24,17 @@ class nsPlacesImportExportService : publ
+>     virtual ~nsPlacesImportExportService();
+> 
+>   protected:
+>     nsCOMPtr<nsIFaviconService> mFaviconService;
+>     nsCOMPtr<nsIAnnotationService> mAnnotationService;
+>     nsCOMPtr<nsINavBookmarksService> mBookmarksService;
+>     nsCOMPtr<nsINavHistoryService> mHistoryService;
+>     nsCOMPtr<nsILivemarkService> mLivemarkService;
+>+    nsCOMPtr<nsIMicrosummaryService> mMicrosummaryService;
+
+Ensure its state in EnsureServiceState()
+
+r=mano otherwise.
+Created attachment 264932
+Patch to be checked in
+
+This fixes Mano's comments above, updates the patch for the latest changes on the trunk, and fixes tests so they don't fail.
+The microsummary tests are commented out due to bug 380468.
+Committed:
+
+Checking in browser/components/build/Makefile.in;
+/cvsroot/mozilla/browser/components/build/Makefile.in,v  <--  Makefile.in
+new revision: 1.55; previous revision: 1.54
+done
+Checking in browser/components/places/src/Makefile.in;
+/cvsroot/mozilla/browser/components/places/src/Makefile.in,v  <--  Makefile.in
+new revision: 1.23; previous revision: 1.22
+done
+Checking in browser/components/places/src/nsPlacesImportExportService.cpp;
+/cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.cpp,v  <--  nsPlacesImportExportService.cpp
+new revision: 1.9; previous revision: 1.8
+done
+Checking in browser/components/places/src/nsPlacesImportExportService.h;
+/cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.h,v  <--  nsPlacesImportExportService.h
+new revision: 1.5; previous revision: 1.4
+done
+Checking in browser/components/places/tests/unit/bookmarks.preplaces.html;
+/cvsroot/mozilla/browser/components/places/tests/unit/bookmarks.preplaces.html,v  <--  bookmarks.preplaces.html
+new revision: 1.3; previous revision: 1.2
+done
+Checking in browser/components/places/tests/unit/test_bookmarks_html.js;
+/cvsroot/mozilla/browser/components/places/tests/unit/test_bookmarks_html.js,v  <--  test_bookmarks_html.js
+new revision: 1.4; previous revision: 1.3
+done
+
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

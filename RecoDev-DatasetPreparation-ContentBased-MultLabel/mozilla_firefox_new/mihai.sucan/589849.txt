@@ -1,0 +1,460 @@
+We should find ways to improve the performance of the new Style panel.
+
+One idea I have is to use getCSSStyleRules(node) from inIDOMUtils, for the highlighted node and its parents. This would allow us to build up most of the information we show now in the Style panel.
+
+We'd only miss the unmatched rules that I believe we could list optionally (when the user asks for them), and we could certainly do important code simplifications, like going through them only once, not twice like now (if we count UI code and sorting code, we go through them four times). Also, I think we can cache the data more nicely, more friendly across property views - we currently do findRules and markMatches for each expanded property view.
+
+We should find ways to improve the performance of the new Style panel.
+
+One idea I have is to use getCSSStyleRules(node) from inIDOMUtils, for the highlighted node and its parents. This would allow us to build up most of the information we show now in the Style panel.
+
+We'd only miss the unmatched rules that I believe we could list optionally (when the user asks for them), and we could certainly do important code simplifications, like going through them only once, not twice like now (if we count UI code and sorting code, we go through them four times). Also, I think we can cache the data more nicely, more friendly across property views - we currently do findRules and markMatches for each expanded property view.
+Created attachment 471282
+patch snapshot
+
+Working patch snapshot as of today.
+
+Currently only matched rules show, and the filter UI works fine. Performance seems really good - no stalls on my system. Will provide more details when the patch is ready.
+
+More work needed to show unmatched rules. I believe performance will be fine for them as well - I have in mind how we can go through them quite fast.
+Note that this patch depends on bug 585565 and on bug 582596.
+
+To reduce patch size I think we should split the stylePanel.jsm removal out of this patch, and put that into a separate bug.
+Created attachment 471644
+proposed patch
+
+Proposed patch. It's done. Please let me know if you find bugs and issues.
+
+Patch requires:
+- patch from bug 593107 (remove stylePanel.jsm).
+- patch from bug 585565 (alternate stylesheet filter).
+- patches from bug 582596 (the new style panel).
+- patches from bug 572038 (the new tree panel).
+
+This patch also fixes issues reported in bug 589427 (it now shows the element.style property value for each parent element of the highlighted element), and issues reported in bug 587760 - the Firefox UI no longer blocks, I removed the scheduler, because performance is quite fine. I could not repro freezes/stalls on sites like ubuntu.com.
+
+This patch includes fixes for tests - all tests pass, and jsdoc comments for all of the new code. Tomorrow I'll test in a debug build for memleaks as well.
+
+Tomorrow I suggest we have a Skype meeting to discuss the code, after I write the code overview. Thanks!
+Created attachment 471855
+upload 3 (rebase)
+The current style panel situation:
+=================================
+(based on patches in bug 585565)
+
+We have csslogic.js and csshtmltree.js. The former is somehow "the backend",
+while the latter is the code that displays all CSS information in the style 
+panel nicely for the user.
+
+csslogic.js:
+
+A new instance of the CssLogic class is created when the Inspector is open.
+
+When an element is highlighted, the CssLogic.highlight() method is invoked. If 
+the document stylesheets are not cached, the script walks through all of the 
+document.stylesheets and its children sheets, to find @imported sheets as well.  
+See CssLogic.highlight() and CssLogic._cacheSheet().
+
+For each stylesheet a CssSheet object is constructed, which is indexed in the 
+CssLogic.sheets array.
+
+Problem: CSSMediaRules are ignored.
+
+csshtmltree.js:
+
+Similarly, a new instance of the CssHtmlTree class is created when the Inspector 
+is open.
+
+For each group of style properties, we have an instance of the StyleGroupView 
+class.  Each StyleGroupView holds in the this.properties array the list of 
+PropertyView class instances for each of the properties displayed by that given 
+group.
+
+When the user expands a group view, each property view builds its own title that 
+shows the number of "rules" (from all stylesheets, irrespective of match status) 
+that hold that property. "Rules" because they are not truly CSS rules: it counts 
+selectors split by comma, from all CSS rules.
+
+The CssLogic.getCssInfo() method is used to get the rules, and the ruleCount.  
+Because this process is slow, the Scheduler object is used to asynchronously 
+generate each rule title, every few milliseconds. See 
+PropertyView._populateTemplate() and PropertyView.ruleTitle().
+
+csslogic.js:
+
+The CssLogic.getCssInfo() method creates an instance of the CssInfo class. Each 
+object is cached, such that subsequent requests return the same instance.
+
+The CssInfo object allows one to retrieve the computed style value for the given 
+property, for the highlighted element, and the filtered rules that match the 
+highlighted element and its parents.
+
+The heart of the code is in the CssInfo._findRules() method. This method loops 
+through all of the cached CssSheet objects, and through all of the CSSStyleRule 
+objects of each sheet.
+
+Problem: CSSMediaRules are ignored. It should descend through such rules and 
+find the CSSSStyleRules they have.
+
+Snippet:
+  this._rules = [];
+  for (let s = 0; s < this._cssLogic.sheets.length; s++) {
+    let sheet = this._cssLogic.sheets[s];
+    let domRules = sheet.domSheet.cssRules;
+    for (let r = 0; r < domRules.length; r++) {
+      for (let t = 0; t < domRule.style.length; t++) {
+        if (domRule.style[t] == this.property) {
+            let selectors = 
+              CssLogic.selectorTextSplit(domRule.selectorText);
+            selectors.forEach(function(aSelector) {
+              let rule = new CssRule(this._cssLogic, domRule, this.property,
+                  sheet, aSelector.trim());
+              this._rules.push(rule);
+  // ...
+
+One obvious optimization in the above code: instead of looping through each 
+domRule.style.length, we can use domRule.style.getPropertyValue(this.property) 
+and check if it has a value or not. Based on that we could skip or not the rule.
+
+Another problem is we loop through all of the sheets, rules and selectors, 
+without caching any information gathered, for reuse in other CssInfo instances.  
+A big StyleGroupView would repeat the above for every CssInfo instance of every 
+property.
+
+For each selector found in each rule, an instance of the CssRule class is 
+created. These object hold information about the DOM CSSStyleRule, the property, 
+the sheet and about the selector. Repeating this for every property is, perhaps, 
+a bit superfluous, because nothing changes - only the property.
+
+To find the element.style properties, there is the CssInfo._findElementRules() 
+method, which for the moment only does it for the highlighted element. To do it 
+properly, it would need to walk through each of the parents of the highlighted 
+element.
+
+To find the browser-default styles, we use the inIDOMUtils.getCSSStyleRules() 
+method. This method gives us the list of all the rules that matched the 
+highlighted element, from all the stylesheets in the document, and in the 
+browser-defaults. We can already see an overlap here with the above. See the 
+CssInfo._findUARules() method. How it works: we walk through each of the rules 
+returned by getCSSStyleRules() and build a list of system sheets. Then we walk 
+each cssRule of each system sheet. Finally, we split the selectors and build 
+CssRule instances for every such selector, which are pushed to the this._rules 
+array.
+
+Problem: we do not check if there are UA rules coming from different sheets that 
+match parents of the highlighted element. We'd need to repeat the above for 
+every parent. Still, for the sheets that apply both to the highlighted element 
+and its parents, we do find the rules that match the parents, because we cache 
+all the rule, irrespective of match status. We check match status later, in 
+_markMatches().
+
+Another important method is the CssInfo._markMatches(). When the user expands a 
+PropertyView, the _markMatches() method is invoked. This method loops through 
+all of the cached this._rules array elements, which are all instances of the 
+CssRule class.
+
+For every CssRule the rule.selector is checked if it matches the viewedElement 
+or any of its parents. rules.length * parents.length. At the end, the _rules 
+array is sorted.
+
+csshtmltree.js:
+
+It uses the Templater to build the DOM from the data it is given. For each 
+CssInfo._rules object, nodes are cloned and updated accordingly.
+
+csslogic.js:
+When a new element is highlighted, from the same document:
+- sheets are not re-cached, which is good.
+- for every cached CssInfo object, the unmarkMatches() method is executed. This 
+walks each this._rules element and sets status = UNKNOWN, and removes 
+element.style rules and system-rules. These change for each highlighted element.
+- once the user expands a PropertyView, the _rules array is reused by the 
+_markMatches() method.
+
+When switching to a new document: all cached information is cleared.
+
+When changing sourceFilter: for all of the cached CssInfo objects: _findRules(), 
+     _findElementRules(), _findUARules() and, if _matched, also call 
+       _markMatches(). I presume this could be simplified to just clearing the 
+       CssLogic._cssInfos object, and let all the information be rebuilt only as 
+       needed.
+
+
+Summary of the above:
+
+- all CSSStyleSheets are cached once per document.
+- all CSSStyleRules from all stylesheets are processed for each PropertyView 
+that has one CssInfo instance. For every selector from each CSSStyleRule, an 
+instance of the CssRule class is created and pushed into the CssInfo._rules 
+array.
+  I view that as a number of important numbers:
+    CssLogic._sheets.length, uaSheets.length
+    sheet.cssRules[i].length, each cssRule.selectors.length,
+    all multiplied by StyleGroupView.properties.length.
+- when a PropertyView is open CssInfo._markMatches() is called. This finds which 
+rules match the highlighted element and its parents:
+  CssInfo._rules.length * (parents+1)
+- to not stall Firefox badly, CssHtmlTree uses a simple Scheduler that delays 
+the PropertyView title calculations, every few milliseconds.
+
+Thoughts on keeping the style panel up-to-date with page changes:
+
+- when a new sheet is added we could process all of its rules like we do now, 
+  and add them to all of the cached CssInfo instances (to their this._rules 
+      array). We would also need to run markMatches on the new set of rules.  
+    This is not really bad.
+
+- when a sheet is removed we could loop through all of the CssLogic._sheets and 
+find which one we need to remove. We would then need to find all CssRule 
+instances, from each CssInfo instance, that come from the given CssSheet, and 
+remove them.
+
+Problem: we do not store in CssRule instances a reference back to the DOM 
+CSSStyleRule that "owns" the rule object. We also do not store a reference back 
+to the CssSheet object that "owns" the rule object. Which means we would have 
+too loop all CssSheets and find which CssSheet has this.domSheet = removedSheet, 
+and splice-it out from the array. For removing the CssRules, I think we can't do 
+  it nicely: we would have to clear all of the cached CssInfo objects.
+
+- when a sheet is enabled, we can use the same behavior as when a new sheet is 
+added.
+- when a sheet is disabled, we need to use the same behavior as when a sheet is 
+removed.
+- aspects are similar for when it comes to @media changes.
+- not sure about DOM mutation with regards to the insertion/removal rules in 
+sheets. I expect insertion could be handled with similar behavior as explained 
+above. Removal is, again, a problem - we might have to clear CssInfos for that 
+as well.
+Situation with the new CssLogic:
+================================
+
+We keep the same csslogic.js and csshtmltree.js separation.
+
+csslogic.js:
+
+CssLogic class instances are created when the Inspector opens up. If the user is 
+inspecting an unknown document, we cache all stylesheets from the document. This 
+includes finding all of the @imported sheets, by walking all of the cssRules of 
+the DOM sheet. (just like the old csslogic.js) See CssLogic.highlight(), 
+CssLogic._cacheSheets(), CssLogic._cacheSheet() and CssLogic.getCachedSheet().
+
+For every DOM CSSStyleSheet object, a new instance of the CssSheet class is 
+created. CssSheet objects hold cached information about each style sheet in the 
+document, or in the browser (default sheets). Browser sheets are only cached 
+on-demand, not on initialization.
+
+The CssSheet objects provide API that allows us to retrieve short source, to 
+check if the CssLogic.sourceFilter allows the sheet to be displayed or not. The 
+CssSheet.getCachedRule() method allows us to conveniently give it a DOM 
+CSSStyleRule and get back a CssRule instance that is cached in CssSheet._rules.  
+We also have a way to execute callback functions for each rule, using the 
+forEachRule() method. The callback function receives a CssRule instance for 
+every CSSStyleRule inside the sheet, including those CSSStyleRules found inside 
+@media rules (CSSMediaRule). This abstracts away media rules nicely.
+
+
+csshtmltree.js:
+
+Things are the same, only with changes to make use of the changed API in 
+CssLogic. More specifically, instead of CssLogic.getCssInfo(), we now call the 
+getPropertyInfo() method. We get the .matchedSelectors and .unmatchedSelectors 
+arrays that hold matched and unmatched selectors, each represented by 
+CssSelectorInfo objects. See PropertyView._populateTemplate().
+
+The PropertyView.ruleTitle() method no longer makes use of the Scheduler object.  
+The Scheduler object is now removed.
+
+csslogic.js:
+
+The CssLogic.getPropertyInfo() works as getCssInfo() worked. For every property 
+we cache CssPropertyInfo instances.
+
+CssPropertyInfo objects hold information for use by a PropertyView in 
+CssHtmlTree: the computed property value, the list of selectors that matched or 
+
+When did not match the highlighted element and its parents.
+
+The heart of the CssPropertyInfo objects is the _findMatchedSelectors() and 
+_findUnmatchedSelectors() methods. These are invoked when the PropertyView tries 
+to access the .matchedSelectors and .unmatchedSelectors arrays. Results are 
+cached, for later reuse.
+
+The CssPropertyInfo._findMatchedSelectors() method calls the 
+CssLogic.processMatchedSelectors() method. That method finds all of the matched 
+selectors and calls the CssPropertyInfo._processMatchedSelector() method. We 
+build an array of CssSelectorInfo class instances for every matched selector 
+that comes from a CSSStyleRule that holds the this.property style property. This 
+list is built irrespectively of the CssLogic.sourceFilter, however we do count 
+the number of matched rules taking into consideration filtering - this is needed 
+for the UI. 
+
+The CssPropertyInfo._matchedSelectors and _unmatchedSelectors arrays are sorted 
+  based on their match status (for the former) and specificity (for both).
+
+Similarly, the CssPropertyInfo._findUnmatchedSelectors() method calls the 
+  CssLogic.processUnmatchedSelectors() method, which finds all of the unmatched 
+  selectors, and for each of them invokes the 
+  CssPropertyInfo._processUnmatchedSelector() method. Again, we build an array 
+  of CssSelectorInfo class instances, and we count the unmatched rules. We skip 
+  selectors coming from browser-default sheets.
+
+The CssLogic.processMatchedSelectors() method takes a callback function and 
+execution scope, and finds all of the selectors that match the highlighted 
+element or its parents. For every element the inIDOMUtils.getCSSStyleRules() 
+method is used. This method gives us the list of all CSSStyleRules that match 
+the given element. For each such rule, we retrieve the parent stylesheet, and we 
+check if it's a system-provided one or not - based on this we can skip it or 
+not, if sourceFilter != "ua".
+
+We use the CssLogic.getCachedSheet(parentStyleSheet) to get the (cached) 
+CssSheet instance for that precise DOM sheet. Similarly, we use the 
+CssSheet.getCachedRule(domRule) to get the CssRule instance of the matched DOM 
+CSSStyleRule. This way we don't bother with "is it cached or not?", we just "get 
+it".
+
+The CssRule.selectors array is then used to check if the selector matches or not 
+the current element in the while-loop. If we find a selector that is matched, we 
+add it to the CssLogic._matchedSelectors array, and we invoke the callback - 
+generally the callback is a function given by the CssPropertyInfo object.
+
+The CssLogic.processMatchedSelectors() method also checks the element.style for 
+every parent (and for the highlighted element), to find the styles it has 
+associated.
+
+We keep track of passes through CssRule objects and CssSelector objects, such 
+that we do not add duplicates, and we do not recheck the same objects.
+
+For the CssLogic.processUnmatchedSelectors() method we loop through all of the 
+sheets, all of their rules, and all of their selectors. We keep this 3-level 
+loop fast by only checking the CssSelector._matchId. We know a rule did not 
+match if the _matchId is different than the current CssLogic._matchId. The 
+callback function is allowed to do further processing of the unmatched 
+selectors.
+
+The results of CssLogic.processMatchedSelectors() and 
+CssLogic.processUnmatchedSelectors() methods are cached, which means these are 
+reused for all CssPropertyInfo objects. When they ask for the matched/unmatched 
+selectors, we just loop their callbacks on the array we already have.
+
+The CssPropertyInfo._findMatchedSelectors() does what CssInfo._findRules(),
+CssInfo._findElementRules(), CssInfo._findUARules() and CssInfo._markMatches() 
+  did, with caching of data is shared across different CssPropertyInfo 
+  instances, in less loop steps. We no longer loop all sheets, all rules, and 
+  all selectors - only those that interest us.
+
+
+The CssRule class allows us to process DOM CSSStyleRule objects. It give us 
+quick access to the (parsed and cached) selectors of the rule. Selectors are 
+instances of the CssSelector class, which gives us information on the selector 
+specificity (IDs, classes and tags).
+
+The CssSelectorInfo objects are used by CssPropertyInfo to wrap CssSelectors for 
+later use by the CssHtmlTree. These objects tie the current CssPropertyInfo to 
+the CssSelector and CssRule, by checking if the style property is important or 
+not, by retrieving the property value in the given CssRule, and by making the 
+final calculations for the specificity score. CssSelectorInfo instances are also 
+comparable to each other, through their complete specificity information. These 
+objects are transient in their nature, representing only the snapshot of the 
+selector match state and values at the moment of matching.
+
+When a new element is highlighted, from the same document:
+- sheets are not re-cached, just like in the old CssLogic.
+- CssLogic._matchedSelectors, CssLogic._unmatchedSelectors, 
+CssLogic._propertyInfos are all cleared. There is no call to something like 
+  CssInfo.unmarkMatches().
+- once the user expand a PropertyView, we reused all cached information about 
+CssSheets, CssRules and CssSelectors, which means we wont reparse selectors, or 
+recalculate specificities.
+
+When the user switches to a new document: all cached information is cleared.
+
+When the sourceFilter changes:
+- clear the sheetAllowed cached result for all of the cached CssSheet objects.
+- if oldValue == "ua" || newValue == "ua": clear all cached information, except 
+the CssSheet objects.
+- otherwise:
+  - set CssPropertyInfo.needRefilter = true for all of the cached instances.  
+  Which means that when a PropertyView will ask again for the matchedSelectors 
+  and unmatchedSelectors arrays, they will be pre-processed.
+
+The CssPropertyInfo._refilterSelectors() method only recounts the number of 
+matched and unmatched rules by walking the cached arrays of matched and 
+unmatched selectors. Nothing else changes.
+
+Summary of the above:
+
+- all CSSStyleSheets are cached once per document, and after this they are 
+cached on-demand.
+- matched and unmatched selectors are found by 
+CssLogic.processMatchedSelectors() and CssLogic.processUnmatchedSelectors().  
+Data is cached, and gathered only on-demand - when a CssPropertyInfo instance 
+requests it.
+  - for matching: we only walk once the matched rules for the highlighted 
+  element and its parents. We also walk each selector of the matched rules once.
+    That means the following numbers:
+    matchedRules.length, matchedRule.selectors.length, parents+1
+  - for finding the unmatched selectors: we walk all selectors, from all rules, 
+from all sheets, to find those that are not marked as matched. We do not check 
+  again if they match or not, we reuse matching information.
+    That means the following numbers:
+    sheets.length, sheets[i].cssRules.length, cssRules[i].selectors.length.
+    It's a lot, but we only walk them, without checking any matching, so it's 
+    actually fast enough.
+- every PropertyView uses one CssPropertyInfo instance.
+  - invokes CssLogic.processMatchedSelectors(), and re-uses cached information.
+    Important number: matchedSelectors.length. It's really quick once the data 
+    is cached.
+  - when the user chooses to view the unmatched selectors, the 
+  CssLogic.processUnmatchedSelectors() method is invoked. Important number: 
+  unmatchedSelectors.length. Again, this is really quick once data is cached.
+
+One important aspect is that the code uses the notion of callback for processing 
+selectors. When data is not cached, we do not walk the data twice, we go through 
+it once as if it's cached.
+
+Thoughts on keeping the style panel up-to-date with page changes:
+
+- when a new sheet is added we can cache it and run the same checks as now, to 
+see if its rules match, and which do, to add them to the 
+CssLogic._matchedSelectors array. Similarly for _unmatchedSelectors, and for all 
+of the CssPropertyInfo instances.
+- when a sheet is removed we can quickly find the cached sheet, and remove it 
+from the cache. This removes all of its cached CssRules, and CssSelectors.  
+Through a single walk of the _matchedSelectors and _unmatchedSelectors arrays we 
+can clean them up of obsolete elements.
+- when a sheet is enabled, the same behavior as with adding a new sheet.
+- when a sheet is disabled, the same behavior as with removing a sheet applies.
+- similar approaches for @media changes.
+- when rules are inserted/removed in sheets: we can quickly get the parent 
+stylesheet cached object and just add the new rule. If the rule is deleted, we 
+can clear it similarly quick. We can also delete in this way the 
+_matchedSelectors and _unmatchedSelectors that come from that rule.
+
+Other thoughts:
+- we can, if wanted, merge CssSelectorInfo into CssSelector.
+- we should not refresh the .sheetFilter template every time the user changes 
+the filter value, or every time the user inspects a node. This is not needed.
+Created attachment 471905
+upload 4
+
+merge fix
+Created attachment 471975
+rebased patch
+
+Rebased the latest patch against the latest tree panel patches, style panel patches.
+
+Patch requirements:
+- the tree panel patches.
+- the style panel patches.
+- bug 585565.
+- bug 593107.
+Removing items from kd4b6.
+Reprioritizing bugs. You can filter the mail on the word TEABAGS.
+Comment on attachment 471975
+rebased patch
+
+discussed over skype. thanks mihai
+
+
+Performance improvements for the style panel
+

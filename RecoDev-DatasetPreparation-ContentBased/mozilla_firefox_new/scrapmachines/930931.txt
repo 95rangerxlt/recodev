@@ -1,0 +1,380 @@
+As for now, it's not possible to get a list of all the databases. We have to go through the filesystem and find and open all the sqlite files.
+
+We need an efficient way to list all the databases for a domain. Being notified when a new db is created is necessary too.
+
+It's not necessary to expose this method to the content.
+
+As for now, it's not possible to get a list of all the databases. We have to go through the filesystem and find and open all the sqlite files.
+
+We need an efficient way to list all the databases for a domain. Being notified when a new db is created is necessary too.
+
+It's not necessary to expose this method to the content.
+Gecko is just going to end up doing that behind the scenes anyways since there's no master list anywhere.
+
+I assume you want notifications when the db is deleted too?  Are asynchronous notifications ok?
+(In reply to Kyle Huey [:khuey] (khuey@mozilla.com) from comment #1)
+> Are asynchronous notifications ok?
+
+Yes. The devtools wrapper around indexeddb (we call that an actor) will have to be asynchronous (we want to be able to debug remote targets, like Firefox OS, from Firefox Desktop. We use a TCP based protocol). So any synchronous calls will be made async anyway.
+We want to start working on bug 926449, and we'll need this. Can anyone help?
+[0] is an awesome addon written by Ben which has almost all the stuff we need here [1].
+
+[0] https://github.com/benturner/idbbrowser
+[1] https://github.com/benturner/idbbrowser/blob/master/src/chrome/browser.js
+Created attachment 8392540
+WIP
+
+First things first : This bug will only introduce the non-live reading and fetching of IndexedDB dbs, object stores and their contents. I will add the observer notifications in a followup as Ben was suggesting that adding notifications might not be a good thing depending on the approach taken, so will have to read through the back end C++ code and understand the logic there.
+
+Now, this WIP makes the listStores() call return correct data for Indexed DB too. The format is following:
+
+where other stores have hosts like:
+
+hosts: {
+ "host1.com": [], // empty
+ "host2.org": []
+}
+
+Indexed DB has it like :
+
+hosts: {
+  "host1.com": [JSON.stringify(["db1", "objectStore1"]), JSON.stringify(["db1", "objectStore2"]), JSON.stringify(["db2", "objectStore3"])],
+  ...
+}
+
+This makes it easier for the frontend to handle response of each actor in the same manner.
+Created attachment 8393153
+Final WIP
+
+Almost done here. Now I can fetch the actual contents of the object store, based on a index or the keyPath (if no index provided)
+
+I think this should be good for first cut.
+
+We will have to think through the UI for more complex usecases like interating over indexes doing activities like "nextunique" and "prev" for getting reverse ordered key-value pairs for the given index but only the unique ones.
+
+What I would like to get feedback would be the changes to the existing code to accommodate the IndexedDB actor.
+Comment on attachment 8393153
+Final WIP
+
+Review of attachment 8393153:
+-----------------------------------------------------------------
+
+Thanks!
+Given the slightly hacky nature of what we're doing here, we're going to need decent tests.
+
+::: toolkit/devtools/server/actors/storage.js
+@@ +297,5 @@
+>       *                     invalid
+>       *          - size - The actual size of the returned array.
+>       *          - data - The requested values.
+>       */
+> +    getStoreObjects: method(async(function*(host, names, options = {}) {
+
+Bleugh. See bug 985953.
+
+@@ +311,5 @@
+>  
+>        if (names) {
+>          for (let name of names) {
+> +          toReturn.data = toReturn.data.concat(
+> +            yield this.getValuesForHost(host, name, options)
+
+See comment below on this being async.
+
+@@ -341,5 @@
+>   * The Cookies actor and front.
+>   */
+>  StorageActors.createActor({
+>    typeName: "cookies",
+> -  observationTopic: "cookie-changed",
+
+Why are we removing this?
+
+@@ +672,5 @@
+>        let storage = this.hostVsStores.get(host);
+>        return [key for (key in storage)];
+>      },
+>  
+> +    getValuesForHost: async(function*(host, name) {
+
+Don't think this needs to be async does it?
+
+@@ +902,5 @@
+> +
+> +  /**
+> +   * This method is overriden and left blank as in the case of indexedDB, this
+> +   * operation cannot be performed synchronously. This the preListStores method
+> +   * exists to do the same task async.
+
+Is there a reason we can't make populateStoresForHosts async?
+
+@@ +1067,5 @@
+> +
+> +  /**
+> +   * Fetches all the databases and their metadata for the given `host`.
+> +   */
+> +  getDBNamesForHost: async(function*(host) {
+
+Have you communicated what we're doing here with people maintaining IndexedDB?
+
+@@ +1080,5 @@
+> +      directory = OS.Path.join(OS.Constants.Path.profileDir, "storage",
+> +                               "persistent", sanitizedHost, "idb");
+> +      exists = yield OS.File.exists(directory);
+> +    }
+> +    if (!exists) {
+
+I think this would be clearer if we moved this if above the previous if. Right?
+(In reply to Joe Walker [:jwalker] from comment #7)
+> Comment on attachment 8393153
+> Final WIP
+> 
+> Review of attachment 8393153:
+> -----------------------------------------------------------------
+> 
+> Thanks!
+> Given the slightly hacky nature of what we're doing here, we're going to
+> need decent tests.
+> 
+> ::: toolkit/devtools/server/actors/storage.js
+> @@ +297,5 @@
+> >       *                     invalid
+> >       *          - size - The actual size of the returned array.
+> >       *          - data - The requested values.
+> >       */
+> > +    getStoreObjects: method(async(function*(host, names, options = {}) {
+> 
+> Bleugh. See bug 985953.
+
+Yeah, I know, its looks ugly, but actually this approach and workflow and usage is much much better than other alternatives (plain Task.jsm or Promises)
+
+> @@ +311,5 @@
+> >  
+> >        if (names) {
+> >          for (let name of names) {
+> > +          toReturn.data = toReturn.data.concat(
+> > +            yield this.getValuesForHost(host, name, options)
+> 
+> See comment below on this being async.
+> 
+> @@ -341,5 @@
+> >   * The Cookies actor and front.
+> >   */
+> >  StorageActors.createActor({
+> >    typeName: "cookies",
+> > -  observationTopic: "cookie-changed",
+> 
+> Why are we removing this?
+
+Because cookies actor is overriding the initialize and destroy methods, so this property will not be used anyway.
+
+> @@ +672,5 @@
+> >        let storage = this.hostVsStores.get(host);
+> >        return [key for (key in storage)];
+> >      },
+> >  
+> > +    getValuesForHost: async(function*(host, name) {
+> 
+> Don't think this needs to be async does it?
+
+This is the side effect of using async() (or in general any async framework)
+
+Since the indexedDB's version is async, the listStores method becomes async and thus, all the implementations of getValuesForHost will have to be yield-able :|
+
+
+> @@ +902,5 @@
+> > +
+> > +  /**
+> > +   * This method is overriden and left blank as in the case of indexedDB, this
+> > +   * operation cannot be performed synchronously. This the preListStores method
+> > +   * exists to do the same task async.
+> 
+> Is there a reason we can't make populateStoresForHosts async?
+
+The initialize method of any actor cannot be async. populateStoresForHosts  is called in initialize of every other actor. Thus no async.
+
+> 
+> @@ +1067,5 @@
+> > +
+> > +  /**
+> > +   * Fetches all the databases and their metadata for the given `host`.
+> > +   */
+> > +  getDBNamesForHost: async(function*(host) {
+> 
+> Have you communicated what we're doing here with people maintaining
+> IndexedDB?
+
+Yeah, I talked with Ben, he pointed me to his addon and said that it is the right approach. Although I have some doubt on data blobs. Will ask him when he is back.
+
+> @@ +1080,5 @@
+> > +      directory = OS.Path.join(OS.Constants.Path.profileDir, "storage",
+> > +                               "persistent", sanitizedHost, "idb");
+> > +      exists = yield OS.File.exists(directory);
+> > +    }
+> > +    if (!exists) {
+> 
+> I think this would be clearer if we moved this if above the previous if.
+> Right?
+
+We don't want to return just yet. Because there can be a dirctory name of moz-safe-about:*
+(In reply to Girish Sharma [:Optimizer] from comment #8)
+> > @@ +672,5 @@
+> > >        let storage = this.hostVsStores.get(host);
+> > >        return [key for (key in storage)];
+> > >      },
+> > >  
+> > > +    getValuesForHost: async(function*(host, name) {
+> > 
+> > Don't think this needs to be async does it?
+> 
+> This is the side effect of using async() (or in general any async framework)
+> 
+> Since the indexedDB's version is async, the listStores method becomes async
+> and thus, all the implementations of getValuesForHost will have to be
+> yield-able :|
+> 
+
+Scratch that. Just tested. It doesn't have to be.
+Created attachment 8401484
+idb
+
+This is it. Phew that took longer than expected (mostly because of tests)
+
+- Added a way to get details about all db in a host and all object stores in a db. (Will update builds on the frontend bug to get a feel of it)
+- Added tests to make sure indexed db related stuff is fetched properly.
+
+try push at : https://tbpl.mozilla.org/?tree=Try&rev=39053a15b613
+bah xpcshell failures. Already fixed in local, 2 line change. no need to block review on that :)
+Created attachment 8401539
+idb
+
+okay, xpcshell tests fixed. Couple of rebasing issues fixed.
+
+new try : https://tbpl.mozilla.org/?tree=Try&rev=324db3ab63f4
+This is really weird. For some reason, Windows Opt builds are failing because SQLite.openConnection fails in one particular case:
+
+for the "https://sectest1.example.org" domain and "idb-s2" db,
+sqlite file path : [path 1]
+
+The failure is coming from SQLite.jsm line 112 as connection is null and status is 2153971713
+
+Note that just before the call to open connection for [path 1], the SQLite.openConnection call for [path 2] is working just fine.
+
+[path 1] c:\users\cltbld~1.t-w\appdata\local\temp\tmpodfqhi\storage\persistent\https+++sectest1.example.org\idb\4060755950i2dsb-.sqlite
+[path 2] c:\users\cltbld~1.t-w\appdata\local\temp\tmpodfqhi\storage\persistent\https+++sectest1.example.org\idb\1406320181i1dsb-.sqlite
+Somehow, the sqlite returns SQLITE_BUSY which in turns returns NS_ERROR_STORAGE_BUSY for the above case.
+
+Sadly, I cannot reproduce it on local windows opt build, how so ever I try.
+
+This is the full log for the failure with additional logging : https://tbpl.mozilla.org/php/getParsedLog.php?id=37334859&tree=Try&full=1#error0
+SQLite by default doesn't block when you try to open a database that is already being used by another connection. Instead it lets you handle the contention yourself. So you'll need to either a) make sure that no two connections are open at the same time by staggering the tests better, or b) doing some kind of retry.
+(In reply to ben turner [:bent] (use the needinfo? flag!) from comment #15)
+> SQLite by default doesn't block when you try to open a database that is
+> already being used by another connection. Instead it lets you handle the
+> contention yourself. So you'll need to either a) make sure that no two
+> connections are open at the same time by staggering the tests better, or b)
+> doing some kind of retry.
+
+Yeah, currently making the deleting of db at the end of each test as iterators so that we block on them, lets see if they fix the issue [0].
+
+My main concern was that it was only happening on Windows Opt and only on try, not on local, even though this is a perma orange, not an intermittent.
+
+[0] https://tbpl.mozilla.org/?tree=Try&rev=1f4c84bd5f9f
+Also, staggering of events did not help either. The latest try push had all the async events in order so that no race condition is possible.
+
+I have pushed another try with retry logic [0] for opening sqlite connection. The question is, how long should I retry ?
+
+[0] https://tbpl.mozilla.org/?tree=Try&rev=632e1c59c3e3
+Created attachment 8402849
+idb final
+
+So, even after staggering all async calls so that the test never shows any race conditions and everything happens in a single order, I was getting SQLITE_BUSY return code, leading to exceptions.
+
+So I had to place the retry logic. This issue is only seen in Windows opt (and most probably pgo too) and only at a very particular scenario, so most likely should not be the case.
+
+I will file a followup investigating more into the issue, but for now, this should be okay to land, I guess .
+final try : https://tbpl.mozilla.org/?tree=Try&rev=b551edc1ccd5
+(the yield sleep code was unreachable in the previous try in case when the openConnection throws)
+pushed another try with the fix : https://tbpl.mozilla.org/?tree=Try&rev=75ceaeb50e27
+After some more discussion with Mak, it seems like the only culprit for the exceptions (and the need for retry) is that IDBDatabase.close method does not return a promise. It just returns as soon as possible, while closing the database connection in another thread.
+
+When my test html pages setup the indexed db , populating dummy data to test, they open each of the database. While I wait for every other event using yield, waiting for close method is not possible, thus the sqlite file is still locked by IndexedDB when I try to open it via Sqlite.openConnection.
+
+Bent, do you think that returning a promise from the IDBDatabase.close method makes sense ?
+Comment on attachment 8402849
+idb final
+
+Review of attachment 8402849:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/storage.js
+@@ +42,5 @@
+>  
+> +// A RegExp for characters that cannot appear in a file/directory name. This is
+> +// used to sanitize the host name for indexed db to lookup whether the file is
+> +// present in <profileDir>/storage/persistent/ location
+> +let illegealFileNameCharacters = [
+
+:illegal"
+
+@@ +959,5 @@
+> +
+> +  /**
+> +   * This method is overriden and left blank as in the case of indexedDB, this
+> +   * operation cannot be performed synchronously. This the preListStores method
+> +   * exists to do the same task async.
+
+Nit: grammatical errors
+
+@@ +1140,5 @@
+> +                                         options.index, options.size);
+> +  }),
+> +
+> +  /**
+> +   * Purpose of this method is same as populateStoresForHosts but this is async.
+
+Could you explain (in comments) why we need these 2 versions
+(In reply to Girish Sharma [:Optimizer] from comment #21)
+> Bent, do you think that returning a promise from the IDBDatabase.close
+> method makes sense ?
+
+The sqlite file is only held open while transactions are in progress. Calling close does not change anything. Sounds like you need to wait for the 'complete' event to be fired on all your transactions.
+Comment on attachment 8402849
+idb final
+
+Review of attachment 8402849:
+-----------------------------------------------------------------
+
+I'm not really a good reviewer for this... I cobbled together some JS for my addon but I have no idea how real JS developers should do it ;)
+(In reply to ben turner [:bent] (use the needinfo? flag!) from comment #24)
+> Comment on attachment 8402849
+> idb final
+> 
+> Review of attachment 8402849:
+> -----------------------------------------------------------------
+> 
+> I'm not really a good reviewer for this... I cobbled together some JS for my
+> addon but I have no idea how real JS developers should do it ;)
+
+Ah, okay :) , I will then take Joe's review as final, address his review comments, and try out the waiting on transaction complete, to see if the sqlite exception is fixed or not.
+The latest patch I pushed to try [0] seems to be completely green. That patch waits for transaction complete event before the sqlite.openConnection call is called without having the retry mechanism. Thus, retry is not required anymore for tests.
+
+That said, in a real case scenario, we cannot prevent the content page to not have the connection open while storage inspector tries to sqlite.openConnection on the same db. Thus, I will keep the retry mechanism in place for the final landing.
+
+
+[0] https://tbpl.mozilla.org/?tree=Try&rev=a1454f846721
+Created attachment 8405419
+landed patch
+
+landed in fx-team : https://hg.mozilla.org/integration/fx-team/rev/6d4bea440fea
+
+Thanks everyone :)
+https://hg.mozilla.org/mozilla-central/rev/6d4bea440fea
+mass component move . filter on #MassComponentMoveStorageInspector
+
+
+Implement a simple way to get the list of IndexedDB per domain
+
+
+
+Bug 930931 - Storage Inspector - Indexed DB non-live actor, r=jwalker 

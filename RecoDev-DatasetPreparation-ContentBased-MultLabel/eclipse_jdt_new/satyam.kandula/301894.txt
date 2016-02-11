@@ -1,0 +1,537 @@
+Build Identifier: 3.4.2 + R342patch_1.0.12
+
+This bug is a follow-on to bug 288211, which appeared to fix some memory issues with APT. However our adopters product still sees issues with running out of memory when compiling large projects with APT enabled.
+
+
+Reproducible: Always
+
+Build Identifier: 3.4.2 + R342patch_1.0.12
+
+This bug is a follow-on to bug 288211, which appeared to fix some memory issues with APT. However our adopters product still sees issues with running out of memory when compiling large projects with APT enabled.
+
+
+Reproducible: Always
+Robert, can you provide any information that might help diagnose or debug?  Such as, for instance, a precise definition of 'large'; or a repro case; or a memory profile of a failing project?
+
+How much memory are they giving Eclipse?  Does the project compile successfully with apt?  What JDK are they using?  Do the problems happen repeatably on a given project, or is it only over time (as a memory leak would behave)?  What are the processors they are using; for that matter, does the project still OOME if there are no processors on the factory path but annotation processing is still enabled?
+I agree with Walter we first need to get a concrete test setup. Otherwise we make a fix and then it's not fixing the issue again.
+We have a concrete setup and can repro consistently. The unfortunate issue is we cannot share the repro as it contains confidential data. I can however gather you any information you require, or can arrange for diagnostics, javacores etc.
+
+Our adopter product uses the IBM Java 6 SR7 JDK with the following settings:
+
+-Xms40m
+-Xmx1024m
+-Xmnx64m
+
+The project does not compile successfully with apt enabled. When we issue a full rebuild it gets to around 72% after 20 or so minutes and then dies with the OOME. It is 100% reproducible with our project. Here are some findings based on some of your questions:
+
+- Turning off APT on the project works around the issue (and is our current workaround)
+- Turning on APT but turning off all the processors works around the issue
+- As soon as I enable one of the processors and do a build, the problem occurs
+- we have two processors (com.ibm.ws.ast.wsfp.annotations.processor and com.ibm.etools.webtools.jpa) enabled by default
+
+Hope this info helps.
+Satyam, please investigate.
+
+(In reply to comment #3)
+> We have a concrete setup and can repro consistently. The unfortunate issue is
+> we cannot share the repro as it contains confidential data.
+Satyam is able to access that internal info.
+
+We might need to investigate getting rid of the compiler bindings in memory and persist only a key on the dom binding. Then we should recreate compiler bindings on demand when the dom bindings are used. This should slow down some operations, but should save a lot of memory.
+However backporting such a fix to 3.4.2+ will require a careful risk assessment once we have a fix.
+Given that the problem goes away when APT is enabled but there are no processors, I am not sure whether the approach in Comment 4 will work.  However, there's no point speculating; if Satyam has access to the project and processors, we should get a memory profile and find out.
+
+Are those processors written against the Java 5 or Java 6 processor API?
+It is running out of memory before the createASTs() return. Hence, changes in comment 4 should help. Trying with the apt.jar and aptext.jar processors also runs out of memory.
+Walter, I am trying to look for some solutions for this and have some questions. Please let me know your answers for the following questions. 
+
+1. We run into this problem only with java 5 annotation processors and don't run into the same problem with java 6 processors. Am I right in this statement? 
+
+2. If my above observation is correct, why not refactor the java 5 processors to be similar to java 6 processor? I could think of one reason - Batch mode Java 5 processors should be able to show all the type declarations. Is that the main reason or am I missing some things? 
+
+3. Why is that the plugin based processors run only in File mode and not in Batch mode? 
+
+4. Assuming my observations are correct, one option that we could have is to refactor the java 5 processors for atleast file based processors so that they call createASTs() for only one file at once. What do you think about this approach? 
+Another approach that I am exploring is to get the bindings as late as possible. I believe Olivier was talking of this approach some time back. I am trying to see if that could work. 
+
+Do you have any other approaches that you think we could take?
+(In reply to comment #7)
+> 1. We run into this problem only with java 5 annotation processors and don't
+> run into the same problem with java 6 processors. Am I right in this statement? 
+
+I don't think that's correct.
+
+In terms of data in the field, I doubt there are enough projects using purely Java 6 processors that we would have any data points.  But even if we did, the problem at present is that the APT code obtains ASTs for all available compilation units regardless of what the mix of processors is, I think.  (I don't have the code available to me right now so I can't confirm, but that's my recollection.)
+
+Basically, once a processor has been called, it has access to any types in the typesystem; and if it asks about a source type, the processor can fairly expect to have access to source location and to external details of the AST even if the type contains unresolved bindings or other problems that permit parsing but prevent code generation.  One reason this is needed, by the way, is that it is possible to generate a referenced type; that is, type A might reference type AGen, which would not exist until A is processed.  Therefore it must be possible to process A even though it contains unresolved bindings.
+
+The designers of the APT API did not do a very good job of distinguishing access to the type being processed from access to other types.  Our life would be much, much easier if types were processed one at a time and the processor only had detailed access to the type being processed; but instead, the processor is called with a list of types and it has full access to all of those types and to all the other types in the typesystem, even those not being processed.
+
+So, this is an unfortunately powerful API, and supporting it requires a lot of memory.  
+
+
+> 2. If my above observation is correct, why not refactor the java 5 processors
+> to be similar to java 6 processor? I could think of one reason - Batch mode
+> Java 5 processors should be able to show all the type declarations. Is that the
+> main reason or am I missing some things?
+
+There are three reasons they're so differently implemented right now.  First, the Java 5 implementation was required to use only the public JDT APIs; for Java 6, however, we needed to support command-line compilation, and the command-line compiler does not have access to Eclipse types such as IProject, which meant we had to, and thus could, use internal methods.  Second, the Java 6 APT API is somewhat better aimed at incremental compilation.  Third, when I did the Java 6 implementation I was able to learn a lot from the mistakes made during the Java 5 implementation :-)
+
+Batch mode is an issue, though.  The reason for batch mode is that there are popular, important processors - the Sun JAX-WS processor being one, if I remember - that save state in static variables and rely on being called for a particular number of rounds.  Those assumptions are false in incremental compilation, which broke those processors badly; we were forced to implement batch mode to work around the problem.  When the Java 6 API was designed we were able to explicitly disallow that kind of behavior in the spec, so batch mode was no longer needed.
+
+
+> 3. Why is that the plugin based processors run only in File mode and not in
+> Batch mode? 
+
+The feeling was that batch mode was only for supporting legacy processors.  If someone can write a plugin based processor, they can fix the bugs that would otherwise require batch mode.
+
+
+> 4. Assuming my observations are correct, one option that we could have is to
+> refactor the java 5 processors for atleast file based processors so that they
+> call createASTs() for only one file at once. What do you think about this
+> approach? 
+
+As I said in #1, unfortunately I think we are required to have at least a lightweight AST for every type that is being processed, and arguably for every type that is being compiled (there is really not much distinction between these sets anyway).
+
+
+
+> Another approach that I am exploring is to get the bindings as late as
+> possible. I believe Olivier was talking of this approach some time back. I am
+> trying to see if that could work. 
+> 
+> Do you have any other approaches that you think we could take?
+
+I think the late binding approach is the best one, because in general processors do not require the sort of "horizontal" access to other types that the spec permits.  So some processors would still be memory-intensive but the majority would not.
+
+The main issue is to be sure that types remain comparable.  Note that some processors cache bindings to elements during the initial processing round and then refer back to them in later rounds or when processing later files; so once a binding has been obtained we need to keep it around for the duration of compilation.  Note also that if type A is parsed at one point, and type B is parsed at a later point in compilation and contains a reference to A (or a nested element of A), the two As need to be comparable.  "Comparable" in this sense means by using the utilities in, e.g., com.sun.mirror.util.Types or the equivalent Java 6 API; it explicitly does NOT mean == comparison.
+
+I think any effective solution is going to fall into the general category of virtualizing the AST, that is, of using some intermediate object and only generating the actual AST when needed.  Within that category of solutions, one can imagine lazy evaluation, an MRU cache, and so forth.
+(In reply to comment #8)
+Thanks Walter for your detailed explanation. It was useful. 
+
+>In terms of data in the field, I doubt there are enough projects using purely
+>Java 6 processors that we would have any data points
+As Java 6 processor API is clean, I thought people would have moved to that, but as I understand from you, that is not the case :(. 
+
+>Basically, once a processor has been called, it has access to any types in the
+>typesystem;
+Do you mean that even java 6 processors will be called with all the source files? Or are you telling that the processors can get hold of all the source files. 
+
+> Within that category of solutions, one can imagine lazy evaluation, an MRU >cache, and so forth.
+I agree with this and am on this approach. I will update as this goes. 
+
+Thanks again.
+(In reply to comment #9)
+> >Basically, once a processor has been called, it has access to any types in the
+> >typesystem;
+> Do you mean that even java 6 processors will be called with all the source
+> files? Or are you telling that the processors can get hold of all the source
+> files. 
+
+"Called with" is somewhat misleading terminology.  It's better to think in terms of when the processor is called and what information it has access to.
+
+In Java 6, when the processor's process() method is called, it is given a list of annotation types (which is basically just the annotation types it said that it supported, so this is rarely useful) and a RoundEnvironment.  The RoundEnvironment gives access to the set of types being presented to the processor, which is basically the set being compiled.  This set will change on each round, as new types are generated by processors.
+
+From the RoundEnvironment, a processor can get a type declaration.  It can then navigate that type's referenced types.  For example, the processor could call RoundEnvironment.getElementsAnnotatedWith(), and then on each Element it could call getEnclosingElement() until it walks out to a PackageElement, and then it could call getEnclosedElements() and navigate the entire contents of the package; and then so forth back down to ExecutableElements (ie methods), and then it could spit out all the annotations on each method, regardless of whether it had actually been asked to process those annotation types and regardless of whether the method returns a type that has not yet been generated.  Finally, it could also report messages which would be expected to appear as compiler warnings attached to the position of the methods it found.
+
+Typically, processor writers seem to expect that a tree navigation like this will return source types when available; they also don't generally seem to understand that package fragments may be widespread throughout the classpath, and that such a processor would be extremely expensive to run.
+
+Note that a processor never gets hold of a source file, as such.  The APT API does not present source, and in fact it never even gets inside a method body at all.  It is just a typesystem view.  But it's a weird typesystem view, because it tries to navigate defective types.
+
+In Java 5, it was possible for a processor to access a SourcePosition, when a type was available in source.  In Java 6 that's not there any more, but it's still possible for a processor to report a message against a specific element, and the message is expected to be presented by the IDE in some useful way.  We actually have a bug about this right now, because there's no way for a CompilationParticipant to report a message about a file that is not in the list of files being compiled but there's nothing stopping processors from trying to do so.
+
+So in a nutshell: yes, any processor can "get hold of" any source file, in the twisted, non-intuitive sense of APT :-)
+
+It's a very strange API.
+I am taking the lazy bindings approach and getting there in 2/3/4 phases. 
+
+Phase 1: While creating the DOM/AST nodes, the mapping between the compiler node and the DOM/Ast Node are not stored, the bindings are not resolved. When needed, the CU will be parsed once again and the corresponding Compiler node will be found and so is the binding.
+Theoretically, all corresponding nodes may be referenced at a latter point of time and the problem could be just postponed. However, many of the mappings will not be required at runtime. Hence it should be OK. 
+OOME should actually be gone after this phase 1. 
+
+Phase 2: Cache some compilation Units so that the performance impact will not be bad. Reading the CU many times will impact the performance and hence caching them could help. 
+
+Phase 3: If memory achieved by phase 1 is not enough, the references to some compiler bindings could be made weak. 
+
+Phase 4: Optimize the other Dom/AST node code to work good with the other phase
+Created attachment 180640
+patch (0.1)
+
+I have done some significant work on phase 1. This patch shows the approach I am taking. They are still some TODO's left. 
+
+As with this patch, APT tests pass and some DOM tests fail. With the customer's workspace, it seem to work without OOME if Javadoc processing is disabled. Looks like there are still some references to compiler bindings and in-turn some compiler nodes still in the memory. I am currently investigating it. 
+
+Walter/Olivier, Please have a look at the patch and let me know your thoughts on it.
+(In reply to comment #12)
+> Walter/Olivier, Please have a look at the patch 
+
+Hi, Satyam.  I've taken an initial look but I need to spend some more time with this before I have anything intelligent to say.
+Have created bug 328358 to take care of phase 1 mentioned in comment 11.
+Since this depends on bug 328358, also moving to M5.
+The adapted product still runs out of OOME with the patch for bug 328358 :( - the plain Eclipse SDK passes. This is running out of memory during the call to createASTs() itself after processing 4400 files. Without the patch, it was failing at 2000 files while the project has around 5000 files. I don't see any other big memory that can be squeezed. They are some small things that I can try out but doesn't seem to be hopeful. 
+
+The adapted product uses only plugin based processors and as APT doesn't support batch processing for plugin based processors, I am exploring ways of making the APT code call createASTs for only a subset of files for plugin based processors. Walter, do you have any comments for this?
+Robert, As I understand the processors you use are only plugin based. Can you confirm this?
+Created attachment 185990
+Patch to demonstrate the changes as part of comment 16
+
+This patch demonstrates what I mean in comment 16. 
+
+With this patch, there is no OOME for the given project with the given product. All tests pass even after setting the files in an iteration to 1. 
+
+In this patch, I haven't handled breaking of _filesWithoutAnnotation. 
+
+Walter, What are your comments?
+(In reply to comment #17)
+> Robert, As I understand the processors you use are only plugin based. Can you
+> confirm this?
+
+Hi Satyam,
+
+Can you expand on this? I am not quite understanding the question and want to clarify with the right folks on my team. Thanks.
+> Hi Satyam,
+> 
+> Can you expand on this? I am not quite understanding the question and want to
+> clarify with the right folks on my team. Thanks.
+APT allows processors to be either plugins or external jars. I wanted to find out if the processors that your product uses are plugins or external jars.
+Our annotations processors are plugins.
+Created attachment 186186
+Another patch ..
+
+This is another patch to demonstrate as mentioned in bug 328358 comment 19, built on the patch given on bug 328358. It is not complete but does give the idea that I am describing here under.
+
+I do see that APT mostly relies more on the bindings rather than DOM/ASTs. Hence, in this patch, only weak references to ASTs are stored - caching only some ASTs. ASTs are recreated if required. To have the same DOM binding, it uses the same binding environment that the original createASTs() uses. Thus it is built on the patch of bug 328358. Though all the changes in bug 328358 will not be required, considerable changes will have to be retained. 
+
+With this change the adapted product finishes the build without OOME.
+Walter, I think the patch in the comment 18 should be the right thing to do. If you think that could impact some processors, we could even think of putting this under some JVM system variable. If you think that patch has issues, please look at the patch in comment 22 and give your comments. The patch is big -- try to look for the changes done in org.eclipse.jdt.apt.core.
+The idea in Comment 22 sounds good to me.  I will try to review the apt.core changes this weekend.  Getting eye surgery today so it depends on how well I can see :-)
+Comments on the proposed patch:
+
+The basic idea of this patch is to replace the BuildEnv's array of parsed compilation units with an MRU cache that can release and then regenerate ASTs as needed.  I agree with this basic idea.  One question is what happens if processors hold onto the results of typesystem queries.  Declarations must remain .equals() comparable across repeated accesses within a given invocation (which may involve multiple processing rounds); Types must remain comparable with the utilities in the "Types" utility class.
+
+I do not see any problems with this basic approach.  I'm not in a position currently to be able to verify that the patch is bug free (I'm recuperating from eye surgery).
+
+Details:
+
+ASTRequestor1 is causing an API comparison error because it is new API.  Do we need to expose this as API?  I think org.eclipse.jdt.apt.core is an x-friend of jdt.core so maybe it can remain restricted.  (Either way, ASTRequestor1 will need javadoc, a copyright header, and probably a better name.)
+
+In AptDispatchRunnable, I am not sure why we need separate methods for buildInMixedMode() and buildInFileMode()?  The two methods are almost exactly identical.  Can you just pass in a boolean parameter?
+
+In shouldDispatchToBatchProcessor() I am not sure why the parameter changed from Phase to AnnotationProcessorEnvironment?
+
+In runAPTInMixedMode() you add a check for annotationDecls == null, but looking at BuildEnv.getAllAnnotationTypes() this does not seem like it can ever happen.  (Also, here and in other files, please don't leave commented-out code - just delete it.)
+
+Please add javadoc, and a copyright header, to ASTRoots.java.  I have to say I find ASTRoots a bit confusing and wonder whether there is an existing collection class that already does this?  As I understand it, it keeps weak references to all the compilation units, and then maintains strong references to the most recently used two.  Maybe it could be rewritten a little, or at least variables renamed, to make that functionality more clear?  Also, please use WeakReference<...> rather than the raw type; the APT code is Java 1.5 compliant.  And please make class ASTCache be private (it does not seem to need to be package-scoped).
+
+In BaseProcessorEnv, re the "this is not good" comment, I agree; this caching should be implemented lower down, if at all.
+
+In BuildEnv, please javadoc the new methods.
+
+In BuildEnv, re the "Need a better way" comment in searchLocally...(), I wouldn't worry too much about performance in batch mode.  In batch mode, processing only happens during a full build, and we already know perf is going to be awful.
+
+In Visitors.java, there is an @param map comment that doesn't seem to apply to any existing parameter.
+(In reply to comment #25)
+Walter, Thanks for your detailed review inspite of your surgery. Though I understand you like this idea, you haven't given your review comments about the patch on comment 18 :). You have talked about the idea, but I couldn't exactly infer your exact thoughts on the patch. Please let me know about the patch, as we feel that is the safest. 
+
+> Comments on the proposed patch:
+> 
+> The basic idea of this patch is to replace the BuildEnv's array of parsed
+> compilation units with an MRU cache that can release and then regenerate ASTs
+> as needed.  I agree with this basic idea.  One question is what happens if
+> processors hold onto the results of typesystem queries.  Declarations must
+> remain .equals() comparable across repeated accesses within a given invocation
+> (which may involve multiple processing rounds); Types must remain comparable
+> with the utilities in the "Types" utility class.
+Yes, I think we should route all the createASTs through the cache and that should be fine. 
+
+> 
+> I do not see any problems with this basic approach.  I'm not in a position
+> currently to be able to verify that the patch is bug free (I'm recuperating
+> from eye surgery).
+> 
+> Details:
+> 
+> ASTRequestor1 is causing an API comparison error because it is new API.  Do we
+> need to expose this as API?  I think org.eclipse.jdt.apt.core is an x-friend of
+> jdt.core so maybe it can remain restricted.  (Either way, ASTRequestor1 will
+> need javadoc, a copyright header, and probably a better name.)
+I couldn't find a much cleaner approach than this even with having the x-friend mechanism. AS this was more from a demonstrating purpose, I haven't written all those things. Once we agree that we should go in this approach, I will add this. 
+
+> 
+> In AptDispatchRunnable, I am not sure why we need separate methods for
+> buildInMixedMode() and buildInFileMode()?  The two methods are almost exactly
+> identical.  Can you just pass in a boolean parameter?
+Yes, that should be good enough. 
+
+> 
+> In shouldDispatchToBatchProcessor() I am not sure why the parameter changed
+> from Phase to AnnotationProcessorEnvironment?
+Because I have moved the shouldDispatchToBatchProcessor before constructing AbstractCompilationEnv. Actually this can be moved inside,  
+
+> 
+> In runAPTInMixedMode() you add a check for annotationDecls == null, but looking
+> at BuildEnv.getAllAnnotationTypes() this does not seem like it can ever happen.
+>  (Also, here and in other files, please don't leave commented-out code - just
+> delete it.)
+Sure, I will do this. As I have mentioned, I haven't cleanedup the patch. 
+
+> 
+> Please add javadoc, and a copyright header, to ASTRoots.java.  I have to say I
+> find ASTRoots a bit confusing and wonder whether there is an existing
+> collection class that already does this?  As I understand it, it keeps weak
+> references to all the compilation units, and then maintains strong references
+> to the most recently used two.  Maybe it could be rewritten a little, or at
+> least variables renamed, to make that functionality more clear?  Also, please
+> use WeakReference<...> rather than the raw type; the APT code is Java 1.5
+> compliant.  And please make class ASTCache be private (it does not seem to need
+> to be package-scoped).
+I want to have the cache size of around 100, but kept it 2 so that testing can be more realistic. 
+
+> 
+> In BaseProcessorEnv, re the "this is not good" comment, I agree; this caching
+> should be implemented lower down, if at all.
+> 
+> In BuildEnv, please javadoc the new methods.
+> 
+> In BuildEnv, re the "Need a better way" comment in searchLocally...(), I
+> wouldn't worry too much about performance in batch mode.  In batch mode,
+> processing only happens during a full build, and we already know perf is going
+> to be awful.
+> 
+> In Visitors.java, there is an @param map comment that doesn't seem to apply to
+> any existing parameter.
+Sure, will fix these.
+Created attachment 186637
+APT plugin based on 3.6.1 patched with changes done in comment 16
+
+Robert, Can you please test this attached patch with the processors you use?
+As long as all units end up being properly processed, I see nothing wrong with the patch.
+We could however test cases where the annotation processor would refer to a type that is not being processed yet and see if this behaves well.
+(In reply to comment #28)
+> As long as all units end up being properly processed, I see nothing wrong with
+> the patch.
+All units are being processed properly.
+
+> We could however test cases where the annotation processor would refer to a
+> type that is not being processed yet and see if this behaves well.
+Some APT test cases test this feature and those tests are passing good.
+Robert says that the small patch as of comment 18/16 works good with their processors. Thanks Robert for getting this tested. 
+
+As I understand as of now, this should not break any processors, but there is a change in the behavior. To avoid any unseen paths, we could put these changes out of a JVM system variable. By out, I do mean that by default these changes will be in effect, but if any user runs into any problems, this could be surpassed by using this system variable. 
+
+If we do see problems from users, then we could bring back the other patch I am trying with. I will put some notes around the other patch and attach to this bug so that it could be revived easily. 
+
+Comments/Suggestions?
+Created attachment 187009
+Patch for 3.6 Maintenance
+
+Patch as described in comment 16 that we will like to release in 3.6.2.
+Created attachment 187011
+Patch for 3.6 Maintenance
+
+This patch is similar to the one attached throught comment 16, but it splits the files only if the JVM property org.eclipse.jdt.apt.core.split_files is set to true.
+Created attachment 187074
+Proposed patch for HEAD
+
+This patch is similar to the 3.6 Maintenance patch except that the default for splitting files is true in this patch.
+(In reply to comment #32)
+> Created attachment 187011 [details]
+> Patch for 3.6 Maintenance
+> 
+> This patch is similar to the one attached throught comment 16, but it splits
+> the files only if the JVM property org.eclipse.jdt.apt.core.split_files is set
+> to true.
+
+Good - for 3.6.2 I think this should be off by default and only turned on if someone is having trouble.  We can turn it on by default in 3.7.
+
+I am still hoping to review this later tonight (on a plane right now, still no access to code) if I have any energy left when I get home.
+(In reply to comment #34)
+
+> Good - for 3.6.2 I think this should be off by default and only turned on if
+> someone is having trouble.  We can turn it on by default in 3.7.
+Yes, this is how I have put in the attached patches. 
+
+> I am still hoping to review this later tonight (on a plane right now, still no
+> access to code) if I have any energy left when I get home.
+Sorry for forcing you at this last minute. Today is the 3.6.2 RC2 build and hence. 
+
+This fix is not intended as a solution to the problem in its full generality
+and complexity. It is intended to unblock a class of applications that use only
+file mode processors (and plugin-based processors) by definition should be able
+to cope with incomplete sets. This may also not address processors which
+need all the types, but should help many other processors.
+I took a look at the latest patch posted for 3.6.2 branch and
+here are some comments:
+
+    - MAX_FILES_IN_A_ITERATION should be MAX_FILES_IN_AN_ITERATION
+                                                     ^^^^
+    - The field SPLIT_FILES not being a static final one, should be
+      named splitFiles instead (_splitFiles ?).
+
+    - The gating condition to decide whether to split or not i.e
+
+    if (SPLIT_FILES && (!_isFullBuild || !hasBatchFactory())) { // should have to run in mixed mode
+
+    Is this capturing the minimal and precise scenario where we want
+the new behavior to kick in ? 
+
+    May be it does, but I have been staring at this single line of code
+for a long while now and can't get rid of the funny feeling that something
+is odd there.
+
+ (May be there isn't anything wrong there)  
+
+(In reply to comment #35)
+
+[...]
+
+> to cope with incomplete sets. This may also not address processors which
+> need all the types, but should help many other processors.
+
+Though you don't state explicitly, I am assuming that in the last case
+you cite, the failure mode would continue to be OOME as opposed to incorrect
+results.
+
+I am trying to reconcile bug 328358 comment 18 with bug 328358 comment 20
+in particular the part from the former about:
+
+"It would be better to disable APT (ie put up an error or warning saying that
+due to the size of the project there is not enough memory to run APT) than to
+present partial, which is to say incorrect, information via the APT API."
+
+with the part from the latter about:
+
+"... file-mode processors (and plugin-based processors) by
+definition should be able to cope with incomplete sets."
+
+IMO, it is a good leap forward even if we unblock only a class of
+applications (obviously that includes the current reporter) that meet
+certain characteristics (plugin based processors, file-mode etc...)
+(as long as there are no silent failures,) even if the approach fails
+short of solving the full blown problem. 
+
+Hopefully the latest patch lives upto that - Let us wait for Walter's
+review comments to understand this better.
+(In reply to comment #36)
+> I took a look at the latest patch posted for 3.6.2 branch and
+> here are some comments:
+> 
+>     - MAX_FILES_IN_A_ITERATION should be MAX_FILES_IN_AN_ITERATION
+>                                                      ^^^^
+>     - The field SPLIT_FILES not being a static final one, should be
+>       named splitFiles instead (_splitFiles ?).
+I actually could make SPLIT_FILES final. 
+
+> 
+>     - The gating condition to decide whether to split or not i.e
+> 
+>     if (SPLIT_FILES && (!_isFullBuild || !hasBatchFactory())) { // should have
+> to run in mixed mode
+> 
+>     Is this capturing the minimal and precise scenario where we want
+> the new behavior to kick in ? 
+I have put this to semantically match the gating condition for runAPTInMixedMode(). However, isFullBuild check could be inconsistent and probably be not there. I will remove this. 
+
+
+> > to cope with incomplete sets. This may also not address processors which
+> > need all the types, but should help many other processors.
+> 
+> Though you don't state explicitly, I am assuming that in the last case
+> you cite, the failure mode would continue to be OOME as opposed to incorrect
+> results.
+
+Yes, I did mean that there will be OOME in that case. 
+
+> I am trying to reconcile bug 328358 comment 18 with bug 328358 comment 20
+> in particular the part from the former about:
+> 
+> "It would be better to disable APT (ie put up an error or warning saying that
+> due to the size of the project there is not enough memory to run APT) than to
+> present partial, which is to say incorrect, information via the APT API."
+> 
+> with the part from the latter about:
+> 
+> "... file-mode processors (and plugin-based processors) by
+> definition should be able to cope with incomplete sets."
+> 
+> IMO, it is a good leap forward even if we unblock only a class of
+> applications (obviously that includes the current reporter) that meet
+> certain characteristics (plugin based processors, file-mode etc...)
+> (as long as there are no silent failures,) even if the approach fails
+> short of solving the full blown problem. 
+> 
+> Hopefully the latest patch lives upto that - Let us wait for Walter's
+> review comments to understand this better.
+
+Will update the new patches with your comments.
+Created attachment 187091
+patch for 3.6 Maintenance
+
+The patch in comment 32 updated with Srikanth's comments.
+Created attachment 187092
+Proposed patch for HEAD
+
+The patch in comment 33 updated with Srikanth's comments.
+(In reply to comment #36)
+> I took a look at the latest patch posted for 3.6.2 branch and
+> here are some comments:
+> 
+>     - MAX_FILES_IN_A_ITERATION should be MAX_FILES_IN_AN_ITERATION
+To be picky I would even say:
+MAX_FILES_PER_ITERATION
+But I can live with this one as well.
+Satyam, please update the contributions list of the type org.eclipse.jdt.apt.core.internal.APTDispatchRunnable to show that IBM Corporation made a contribution.
+Thanks.
+
+This should apply to both patches (HEAD and 3.6 maintenance).
+I think this is fine.  The code path when the setting is disabled (as it is by default for 3.6.2) is the same as before, so for 3.6.2 no users should be negatively surprised.
+
+Satyam, I'm thinking that as a test we should set the number to something small (like 2 or 3) and then make sure all the APT tests pass.  I think you might already have done that?  If not, please do so.
+
+That in turn made me wonder whether the system setting should be a number, rather than a boolean.  But I think it's fine either way.
+
+Thank you for all your work on this problem!
+(In reply to comment #42)
+
+> Satyam, I'm thinking that as a test we should set the number to something small
+> (like 2 or 3) and then make sure all the APT tests pass.  I think you might
+> already have done that?  If not, please do so.
+Yes, I have run the tests setting 1 and 2. 
+ 
+> That in turn made me wonder whether the system setting should be a number,
+> rather than a boolean.  But I think it's fine either way.
+I didn't want to expose too much for the user, but it would have helped testing.
+Walter, 
+Some how I seemed to have messed up with your review flags. I don't know what I did. Can you please set it again?
+I'm not sure what's going on with the flags either.  But anyway, "+1".
+(In reply to comment #42)
+
+> Thank you for all your work on this problem!
+
+Let me join the chorus: appreciate the good work on this
+tough problem. +1 for 3.6.2 and for HEAD.
++1
+Created attachment 187185
+Patch for HEAD
+
+Updated the patch with Olivier's comments (Added contribution and changed the name to MAX_FILES_PER_ITERATION)
+Created attachment 187186
+Patch for 3.6 Maintenance
+
+Updated the patch with Olivier's comments (Added contribution and changed the name to MAX_FILES_PER_ITERATION)
+Olivier, Can you please release the patches?
+Released and tagged the 3.6 maintenance branch (project org.eclipse.jdt.apt.core) on the behalf of Satyam.
+
+Released and tagged the HEAD branch (project org.eclipse.jdt.apt.core) on the behalf of Satyam.
+
+
+OutOfMemory error when building a large project with annotations
+
+
+
+HEAD - Added the bugid for the fix of bug 301894 
+
+HEAD - Fixed bug 301894: OutOfMemory error when building a large project with annotations 
+
+3.6 maintenance - Fixed bug 301894: OutOfMemory error when building a large project with annotations 

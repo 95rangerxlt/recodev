@@ -1,0 +1,158 @@
+I have been unable to see console.log() messages when debugging on a FxOS device in WebIDE on both aurora and nightly channels for the last few days.
+
+I have been unable to see console.log() messages when debugging on a FxOS device in WebIDE on both aurora and nightly channels for the last few days.
+I have had this problem as well.
+Paul does not work on WebIDE regularly anymore.
+Any update on this? Its been almost a week since this bug was last commented on. This is impacting our ability to debug Gaia apps.
+(In reply to Justin D'Arcangelo [:justindarc] from comment #3)
+> Any update on this? Its been almost a week since this bug was last commented
+> on. This is impacting our ability to debug Gaia apps.
+
+Sorry for the delay, I was out last week, and Alex hopes to get to this soon but hasn't yet.
+
+In any case, can you identify a specific console.log you expect to see but now are not?
+
+I just tried WebIDE from Nightly 2015-03-09 with a Flame running:
+
+Build ID               20150310165147
+Gaia Revision          cd9ed21cc0cea4b75004d50f29e6f5136cf6e977
+Gaia Date              2015-03-10 21:35:01
+Gecko Revision         n/a
+Gecko Version          39.0a1
+Device Name            flame
+Firmware(Release)      4.4.2
+Firmware(Incremental)  eng.jryans.20150310.163751
+Firmware Date          Tue Mar 10 16:39:54 CDT 2015
+Bootloader             L1TC10011880
+
+and I see logging printed from the Clock app.
+jryans: Any console.log called *before* you open the devtools in WebIDE will show up. However, once you have the devtools open, any future console.log's will not show up until you close and re-open the devtools again.
+jryans: You can also open the console in WebIDE and run a console.log command:
+
+```
+console.log('test');
+```
+
+You should expect to see "test" echoed back immediately, but you do not. However, if you close the console and re-open it, you'll see it.
+Okay, thanks for the extra info!  I am able to reproduce this in a simple test app.
+
+I'll try to spot what's wrong, or at least hand off to Alex with some extra insight.
+So far, this seems to be a server side change.  Also, this does not appear to affect the simulator, only real devices.
+
+This suggests it's related to e10s / child process changes, as the simulator does not use multiple processes.
+
+I found a regression window via Flame device builds:
+
+Last Working Build: 
+
+Build ID:    2015-01-29-01-02-39
+Gecko (hg):  6bfc0e1c4b29
+Gecko (git): a4cef467ebde6112812977dbb5a56a38dfdeb196
+
+First Broken Build:
+
+Build ID:    2015-01-29-16-02-30
+Gecko (hg):  29b05d283b00
+Gecko (git): f62801541d1c5a5676c7d926ee63317e358e22c6
+
+I'll see if I can find some suspects from the push log[1].
+
+[1]: https://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=6bfc0e1c4b29&tochange=29b05d283b00
+I couldn't easily subdivide further as building individual changes wasn't working for me.
+
+I am hopeful Alex can spot the problem from the change list.
+I'm sorry but I'm unable to get a working build environment for my flame (unagi support got broken...).
+I'll most likely continue looking into that on monday, hopefully I'll be able to have a clean env by then.
+May be downloading the zillion of git repos will be faster during the weekend... It looks like my git repos are corrected and ./repo isn't able to recover.
+(In reply to Alexandre Poirot [:ochameau] from comment #10)
+> I'm sorry but I'm unable to get a working build environment for my flame
+> (unagi support got broken...).
+> I'll most likely continue looking into that on monday, hopefully I'll be
+> able to have a clean env by then.
+> May be downloading the zillion of git repos will be faster during the
+> weekend... It looks like my git repos are corrected and ./repo isn't able to
+> recover.
+
+FWIW, I don't think this issue is limited to the Flame. I'm having the same problem with my Aries device and WebIDE (Sony Z3 Compact).
+Reverting bug 1126042 (changes to e10s window IDs) fixes the regression here.
+
+So, we'll need to fix the console somehow to adapt to the world about that bug.  I don't yet know what needs to change.
+I was finally able to build a custom image for my phone, but it is not handy I have to do full flash because it ended up being in production mode for some unknown reason (I just used VARIANT=user).
+It looks like modifying userconfig isn't enough, I'll have to rebuild everything from scratch :'(
+
+
+Anyway I was able to track it down to:
+http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/webconsole/utils.js#1450
+  let msgWindow = Services.wm.getCurrentInnerWindowWithId(apiMessage.innerID);
+
+msgWindow is null whereas apiMessage.innerID is defined and looks good...
+I'll continue tracking this down.
+Bill, any idea how bug 1126042 would have broke nsGlobalWindow* GetInnerWindowWithId?
+
+I tracked it down to this line:
+ http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.h#721
+ nsGlobalWindow* innerWindow = sWindowsById->Get(aInnerWindowID);
+
+innerWindow is null. aInnerWindowID was 4 in my test case (web console message scenario).
+
+I'm lost because I also tracked down this line:
+  http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.cpp#1224
+  sWindowsById->Put(mWindowID, this);
+We do call this line with mWindowID also equal to 4.
+
+Now, I haven't try to check the very precise type/value of mWindowID/aInnerWindow, I printf these values as %ld and casted them as (long). Nor did I tried to dump sWindowsById whole content from GetInnerWindowWithId.
+Bug 1126042 makes window IDs bigger than will fit in 32 bits, although in theory they always could have gotten that big. It looks like our console code assumes that window IDs will fit inside 32 bits. The WebIDL for a ConsoleEvent is here:
+http://mxr.mozilla.org/mozilla-central/source/dom/webidl/Console.webidl#47
+The type for innerID is (unsigned long or DOMString). unsigned long seems to map to uint32_t in C++.
+
+We store the ID in this field as follows:
+http://mxr.mozilla.org/mozilla-central/source/dom/base/Console.cpp#1154
+We always take the eNumber path here.
+
+Boris, what should we do here? Can I just use a wider type in the WebIDL? Or should I use the string instead? Not sure what effect that would have on callers.
+Yikes.  The use of "long" there is just bunk.  
+
+I suspect think using strings there will confuse the chrome JS, at least if it ever compares things with === instead of ==.
+
+The simple fix is to use "unsigned long long" in the IDL, at least if we're pretty sure our window IDs will fit in 53 bits.  Which given the patch in bug 1126042 should be ok.  Then the Web IDL union struct will use a 64-bit int type, which we'll convert to a JS Number value in the usual way and whatnot.
+Created attachment 8578644
+patch v1
+
+That fixes the console issue, is that enough?
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=4e27641b032b
+Comment on attachment 8578644
+patch v1
+
+Yep, that's all you need.  r=me
+dom/media/test/test_eme_playback.html often fails but I'll consider it as a know very intermittent.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/28de9a3cbb55
+https://hg.mozilla.org/mozilla-central/rev/28de9a3cbb55
+Don't forget to uplift.
+Comment on attachment 8578644
+patch v1
+
+Approval Request Comment
+[Feature/regressing bug #]:
+  bug 1126042
+[User impact if declined]:
+  Webconsole has the bug described in comment 0.
+[Describe test coverage new/current, TreeHerder]:
+  We still do not conver testing webconsole with child processes.
+  That's why no test broke when bug 1126042 landed.
+  But hopefully bug 1064253 is going to allow us cover this scenario.
+[Risks and why]: 
+  bug 1126042 regressed the console, so idealy this patch is going to get applied everywhere bug 1126042 landed.
+[String/UUID change made/needed]:
+  no.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/656031c22432
+
+Is this something we could test?
+I don't know why it wasn't catched by mochitests-devtools e10s...
+But it will surely be catched by new tests running on the upcoming luciddream new test harness (bug 1064253).
+
+
+New console.log calls don't show output after toolbox open
+
+regression
+
+Bug 1139984 - Fix console API in child processes by ensuring windowID is correctly typed. r=bz 

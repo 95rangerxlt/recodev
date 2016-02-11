@@ -1,0 +1,282 @@
+Currently, the NetworkPanel displays the response body. When the server sends back a 304 status there is no response body sent but the cached version of the browser is used. However, the NetworkPanel doesn't show this cached response body. Get the cached content for a 304 status and display it the NetworkPanel
+
+Currently, the NetworkPanel displays the response body. When the server sends back a 304 status there is no response body sent but the cached version of the browser is used. However, the NetworkPanel doesn't show this cached response body. Get the cached content for a 304 status and display it the NetworkPanel
+This would be nice, but is relatively lower priority.
+Implementing this needs some more strings. Also, I don't think this gone take long to implement but then the NetworkPanel should be quite complete in terms of functionality. Maybe schedule for b5?
+OK, moving to b5.
+Created attachment 467162
+Patch v1
+
+Gets the content from the cache if the server returns a 304 status. Includes unit tests.
+Requesting blocking status on this bug as it improves an important feature of the WebConsole - the NetworkPanel - and it also includes strings -> should land before b5.
+Comment on attachment 467162
+Patch v1
+
++XPCOMUtils.defineLazyGetter(this, "ioService", function () {
++  return Cc["@mozilla.org/network/io-service;1"].getService(Ci.nsIIOService);
++});
++
+ 
+you should use Services.io.*
+
++  /**
++   * Taken from tabCache.js.
++   * Loads the content of aUrl from the cache.
+We need a license and author that is compatible with MPL
+
++      let channel = ioService.newChannel(aUrl, null, null);
+all of the ioService should move to Services.io
+
+Looking good though:)
+Created attachment 467706
+Patch v1.2
+
+Rebased and improved based on David's feedback.
+Not working with cached content seems really bad, and this needs new strings, so this blocks beta 5.
+Comment on attachment 467706
+Patch v1.2
+
+>+  /**
+>+   * Taken from tabCache.js.
+>+   * Loads the content of aUrl from the cache.
+>+   *
+>+   * @param string aUrl
+>+   * @param string aCharset
+Descriptions here would be useful.  Charset of what, for example.
+
+>+  loadFromCache: function NH_loadFromCache(aUrl, aCharset)
+>+  {
+>+    var stream;
+>+    var responseText = null;
+>+    try {
+>+      let channel = Services.io.newChannel(aUrl, null, null);
+NetUtil.newChannel(aUrl);
+
+>+      // These flag combination doesn't repost the request.
+>+      channel.loadFlags = Ci.nsIRequest.LOAD_FROM_CACHE |
+>+        Ci.nsICachingChannel.LOAD_ONLY_FROM_CACHE |
+>+        Ci.nsICachingChannel.LOAD_BYPASS_LOCAL_CACHE_IF_BUSY;
+What is meant by repost?  Resubmit the request to the server?  I think you mean to say "Ensure that we only read from the cache and not the server."
+
+>+      stream = channel.open();
+So, this opens the cache synchronously, on the main thread, which is bad.  Can we please use openAsync here?  You might want to take advantage of NetUtil.asyncFetch to make your life easier.
+Created attachment 469179
+Patch v2
+
+Updated patch that includes Shawn review feedback. Uses NetUtil.asyncFetch now to get the cached content async and gets the contentCharset from the NetUtil.asyncFetch's aRequest object.
+Adding bz to this bug as he seems to be the master of string-character-encoding.
+Where does that convertToUnicode impl live?
+(In reply to comment #12)
+> Where does that convertToUnicode impl live?
+It's off of nsIScriptableUConv, which is implemented at http://mxr.mozilla.org/mozilla-central/source/intl/uconv/src/nsScriptableUConv.cpp#152
+So self.convertToUnicode just returns whatever nsIScriptableUConv returned?  In that case the attached patch looks wrong to me.  It'll return UTF-16 codepoints if the encoding is not UTF-8 and UTF-8 bytes zero-padded to 16 bits if the encoding is UTF-8.  That doesn't seem likely to be what the consumer expects.  (And I bet some tests would have caught that issue!)
+(In reply to comment #14)
+> So self.convertToUnicode just returns whatever nsIScriptableUConv returned?  In
+> that case the attached patch looks wrong to me.  It'll return UTF-16 codepoints
+> if the encoding is not UTF-8 and UTF-8 bytes zero-padded to 16 bits if the
+> encoding is UTF-8.  That doesn't seem likely to be what the consumer expects. 
+> (And I bet some tests would have caught that issue!)
+
+Boris, I tried to understand what you're saying but I couldn't. The current convertToUnicode function looks like this:
+
++  convertToUnicode: function NH_convertToUnicode(aText, aCharset)
++  {
++    let conv;
++    conv = Cc["@mozilla.org/intl/scriptableunicodeconverter"].
++              createInstance(Ci["nsIScriptableUnicodeConverter"]);
++    conv.charset = aCharset || "UTF-8";
++    return conv.ConvertToUnicode(aText);
++  },
+
+Does the conv.ConvertToUnicode return UTF-16 or does it return UTF-8?
+
+Also, could someone give me a hint how to write unit tests for this?
+Just talked with Kevin about this. Firebug uses the encoding of the web page when loading something from the cache. This might not be always right, but a good assumption as most developers use the same encoding for all their web content.
+
+The way to figure out the encoding of some cached content would look like this then:
+
+1: try to get the encoding from the channel used to load up the data from cache
+2: try to use the encoding of the web page
+3: use UTF-8 if nothing is specified
+
+Kevin also pointed out that we might should consider to open a follow up bug on this but get the basic feature landed as it's a beta 5 blocker.
+> Boris, I tried to understand what you're saying but I couldn't.
+
+Catch me on irc and we'll talk about character encodings and what our various IDL string types mean in terms of the way strings are represented?
+
+> The current convertToUnicode function looks like this
+
+Thanks.  So yeah, that's buggy.
+
+> Does the conv.ConvertToUnicode return UTF-16 or does it return UTF-8?
+
+It returns UTF-16.
+
+As for tests... how does one trigger this code to start with?  Can you write a browser-test or better yet chrome-test that would exercise it?
+(In reply to comment #17)
+> > Boris, I tried to understand what you're saying but I couldn't.
+> 
+> Catch me on irc and we'll talk about character encodings and what our various
+> IDL string types mean in terms of the way strings are represented?
+> 
+
+I'm gone be out for a few hours but when I get back it should be around afternoon for you.
+
+> > The current convertToUnicode function looks like this
+> 
+> Thanks.  So yeah, that's buggy.
+> 
+> > Does the conv.ConvertToUnicode return UTF-16 or does it return UTF-8?
+> 
+> It returns UTF-16.
+
+Ahh, that makes a difference then. I thought it returns UTF-8.
+
+> As for tests... how does one trigger this code to start with?  Can you write a
+> browser-test or better yet chrome-test that would exercise it?
+
+We use "make mochitest-browser-chrome" to run the tests. Not sure if the tests in the patch can give you a hint but otherwise let's talk about it later.
+Comment on attachment 469179
+Patch v2
+
+>+XPCOMUtils.defineLazyGetter(this, "NetUtil", function () {
+>+  var obj = {};
+>+  try {
+>+    Cu.import("resource://gre/modules/NetUtil.jsm", obj);
+>+  } catch (err) {
+>+    Cu.reportError(err);
+>+  }
+>+  return obj.NetUtil;
+>+});
+If this ever failed to import, we'd have test failures all over the tree, so you don't need the try-catch here
+
+>+  /**
+>+   * Taken from tabCache.js. Modified to use NetUtil.asyncFetch
+not sure what or where tabCache.js lives, but this comment doesn't seem useful (unless you need it for licensing, but then you need to include the license stuff too.
+
+>+  loadFromCache: function NH_loadFromCache(aUrl, aCallback)
+>+  {
+>+    var stream;
+>+    var responseText = null;
+You don't use these variables.
+
+>+    try {
+I don't think you want a global try-catch here.  I think the only place you need it is around the unicode conversion (and maybe not even that since I'm pretty sure we have one in there but I can't find that code).
+
+>+      let self = this;
+You don't need this - where you need it, just do NetworkHelper.whatever
+
+>+      NetUtil.asyncFetch(channel, function (aInputStream, aStatusCode, aRequest) {
+>+        if (!Components.isSuccessCode(aStatusCode)) {
+>+          aCallback(null);
+>+        }
+just do a return after aCallback.  We tend to encourage early returns in our codebase (keeps code easier to read with less indentation).
+
+>+          // Read the content from the stream.
+>+          let contentLength = aInputStream.available();
+>+          let is = Cc["@mozilla.org/scriptableinputstream;1"].
+>+                      createInstance(Ci.nsIScriptableInputStream);
+>+          is.init(aInputStream);
+>+          let content = is.read(contentLength);
+Just use NetUtil.readInputStreamToString (bug 590654, be sure to add the dependency)
+
+>+          // Get the contentCharset of the channel. If it's set and it's not
+>+          // UTF-8, then convert it to UTF-8.
+this comment doesn't make sense
+
+>+          let aChannel = aRequest.QueryInterface(Ci.nsIChannel);
+>+          let contentCharset = aChannel.contentCharset;
+>+
+>+          if (contentCharset && contentCharset != "UTF-8") {
+>+            content = self.convertToUnicode(content, contentCharset);
+This doesn't seem right either.  This is going to give you back UTF-16.
+
+
+>+   * @param string [aCachedContent]
+>+   *        Cached content for this request. If this argument is set, the
+>+   *        responseBodyCached section is displayed.
+nit: we usually flag this with [optional] instead of putting the argument in brackets.  I wasn't sure what that meant at first.
+
+>+          else if (this._isResponseCached) {
+>+            let self = this;
+likewise here.  you can just do NetworkPanel.whatever instead of having to use self
+
+r- only because I think the charset stuff is wrong (or needs to be better explained), but everything else looks good to me once you address the comments.  Next review should be quick.
+Created attachment 469709
+Patch v3
+
+Updated patch. This one handles the decoding of the cached content as discussed with Boris on the IRC:
+1) Use the encoding passed by querying the cache channel
+2) If that doesn't have a value, then use the charset of the page
+3) Otherwise, assume UTF-8
+
+The encoding takes now place all the time. To read the data from the stream the function NetworkHelper.readAndConvertFromStream() is used now which uses internally the NetUtil.readInputStreamToString() internally.
+
+I've also added a simple unit test that checks if an ISO-8859-1 encoded HTML file is displayed alright in the NetworkPanel when read from the cache.
+
+
+> >+          else if (this._isResponseCached) {
+> >+            let self = this;
+> likewise here.  you can just do NetworkPanel.whatever instead of having to use
+> self
+
+I can't replace self with NetworkPanel here, because this/self is an object that stores data on the this object. To replace self I need to do something like:
+
+  NetworkPanel.prototype.fooBar.call(NetworkPanelInstance, aArgument)
+
+"NetworkPanelInstance" has to be saved somewhere which means there is no win in replacing self here.
+Created attachment 469730
+Patch v3.1
+
+Sames as patch v3 but replaced "Contenet" by "Content"
+Created attachment 469887
+Patch v3.2
+
+Rebased patch.
+Comment on attachment 469887
+Patch v3.2
+
+>+  /**
+>+   * Loads the content of aUrl from the cache.
+>+   *
+>+   * @param string aUrl
+>+   *        URL to load the cached content for.
+>+   * @param function aCallback
+>+   *        Callback that is called with the loaded cached content if available
+>+   *        or null if something failed while getting the cached content.
+>+   * @param string aCharset
+>+   *        Assumed charset of the cached content. Used if there is no charset
+>+   *        on the channel directly.
+nit: these are out of order from what they are declared
+
+>+   * @returns void
+nit: not needed since it doesn't return anything (we don't usually include this stuff)
+
+>+      // Try to get the encoding form the channel. If there is none, then use
+>+      // the passed assumed aCharset.
+nit: from the channel
+
+>+      aCallback(NetworkHelper.readAndConvertFromStream(aInputStream,
+>+                                                        contentCharset));
+nit: indent is one space too far on the second line here
+
+r=sdwilsh
+Created attachment 469922
+Patch v3.3
+
+Improved based on latest comments.
+Created attachment 470088
+Patch v3.4
+
+Rebased patch.
+Created attachment 470112
+[checked-in] Patch v3.5
+
+Rebased patch.
+Comment on attachment 470112
+[checked-in] Patch v3.5
+
+http://hg.mozilla.org/mozilla-central/rev/f1897201ea6c
+http://hg.mozilla.org/mozilla-central/rev/db5a555fb4f0
+
+After try server success, one more go.

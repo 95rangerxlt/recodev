@@ -1,0 +1,187 @@
+When launching WebIDE and re-connecting to a device,
+it quickly reopen the last selected runtime app,
+but it takes quite some time before the toolbox appear.
+It is most likely due to the fact that we pull all runtime app icons on connection and the request to get the tab actor for the toolbox is stuck in the queue of requests.
+
+When launching WebIDE and re-connecting to a device,
+it quickly reopen the last selected runtime app,
+but it takes quite some time before the toolbox appear.
+It is most likely due to the fact that we pull all runtime app icons on connection and the request to get the tab actor for the toolbox is stuck in the queue of requests.
+Created attachment 8552038
+patch v1
+
+Try to use bulk to see if that speeds up icon retrieval...
+unfortunately this patch break the connection on the second icon request!
+Comment on attachment 8552038
+patch v1
+
+Review of attachment 8552038:
+-----------------------------------------------------------------
+
+Any guess why it break the connection??
+Comment on attachment 8552038
+patch v1
+
+Review of attachment 8552038:
+-----------------------------------------------------------------
+
+I think you may find it's the preference reading (bug 1109388) that is the perf problem...  but anyway, I am glad you are investigating!
+
+::: toolkit/devtools/apps/app-actor-front.js
+@@ +476,5 @@
+>        }
+>      });
+> +    r.on("bulk-reply", ({length, stream, done}) => {
+> +      dump("getIcon.bulk > "+(new Date().getTime()-s)+"\n");
+> +      let url = StreamUtils.delimitedRead(stream, null, length);
+
+This method should be called "read inefficiently"! ;)
+
+Probably NetUtil.readInputStreamToString will be better here to read all in one go.
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +835,5 @@
+>          });
+>          return;
+>        }
+>  
+> +      // Convert the blob to a base64 encoded data URI
+
+Maybe bulk data should learn how to send blobs natively if this test shows it is actually useful.
+
+@@ +841,5 @@
+>                       .createInstance(Ci.nsIDOMFileReader);
+> +      reader.onload = () => {
+> +        let url = reader.result;
+> +        if (aRequest.bulk) {
+> +          this.conn.startBulkSend({
+
+When bulk is used, this actor method returns a promise (for a JSON reply) that is never resolved.
+
+I don't there is a "nice" way to use a promise in an actor but also possibly send bulk.
+
+You may need to convert the |resolve| cases into |this.conn.send| to send JSON the more boring way.
+Before you go too much further, what if you just comment out requesting the icons entirely.  Is it fast?  Or does something else (prefs, etc.) still make it slow?
+Created attachment 8552442
+patch v2
+
+with some log messages, this times it works for 2 requests,...
+Comment on attachment 8552442
+patch v2
+
+Review of attachment 8552442:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/webapps.js
+@@ +866,5 @@
+>        reader.readAsDataURL(req.response);
+>      });
+>  
+> +    if (!aRequest.bulk) {
+> +      return deferred.promise;
+
+I think your actor is not quite right still, because the deferred is still used in bulk mode if there is an error. In my testing, the second app triggers the no icon error[1].
+
+This is why I said you probably need to drop the promise entirely.
+
+[1]: https://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webapps.js#796
+Created attachment 8552495
+Use bulk - v3
+
+Ok, so using bulk isn't a big win :(
+It is faster if we keep doing getIcon requests in parralel
+(fetchIcons, today, spam the device with tons of getIcon requests).
+
+But... the current request ends up being faster if we queue getIcon requets!
+4.4s and less with dataurl in JSON queued, around 4.5s with bulk in parralel.
+And between 5 and 6s for other scenarios, like today: JSON+parralel)
+
+I'll attach another patch just to make fetchIcon dispatch queued requests.
+Created attachment 8552500
+request icons one by one - v1
+
+Here is a patch to save 1 or 2s in icon fetching (on fast hardware).
+Created attachment 8552502
+delay icon fetching - v1
+
+Even with previous patch, it still takes between 6 and 7s to display a toolbox when connecting to a device.
+With this simple patch, we no longer wait for icons.
+I tried delaying it even more with some setTimeout but I haven't seen any difference yet.
+It may be useful to delay it even more on slow hardware...
+But just allowing opening the toolbox in parralel allows to display the toolbox in just 3s.
+I think we now have some time spent in preferences, getAppActor, the toolbox creation,...
+We may be able to tweak icons even more once other stuff are optimized,
+but this patch is already a great win!
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=068ffb1c5bbb
+Comment on attachment 8552500
+request icons one by one - v1
+
+Review of attachment 8552500:
+-----------------------------------------------------------------
+
+Before giving r+, I want to understand this more...  Do you know *why* this is faster?
+
+I would have thought that running them all at once would be the faster option...  Any guess why forcing them in a queue like this is faster?
+(In reply to J. Ryan Stinnett [:jryans] from comment #11)
+> Comment on attachment 8552500
+> I would have thought that running them all at once would be the faster
+> option...  Any guess why forcing them in a queue like this is faster?
+
+I only have guess... I imagine it stress the device too much on just one thread, the main process/thread.
+The poor phone receive X requests reading X files at the same time, the SD card or whatever storage used on phone becomes overloaded without much way to parralelize things as all requests are queued on the main process/thread.
+Also I haven't looked but it may prevent freezing the phone when connecting? (I'll give it a try)
+With and without this particular patch the device stays quite responsive. Responsive enough to not see any significant difference between both...
+Comment on attachment 8552502
+delay icon fetching - v1
+
+Review of attachment 8552502:
+-----------------------------------------------------------------
+
+Makes sense, no reason to wait for the icons.
+(In reply to Alexandre Poirot [:ochameau] from comment #12)
+> (In reply to J. Ryan Stinnett [:jryans] from comment #11)
+> > Comment on attachment 8552500
+> > I would have thought that running them all at once would be the faster
+> > option...  Any guess why forcing them in a queue like this is faster?
+> 
+> I only have guess... I imagine it stress the device too much on just one
+> thread, the main process/thread.
+> The poor phone receive X requests reading X files at the same time, the SD
+> card or whatever storage used on phone becomes overloaded without much way
+> to parralelize things as all requests are queued on the main process/thread.
+> Also I haven't looked but it may prevent freezing the phone when connecting?
+> (I'll give it a try)
+
+But even without this change, we are already sending the icon requests serially...
+
+Since it's all to the same actor, the client waits for a reply before send another message.  So, why does your change affect things at all?
+If I benchmark again this patch on top of the other one, It only saves 100ms. 2.7s against 2.8s. Still 5% win...
+I tried to benchmark dbg-client.jsm and transport.js, but I haven't seen anything significantly different.
+The issue is that the difference is only about 2-4ms per request. And the dark matter noise makes it hard to spot where parallel requests are slower then sequential one.
+But I confirm. The request are sent sequentially to the device from DebuggerTransport no matter what we do with DebuggerClient APIs.
+There is most likely something in dbg-client.jsm, with _pendingRequests...
+(In reply to Alexandre Poirot [:ochameau] from comment #16)
+> If I benchmark again this patch on top of the other one, It only saves
+> 100ms. 2.7s against 2.8s. Still 5% win...
+> I tried to benchmark dbg-client.jsm and transport.js, but I haven't seen
+> anything significantly different.
+> The issue is that the difference is only about 2-4ms per request. And the
+> dark matter noise makes it hard to spot where parallel requests are slower
+> then sequential one.
+> But I confirm. The request are sent sequentially to the device from
+> DebuggerTransport no matter what we do with DebuggerClient APIs.
+> There is most likely something in dbg-client.jsm, with _pendingRequests...
+
+Let's land the delay icon fetch patch (which is a much larger improvement), and file a separate bug to investigate this other issue.
+
+It sounds like there's a general performance problem here, so I'd prefer that we profile and fix the root cause instead of landing a patch just for one call site.
+ok ok, checking needed for last attachment 8552502. (green try for this patch on comment 10)
+https://hg.mozilla.org/integration/fx-team/rev/12226d2be709
+https://hg.mozilla.org/mozilla-central/rev/12226d2be709
+
+
+Toolboxes takes severals seconds to appear when connecting to a device
+
+
+
+Bug 1123788 - Do not wait for icons before opening toolboxes. r=jryans 

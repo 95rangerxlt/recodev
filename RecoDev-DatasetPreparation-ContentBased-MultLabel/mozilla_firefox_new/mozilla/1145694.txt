@@ -1,0 +1,150 @@
+When a user unchecks the "Play DRM" checkbox in Preferences > Content we should uninstall the currently installed/registered CDMs. The CDM addons are already being hidden in the addons manager when this is the case, so we shouldn't leave files behind.
+
+When a user selects the checkbox again, we should initiate a GMP check and download/install any available CDMs.
+
+When a user unchecks the "Play DRM" checkbox in Preferences > Content we should uninstall the currently installed/registered CDMs. The CDM addons are already being hidden in the addons manager when this is the case, so we shouldn't leave files behind.
+
+When a user selects the checkbox again, we should initiate a GMP check and download/install any available CDMs.
+Created attachment 8580785
+Patch
+
+Test updates to follow.
+Comment on attachment 8580785
+Patch
+
+Review of attachment 8580785:
+-----------------------------------------------------------------
+
+The GMPProvider.jsm changes look ok but I think the forceCheck parameter isn't going to work right. If the user quits Firefox before the timer fires then the check will never be forced and so they'll never get the CDM downloaded. Instead just reset GMPPrefs.KEY_BUILDID then whether the update check runs in the timer or on next startup it will still go through.
+You're right, I didn't think about this scenario. Do you prefer that I reset GMPPrefs.KEY_BUILDID over GMPPrefs.KEY_PROVIDER_LASTCHECK?
+(hit enter too fast)
+
+It seems like clearing GMPPrefs.KEY_PROVIDER_LASTCHECK would be cleaner and this would still guarantee that we run an update check 1 minute after startup, but I wanted to make sure that I didn't miss something else.
+(In reply to Stephen Pohl [:spohl] from comment #4)
+> (hit enter too fast)
+> 
+> It seems like clearing GMPPrefs.KEY_PROVIDER_LASTCHECK would be cleaner and
+> this would still guarantee that we run an update check 1 minute after
+> startup, but I wanted to make sure that I didn't miss something else.
+
+Ah yeah that does looke like the better choice
+Created attachment 8580883
+Patch
+
+Thanks, Dave! Addressed feedback.
+
+I ended up addressing the test changes in bug 1145336 and the tests are still passing after the patch here.
+Created attachment 8580886
+Patch
+
+Oops, fixed alignment.
+Comment on attachment 8580886
+Patch
+
+Review of attachment 8580886:
+-----------------------------------------------------------------
+
+Sorry, I spotted another problem here.
+
+::: toolkit/mozapps/extensions/internal/GMPProvider.jsm
+@@ +346,2 @@
+>        AddonManagerPrivate.callAddonListeners("onUninstalled", this);
+> +    } else if (!this._isUpdateCheckPending) {
+
+This check needs to guard triggering the timeout rather than here or it will stop you sending out the AddonManager notifications in case of a quick enable, disable, enable.
+
+@@ +353,5 @@
+> +      // Delay this for 10 seconds in case the user changes his mind and doesn't
+> +      // want to enable EME after all.
+> +      setTimeout(() => {
+> +        if (!this.appDisabled) {
+> +          GMPPrefs.reset(GMPPrefs.KEY_PROVIDER_LASTCHECK, null);
+
+You want to reset the pref immediately rather than 10 seconds later otherwise if the user restarts the pref won't be reset and the update check will not happen.
+
+You might be able to use the pref instead of _isUpdateCheckPending to control doing this too, don't know if that is easier or not. I don't mind which.
+
+@@ +360,5 @@
+> +          // they can check the log.
+> +          gmpInstallManager.simpleCheckAndInstall().then(null, () => {});
+> +        }
+> +        this._isUpdateCheckPending = false;
+> +      }, 1000 * 10);
+
+Stick this in a const defined at the top of the file.
+Created attachment 8581007
+Patch
+
+(In reply to Dave Townsend [:mossop] from comment #8)
+> Sorry, I spotted another problem here.
+
+No, thank you for taking the time to catch all these issues! I really appreciate it.
+
+> @@ +353,5 @@
+> > +      // Delay this for 10 seconds in case the user changes his mind and doesn't
+> > +      // want to enable EME after all.
+> > +      setTimeout(() => {
+> > +        if (!this.appDisabled) {
+> > +          GMPPrefs.reset(GMPPrefs.KEY_PROVIDER_LASTCHECK, null);
+> 
+> You want to reset the pref immediately rather than 10 seconds later
+> otherwise if the user restarts the pref won't be reset and the update check
+> will not happen.
+> 
+> You might be able to use the pref instead of _isUpdateCheckPending to
+> control doing this too, don't know if that is easier or not. I don't mind
+> which.
+
+I've switched to using the pref only. While doing so, I noticed that we had two equivalent prefs in GMPPrefs that I didn't spot while refactoring GMPInstallManager and GMPProvider. I went ahead and consolidated the two (hence the additional changes in the GMPProvider tests).
+Comment on attachment 8581007
+Patch
+
+Actually, there's another edge-case that we missed and I'd like to go back to using _isUpdateCheckPending: When the user flips the media.eme.enabled pref false > true > false, or true > false > true > false, then waits for the 10 seconds to expire, we will not do an update check (since we're appDisabled) but the media.gmp-manager.lastCheck pref is still reset. If the user then sets the pref back to true, we will fail to check for GMPs immediately since we wrongly assume that a check is pending. This may lead to a delay of our GMP check of up to 24 hours.
+Created attachment 8581014
+Patch
+
+Now with comment 10 addressed.
+Comment on attachment 8581014
+Patch
+
+Review of attachment 8581014:
+-----------------------------------------------------------------
+
+Looks good, thanks
+
+::: toolkit/mozapps/extensions/internal/GMPProvider.jsm
+@@ +27,5 @@
+>  const URI_EXTENSION_STRINGS  = "chrome://mozapps/locale/extensions/extensions.properties";
+>  const STRING_TYPE_NAME       = "type.%ID%.name";
+>  
+>  const SEC_IN_A_DAY           = 24 * 60 * 60;
+> +const GMP_CHECK_DELAY        = 10 * 1000; // milliseconds
+
+Add a comment here, something to the effect of "How long to wait after a user enabled EME before attempting to download CDMs."
+Created attachment 8581133
+Patch
+
+Thanks, Dave! Added comment, carrying over r+. Waiting for bug 1145336 to be reviewed since we rely on the GMPService changes there.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/017d9b8dc633
+https://hg.mozilla.org/mozilla-central/rev/017d9b8dc633
+[Tracking Requested - why for this release]:
+This is part of EME, which is slated for first release in Firefox 38.
+Comment on attachment 8581133
+Patch
+
+Note: this patch requires the combined aurora patches for bug 1140263 and bug 1145336 to be applied first!
+
+Approval Request Comment
+[Feature/regressing bug #]: Adobe EME
+[User impact if declined]: When the user unchecks the checkbox to "Play DRM" in Preferences, we would disable the playback of DRM but fail to remove any EME CDMs from the user's harddrive.
+[Describe test coverage new/current, TreeHerder]: We have mochitest and xpcshell regression tests. Local testing confirms that EME CDMs are properly removed from disk when the pref "media.eme.enabled" is set to false.
+[Risks and why]: minimal
+[String/UUID change made/needed]: none
+https://hg.mozilla.org/releases/mozilla-aurora/rev/4cf8979b0915
+
+
+[EME] Uninstall CDMs when "media.eme.enabled" is set to false via Preferences > Content
+
+qawanted
+
+Bug 1145694: Uninstall Adobe EME when media.eme.enabled is set to false. r=mossop 

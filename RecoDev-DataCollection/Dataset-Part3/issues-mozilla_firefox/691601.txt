@@ -1,0 +1,671 @@
+gFormSubmitObserver currently touches content objects directly. It can't do that in e10s mode, and so we need to sort out some new solution (this is the frontend portion of bug 690570).
+
+gFormSubmitObserver currently touches content objects directly. It can't do that in e10s mode, and so we need to sort out some new solution (this is the frontend portion of bug 690570).
+Created attachment 764595
+get form validation mostly working in e10s
+
+FTR, this is a patch that "mostly" works.  It borrows the approach (and much code) from the metro implementation.  The basic idea is that the form submit observer lives in the content process.  It then messages back to the chrome process with details about the invalid element, and the chrome process displays the UI.
+
+This approach means that bug 690570 probably doesn't need anything done.  The main problem with this approach is that the popup isn't truly anchored to the invalid element (which would require bug 873923).
+
+The patch also has a fair bit of code that's not directly used - it was basically "forked" from the metro code, which also handles the form autocomplete functionality - by effectively re-implementing the form fill controller (as it isn't e10s friendly - it requires a reference to both the docshell and the popup, both of which are in different processes).
+
+Before we adopt a patch like this, we'd want a story for form-fill too.  If we choose to go the metro route, I'd think we want to arrange to share the metro code rather than forking it - not surprisingly, it currently has various bits of metro-specific functionality we'd need to abstract, and also has a partial reimplementation of panels (with "todo" comments for RTL etc).  Or maybe we re-implement nsFormFillController.cpp into an e10s-friendly JS implementation?  Either way, it's a reasonably large job and we should discuss this more...
+(In reply to Mark Hammond (:markh) from comment #1)
+> Or maybe we re-implement nsFormFillController.cpp into an e10s-friendly JS
+> implementation?
+
+This sounds nice, not having looked into it deeply. I assume the "C++->JS" part is relatively straightforward (mutation observers may require exposing some APIs?), but the "e10s-friendly" part perhaps more complicated? It seems like maybe we don't have much in the way of external compatibility constraints here, though?
+Mark are you still working on this or can someone else pick this up?
+(In reply to Jim Mathies [:jimm] from comment #3)
+> Mark are you still working on this or can someone else pick this up?
+
+No current plans for this patch, so please feel free to take it!
+Created attachment 8415183
+desktop prompt
+Created attachment 8415184
+test case
+A few comments after poking around at this. Comment 1 mentioned that the nsFormFillController isn't e10- friendly, I think maybe some work has been done in this areas since we first took a look at this. In nightly, nsFormFillController currently runs in the content process and appears to be working correctly. (At least for form filling, usernames and password from satchel don't appear to work right, but I think that's probably another bug.)
+
+I like the approach Mark took in the initial patch, however, I fail to see why the validation panel we display needs to be in the parent process. This has a number of issues with e10s revolving around proper positioning that I think can be avoided by injecting the panel into the xul content of the browser tab directly over in content. In which case browser.js doesn't need to know about form validation at all. Having the panel defined in browser.xul actually has some issues in the local browser as well - zooming while it's displayed orphans the panrl in content, and the panel contents don't respect zoom level when initially displayed. Also when switching tabs the panel has to be hidden since there's only one panel per window vs one panel per tab. So I think if we can get that down into content, it would make this simpler to implement and be less bug free.
+
+I'm not sure yet how to combine something like this our current local implementation, maybe just disabling the browser.xul code when running in e10s is the way to go. I really haven't dug that far into it to say yet.
+
+The other thing I'm wondering about is addins. (In metro we really didn't have to worry about addins at all so I don't have a lot of experience with dealing with addin issues and e10s.) But here are some thoughts - 
+
+- HTMLFormElement fires the 'invalidformsubmit' observer.
+- With e10s, this observer doesn't propagate over to the parent process.
+- The observer carries with it a list of elements that are invalid.
+
+I assume some addins might listen for invalidformsubmit, and those would be running int he context of the aprent process. In which case we need to pick up invalidformsubmit on the content side, forward it over via message manager with the right payload, and re-fire the observer on the parent side. As far as the list of elements go, I'm think this is where CPOWs might come in.. need to dig into that a bit more, I haven't worked with those at all.
+(In reply to Jim Mathies [:jimm] from comment #7)
+> make this simpler to implement and be less bug free.
+
+eh, *more* bug free.
+(In reply to Jim Mathies [:jimm] from comment #7)
+> I like the approach Mark took in the initial patch, however, I fail to see
+> why the validation panel we display needs to be in the parent process. This
+> has a number of issues with e10s revolving around proper positioning that I
+> think can be avoided by injecting the panel into the xul content of the
+> browser tab directly over in content. In which case browser.js doesn't need
+> to know about form validation at all.
+
+Hmm, looks like this isn't possible afaict, in the content script all we have is a nsIDOMWindow (content) and its document, so I don't see an element I can attach the panel too except the actual content document, which I assume isn't acceptable.
+Created attachment 8415997
+test case
+
+- added some page scroll spacing
+Created attachment 8416112
+e10s wip
+
+I'm still digging around to see if we can get anonymous content working in the content process for a better solution, but in the mean time I'm putting together an e10s version of this. There's a few things to finish up here, specifically - 
+
+1) we don't get a true arrow panel without an anchor, so I'm going to add a transparent div on top of the form area for that.
+2) I need to translate from content coords to chrome coords in the positional info, hopefully we have some translation helpers somewhere.
+3) dealing with scroll and zoom. Interestingly, scroll and zoom are both busted in the current implementation, so in addition to making that work with this e10s version I'm going to put together some tests to cover both.
+Comment on attachment 8416112
+e10s wip
+
+Looks like browser-formvalidation.js should probably be a JSM in browser/modules, rather than a straight #included js file?
+Created attachment 8418183
+form val v.1
+
+This is mostly complete. Need to check tests, and look at moving this into a jsm per comment 12. Nice thing about this implementation is that it works with both local and remote content without any special handling.
+Created attachment 8418184
+form val v.1
+
+- added call to uninit.
+Created attachment 8418318
+form val v.2
+
+- moved the chrome side into a jsm
+- fixed up an issue with properly targeting the the window the form element is in.
+- general cleanup and commenting.
+Created attachment 8418797
+form val v.3
+
+Updates to get tests passing.
+Created attachment 8419769
+form val v.3
+Created attachment 8421147
+test helpers v.1
+
+This a handy promise based test framework we used over in metro. I'd like to bring it over to desktop since it makes coding repetitive tests like this simpler.
+Created attachment 8421149
+test helpers v.1
+Created attachment 8421150
+tests v.1
+
+These are succeeding with local content, but I've run into a cpow related crash when running with remote I'm still tracking down.
+Created attachment 8421188
+cpow crash stack calling click()
+Bill, blassey mentioned this might be a known limitation of cpows, curious what your thoughts are. I have a test that calls the click handler in remote content which triggers a crash caused by puppet widget asking for some ime related information sync. This occurs when the focus changes due to the click. I can work around this in the test, however I'm wondering if this is something we want to fix since behavior like this is common in tests and possibly addon code.
+Yes, this is a known problem with CPOWs. If you're in the middle of processing a CPOW message, you're not allowed to send any async or sync messages. We'll need to resolve this somehow; I'm just not sure how yet.
+
+Also, I'm not sure if it would help, but we have a method called mapScreenCoordinatesFromContent that's on the <browser> element. It's defined in browser.xml and remote-browser.xml so that it works in e10s and non-e10s.
+
+Also, I took a brief look at the patch, and it seems like it might not handle forms that are inside iframes. The |if (content != aFormElement.ownerDocument.defaultView)| check will work differently than the |if (gBrowser.contentDocument !=		
+aFormElement.ownerDocument.defaultView.top.document)| check that was in the old code. I don't think the new code needs to do that check at all. Instead, I think we need to do something in FormValidationHandler.jsm to make sure that we don't show a popup for a tab that's not the current one. We could probably make a check based on msg.target or something.
+(In reply to Bill McCloskey (:billm) from comment #23)
+> Yes, this is a known problem with CPOWs. If you're in the middle of
+> processing a CPOW message, you're not allowed to send any async or sync
+> messages. We'll need to resolve this somehow; I'm just not sure how yet.
+
+Ok sounds good. I will avoid working around this in the test.
+
+> Also, I'm not sure if it would help, but we have a method called
+> mapScreenCoordinatesFromContent that's on the <browser> element. It's
+> defined in browser.xml and remote-browser.xml so that it works in e10s and
+> non-e10s.
+
+Ah, great, I was looking around for coordinate conversion routines but didn't come across this.
+
+> Also, I took a brief look at the patch, and it seems like it might not
+> handle forms that are inside iframes. The |if (content !=
+> aFormElement.ownerDocument.defaultView)| check will work differently than
+> the |if (gBrowser.contentDocument !=		
+> aFormElement.ownerDocument.defaultView.top.document)| check that was in the
+> old code. I don't think the new code needs to do that check at all. Instead,
+> I think we need to do something in FormValidationHandler.jsm to make sure
+> that we don't show a popup for a tab that's not the current one. We could
+> probably make a check based on msg.target or something.
+
+Yes found this running tests on try, we have a sub frame form validation test. I have newer patches I'll post once I get a full set of green test runs. Currently dealing with leaked doc shells on random tests, not sure if it's my work or something random.
+Created attachment 8422339
+form val v.4
+Created attachment 8422342
+test helpers v.2
+Created attachment 8422344
+updated tests v.2
+Created attachment 8422426
+form val v.5
+
+- fixing up the doc shell leaks in debug tests
+Created attachment 8423009
+form val v.5
+
+Not sure who reviews work like this, bill, would you like to take the e10s work? Feel free to suggest someone more appropriate.
+
+try run:
+
+https://tbpl.mozilla.org/?tree=Try&showall=0&rev=34e34d0d8f96
+Created attachment 8423012
+test helpers v.2
+
+This is a small test helper that facilitates using promises to run a set of tests. It's a copy of the main harness we used in all of our metro mochitests. Thought I'd bring it over since it really helps cleans up tests like this.
+Created attachment 8423014
+updated tests v.2
+
+The same set of tests we already had modified to use the new framework.
+Comment on attachment 8423012
+test helpers v.2
+
+I'm concerned this is duplicating existing harness infra like bug 872229, and e.g. the existing waitForCondition in head.js. Does it make sense to re-use and maybe extend that, rather than creating more helpers?
+
+I do know there are some tests that do similar stuff (like browser_aboutHome.js) and would probably benefit from something like this too.
+
+(waitForCondition/waitForCondition2 seems like an unfortunate duplication, can we avoid it?)
+Comment on attachment 8423014
+updated tests v.2
+
+Is this strictly related to e10s support somehow, or just related clean up? It would be nice to split this into a separate bug if it's the latter.
+(In reply to :Gavin Sharp (email gavin@gavinsharp.com) from comment #32)
+> Comment on attachment 8423012
+> test helpers v.2
+> 
+> I'm concerned this is duplicating existing harness infra like bug 872229,
+> and e.g. the existing waitForCondition in head.js. Does it make sense to
+> re-use and maybe extend that, rather than creating more helpers?
+
+add_task looks like somewhat of a dumbed down version of what I've added. You don't get any of the niceties built into TaskTests test execution but if you think that's frivolous I can live with add_task.
+
+I can convert all the helpers to promiseXYZ functions too I suppose. The existing waitForCondition function though doesn't return a promise, so I'd probably convert my waitForCondition to a promiseWaitForCondition assuming there isn't an existing promise based function like that in there already.
+Comment on attachment 8423012
+test helpers v.2
+
+Review of attachment 8423012:
+-----------------------------------------------------------------
+
+::: browser/base/content/test/general/head.js
+@@ +448,5 @@
+> + * in test() to execute gTaskTests.
+> + *
+> + * TaskTest also contains a number of promise based helpers you can yield on.
+> + * Any of the promiseXYZ() based helpers here in head.js should work as well.
+> + */
+
+I haven't had time to look in details, but the waitFor* tools look useful. On the other hand, `TaskTest.run()` seems to mostly duplicate `add_task`.
+Comment on attachment 8423009
+form val v.5
+
+Can you please look at this Felipe? The only thing I noticed is that the Ci.nsIDOMHTMLFoo constants will break once bug 673569 lands, so it would be nice to avoid that.
+Comment on attachment 8423012
+test helpers v.2
+
+Review of attachment 8423012:
+-----------------------------------------------------------------
+
+I agree with using add_task and avoid adding new sub-harnesses, we have enough around that should already be converted to a common one..
+
+I also agree somehow unifying the waitForXXX handling is useful, provided these are promise based... We surely have a lot of these duplicated in various tests, unifying them can only be useful.
+
+I didn't look deep at the code, but I assume the feedback was not yet for that, I'd be happy to help in case you need deeper look.
+
+::: browser/base/content/test/general/head.js
+@@ +507,5 @@
+> +   * @param aEventName the event to wait for
+> +   * @param aTimeoutMs the number of miliseconds to wait before giving up
+> +   * @returns a Promise that resolves to the received event, or to an Error
+> +   */
+> +  waitForEvent: function waitForEvent(aSubject, aEventName, aTimeoutMs, aTarget) {
+
+the javadoc should state what's optional (likely timeout should be the last arg, it's less likely someone doesn't like the default)
+
+@@ +537,5 @@
+> +
+> +  /**
+> +   * Wait for an nsIMessageManager IPC message.
+> +   */
+> +  waitForMessage: function waitForMessage(aName, aMessageManager) {
+
+this is a bit generic, Message may be anything, waitForIPCMessage would be much clearer
+
+@@ +560,5 @@
+> +   *
+> +   * @param aMs the number of miliseconds to wait for
+> +   * @returns a Promise that resolves to true after the time has elapsed
+> +   */
+> +  waitForMs: function waitForMs(aMs) {
+
+this one may be abused, I know that there are surely already other methods like this around and it'd saner to have a centralized one, but here there should be a huge WARNING saying this must be the LAST choice after discarding any other solution. Intermittent failures are looking at us :)
+waitForCondition is already better than this one, I'd say until we have clear use-cases where waitForCondition can't be used this one should not be added.
+
+@@ +591,5 @@
+> +   * @param aTimeoutMs the number of miliseconds to wait before giving up
+> +   * @param aIntervalMs the number of miliseconds between calls to aCondition
+> +   * @returns a Promise that resolves to true, or to an Error
+> +   */
+> +  waitForCondition: function waitForCondition(aCondition, aTimeoutMs, aIntervalMs) {
+
+yeah, duplicate of the existing utils, the existing one should probably be merged to this one
+javadoc should point out what's optional
+
+@@ +625,5 @@
+> +    return deferred.promise;
+> +  },
+> +
+> +  /**
+> +   * same as waitForCondition but with better test output.
+
+why should one want worse test output?
+
+@@ +675,5 @@
+> +   * @param aWindow the tab or window that contains the image.
+> +   * @param aImageId the id of the image in the page.
+> +   * @returns a Promise that resolves to true, or to an Error
+> +   */
+> +  waitForImageLoad: function waitForImageLoad(aWindow, aImageId) {
+
+imo this is very specific and considered it's easily implemented through waitForCondition it doesn't deserve to be a generic util.
+
+@@ +692,5 @@
+> +   * @param aObsEvent the observer event to wait for
+> +   * @param aTimeoutMs the number of miliseconds to wait before giving up
+> +   * @returns a Promise that resolves to true, or to an Error
+> +   */
+> +  waitForObserver: function waitForObserver(aObsEvent, aTimeoutMs, aObsData) {
+
+waitForObserverTopic, the data is optional I assume, the timeout should be last argument
+Comment on attachment 8423012
+test helpers v.2
+
+Since this isn't going to land as is, I'll split this work off into a different bug. The promise helpers here are still available over in the metro code base if anyone needs them.
+Comment on attachment 8423014
+updated tests v.2
+
+will update these to work with the new e10s validation helper without introducing new test methodology.
+Created attachment 8424819
+form val v.6
+
+one minor update here, checking to be sure the message target is the foreground browser.
+Created attachment 8424823
+update tests
+
+The only change I needed to make to these was delaying the initial clicks so that the frame script was set up. I also cleaned up a bunch of spurious content encoding errors that were spamming the logs.
+try push:
+https://tbpl.mozilla.org/?tree=Try&rev=d6f98dead993
+Comment on attachment 8424819
+form val v.6
+
+Review of attachment 8424819:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.css
+@@ +654,5 @@
+>  
+> +.form-validation-anchor {
+> +  /* should occupy space but not be visible */
+> +  opacity: 0;
+> +  visibility: hidden;
+
+with visibility: hidden, opacity: 0 shouldn't be necessary.
+
+::: browser/base/content/content-formvalidation.js
+@@ +8,5 @@
+> + */
+> +
+> +"use strict";
+> +
+> +let FormSubmitObserver =
+
+Besides the per-page event listeners (pageshow, unload), nothing in this module is too focused on the specific `content` object. So instead of having this compiled once for each tab (as a frame script does), this whole obj could go inside a .jsm  (FormValidationHandler.jsm is fine, we have some jsms with code mixed for parent and child processes).
+
+It can be a constructor with all the functions in the prototype, and you initialize once per tab in content.js; or better if it can be just a singleton object that is used for the listeners of all pages, if that works (I think it won't because of the per-tab state of _element, _validationMessage)
+
+@@ +11,5 @@
+> +
+> +let FormSubmitObserver =
+> +{
+> +  _validationMessage: "",
+> +  _element: null,
+
+does blur fire during hidePopup/pagehide too? I wonder if _element needs to be cleared more aggressively or if the clearing in onBlur is enough
+
+@@ +23,5 @@
+> +    // nsIFormSubmitObserver callback about invalid forms. See HTMLFormElement
+> +    // for details.
+> +    Services.obs.addObserver(this, "invalidformsubmit", false);
+> +    addEventListener("pageshow", this, false);
+> +    addEventListener("unload", this, false);
+
+When does this unload fire? only on tab closing, or also when navigating from one page to another (i.e., the unload event from the page bubbling up)?  If it's the latter I think this is wrong, as you'll unregister your listener after the first page navigation.
+
+@@ +30,5 @@
+> +  uninit: function()
+> +  {
+> +    Services.obs.removeObserver(this, "invalidformsubmit");
+> +    removeEventListener("pageshow", this, false);
+> +    removeEventListener("unload", this, false);
+
+clear the _element ref here
+
+@@ +60,5 @@
+> +  /*
+> +   * nsIFormSubmitObserver
+> +   */
+> +
+> +  notifyInvalidSubmit : function (aFormElement, aInvalidElements)
+
+wow, what a strange way to use the observer service! o.o
+
+@@ +188,5 @@
+> +    return content.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowUtils);
+> +  },
+> +
+> +  _isRootDocumentEvent: function (aEvent) {
+> +    if (content == null) {
+
+does this case happen?
+
+::: browser/base/content/content.js
+@@ +503,2 @@
+>    TranslationHandler.init();
+> +}
+
+unrelated change to this patch :) but this has already been changed by https://hg.mozilla.org/integration/fx-team/rev/03aa0984c437#l1.81
+
+::: browser/base/content/tabbrowser.xml
+@@ +154,5 @@
+> +          let stack = this.mCurrentBrowser.parentNode;
+> +          for (let index = 0; index < stack.childNodes.length; index++) {
+> +            if (stack.childNodes[index].getAttribute("anonid") == "formValidationAnchor") {
+> +              return stack.childNodes[index];
+> +            }
+
+this loop can be replaced by .getAnonymousElementByAttribute
+
+However, if _formValidationAnchor is a member property of tabbrowser, why does one need to exist for each tab? I think one anchor per tabbrowser should suffice.
+
+See here how there's precedent like this for various things, including the e10s handling of <select> elements: http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.xul#140
+
+You can keep the element in the tabbrowser.xml binding if you prefer, or put it in browser.xul like the others. Whatever you prefer.
+
+::: browser/components/nsBrowserGlue.js
+@@ +503,5 @@
+>      AboutHome.init();
+>      SessionStore.init();
+>      BrowserUITelemetry.init();
+>      ContentSearch.init();
+> +    FormValidationHandler.init();
+
+can this be initialized in delayedStartup instead of here?
+
+::: browser/modules/FormValidationHandler.jsm
+@@ +53,5 @@
+> +   */
+> +
+> +  receiveMessage: function (aMessage) {
+> +    let window = aMessage.target.ownerDocument.defaultView;
+> +    let json = aMessage.json;
+
+.json has been deprecated, use .data (same thing, just a name change)
+http://mxr.mozilla.org/mozilla-central/source/content/base/public/nsIMessageManager.idl#165
+
+::: toolkit/modules/BrowserUtils.jsm
+@@ +19,5 @@
+> +    for (let i = 0; i < arguments.length; i++) {
+> +      dump(arguments[i] + " ");
+> +    }
+> +    dump("\n");
+> +  },
+
+not sure if we should include this function
+(In reply to :Felipe Gomes from comment #43)
+> ::: browser/base/content/content-formvalidation.js
+> @@ +8,5 @@
+> > + */
+> > +
+> > +"use strict";
+> > +
+> > +let FormSubmitObserver =
+> 
+> Besides the per-page event listeners (pageshow, unload), nothing in this
+> module is too focused on the specific `content` object. So instead of having
+> this compiled once for each tab (as a frame script does), this whole obj
+> could go inside a .jsm  (FormValidationHandler.jsm is fine, we have some
+> jsms with code mixed for parent and child processes).
+> 
+> It can be a constructor with all the functions in the prototype, and you
+> initialize once per tab in content.js;
+
+I'll take a look at using a jsm. It needs to be loaded per tab however.
+
+> 
+> @@ +11,5 @@
+> > +
+> > +let FormSubmitObserver =
+> > +{
+> > +  _validationMessage: "",
+> > +  _element: null,
+> 
+> does blur fire during hidePopup/pagehide too? I wonder if _element needs to
+> be cleared more aggressively or if the clearing in onBlur is enough.
+
+On blur should file whenever the input loses focus, including during page unloads.
+
+> @@ +23,5 @@
+> > +    // nsIFormSubmitObserver callback about invalid forms. See HTMLFormElement
+> > +    // for details.
+> > +    Services.obs.addObserver(this, "invalidformsubmit", false);
+> > +    addEventListener("pageshow", this, false);
+> > +    addEventListener("unload", this, false);
+> 
+> When does this unload fire? only on tab closing, or also when navigating
+> from one page to another (i.e., the unload event from the page bubbling up)?
+> If it's the latter I think this is wrong, as you'll unregister your listener
+> after the first page navigation.
+
+The handler makes sure only the top level document event is handled. I haven't seen any problems with leaks while running tests but I'll double check the logic to be sure. Navigating between pages doesn't break anything.
+
+> 
+> @@ +30,5 @@
+> > +  uninit: function()
+> > +  {
+> > +    Services.obs.removeObserver(this, "invalidformsubmit");
+> > +    removeEventListener("pageshow", this, false);
+> > +    removeEventListener("unload", this, false);
+> 
+> clear the _element ref here
+
+
+added.
+
+> @@ +188,5 @@
+> > +    return content.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowUtils);
+> > +  },
+> > +
+> > +  _isRootDocumentEvent: function (aEvent) {
+> > +    if (content == null) {
+> 
+> does this case happen?
+
+Yes it does occasionally happen for frames that don't have content. 
+
+> ::: browser/base/content/tabbrowser.xml
+> @@ +154,5 @@
+> > +          let stack = this.mCurrentBrowser.parentNode;
+> > +          for (let index = 0; index < stack.childNodes.length; index++) {
+> > +            if (stack.childNodes[index].getAttribute("anonid") == "formValidationAnchor") {
+> > +              return stack.childNodes[index];
+> > +            }
+> 
+> this loop can be replaced by .getAnonymousElementByAttribute
+
+Actually it can't, that's what I started with but it didn't work out. You can't call getAnonymousElementByAttribute on a sub element from within the anonymous block. Hence the need for this loop to find the right anchor for the tab.
+
+> 
+> However, if _formValidationAnchor is a member property of tabbrowser, why
+> does one need to exist for each tab? I think one anchor per tabbrowser
+> should suffice.
+
+The anchor needs to be in the stack so it can float on top of the browser element, and there's a stack per tab. I originally had a single element in just one stack, but I ran into show and positional problems. I can experiment around again with one element, but I'm not sure it'll work right.
+
+> ::: browser/components/nsBrowserGlue.js
+> @@ +503,5 @@
+> >      AboutHome.init();
+> >      SessionStore.init();
+> >      BrowserUITelemetry.init();
+> >      ContentSearch.init();
+> > +    FormValidationHandler.init();
+> 
+> can this be initialized in delayedStartup instead of here?
+
+I'm not sure, how delayed is delayedStartup? Prior to a point where the user can start interacting with content?
+
+> ::: toolkit/modules/BrowserUtils.jsm
+> @@ +19,5 @@
+> > +    for (let i = 0; i < arguments.length; i++) {
+> > +      dump(arguments[i] + " ");
+> > +    }
+> > +    dump("\n");
+> > +  },
+> 
+> not sure if we should include this function
+
+We should!
+
+
+
+Created attachment 8433322
+form val v.7
+Created attachment 8433523
+form val v.7
+
+Updated the formValidationAnchor code in tabbrowser.xml to be more efficient.
+Comment on attachment 8433523
+form val v.7
+
+Review of attachment 8433523:
+-----------------------------------------------------------------
+
+Wonderful, thanks for doing all these changes!
+
+::: browser/base/content/browser.css
+@@ +653,5 @@
+>  }
+>  
+> +.form-validation-anchor {
+> +  /* should occupy space but not be visible */
+> +  opacity: 0;
+
+I mentioned it in the previous comment, so I wonder if you found out if "opacity: 0" is really necessary or if you just forgot to remove it? AIUI "visibility: hidden" should be enough
+
+::: browser/modules/FormSubmitObserver.jsm
+@@ +41,5 @@
+> +  init: function(aWindow, aTabChildGlobal)
+> +  {
+> +    this._content = aWindow;
+> +    this._tab = aTabChildGlobal;
+> +    this._mm = 
+
+minor nit, there's some trailing whitespace left across this file
+Comment on attachment 8433523
+form val v.7
+
+>+      <property name="formValidationAnchor" readonly="true">
+>+        <getter><![CDATA[
+>+        if (this.mCurrentTab._formValidationAnchor) {
+>+          return this.mCurrentTab._formValidationAnchor;
+>+        }
+>+        let stack = this.mCurrentBrowser.parentNode;
+>+        // Create an anchor for the form validation popup
+>+        const NS_XUL = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+>+        let formValidationAnchor = document.createElementNS(NS_XUL, "hbox");
+>+        formValidationAnchor.className = "form-validation-anchor";
+>+        formValidationAnchor.setAttribute("anonid", "formValidationAnchor");
+>+        formValidationAnchor.hidden = true;
+>+        stack.appendChild(formValidationAnchor);
+>+        return this.mCurrentTab._formValidationAnchor = formValidationAnchor;
+>+        ]]></getter>
+>+      </property>
+
+The anonid attribute is unused.
+
+>+    let tabBrowser = aWindow.document.getElementById("content");
+
+aWindow.gBrowser
+
+>+    Services.obs.addObserver(this, "browser-fullZoom:zoomChange", false);
+>+    Services.obs.addObserver(this, "browser-fullZoom:zoomReset", false);
+
+>+  observe: function (aSubject, aTopic, aData) {
+>+    this._hidePopup();
+>+  },
+
+browser-fullZoom:zoomChange is a hack that was added for a test. It's not the right API to use here. Note in particular that these notifications are not associated with any window but global.
+> browser-fullZoom:zoomChange is a hack that was added for a test. It's not
+> the right API to use here. Note in particular that these notifications are
+> not associated with any window but global.
+
+Looks like this is used for more than just tests - 
+
+http://mxr.mozilla.org/mozilla-central/search?string=browser-fullZoom%3AzoomChange
+
+All I really need is a general event indicating zoom changed so I can hide the popup to prevent messed up positioning. This event worked well for that. Is there something else you can suggest?
+(In reply to :Felipe Gomes from comment #50)
+> Comment on attachment 8433523
+> form val v.7
+> 
+> Review of attachment 8433523:
+> -----------------------------------------------------------------
+> 
+> Wonderful, thanks for doing all these changes!
+> 
+> ::: browser/base/content/browser.css
+> @@ +653,5 @@
+> >  }
+> >  
+> > +.form-validation-anchor {
+> > +  /* should occupy space but not be visible */
+> > +  opacity: 0;
+> 
+> I mentioned it in the previous comment, so I wonder if you found out if
+> "opacity: 0" is really necessary or if you just forgot to remove it? AIUI
+> "visibility: hidden" should be enough
+
+I make the panel visible when I'm using it as an anchor, hence the 0 opacity. If I don't set visible property prior to showing the popup the popup won't display.
+(In reply to Jim Mathies [:jimm] from comment #52)
+> > browser-fullZoom:zoomChange is a hack that was added for a test. It's not
+> > the right API to use here. Note in particular that these notifications are
+> > not associated with any window but global.
+> 
+> Looks like this is used for more than just tests - 
+> 
+> http://mxr.mozilla.org/mozilla-central/search?string=browser-
+> fullZoom%3AzoomChange
+
+Yes, that's also broken. It would be nice if we didn't expand this unfortunate state further.
+
+> All I really need is a general event indicating zoom changed so I can hide
+> the popup to prevent messed up positioning. This event worked well for that.
+> Is there something else you can suggest?
+
+Bug 1015721 should help here.
+*** Bug 1047708 has been marked as a duplicate of this bug. ***
+Created attachment 8476639
+new remote-browser zoom events v.1
+
+Similar to what markus added in bug 1015721, In the browser patch we'll need dom events for these so we can hide the validation popup when zoom changes.
+Created attachment 8476643
+form validation v.8 (r=felipe, dao)
+
+nits in comment 51 addressed plus add the use of new remote-browser dom events in hiding the popup.
+try push:
+https://tbpl.mozilla.org/?tree=Try&rev=27fe1c2f348e
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/758b93851c02
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/82d1a1b7e098
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/d87041252912
+
+https://hg.mozilla.org/mozilla-central/rev/758b93851c02
+https://hg.mozilla.org/mozilla-central/rev/82d1a1b7e098
+https://hg.mozilla.org/mozilla-central/rev/d87041252912

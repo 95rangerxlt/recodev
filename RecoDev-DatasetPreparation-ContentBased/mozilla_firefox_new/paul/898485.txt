@@ -1,0 +1,492 @@
+
+
+
+Created attachment 781754
+898485.diff
+From the connection-manager.js:
+
++/**
++ * Debugger Connections Manager.
++ *
++ * To use this module:
++ * const {ConnectionsList, Connection} = require("devtools/client/connections-manager");
++ *
++ * This module exports 2 objects:
++ *
++ * # ConnectionsList
++ * 
++ * A persistent list (Set()) of Connection objects (a new Connection is
++ * automatically added to ConnectionsList).
++ *
++ * # Connection
++ *
++ * A connection is a wrapper around a debugger client. It has a simple
++ * API to instanciate a connection to a debugger server. Once disconnected,
++ * no need to re-create a Connection object. Calling `connect()` again
++ * will re-create a debugger client.
++ *
++ * Constructor:
++ *  ⬩ new Connection(host, port)
++ *
++ * Methods:
++ *  ⬩ connect()         Connect to host:port. Expect a "connecting" event. If
++ *                      host is not specified, a local pipe is used.
++ *  ⬩ disconnect()      Disconnect if connected. Expect a "disconnecting" event
++ *
++ * Properties:
++ *  ⬩ host              IP address or hostname
++ *  ⬩ port              Port
++ *  ⬩ logs              Current logs. "newlog" event notifies new available logs
++ *  ⬩ store             Reference to a local data store (see below)
++ *
++ * Events (as in event-emitter.js):
++ *  ⬩ "connecting"      Trying to connect to host:port
++ *  ⬩ "connected"       Connection is successful
++ *  ⬩ "disconnecting"   Trying to disconnect from server.
++ *  ⬩ "disconnected"    Disconnected (as request, or because of timeout or connection error)
++ *  ⬩ "status-changed"  The connection status (connection.status) has changed
++ *  ⬩ "timeout"         Connection timeout
++ *  ⬩ "port-changed"    Port has changed
++ *  ⬩ "host-changed"    Host has changed
++ *  ⬩ "newlog"          A new log line is available
++ *
++ * # Store
++ *
++ *  The store is a JSON-like object that store different data about the
++ *  connected device. The available data are:
++ *
++ *  store.object = {
++ *      description: {
++ *        width: 320,
++ *        height: 480,
++ *        dpi: 160,
++ *        name: "B2G",
++ *        geckoVersion: "25.0a1",
++ *        channel: "nightly",
++ *        version: "1.2.0.0-prerelease",
++ *        phoneNumber: "XXX-XXX-XXX-XXX"
++ *      },
++ *      activities: [
++ *      ],
++ *      permissions: [
++ *      ],
++ *      apps: {
++ *       all: [
++ *       ]
++ *      },
++ *     }
++ *
++ *  If any of these data are updated, a "set" event is fired:
++ *
++ *  connection.store.on("set", function(event, path, value) {
++ *    // event: "set"
++ *    // path:  ["apps","all", "4","appStatus"]
++ *    // value: 2
++ *  });
++ * 
++ */
+From Panos in bug 894352:
+
+
+- the connections-manager module API does not seem sufficiently encapsulated and gives clients access to stuff that should be private. I would expect a ConnectionManager object to encapsulate the connection list and provide createConnection/destroyConnection methods to add/remove connections, instead of handing out the connection list to the clients.
+
+- the Connection object is described as a wrapper around a debugger client object, but it looks more like a RemoteInstance or RemoteTarget object to me. It contains both connection-related data like host and port, but also a generically-named "store" that contains device-related information. In pure remote protocol terms, it looks more like a DeviceActor front combined with a debugger client. This weird layering is partly the fault of dbg-client.jsm, which needs to be refactored to split the various actor fronts from the connection management parts.
+Created attachment 783054
+Patch v1
+
+The connection manager now only handles connections. The store thing will happen elsewhere.
+Created attachment 783077
+Patch v1.1
+
+just some more comments
+Created attachment 783083
+Patch v1.2
+
+s/const {EventEmmiter}/const EventEmitter/
+
+(because I changed that in the blocking bug)
+I assume you want me to review the latest revision, right?
+(In reply to Panos Astithas [:past] from comment #7)
+> I assume you want me to review the latest revision, right?
+
+Yes.
+Comment on attachment 783083
+Patch v1.2
+
+Review of attachment 783083:
+-----------------------------------------------------------------
+
+The connection manager seems like a very thin veneer on top of the debugger client. I think it would have been less work to add event handling directly to the latter, but I don't really mind.
+
+I'd like Dave to take a look at the loader and makefile changes. I'm also going to be away for a week starting Friday, so perhaps he should sign off on the next iterations of the patch as a whole.
+
+::: toolkit/devtools/client/connections-manager.js
+@@ +58,5 @@
+> + *  ⬩ "disconnected"    Disconnected (as request, or because of timeout or connection error)
+> + *  ⬩ "status-changed"  The connection status (connection.status) has changed
+> + *  ⬩ "timeout"         Connection timeout
+> + *  ⬩ "port-changed"    Port has changed
+> + *  ⬩ "host-changed"    Host has changed
+
+What are the circumstances that would trigger these events? Will the UI provide the option to repurpose an existing connection?
+
+@@ +69,5 @@
+> +  createConnection: function(host, port) {
+> +    let c = new Connection(host, port);
+> +    c.once("destroy", (event) => this.destroyConnection(c));
+> +    this._connections.add(c);
+> +    this.emit("new", c);
+
+What's the use of this event? Listening for new connections in case multiple app managers are open or something?
+
+If there is a legitimate use, we should have a test for this event. Also, it seems that if we need to listen for "new" events, we ought to be able to listen for "destroyed" events, too.
+
+@@ +80,5 @@
+> +        connection.destroy();
+> +      }
+> +    }
+> +  },
+> +  getConnections: function() {
+
+If you made this a getter, it would be more JavaScript-y I think.
+
+@@ +146,5 @@
+> +  connect: function() {
+> +    this._ensureNotDestroyed();
+> +    if (!this._client) {
+> +      this.log("connecting to " + this._host + ":" + this._port);
+> +      this._connectionDate = new Date();
+
+This doesn't seem used anywhere.
+
+@@ +158,5 @@
+> +      } else {
+> +        transport = debuggerSocketConnect(this._host, this._port);
+> +      }
+> +      this._client = new DebuggerClient(transport);
+> +      this._client.addListener("closed", this._onDisconnected);
+
+You could also use addOneTimeListener and not have to worry about removing it.
+
+@@ +159,5 @@
+> +        transport = debuggerSocketConnect(this._host, this._port);
+> +      }
+> +      this._client = new DebuggerClient(transport);
+> +      this._client.addListener("closed", this._onDisconnected);
+> +      this._client.connect(() => this._onConnected());
+
+Nit: you could handle _onConnected, _onDisconnected and _onTimeout in a more consistent way. Whether that is using bound or arrow functions, I don't really care.
+
+@@ +183,5 @@
+> +    if (this._status == value)
+> +      return;
+> +    this._status = value;
+> +    this.emit(value);
+> +    this.emit("status-changed", value);
+
+Why are both events needed? I would expect only a few users of this API to ever exist and I assume they would be interested in every state change, hence "status-changed" would suffice.
+
+@@ +196,5 @@
+> +      case this.CONNECTING:
+> +        this.log("Connection error");
+> +        break;
+> +      default:
+> +        this.log("disconnected");
+
+I expect these log messages would appear in the UI somewhere, so consistency should be improved here. Also l10n. If that's not the case, you can ignore this.
+
+::: toolkit/devtools/server/tests/mochitest/test_connections-manager.html
+@@ +1,4 @@
+> +<!DOCTYPE HTML>
+> +<html>
+> +<!--
+> +https://bugzilla.mozilla.org/show_bug.cgi?id=
+
+A descriptive comment instead of the bug reference would be more useful here. We can always get the bug number from 'hg blame'.
+> ::: toolkit/devtools/client/connections-manager.js
+> @@ +58,5 @@
+> > + *  ⬩ "disconnected"    Disconnected (as request, or because of timeout or connection error)
+> > + *  ⬩ "status-changed"  The connection status (connection.status) has changed
+> > + *  ⬩ "timeout"         Connection timeout
+> > + *  ⬩ "port-changed"    Port has changed
+> > + *  ⬩ "host-changed"    Host has changed
+> 
+> What are the circumstances that would trigger these events? Will the UI
+> provide the option to repurpose an existing connection?
+
+Yes. A connection can live in a "disconnected" state. And in this state, port and host can be changed.
+
+> @@ +69,5 @@
+> > +  createConnection: function(host, port) {
+> > +    let c = new Connection(host, port);
+> > +    c.once("destroy", (event) => this.destroyConnection(c));
+> > +    this._connections.add(c);
+> > +    this.emit("new", c);
+> 
+> What's the use of this event? Listening for new connections in case multiple
+> app managers are open or something?
+
+In bug 894352, we introduce "connections footers". These are widgets that will be used in several places. It will show the different available connections. And they need to be updated as a new connection is created.
+
+> If there is a legitimate use, we should have a test for this event. Also, it
+> seems that if we need to listen for "new" events, we ought to be able to
+> listen for "destroyed" events, too.
+
+Ok.
+
+> @@ +80,5 @@
+> > +        connection.destroy();
+> > +      }
+> > +    }
+> > +  },
+> > +  getConnections: function() {
+> 
+> If you made this a getter, it would be more JavaScript-y I think.
+
+Ok.
+
+> @@ +146,5 @@
+> > +  connect: function() {
+> > +    this._ensureNotDestroyed();
+> > +    if (!this._client) {
+> > +      this.log("connecting to " + this._host + ":" + this._port);
+> > +      this._connectionDate = new Date();
+> 
+> This doesn't seem used anywhere.
+
+Oops!
+
+> @@ +158,5 @@
+> > +      } else {
+> > +        transport = debuggerSocketConnect(this._host, this._port);
+> > +      }
+> > +      this._client = new DebuggerClient(transport);
+> > +      this._client.addListener("closed", this._onDisconnected);
+> 
+> You could also use addOneTimeListener and not have to worry about removing
+> it.
+
+Ok.
+
+> @@ +159,5 @@
+> > +        transport = debuggerSocketConnect(this._host, this._port);
+> > +      }
+> > +      this._client = new DebuggerClient(transport);
+> > +      this._client.addListener("closed", this._onDisconnected);
+> > +      this._client.connect(() => this._onConnected());
+> 
+> Nit: you could handle _onConnected, _onDisconnected and _onTimeout in a more
+> consistent way. Whether that is using bound or arrow functions, I don't
+> really care.
+
+Ok.
+
+> @@ +183,5 @@
+> > +    if (this._status == value)
+> > +      return;
+> > +    this._status = value;
+> > +    this.emit(value);
+> > +    this.emit("status-changed", value);
+> 
+> Why are both events needed? I would expect only a few users of this API to
+> ever exist and I assume they would be interested in every state change,
+> hence "status-changed" would suffice.
+
+It's convenient. I need both on the UI side.
+
+> @@ +196,5 @@
+> > +      case this.CONNECTING:
+> > +        this.log("Connection error");
+> > +        break;
+> > +      default:
+> > +        this.log("disconnected");
+> 
+> I expect these log messages would appear in the UI somewhere, so consistency
+> should be improved here. Also l10n. If that's not the case, you can ignore
+> this.
+
+I don't know exactly what's going to happen with these logs. For the moment, they are in the UI, but we will probably change that. I'll make them localizable if needed. 
+
+> ::: toolkit/devtools/server/tests/mochitest/test_connections-manager.html
+> @@ +1,4 @@
+> > +<!DOCTYPE HTML>
+> > +<html>
+> > +<!--
+> > +https://bugzilla.mozilla.org/show_bug.cgi?id=
+> 
+> A descriptive comment instead of the bug reference would be more useful
+> here. We can always get the bug number from 'hg blame'.
+
+Ok.
+Comment on attachment 783083
+Patch v1.2
+
+Review of attachment 783083:
+-----------------------------------------------------------------
+
+Loader/makefile changes are fine.
+Created attachment 787372
+patch v1.3
+
+Addressed Panos' comments
+https://tbpl.mozilla.org/?tree=Try&rev=8ba5e74895de
+Created attachment 789583
+Patch v1.4
+
+Forgot to destroy server in test
+https://tbpl.mozilla.org/?tree=Try&rev=fdf537f42bb5
+Comment on attachment 789583
+Patch v1.4
+
+I realize that I didn't get a r+ for the main file.
+Comment on attachment 789583
+Patch v1.4
+
+Review of attachment 789583:
+-----------------------------------------------------------------
+
+I found a few more areas for improvement that I didn't spot previously, but this looks good otherwise.
+
+::: toolkit/devtools/client/connections-manager.js
+@@ +31,5 @@
+> + *
+> + * # Connection
+> + *
+> + * A connection is a wrapper around a debugger client. It has a simple
+> + * API to instanciate a connection to a debugger server. Once disconnected,
+
+Typo: "instantiate"
+
+@@ +50,5 @@
+> + *                        Connection.CONNECTED,
+> + *                        Connection.DISCONNECTED,
+> + *                        Connection.CONNECTING,
+> + *                        Connection.DISCONNECTING,
+> + *                        Connection.DESTROYED.
+
+This is not correct: states are defined below on the prototype not on the constructor. But this is actually a better design: class-related constants in general are best declared as properties of the constructor, like this:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/devtools/sourceeditor/source-editor.jsm#190
+
+That way you don't need to have an instance handy or reference the prototype to get at the name. You just say Connection.State.CONNECTED instead of the more cumbersome Connection.prototype.CONNECTED, which leaks an implementation detail in the name.
+
+@@ +52,5 @@
+> + *                        Connection.CONNECTING,
+> + *                        Connection.DISCONNECTING,
+> + *                        Connection.DESTROYED.
+> + *
+> + * Events (as in event-emitter.js):
+
+If you like using identifiers for string constants (especially externally-referenced ones), then why not do the same for events? My main point here is consistency, not to suggest one over the other.
+
+@@ +55,5 @@
+> + *
+> + * Events (as in event-emitter.js):
+> + *  ⬩ "connecting"      Trying to connect to host:port
+> + *  ⬩ "connected"       Connection is successful
+> + *  ⬩ "disconnecting"   Trying to disconnect from server.
+
+This is the only bullet that ends with a full stop and I'm sure you left it there just to see if I'm paying attention :-)
+
+@@ +56,5 @@
+> + * Events (as in event-emitter.js):
+> + *  ⬩ "connecting"      Trying to connect to host:port
+> + *  ⬩ "connected"       Connection is successful
+> + *  ⬩ "disconnecting"   Trying to disconnect from server.
+> + *  ⬩ "disconnected"    Disconnected (as request, or because of timeout or connection error)
+
+Slightly better wording: "at client request, or because of a timeout or connection error".
+
+@@ +65,5 @@
+> + *  ⬩ "newlog"          A new log line is available
+> + *
+> + */
+> +
+> +let ConnectionsManager = {
+
+So this may not be the best time to call it out, but I believe ConnectionManager is the proper spelling in English (unlike say Greek). Just like EventEmitter instead of EventsEmitter or nsITransactionManager instead of nsITransactionsManager. I feel slightly awkward to insist on such a change, so I'll just say that I would be very happy if you made it :-)
+
+You can never be too nitpicky about API design!
+
+@@ +95,5 @@
+> +let lastID = -1;
+> +
+> +function Connection(host, port) {
+> +  EventEmitter.decorate(this);
+> +  this.uid = ++lastID;
+
+lastID and uid don't seem to be used anywhere.
+
+@@ +118,5 @@
+> +    this.logs +=  "\n" + str;
+> +    this.emit("newlog", str);
+> +  },
+> +
+> +  get status() this._status,
+
+Standard getters if you don't mind please (bug 887895).
+
+@@ +142,5 @@
+> +  disconnect: function(force) {
+> +    clearTimeout(this._timeoutID);
+> +    if (this.status == this.CONNECTED ||
+> +        this.status == this.CONNECTING) {
+> +      this._ensureNotDestroyed();
+
+This is redundant here, since the condition check above guarantees that this.status is either CONNECTED or CONNECTING. Furthermore, I actually think the test _ensureNotDestroyed does doesn't deserve a separate method, but could be inlined whenever necessary.
+
+@@ +151,5 @@
+> +  },
+> +
+> +  connect: function() {
+> +    this._ensureNotDestroyed();
+> +    if (!this._client) {
+
+This method seems ambivalent when choosing whether to use _client or status for asserting the connection's state. _ensureNotDestroyed could be left out completely, since the _client is set to null before the state transitions to DESTROYED. As it is I don't believe the "else" branch will ever be taken.
+
+@@ +203,5 @@
+> +        break;
+> +      default:
+> +        this.log("disconnected");
+> +    }
+> +    this._client.removeListener("closed", this._onDisconnected);
+
+No need to remove the listener as it was registered with addOneTimeListener.
+Created attachment 792700
+patch to land
+
+Addressed Panos' comments
+Created attachment 792872
+patch to land
+https://hg.mozilla.org/integration/fx-team/rev/fb59ca084054
+https://hg.mozilla.org/mozilla-central/rev/fb59ca084054
+This patch needed build peer review.
+Comment on attachment 792872
+patch to land
+
+Post-landing review request (sorry for that).
+
+Mike, can you take a look at this and if there's anything to address I'll file a new bug.
+Comment on attachment 792872
+patch to land
+
+Review of attachment 792872:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/client/Makefile.in
+@@ +12,5 @@
+>  include $(topsrcdir)/config/rules.mk
+>  
+>  libs::
+>  	$(INSTALL) $(IFLAGS1) $(srcdir)/*.jsm $(FINAL_TARGET)/modules/devtools
+> +	$(INSTALL) $(IFLAGS1) $(srcdir)/*.js $(FINAL_TARGET)/modules/devtools/client
+
+Meh, it's not making thing significantly worse, since the damage was already there.
+*** Bug 800447 has been marked as a duplicate of this bug. ***
+
+
+[app manager] Implement an abstract connection manager
+
+
+
+Bug 898485 - [app manager] Implement an abstract connection manager. r=past 

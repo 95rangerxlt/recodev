@@ -1,0 +1,134 @@
+Created attachment 377210
+wip
+
+need to remove the observer at shutdown
+
+Created attachment 377210
+wip
+
+need to remove the observer at shutdown
+Created attachment 377301
+v1
+
+ugh. anti-leak crap.
+Comment on attachment 377301
+v1
+
+
+>   nodeIsReadOnly: function PU_nodeIsReadOnly(aNode) {
+>-    if (this.nodeIsFolder(aNode) || this.nodeIsDynamicContainer(aNode))
+>-      return this.bookmarks.getFolderReadonly(this.getConcreteItemId(aNode));
+>-    if (this.nodeIsQuery(aNode) &&
+>+    if (aNode.itemId != -1) {
+>+      if (this._readOnly.indexOf(aNode.itemId) != -1)
+>+        return true;
+>+    }
+>+    else if (this.nodeIsQuery(aNode) &&
+>         asQuery(aNode).queryOptions.resultType !=
+>           Ci.nsINavHistoryQueryOptions.RESULTS_AS_TAG_CONTENTS)
+>       return aNode.childrenReadOnly;
+>     return false;
+
+hm, this does not look correct if aNode.itemId != -1, it could also be a bookmark, but we only support setting readonly on folders...
+also, if aNode.itemId != -1 includes bookmarked queries, while those should be catched by next check.
+
+Please, ensure this won't end up in the Ts path, adding those observers and getting all annotated items could hurt there.
+Created attachment 377309
+v1.1
+
+fixed. it doesn't appear to be called during startup. however, if it is, it might outweigh the multiple sql calls to nodeIsReadOnly.
+Comment on attachment 377309
+v1.1
+
+>diff --git a/toolkit/components/places/src/utils.js b/toolkit/components/places/src/utils.js
+>   nodeIsQuery: function PU_nodeIsQuery(aNode) {
+>     return aNode.type == Ci.nsINavHistoryResultNode.RESULT_TYPE_QUERY;
+>   },
+> 
+>   /**
+>+   * Cache of read-only item IDs. Managed by the annotation observer
+>+   * below.
+>+   */
+
+can you expand the comment a bit explaining how this works really?
+
+>+  // nsIObserver
+>+  observe: function PU_observe(aSubject, aTopic, aData) {
+>+    if (aTopic == "xpcom-shutdown") {
+>+      this.annotations.removeObserver(this);
+>+      const os = Cc["@mozilla.org/observer-service;1"].
+>+                 getService(Ci.nsIObserverService);
+>+      os.removeObserver(this, "xpcom-shutdown");
+
+hm, i'm actually thinking if there could be a possibility _readOnly is never called. For example in tests that use PlacesUtils, or in third party implementations.
+I can't recall if removeObserver throws if the observer does not exist (iirc annotations will throw), in case those should be catched.
+
+>   nodeIsReadOnly: function PU_nodeIsReadOnly(aNode) {
+>-    if (this.nodeIsFolder(aNode) || this.nodeIsDynamicContainer(aNode))
+>-      return this.bookmarks.getFolderReadonly(this.getConcreteItemId(aNode));
+>-    if (this.nodeIsQuery(aNode) &&
+>-        asQuery(aNode).queryOptions.resultType !=
+>-          Ci.nsINavHistoryQueryOptions.RESULTS_AS_TAG_CONTENTS)
+>+    if (this.nodeIsFolder(aNode)) {
+
+why did you discard nodeIsDynamicContainer check? I think it should come back
+
+ok, looking at the code the calls you see probably come from updateCommands or disallowInsertion, so this should be called on focus the first time... since that appear being out of Ts, r=me
+
+PS: can you guess a number of these annotations checks, just to inderstand how much these queries are called while using the library.
+Created attachment 377527
+v1.2
+
+comments fixed
+on an empty profile, about 14 calls when the library is loaded, and another 5 each time it's focused.
+(In reply to comment #6)
+> on an empty profile, about 14 calls when the library is loaded, and another 5
+> each time it's focused.
+Is that with or without the patch applied?
+Comment on attachment 377527
+v1.2
+
+i expect this is a win because we don't have many read-only items.
+
+Just now i was thinking if we should leave PlacesUtils untouched and instead hack this into PlacesUIUtils being a trick for frontend perf.
+But i think it is ok like it is, nobody should have thousands readonly items.
+(In reply to comment #7)
+> (In reply to comment #6)
+> > on an empty profile, about 14 calls when the library is loaded, and another 5
+> > each time it's focused.
+> Is that with or without the patch applied?
+
+without
+
+(In reply to comment #8)
+> (From update of attachment 377527 [details])
+> i expect this is a win because we don't have many read-only items.
+
+exactly. we check all the folder nodes, even tho 99% are not read-only. caching this very small set allows us to fast-path the check.
+ 
+> Just now i was thinking if we should leave PlacesUtils untouched and instead
+> hack this into PlacesUIUtils being a trick for frontend perf.
+> But i think it is ok like it is, nobody should have thousands readonly items.
+
+i think it's better in toolkit, along w/ the rest of the nodeIs* checks. also, if Fennec uses utils.js, they'll want these type of optimizations as well.
+(In reply to comment #9)
+> (In reply to comment #7)
+> > Is that with or without the patch applied?
+> without
+And just to be clear, they all go away now with the patch?
+(In reply to comment #10)
+> (In reply to comment #9)
+> > (In reply to comment #7)
+> > > Is that with or without the patch applied?
+> > without
+> And just to be clear, they all go away now with the patch?
+
+now it's 1 query, lazily executed, for the lifetime of the running application.
+http://hg.mozilla.org/mozilla-central/rev/259b8094d827
+
+
+nodeIsReadOnly should cache read-only item ids
+
+perf
+
+Bug 492799 - nodeIsReadOnly should cache read-only item ids, r=mak77 

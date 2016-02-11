@@ -1,0 +1,152 @@
+STR copied from Shu in https://bugzilla.mozilla.org/show_bug.cgi?id=1008372#c1:
+
+1. Make some page with some JS and open it.
+2. Open debugger, set a breakpoint somewhere.
+3. Reload. Breakpoint hits.
+4. Close the tab.
+5. Open a new tab and navigate to the same page from step 1.
+6. Open debugger, verify no breakpoints are visually set.
+7. Reload. Invisible breakpoint hits.
+
+This is because the DebuggerController tries to cleanup everything on shutdown, including removing all the breakpoints. However, that code is triggered from the tab "close" event, and the debugger server is immediately disconnected afterwards, and the server deletes all the associated actors. So when the DebuggerController cleanup code gets around to sending packets to remove all the breakpoints, the server has already removed all the associated actors. server log:
+
+removing breakpoint!
+DBG-SERVER: Packet 26 sent to "conn0.breakpoint30"
+DBG-SERVER: Packet 27 sent to "conn0.context26"
+DBG-SERVER: in ThreadActor.prototype.disconnect
+DBG-SERVER: in ThreadActor.prototype.disconnect
+DBG-SERVER: Packet 28 sent from "conn0.tab1"
+DBG-SERVER: Packet 29 sent from "root"
+DBG-SERVER: Received packet 26: {
+  "to": "conn0.breakpoint30",
+  "type": "delete"
+}
+DBG-SERVER: Packet 30 sent from "conn0.breakpoint30"
+DBG-SERVER: Received packet 27: {
+  "to": "conn0.context26",
+  "type": "detach"
+}
+DBG-SERVER: Packet 31 sent from "conn0.context26"
+DBG-SERVER: Received packet 28: {
+  "from": "conn0.tab1",
+  "type": "tabDetached"
+}
+DBG-SERVER: Received packet 29: {
+  "from": "root",
+  "type": "tabListChanged"
+}
+DBG-SERVER: Received packet 30: {
+  "from": "conn0.breakpoint30",
+  "error": "noSuchActor",
+  "message": "No such actor for ID: conn0.breakpoint30"
+}
+
+STR copied from Shu in https://bugzilla.mozilla.org/show_bug.cgi?id=1008372#c1:
+
+1. Make some page with some JS and open it.
+2. Open debugger, set a breakpoint somewhere.
+3. Reload. Breakpoint hits.
+4. Close the tab.
+5. Open a new tab and navigate to the same page from step 1.
+6. Open debugger, verify no breakpoints are visually set.
+7. Reload. Invisible breakpoint hits.
+
+This is because the DebuggerController tries to cleanup everything on shutdown, including removing all the breakpoints. However, that code is triggered from the tab "close" event, and the debugger server is immediately disconnected afterwards, and the server deletes all the associated actors. So when the DebuggerController cleanup code gets around to sending packets to remove all the breakpoints, the server has already removed all the associated actors. server log:
+
+removing breakpoint!
+DBG-SERVER: Packet 26 sent to "conn0.breakpoint30"
+DBG-SERVER: Packet 27 sent to "conn0.context26"
+DBG-SERVER: in ThreadActor.prototype.disconnect
+DBG-SERVER: in ThreadActor.prototype.disconnect
+DBG-SERVER: Packet 28 sent from "conn0.tab1"
+DBG-SERVER: Packet 29 sent from "root"
+DBG-SERVER: Received packet 26: {
+  "to": "conn0.breakpoint30",
+  "type": "delete"
+}
+DBG-SERVER: Packet 30 sent from "conn0.breakpoint30"
+DBG-SERVER: Received packet 27: {
+  "to": "conn0.context26",
+  "type": "detach"
+}
+DBG-SERVER: Packet 31 sent from "conn0.context26"
+DBG-SERVER: Received packet 28: {
+  "from": "conn0.tab1",
+  "type": "tabDetached"
+}
+DBG-SERVER: Received packet 29: {
+  "from": "root",
+  "type": "tabListChanged"
+}
+DBG-SERVER: Received packet 30: {
+  "from": "conn0.breakpoint30",
+  "error": "noSuchActor",
+  "message": "No such actor for ID: conn0.breakpoint30"
+}
+When the associated actors are removed, shouldn't they both remove their "low level" Debugger API breakpoint from their D.Scripts and also remove their location from the BreakpointStore? Given those two things happen, I don't see how we could hit a breakpoint in a new tab.
+
+If we were leaving the locations in the BreakpointStore, I could see how we would reset the breakpoints on the server and the client would never know.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #1)
+> When the associated actors are removed, shouldn't they both remove their
+> "low level" Debugger API breakpoint from their D.Scripts and also remove
+> their location from the BreakpointStore? Given those two things happen, I
+> don't see how we could hit a breakpoint in a new tab.
+
+I don't see where the BreakpointActor cleans itself up when it is deleted. The BreakpointActor removes itself from the store in `onDelete`, which is called from the protocol, but is that called automatically somehow when the BreakpointActor is cleared from the actor pool? I don't see where that is automatically handled.
+It seems you are correct, it doesn't clean itself up therefore leaving its location in the BreakpointStore. If we add a disconnect method to the BreakpointActor's prototype that just calls onDelete, I believe we'd solve the issue here. Want to try it out, James?
+I assume you're very busy with Debugger.Source at the moment, but is this still on your radar James?
+It hasn't been, but it is a pretty quick fix, so I can try to multitask more. I'll put this on my todo list for Monday.
+(In reply to James Long (:jlongster) from comment #5)
+> It hasn't been, but it is a pretty quick fix, so I can try to multitask
+> more. I'll put this on my todo list for Monday.
+
+Yeah, no rush. Debugger.Source is more important. But thanks for looking into it!
+Now that Debugger.Source is 'done', any change you'll be able to look into this soon?
+(In reply to Eddy Bruel [:ejpbruel] from comment #7)
+> Now that Debugger.Source is 'done', any change you'll be able to look into
+> this soon?
+
+Sure thing. Will have to wait until after the holidays though.
+James said he was ok with me stealing this bug.
+Created attachment 8600300
+Add a disconnect method to BreakpointActor.
+
+I am unable to reproduce this bug. From what I can tell, the breakpoint actor is now properly deleted by the frontend before the connection is closed, although I don't really understand why.
+
+I tried to write a regression test where I close the connection without deleting the breakpoint client at all, but that still doesn't seem to trigger the breakpoint on reload.
+
+Now that I think about it, I don't understand why not deleting a breakpoint before closing the connection would cause it to trigger when the tab is reloaded. Reloading the tab introduces new scripts, for which the actor is not set as a breakpoint handler. The actor is no longer kept in the breakpoint store, so it won't be added as breakpoint handler for any of those scripts either.
+
+Perhaps the old way in which we handled breakpoints was different in some way that caused this behavior. I can't tell for sure, but in any case I cannot reproduce it, nor can I explain it based on the workings of the current code.
+
+It seems to me that at worst, this constitutes a memory leak, because the actor from the previous connection is kept alive by the debugger. Simply adding a disconnect method to BreakpointActor should prevent that.
+
+James, can you confirm that the bug no longer occurs, even without this patch applied? I did not write a regression test, because I cannot reproduce the buggy behavior, and I don't know how to test for memory leaks.
+(In reply to Eddy Bruel [:ejpbruel] from comment #10)
+> 
+> Now that I think about it, I don't understand why not deleting a breakpoint
+> before closing the connection would cause it to trigger when the tab is
+> reloaded. Reloading the tab introduces new scripts, for which the actor is
+> not set as a breakpoint handler. The actor is no longer kept in the
+> breakpoint store, so it won't be added as breakpoint handler for any of
+> those scripts either.
+
+What do you mean that the actor is no longer kept in the store? We key off of actor IDs. But there's truth to what you say: this should not happen anymore. We used to key off of URLs, which I think it why the breakpoint could be hit again.
+
+We should still clean this up though for thoroughness.
+Comment on attachment 8600300
+Add a disconnect method to BreakpointActor.
+
+Review of attachment 8600300:
+-----------------------------------------------------------------
+
+Thanks!
+https://hg.mozilla.org/integration/fx-team/rev/73f19e8f1635
+https://hg.mozilla.org/mozilla-central/rev/73f19e8f1635
+
+
+Breakpoints not removed from server when tab is closed
+
+
+
+Bug 1010552 - Breakpoints not removed from server when tab is closed;r=jlong 

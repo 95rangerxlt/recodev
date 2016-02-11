@@ -1,0 +1,109 @@
+Created attachment 310113
+Avoid attempting to use other components during XPCOM registration in FeedProcessor.js
+
+During the component registration phase of startup, it is unwise to assume that any other random component is available for use; your component may be one of the earliest ones registered.
+
+Furthermore, just because abusing this works for you does not mean it will work for others; component load order differs between debug and release builds, as well as between different platforms.
+
+How might this look? Consider the following snippet:
+
+var gIoService = Cc[@mozilla.org/network/io-service;1].
+                 getService(Ci.nsIIOService);
+
+function MyComponent() {}
+
+function NSGetModule(compMgr, fileSpec) {
+  return XPCOMUtils.generateModule([MyComponent]);
+}
+
+In this example, .getService() will be called on the component that implements @mozilla.org/network/io-service;1 during component registration. If that component has not yet been registered, this call will fail, and the load of the JS file will abort.
+
+The component loader is smart enough to retry registering components that fail, but sometimes that isn't good enough. This becomes particularly challenging to track down when the debug build works, but the release build does not. (This happened to us recently at Flock.)
+
+I have updated toolkit/components/feeds/src/FeedProcessor.js to avoid making assumptions about component load order (patch attached). If addressing this issue is deemed worthy of attention and the patch is acceptable, I can look for other occurances of this and provide more patches.
+
+Created attachment 310113
+Avoid attempting to use other components during XPCOM registration in FeedProcessor.js
+
+During the component registration phase of startup, it is unwise to assume that any other random component is available for use; your component may be one of the earliest ones registered.
+
+Furthermore, just because abusing this works for you does not mean it will work for others; component load order differs between debug and release builds, as well as between different platforms.
+
+How might this look? Consider the following snippet:
+
+var gIoService = Cc[@mozilla.org/network/io-service;1].
+                 getService(Ci.nsIIOService);
+
+function MyComponent() {}
+
+function NSGetModule(compMgr, fileSpec) {
+  return XPCOMUtils.generateModule([MyComponent]);
+}
+
+In this example, .getService() will be called on the component that implements @mozilla.org/network/io-service;1 during component registration. If that component has not yet been registered, this call will fail, and the load of the JS file will abort.
+
+The component loader is smart enough to retry registering components that fail, but sometimes that isn't good enough. This becomes particularly challenging to track down when the debug build works, but the release build does not. (This happened to us recently at Flock.)
+
+I have updated toolkit/components/feeds/src/FeedProcessor.js to avoid making assumptions about component load order (patch attached). If addressing this issue is deemed worthy of attention and the patch is acceptable, I can look for other occurances of this and provide more patches.
+Yes. Component instantiation during registration can cause all sorts of problems.
+
+We should not only audit for creating new components directly, but also doing other unsafe things:
+
+Components.utils.import("chrome:///") in a JS component when it's loaded. This will cause bug 292549.
+
+It might even be worth adding a "doingRegistration" flag in the component manager itself, and if you call "createInstance" while registration is ongoing, we should send a message to the error console.
+Comment on attachment 310113
+Avoid attempting to use other components during XPCOM registration in FeedProcessor.js
+
+>Index: FeedProcessor.js
+
+> function strToURI(link, base) {
+>   var base = base || null;
+>+  if (!gIoService) {
+>+    gIoService = Cc[IO_CONTRACTID].getService(Ci.nsIIOService);
+>+  }
+
+uber nit: this file doesn't seem to be very consistent, but I would drop the unneeded brackets around the single-line then clause.
+Created attachment 311583
+Take 2: Avoid attempting to use other components during XPCOM registration in FeedProcessor.js
+
+Nits cleaned, re-rolled for current version, carrying forward Gavin's r+.
+(In reply to comment #1)
+> We should not only audit for creating new components directly, but also doing
+> other unsafe things:
+> 
+> Components.utils.import("chrome:///") in a JS component when it's loaded. This
+> will cause bug 292549.
+
+One of the comments on that bug indicates that a chrome url was being retrieved during component registration, but the nsJarModule had not been registered yet. That is exactly what caused our failure. (Simply renaming jar50.dll to aajar50.dll in the installed application was an effective workaround.)
+
+> It might even be worth adding a "doingRegistration" flag in the component
+> manager itself, and if you call "createInstance" while registration is ongoing,
+> we should send a message to the error console.
+
+I will attack this shortly. Instead of a boolean, I'm thinking of storing the name of the module file being loaded, for use in error output. This will be null once registration is complete.
+
+Should this be an NS_ASSERTION?
+It should be an assertion, for internal use. It should also be a console message so that extension authors (who don't have debug builds) are notified.
+Comment on attachment 311583
+Take 2: Avoid attempting to use other components during XPCOM registration in FeedProcessor.js
+
+How about tests?  Re-request approval once tests are included.
+(In reply to comment #6)
+> (From update of attachment 311583 [details])
+> How about tests?  Re-request approval once tests are included.
+
+Can you give me a hint here?
+
+There is no functionality being introduced, and the defect being corrected only manifests itself under certain build/platform configurations. Any existing tests should be sufficient to exercise the change involved here.
+
+OTOH if there are no existing tests, I will have to climb the test creation learning curve before I can supply one. Sorry about that.
+Comment on attachment 311583
+Take 2: Avoid attempting to use other components during XPCOM registration in FeedProcessor.js
+
+Re-requesting approval. There is not a non-scary way to test this for 1.9, because it depends on XPCOM registration ordering. We should take this patch to fix an expectation mismatch and add component manager assertions post-1.9 when it is safe to do so.
+Comment on attachment 311583
+Take 2: Avoid attempting to use other components during XPCOM registration in FeedProcessor.js
+
+a=me
+mozilla/toolkit/components/feeds/src/FeedProcessor.js 	1.36 

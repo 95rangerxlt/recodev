@@ -1,0 +1,463 @@
+Bug 999239 caused a number of session store tests to stop working. The pattern seems to be as follows:
+
+gBrowser.loadURI(someNonRemoteURI);
+browser.addEventListener("load", ...continue with test...);
+
+Previously, we would switch the remoteness of the browser in loadURI. With bug 999239 it doesn't get switched until a little later. By that time, we've already tried to add the event listener (or at least sent a message to do so). But when we switch remoteness, we throw away the content script and any messages that were sent to it, so we lose track of the fact that we need to watch for load events.
+
+It seems like the only solution is to switch remoteness before adding the event listener. I could change the test to use a different function than loadURI, and it would handle changing the remoteness. However, this is probably a common pattern. It's causing 6 test failures in the session store tests. So I'm not sure what to do.
+
+Bug 999239 caused a number of session store tests to stop working. The pattern seems to be as follows:
+
+gBrowser.loadURI(someNonRemoteURI);
+browser.addEventListener("load", ...continue with test...);
+
+Previously, we would switch the remoteness of the browser in loadURI. With bug 999239 it doesn't get switched until a little later. By that time, we've already tried to add the event listener (or at least sent a message to do so). But when we switch remoteness, we throw away the content script and any messages that were sent to it, so we lose track of the fact that we need to watch for load events.
+
+It seems like the only solution is to switch remoteness before adding the event listener. I could change the test to use a different function than loadURI, and it would handle changing the remoteness. However, this is probably a common pattern. It's causing 6 test failures in the session store tests. So I'm not sure what to do.
+(In reply to Bill McCloskey (:billm) from comment #0)
+> Bug 999239 caused a number of session store tests to stop working. The
+> pattern seems to be as follows:
+> 
+> gBrowser.loadURI(someNonRemoteURI);
+> browser.addEventListener("load", ...continue with test...);
+
+Would gBrowser.addEventListener("load", ...) work here?
+
+> It seems like the only solution is to switch remoteness before adding the
+> event listener. I could change the test to use a different function than
+> loadURI, and it would handle changing the remoteness. However, this is
+> probably a common pattern. It's causing 6 test failures in the session store
+> tests. So I'm not sure what to do.
+
+I think this could be done. I took it out mainly to have a single codepath for this change but we could check the URI and if needed call RedirectLoad instead of loadURI. It looks like that should update the browser remoteness synchronously before returning.
+Created attachment 8499909
+patch rev 1
+
+Various tests and we can assume extensions use gBrowser.loadURI or browser.loadURI so this overrides the <browser> bindings to catch any of those. If the load will need to go to a new process we call back to LoadInNewProcess which handles migrating session information. The previous code here used a sneaky hack of manually altering the session history entries but I've figured out a nicer way to send the original history across plus the new page to load. This means we can also send load flags across as well as just the url and referrer.
+
+Various tests get re-enabled with this, a couple of minor fixes there. One test, browser_724239.js gets disabled. It turns out that bug 999239 broke both that feature and the test in a way that made it keep passing. This patch fixes the test so it now fails correctly but I'm still investigating how to fix so I'll just disable it for now. Filed bug 1077738 to track fixing that.
+Comment on attachment 8499909
+patch rev 1
+
+I'll see if I get to this before Tim.
+Gentle review ping.
+Comment on attachment 8499909
+patch rev 1
+
+Review of attachment 8499909:
+-----------------------------------------------------------------
+
+I really don't like that we have to do this. I still hope this is really only temporary and as Bill said somewhere else this doesn't seem like something we should/could ship.
+
+I wonder if we could avoid some of that hackyness if instead of trying to solve this on the XUL level we tried solving that in the platform. If the XULElement implementation or the nsFrameLoader had support for switching the remoteness of a browser, would that look better? XULElement could for example throw away the current frame loader if the "remote" attribute's value is toggled. This way we might not lose event listeners?
+
+I unfortunately have no idea what to do about session history... that seems quite complicated. AFAIK the platform doesn't even have code to serialize it so we have to piggy-back on sessionstore here. As I said below changing the data format seems really hacky. I wonder if maybe we could start loading the new page and "unshift" existing session entries afterwards? I don't know exactly how well that would be handled but it seems like we wouldn't have to forward load flags then at least.
+
+Is there maybe a completely different solution than remoteness switching? Something we haven't considered yet that would make the whole issue a little more opaque to the frontend?
+
+Did we think about whether our time would be better spent on migrating privileged sites to being non-privileged? The few privileged sites we have that aren't about:newtab could probably just open in a new non-remote tab until we fixed those...
+
+::: browser/base/content/tabbrowser.xml
+@@ +5333,5 @@
+> +              let shouldBeRemote = gMultiProcessBrowser &&
+> +                                   E10SUtils.shouldBrowserBeRemote(aURI);
+> +              let isRemote = this.getAttribute("remote") == "true";
+> +              if (isRemote == shouldBeRemote) {
+> +                this.webNavigation.loadURI(aURI, aFlags, aReferrerURI, aPostData, null);
+
+loadURI() can throw so it makes sense to have that in the try/catch clause. All the other stuff should be moved out or we swallow errors unnecessarily. LoadInNewProcess() shouldn't throw so also that should be moved out.
+
+@@ +5356,5 @@
+> +  <binding id="tabbrowser-remote-browser"
+> +           extends="chrome://global/content/bindings/remote-browser.xml#remote-browser">
+> +    <implementation>
+> +      <!-- throws exception for unknown schemes -->
+> +      <method name="loadURIWithFlags">
+
+Having those functions do the same and not share any code seems suboptimal. Is there any sane way to share code between those two bindings?
+
+@@ +5383,5 @@
+> +              let shouldBeRemote = gMultiProcessBrowser &&
+> +                                   E10SUtils.shouldBrowserBeRemote(aURI);
+> +              let isRemote = this.getAttribute("remote") == "true";
+> +              if (isRemote == shouldBeRemote) {
+> +                this.webNavigation.loadURI(aURI, aFlags, aReferrerURI, aPostData, null);
+
+Same here about try/catch contents.
+
+::: browser/components/sessionstore/ContentRestore.jsm
+@@ +187,5 @@
+>      // load happens.
+>      webNavigation.setCurrentURI(Utils.makeURI("about:blank"));
+>  
+>      try {
+> +      if (tabData.newURI) {
+
+I really don't like hijacking the data format here to forward data to the content script. I always assume that people will find and use that and then we break things later...
+
+::: browser/components/sessionstore/test/browser_819510_perwindowpb.js
+@@ +179,1 @@
+>    whenBrowserLoaded(browser, function () {
+
+It seems really bad to optimize for remoteness switching. I feel like this would break lots of code and probably lots of add-ons if not broken otherwise by e10s? Having to keep this in mind when writing tests and code is bad :(
+(In reply to Tim Taubert [:ttaubert] from comment #5)
+> Comment on attachment 8499909
+> patch rev 1
+> 
+> Review of attachment 8499909:
+> -----------------------------------------------------------------
+> 
+> I really don't like that we have to do this. I still hope this is really
+> only temporary and as Bill said somewhere else this doesn't seem like
+> something we should/could ship.
+> 
+> I wonder if we could avoid some of that hackyness if instead of trying to
+> solve this on the XUL level we tried solving that in the platform. If the
+> XULElement implementation or the nsFrameLoader had support for switching the
+> remoteness of a browser, would that look better? XULElement could for
+> example throw away the current frame loader if the "remote" attribute's
+> value is toggled. This way we might not lose event listeners?
+
+I would prefer this was handled at the platform level too, but I have no idea how difficult that is. Either way it seems likely frontend is going to have to get involved somewhere along the way and for now fixing it here seems simplest.
+
+> I unfortunately have no idea what to do about session history... that seems
+> quite complicated. AFAIK the platform doesn't even have code to serialize it
+> so we have to piggy-back on sessionstore here. As I said below changing the
+> data format seems really hacky. I wonder if maybe we could start loading the
+> new page and "unshift" existing session entries afterwards? I don't know
+> exactly how well that would be handled but it seems like we wouldn't have to
+> forward load flags then at least.
+
+I have an alternative that doesn't involve changing the data format but it does add a new API to sessionstore, see if you prefer it.
+
+> Is there maybe a completely different solution than remoteness switching?
+> Something we haven't considered yet that would make the whole issue a little
+> more opaque to the frontend?
+> 
+> Did we think about whether our time would be better spent on migrating
+> privileged sites to being non-privileged? The few privileged sites we have
+> that aren't about:newtab could probably just open in a new non-remote tab
+> until we fixed those...
+
+Yes we did, in fact if about:newtab was content based I think we could stomach opening the rest in a new tab for a while, but fixing this code was far quicker than fixing about:newtab looks to be. There will always be privileged pages though and at some point we'll even have multiple child processes so we may need to reuse whatever we have here to switch a browser from one process to another.
+
+> ::: browser/base/content/tabbrowser.xml
+> @@ +5333,5 @@
+> > +              let shouldBeRemote = gMultiProcessBrowser &&
+> > +                                   E10SUtils.shouldBrowserBeRemote(aURI);
+> > +              let isRemote = this.getAttribute("remote") == "true";
+> > +              if (isRemote == shouldBeRemote) {
+> > +                this.webNavigation.loadURI(aURI, aFlags, aReferrerURI, aPostData, null);
+> 
+> loadURI() can throw so it makes sense to have that in the try/catch clause.
+> All the other stuff should be moved out or we swallow errors unnecessarily.
+> LoadInNewProcess() shouldn't throw so also that should be moved out.
+
+This isn't a try...catch clause, it's a try...finally clause. Any exceptions from loadURI are supposed to be thrown back to the caller. The try block is here to ensure that we decrement this.userTypedClear whatever. Only wrapping loadURI in it would mean duplicating that code and rethrowing the exception so seems more complex to me.
+
+> @@ +5356,5 @@
+> > +  <binding id="tabbrowser-remote-browser"
+> > +           extends="chrome://global/content/bindings/remote-browser.xml#remote-browser">
+> > +    <implementation>
+> > +      <!-- throws exception for unknown schemes -->
+> > +      <method name="loadURIWithFlags">
+> 
+> Having those functions do the same and not share any code seems suboptimal.
+> Is there any sane way to share code between those two bindings?
+
+It's not ideal I agree, I could stick the function onto tabbrowser and have them call up to that if you like?
+
+> ::: browser/components/sessionstore/test/browser_819510_perwindowpb.js
+> @@ +179,1 @@
+> >    whenBrowserLoaded(browser, function () {
+> 
+> It seems really bad to optimize for remoteness switching. I feel like this
+> would break lots of code and probably lots of add-ons if not broken
+> otherwise by e10s? Having to keep this in mind when writing tests and code
+> is bad :(
+
+So this is actually a problem with how many tests are listening to load events on browser elements. They don't exist in pure e10s, they only work in tests because the shims are doing message passing for it. But since recreating the browser frame trashes all the framescript state the recorded registrations are thrown away. Might be possible to solve that.
+Created attachment 8506295
+patch rev 2
+
+This changes to using a new API to restore history and load a new URI rather than changing the data format.
+So, this bug blocks a couple of M3 bugs related to session store and crashed tabs (bug 1070096 and bug  	1065785), but is only necessary in order to land the included tests for those patches.
+
+To avoid bitrot, I'm going to see if I can land the actual fixes (without the tests) today, and then block landing the associated tests from those bugs once this one gets solved.
+(In reply to Dave Townsend [:mossop] from comment #6)
+> (In reply to Tim Taubert [:ttaubert] from comment #5)
+> > loadURI() can throw so it makes sense to have that in the try/catch clause.
+> > All the other stuff should be moved out or we swallow errors unnecessarily.
+> > LoadInNewProcess() shouldn't throw so also that should be moved out.
+> 
+> This isn't a try...catch clause, it's a try...finally clause.
+
+Sorry, I missed that... obviously.
+Comment on attachment 8506295
+patch rev 2
+
+Review of attachment 8506295:
+-----------------------------------------------------------------
+
+::: browser/base/content/tabbrowser.xml
+@@ +5348,5 @@
+> +  <binding id="tabbrowser-browser"
+> +           extends="chrome://global/content/bindings/browser.xml#browser">
+> +    <implementation>
+> +      <!-- throws exception for unknown schemes -->
+> +      <method name="loadURIWithFlags">
+
+Exposing a function _loadURIWithFlags() that is used by the two implementation sound indeed like a good idea to me.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +178,5 @@
+>    setTabState: function ss_setTabState(aTab, aState) {
+>      SessionStoreInternal.setTabState(aTab, aState);
+>    },
+>  
+> +  restoreTabAndLoad: function ss_restoreTabAndLoad(aTab, aState, aLoadArguments) {
+
+Please add a scary comment that tells people to not rely on this API. We'll remove it when e10s is "done".
+
+@@ +179,5 @@
+>      SessionStoreInternal.setTabState(aTab, aState);
+>    },
+>  
+> +  restoreTabAndLoad: function ss_restoreTabAndLoad(aTab, aState, aLoadArguments) {
+> +    SessionStoreInternal.setTabState(aTab, aState, aLoadArguments);
+
+I think instead of modifying setTabState() and having to pass the load arguments all the way down... how about sending an async message to the browser here that contains only the load args that will be used when restoring into a tab next time?
+
+"SessionStore:restoreTabContent" will arrive exactly after that, use the load flags and clear them.
+
+That should also make it pretty easy to rip out once we don't need it anymore.
+(In reply to Tim Taubert [:ttaubert] from comment #10)
+> @@ +179,5 @@
+> >      SessionStoreInternal.setTabState(aTab, aState);
+> >    },
+> >  
+> > +  restoreTabAndLoad: function ss_restoreTabAndLoad(aTab, aState, aLoadArguments) {
+> > +    SessionStoreInternal.setTabState(aTab, aState, aLoadArguments);
+> 
+> I think instead of modifying setTabState() and having to pass the load
+> arguments all the way down... how about sending an async message to the
+> browser here that contains only the load args that will be used when
+> restoring into a tab next time?
+> 
+> "SessionStore:restoreTabContent" will arrive exactly after that, use the
+> load flags and clear them.
+> 
+> That should also make it pretty easy to rip out once we don't need it
+> anymore.
+
+There's a couple of problems with doing this. First, setTabState can fail, I'd need to catch that and send a follow-up message to drop the cached load args in the child. Second, restoreTab needs to know the new URI to be loaded anyway so it can set the browser remoteness correctly so I have to pass something at least as far as that at which point I might as well just pass the load args down.
+
+I can correct the other stuff but need to know how you want me to proceed with that.
+(In reply to Dave Townsend [:mossop] from comment #11)
+> There's a couple of problems with doing this. First, setTabState can fail,
+> I'd need to catch that and send a follow-up message to drop the cached load
+> args in the child. Second, restoreTab needs to know the new URI to be loaded
+> anyway so it can set the browser remoteness correctly so I have to pass
+> something at least as far as that at which point I might as well just pass
+> the load args down.
+
+Agreed. Needed to think a little more about it... I still don't like having to touch every single function just to pass something down but that does indeed not seem as fragile as my initial suggestion.
+Created attachment 8510477
+patch rev 3
+
+Updated from the comments.
+The changes here are adding a _loadURIWithFlags function to browser.js that both the bindings use and renaming restoreTabAndLoad to _restoreTabAndLoad and adding a comment about not using it.
+Comment on attachment 8510477
+patch rev 3
+
+Review of attachment 8510477:
+-----------------------------------------------------------------
+
+Mostly r+ but I'd like to take a look at the SessionStore.jsm changes again.
+
+::: browser/base/content/browser.js
+@@ +799,5 @@
+>    }
+>  }
+>  
+> +// A shared function used by both remote and non-remote browser XBL bindings to
+> +// load a URI or redirect it to the correct process. 
+
+Nit: trailing space
+
+@@ +806,5 @@
+> +    uri = "about:blank";
+> +
+> +  if (charset) {
+> +    try {
+> +      browser.docShell.parentCharset = charset;
+
+Trying to find out whether and when this can throw, I don't see a |parentCharset| property on nsIDocShell... Can we remove that code from browser.xml as well? Looks like that was introduced by http://hg.mozilla.org/mozilla-central/rev/57f0b07c2dc5 as an nsIDocShell attribute. http://hg.mozilla.org/mozilla-central/rev/2ba9f3b24b8a removed it later and introduced getters/setters not callable from JS so I assume that didn't break anything and made the code a no-op?
+
+@@ +813,5 @@
+> +    }
+> +  }
+> +
+> +  if (!(flags & browser.webNavigation.LOAD_FLAGS_FROM_EXTERNAL))
+> +    browser.userTypedClear++;
+
+Nit: please wrap body in brackets
+
+@@ +821,5 @@
+> +                         E10SUtils.shouldBrowserBeRemote(uri);
+> +    if (browser.isRemoteBrowser == shouldBeRemote) {
+> +      browser.webNavigation.loadURI(uri, flags, referrer, postdata, null);
+> +    }
+> +    else {
+
+Nit: } else {
+
+@@ +830,5 @@
+> +      });
+> +    }
+> +  } finally {
+> +    if (browser.userTypedClear)
+> +      browser.userTypedClear--;
+
+nit: please wrap in brackets
+
+@@ +836,5 @@
+> +}
+> +
+> +// Starts a new load in the browser first switching the browser to the correct
+> +// process
+> +function LoadInNewProcess(browser, loadOptions, historyIndex = -1) {
+
+I would prefer to name this LoadInOtherProcess() maybe? LoadInNewProcess() sounds like we would create a new process every time. Or maybe you can think of another name that's even better.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +1603,5 @@
+>      if (aTab.linkedBrowser.__SS_restoreState) {
+>        this._resetTabRestoringState(aTab);
+>      }
+>  
+> +    this.restoreTab(aTab, tabState, false, aLoadArguments);
+
+Boolean params :/
+
+By forwarding an "options" parameter _restoreTabAndLoad() could then set restoreImmediately=true and we wouldn't need to modify the check below:
+
+_restoreTabAndLoad(aTab, aState, aLoadArguments) {
+  SessionStoreInternal.setTabState(aTab, aState, {
+    restoreImmediately: true,
+    loadArguments: aLoadArguments
+  });	
+},
+
+setTabState(aTab, aState, aOptions = {}) {
+  // ...
+  this.restoreTab(aTab, tabState, aOptions);
+}
+
+There are a few restoreTab() callers we need to fix afterwards but I think this really improves readability.
+
+@@ +2533,5 @@
+>      }
+>    },
+>  
+>    // Restores the given tab state for a given tab.
+> +  restoreTab(tab, tabData, restoreImmediately = false, loadArguments) {
+
+As said above we should morph this to:
+
+restoreTab(tab, tabData, options = {}) {
+  let restoreImmediately = options && options.restoreImmediately;
+  // ...
+
+@@ +2602,5 @@
+>      // attribute so that it runs in a content process.
+>      let activePageData = tabData.entries[activeIndex] || null;
+>      let uri = activePageData ? activePageData.url || null : null;
+> +    if (loadArguments)
+> +      uri = loadArguments.uri;
+
+Nit: wrap in brackets, please
+
+@@ +2638,5 @@
+>      }
+>  
+>      // This could cause us to ignore MAX_CONCURRENT_TAB_RESTORES a bit, but
+>      // it ensures each window will have its selected tab loaded.
+> +    if (restoreImmediately || tabbrowser.selectedBrowser == browser || loadArguments) {
+
+(Can leave this condition unchanged with the proposed changes.)
+Created attachment 8511175
+patch rev 4
+
+Spinning this through try to check the parentCharset thing doesn't break anything but no reason to wait for review for that I think.
+
+(In reply to Tim Taubert [:ttaubert] from comment #15)
+> @@ +2638,5 @@
+> >      }
+> >  
+> >      // This could cause us to ignore MAX_CONCURRENT_TAB_RESTORES a bit, but
+> >      // it ensures each window will have its selected tab loaded.
+> > +    if (restoreImmediately || tabbrowser.selectedBrowser == browser || loadArguments) {
+> 
+> (Can leave this condition unchanged with the proposed changes.)
+
+I was tempted to leave this in because if some code ended up calling with loadArguments but restoreImmediately false the loadArguments would have no effect. I also toyed with the idea of throwing if there were loadArguments but restoreImmediately was false. Since these are all internal callers though maybe it doesn't matter.
+(In reply to Dave Townsend [:mossop] from comment #16)
+> > > +    if (restoreImmediately || tabbrowser.selectedBrowser == browser || loadArguments) {
+> > 
+> > (Can leave this condition unchanged with the proposed changes.)
+> 
+> I was tempted to leave this in because if some code ended up calling with
+> loadArguments but restoreImmediately false the loadArguments would have no
+> effect.
+
+That's a fine point, agreed.
+Comment on attachment 8511175
+patch rev 4
+
+Review of attachment 8511175:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +802,5 @@
+> +// A shared function used by both remote and non-remote browser XBL bindings to
+> +// load a URI or redirect it to the correct process.
+> +function _loadURIWithFlags(browser, uri, flags, referrer, charset, postdata) {
+> +  if (!uri)
+> +    uri = "about:blank";
+
+nit: wrap in brackets please
+https://hg.mozilla.org/integration/fx-team/rev/a06771fa469d
+Bounced thanks to a leak https://hg.mozilla.org/integration/fx-team/rev/55ab671f4df3
+
+1130 INFO TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_635418.js | leaked until shutdown [nsGlobalWindow #1720 inner chrome://browser/content/tabview.html chrome://browser/content/tabview.html] - expected PASS
+1131 INFO TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_635418.js | leaked until shutdown [nsGlobalWindow #1719 outer chrome://browser/content/tabview.html] - expected PASS
+Can't reproduce the leak locally and have no clue what's causing it. Might be worth pushing to try without enabling the currently disabled tests to see whether it's the code changes or the new constellation of enabled tests that somehow cause it.
+(In reply to Tim Taubert [:ttaubert] from comment #21)
+> Can't reproduce the leak locally and have no clue what's causing it. Might
+> be worth pushing to try without enabling the currently disabled tests to see
+> whether it's the code changes or the new constellation of enabled tests that
+> somehow cause it.
+
+I can reproduce it locally, not sure why the log is tagging a session restore test because it's actually the tabview tests (at least browser_tabview_bug587276.js) that is causing it. This is why it slipped by me too, the tabview tests got enabled recently in bug 1080784
+Created attachment 8512806
+Leaking patch
+
+This is apparently the minimum patch that causes browser_tabview_bug587276.js to leak. This is both confusing and terrifying.
+Wow, I kind of suspected that but didn't dare to say it. That sucks :/
+Landed with an over-IRC rs from mconley to disable browser_tabview_bug587276.js which this still seems to break somehow. I filed bug 1091200 to follow-up there.
+
+https://hg.mozilla.org/integration/fx-team/rev/8c589a6d637e
+https://hg.mozilla.org/mozilla-central/rev/8c589a6d637e
+
+
+Enable remaining session store tests that are disabled in e10s
+
+
+
+Bug 1075658: Make browser.loadURI synchronously update the browser remoteness. r=ttaubert 
+
+Backing out bug a06771fa469d from bug 1075658 for leaks. 
+
+Bug 1075658: Make browser.loadURI synchronously update the browser remoteness. r=ttaubert 

@@ -1,0 +1,182 @@
+I am using 44.0a2 (2015-11-04) of Firefox Developer Edition, and the following applies to the Responsive Design mode.
+
+When I adjust the width of the view (referring to a webpage), the CSS styles panel in the dev tool doesn't reflect changes of media queries. It keeps displaying the one that applied when the page was last loaded. So, to see the currently applied CSS rules, I need to reload the page. This hinders the development process.
+
+I am using 44.0a2 (2015-11-04) of Firefox Developer Edition, and the following applies to the Responsive Design mode.
+
+When I adjust the width of the view (referring to a webpage), the CSS styles panel in the dev tool doesn't reflect changes of media queries. It keeps displaying the one that applied when the page was last loaded. So, to see the currently applied CSS rules, I need to reload the page. This hinders the development process.
+Another workaround: select a different element in the DOM tree and select the previous one of interest. It's better than reloading the page, but not as convenient as having the dev tool doing that automatically in real time.
+This is a bug in the inspector, not the responsive design mode, as this also happens if you resize the browser.
+
+STR:
+- open http://www.smashingmagazine.com/
+- open the inspector
+- find and select element #wpsidebar
+- notice that it's displayed (at least if your browser window is wide enough)
+- now resize the browser window to make it smaller until the sidebar disappears from the page
+
+==> The rules displayed in the rule-view are not refreshed. If you select another element and then #wpsidebar again (as comment 1 suggests), then you can see that there's a dipslay:none property applied to the element.
+
+This is a regression because it used to work (tested in 42).
+In fact, it seems to be e10s related, tested with FF44 without e10s and it works fine.
+So this must be coming from the fact that the browser resize event doesn't bubble up to the parent process in inspector-panel.js:
+https://dxr.mozilla.org/mozilla-central/source/devtools/client/inspector/inspector-panel.js#167
+
+The callback doesn't get called with e10s.
+
+So, not a regression after all, just something that probably never worked with e10s.
+We could use the ReflowActor that the layout-view uses (move it from the layout-view up to the inspector), but there might be performance problems, some pages cause a lot of reflows, and window resize isn't the only cause of reflows, so this would be suboptimal.
+But in any case, we should be listening for resize events on the server-side. The good place to add this is in devtools/server/actors/layout.js.
+This module was made specifically for actors that detect layout changes.
+Created attachment 8690301
+Bug_1222409_-_1_-_Make_the_LayoutChangesObserver_a.diff
+
+Bug 1222409 - 1 - Make the LayoutChangesObserver also send "resize" events
+(In reply to Patrick Brosset [:pbrosset] [:pbro] from comment #5)
+> Created attachment 8690301
+> Bug_1222409_-_1_-_Make_the_LayoutChangesObserver_a.diff
+> 
+> Bug 1222409 - 1 - Make the LayoutChangesObserver also send "resize" events
+The LayoutChangesObserver was originally made to observe all kinds of
+layout-related events. So far, it was only observing reflows though.
+This adds the capability to also observe resize events on the content
+window.
+Created attachment 8690302
+Bug_1222409_-_2_-_Removed_the_non-e10s_rule_comput.diff
+
+Bug 1222409 - 2 - Removed the non-e10s rule/computed-views refreshing mechanism
+
+When the window is resized, the styles shown in the rule-view and
+computed-view need to be updated (media-queries may be at play).
+This was done before using a local-only, non-e10s solution. The
+inspector-panel would listen to the resize event on the linkedBrowser
+in the current tab.
+This, obviously, did not work with e10s or across a remote connection.
+This change just removes all of the code involved with this.
+This won't cause any regression or backwards-compatibility problems as
+a new server-driven resize observer is being put in place in this bug.
+Even if you connected to an older server, you wouldn't see a difference
+because the refresh-on-resize didn't work over remote connections already.
+Created attachment 8690303
+Bug_1222409_-_3_-_Refresh_the_style-inspector_when.diff
+
+Bug 1222409 - 3 - Refresh the style-inspector when the LayoutChangesObserver detects resize
+
+The implementation is simple, the inspector actor uses the
+LayoutChangesObserver to detect window resize, and when it does, it
+forwards the event to its front.
+This is similar to how we deal with reflow events, except that for
+reflows, the inspector actor (walker in this case), first filters on
+the server to see if the reflow would indeed impact known nodes.
+For resize events, it seemed more complex to do this kind of server
+side filtering as this would involve remembering which node is currently
+selected and which style were applied, and then compare that with the
+new styles.
+Created attachment 8690304
+Bug_1222409_-_4_-_Tests_for_the_style-inspector_re.diff
+
+Bug 1222409 - 4 - Tests for the style-inspector refresh on window resize
+Created attachment 8690307
+Bug_1222409_-_4_-_Tests_for_the_style-inspector_re.diff
+Comment on attachment 8690301
+Bug_1222409_-_1_-_Make_the_LayoutChangesObserver_a.diff
+
+Review of attachment 8690301:
+-----------------------------------------------------------------
+
+Seems fine to me
+Comment on attachment 8690302
+Bug_1222409_-_2_-_Removed_the_non-e10s_rule_comput.diff
+
+Review of attachment 8690302:
+-----------------------------------------------------------------
+
+::: devtools/client/markupview/markup-view.js
+@@ -856,5 @@
+>          container.update();
+>        }
+>      }
+>  
+> -    if (requiresLayoutChange) {
+
+I wonder if there will be some timing issue here now that the rule view / computed view are doing their own listening for this event.. I guess Try will turn it up if so
+
+::: devtools/client/styleinspector/style-inspector.js
+@@ +147,5 @@
+>    onViewRefreshed: function() {
+>      this.inspector.emit("rule-view-refreshed");
+>    },
+>  
+> +  /**
+
+I guess we don't need to handle this now, but there's a lot of duplicated code between the rule view and computed view (and I imagine any inspector sidebar needs a lot of this stuff also)
+Comment on attachment 8690303
+Bug_1222409_-_3_-_Refresh_the_style-inspector_when.diff
+
+Review of attachment 8690303:
+-----------------------------------------------------------------
+
+I see the reason for putting this event on the InspectorActor as opposed to WalkerActor, since the walker doesn't need to do any filtering.  On the other hand, the walker is already who we consult for things like DOM events and mutations (and indeed it already has a layout change observer for reflows).  And the events are happening on an element (the window) that 'belongs' to the walker.  I could also imagine a future optimization where we might want to discard resize events on nested windows that the walker doesn't care about.  So for those reasons I'd argue in favor of emiting the resize event on the walker.  But I don't feel so strongly about it that I'd stop this though.  Let's discuss more about it before landing though..
+Comment on attachment 8690307
+Bug_1222409_-_4_-_Tests_for_the_style-inspector_re.diff
+
+Review of attachment 8690307:
+-----------------------------------------------------------------
+
+Nice refactor for the old-style tests
+
+::: devtools/server/tests/mochitest/test_inspector-resize.html
+@@ +26,5 @@
+> +  let win = null;
+> +  let inspector = null;
+> +
+> +  addAsyncTest(function* setup() {
+> +    info ("Setting up inspector and walker actors.");
+
+Nit: extra space before (
+(In reply to Brian Grinstead [:bgrins] from comment #13)
+> Comment on attachment 8690303
+> Bug_1222409_-_3_-_Refresh_the_style-inspector_when.diff
+> 
+> Review of attachment 8690303:
+> -----------------------------------------------------------------
+> 
+> I see the reason for putting this event on the InspectorActor as opposed to
+> WalkerActor, since the walker doesn't need to do any filtering.  On the
+> other hand, the walker is already who we consult for things like DOM events
+> and mutations (and indeed it already has a layout change observer for
+> reflows).  And the events are happening on an element (the window) that
+> 'belongs' to the walker.  I could also imagine a future optimization where
+> we might want to discard resize events on nested windows that the walker
+> doesn't care about.  So for those reasons I'd argue in favor of emiting the
+> resize event on the walker.  But I don't feel so strongly about it that I'd
+> stop this though.  Let's discuss more about it before landing though..
+
+Brian and I discussed about this on IRC:
+
+22:20	bgrins	I think walker actor makes a bit more sense as outlined in https://bugzilla.mozilla.org/show_bug.cgi?id=1222409#c13, but I don't feel super strongly
+22:21	pbro	yeah, saw your comment, I was on the fence for this one. In the end I decided inspector because the walker should really just be concerned about walking the DOM. But I'm like you, I don't feel strongly
+22:21	pbro	if the walker already has similar events, I guess that's a point in favor of putting it there instead
+22:21	bgrins	also we could potentially do an optimization in future that requires knowledge of walker
+22:22	bgrins	so that's my argument
+22:22	pbro	true
+22:22	pbro	I'll move it there
+22:22	bgrins	you can treat it as an r+ if you move that to walker
+22:22	pbro	ok, thanks
+
+So I'm going to make the change and R+ it.
+Created attachment 8692469
+Bug_1222409_-_Listen_to_window_resize_events_on_se.diff
+
+Rebased, folded all patches, and addressed feedback.
+Try build before addressing the feedback: https://treeherder.mozilla.org/#/jobs?repo=try&revision=d240777df6fb
+With this new patch: https://treeherder.mozilla.org/#/jobs?repo=try&revision=98d704696682
+https://hg.mozilla.org/integration/fx-team/rev/67fdcf66d7f3
+https://hg.mozilla.org/mozilla-central/rev/67fdcf66d7f3
+
+
+In the rule-view: display currently applied media query rules
+
+
+
+Bug 1222409 - Listen to window resize events on server and use this to refresh style-inspector; r=bgrins

@@ -1,0 +1,259 @@
+It would be useful for extensions to have an API that allows customizing existing logs made in the Console panel. For example, there could be extensions supporting third party JS libraries that appends additional info into the current logs or use its own way how to generate the output.
+
+There is already a proxy object (instance of WebConsoleConnectionProxy in WebConsoleFrame) that is responsible for forwarding all events (logs) from the backend to the console output. Quite nice place that centralizes event flow.
+
+Replacing the proxy by a custom proxy coming from extensions could be a solution, but it currently requires producing quite a lot code. Also the way how to safely replace the original proxy isn't currently there.
+
+We could perhaps introduce a new proxy object (that does nothing by default) and is easily re-placable (safely from the very beginning). Similarly to how "hooks" can be installed for the transport protocol.
+
+Or, the WebConsoleConnectionProxy can fire events that can be handled by extensions.
+
+Thoughts?
+
+Honza
+
+It would be useful for extensions to have an API that allows customizing existing logs made in the Console panel. For example, there could be extensions supporting third party JS libraries that appends additional info into the current logs or use its own way how to generate the output.
+
+There is already a proxy object (instance of WebConsoleConnectionProxy in WebConsoleFrame) that is responsible for forwarding all events (logs) from the backend to the console output. Quite nice place that centralizes event flow.
+
+Replacing the proxy by a custom proxy coming from extensions could be a solution, but it currently requires producing quite a lot code. Also the way how to safely replace the original proxy isn't currently there.
+
+We could perhaps introduce a new proxy object (that does nothing by default) and is easily re-placable (safely from the very beginning). Similarly to how "hooks" can be installed for the transport protocol.
+
+Or, the WebConsoleConnectionProxy can fire events that can be handled by extensions.
+
+Thoughts?
+
+Honza
+Is this not similar to the object printer work that Conor is working on?
+(In reply to Jeff Griffiths (:canuckistani) from comment #1)
+> Is this not similar to the object printer work that Conor is working on?
+(it's Bug 980555)
+
+I think this is different requirement. Connor is working on APIs that should allow customization of objects representation in VariablesView and Console (filtering of objects properties, changing value display, etc.).
+
+I believe it could rather have an impact on web console custom output API [1]
+
+This bug is about API that should allow intercepting existing logs (e.g. console.log API) and customizing them (e.g. display them differently or append additional info coming from 3rd party JS libs).
+
+It's already possible to register a listener and catch various event coming from the back-end just like WebConsoleConnectionProxy does (i.e. toolbox.target.client.addListener("consoleAPICall", ...) ), but it isn't possible to change existing stuff.
+
+Honza
+
+
+[1] https://developer.mozilla.org/en-US/docs/Tools/Web_Console/Custom_output
+Connor, please correct me if I am wrong (see comment #2).
+
+Honza
+Honza: I was thinking of firing events for message objects before they are displayed and after. Would this be sufficient for your use cases? In the event handler for messages before display you can control the message object and ultimately how it will be rendered - eg. you can change it entirely to suit your needs. In the event handler for messages after display you can adjust the dom elements of each message.
+(In reply to Mihai Sucan [:msucan] from comment #4)
+> Honza: I was thinking of firing events for message objects before they are
+> displayed and after. Would this be sufficient for your use cases? In the
+> event handler for messages before display you can control the message object
+You mean the packet.message object, correct?
+
+> and ultimately how it will be rendered - eg. you can change it entirely to
+> suit your needs. In the event handler for messages after display you can
+> adjust the dom elements of each message.
+Sounds good. I would be great if extensions can avoid the default rendering in case it's replaced, this could safe performance.
+
+Where/when the extension would register the listener?
+(it should be soon enough, so extensions can catch also
+e.g. cached massages)
+
+Honza
+(In reply to Jan Honza Odvarko [:Honza] from comment #5)
+> (In reply to Mihai Sucan [:msucan] from comment #4)
+> > Honza: I was thinking of firing events for message objects before they are
+> > displayed and after. Would this be sufficient for your use cases? In the
+> > event handler for messages before display you can control the message object
+> You mean the packet.message object, correct?
+
+I meant the web console output Message object, but you would also get access to the packet.
+
+Not sure how fitting it would be to provide all of the packets from the webconsole connection proxy, even before they become console output Message objects. It would be useful but sounds like this should be a debugger client feature, rather than a webconsole thing.
+
+
+> > and ultimately how it will be rendered - eg. you can change it entirely to
+> > suit your needs. In the event handler for messages after display you can
+> > adjust the dom elements of each message.
+> Sounds good. I would be great if extensions can avoid the default rendering
+> in case it's replaced, this could safe performance.
+
+Right.
+
+> Where/when the extension would register the listener?
+> (it should be soon enough, so extensions can catch also
+> e.g. cached massages)
+
+Immediately after the webconsole is first loaded. You have the toolbox webconsole-ready event. Not sure about cached messages if they are added before or after the -ready event, but we must make sure that you can change their rendering as well.
+Created attachment 8488623
+bug1035707-1.patch
+
+I am attaching a patch:
+
+1) It implements a new event "new-messages" 
+2) Event listeners (extensions) are notified when a new log or updated happens in the console.
+3) Event listeners have access to the rendered node as well as to the packet that came from the back end (this is the main difference from existing "messages-added" and "messages-updated" events).
+
+What do you think?
+
+Honza
+Comment on attachment 8488623
+bug1035707-1.patch
+
+Review of attachment 8488623:
+-----------------------------------------------------------------
+
+I think we can make this less repetitive, but otherwise I agree on the general approach.
+
+::: browser/devtools/webconsole/console-output.js
+@@ +208,5 @@
+>    {
+>      for (let msg of args) {
+>        msg.init(this);
+>        this.owner.outputMessage(msg._categoryCompat, this._onFlushOutputMessage,
+> +                               [msg], msg);
+
+This is a fairly repetitive pattern in this patch, which suggests that outputMessage() could simply expect the last element in the args array to be the entire message. This way we avoid needless repetition and get slightly better performance as well.
+
+@@ +1203,5 @@
+>  Messages.JavaScriptEvalOutput = function(evalResponse, errorMessage)
+>  {
+>    let severity = "log", msg, quoteStrings = true;
+>  
+> +  this.response = evalResponse;
+
+Why this change?
+
+::: browser/devtools/webconsole/webconsole.js
+@@ +470,5 @@
+>        this._initDefer.resolve(this);
+>      }, (aReason) => { // on failure
+>        let node = this.createMessageNode(CATEGORY_JS, SEVERITY_ERROR,
+>                                          aReason.error + ": " + aReason.message);
+> +      this.outputMessage(CATEGORY_JS, node, null, aReason);
+
+My suggestion above would make this:
+
+this.outputMessage(CATEGORY_JS, node, [aReason]);
+
+The code that would ignore null should also ignore [aReason].
+
+@@ +1729,5 @@
+>        private: aActor.private,
+>      };
+>  
+>      this._networkRequests[aActor.actor] = networkInfo;
+> +    this.outputMessage(CATEGORY_NETWORK, this.logNetEvent, [aActor.actor], aActor);
+
+In this case we would probably need to alter the arguments array to pass [aActor] and change the handling code to extract aActor.actor from it. Alternatively, if you are really bored, you could just use [aActor.actor, aActor].
+
+@@ +2130,5 @@
+>          else {
+>            newMessages.add(result.node);
+>          }
+> +
+> +        allMessages.add(result);
+
+Why can't you just use the concatenation of the newMessages and updatedMessages sets? They should contain all the nodes that will be rendered in the output pane.
+
+As far as I can see the 2 separate notifications (messages-added & messages-updated) provide more information than a single one and they are only used by tests and add-ons, so if they are not useful we should replace them with messages-new, not duplicate their functionality.
+(In reply to Jan Honza Odvarko [:Honza] from comment #7)
+> 3) Event listeners have access to the rendered node as well as to the packet
+> that came from the back end (this is the main difference from existing
+> "messages-added" and "messages-updated" events).
+
+Where does that happen? I see in the patch that |result| is being used as the payload, but that only contains the result of WCF__outputMessageFromQueue, which is:
+
+An object that holds the following properties:
+- node: the DOM element of the message.
+- isRepeated: the DOM element of the original message, if this is a repeated message, otherwise null.
+- visible: boolean that tells if the message is visible.
+Created attachment 8491328
+bug1035707-2.patch
+
+(In reply to Panos Astithas [:past] from comment #8)
+> This is a fairly repetitive pattern in this patch, which suggests that
+> outputMessage() could simply expect the last element in the args array to be
+> the entire message. This way we avoid needless repetition and get slightly
+> better performance as well.
+Done
+
+> > +  this.response = evalResponse;
+> 
+> Why this change?
+Console Message objects (e.g. Messages.JavaScriptEvalOutput or Messages.NavigationMarker) are passed to outputMessage() method as the last element within the 'aArguments' array. Note that in case of e.g. console.* API calls - it's the response packet passed into as the last element.
+
+In order to make the response packet (for JS evals) available to extensions it's stored within the JavaScriptEvalOutput instance (and also in NavigationMarker instance).
+
+> My suggestion above would make this:
+> 
+> this.outputMessage(CATEGORY_JS, node, [aReason]);
+Done
+
+> In this case we would probably need to alter the arguments array to pass
+> [aActor] and change the handling code to extract aActor.actor from it.
+Done
+
+> Why can't you just use the concatenation of the newMessages and
+> updatedMessages sets? They should contain all the nodes that will be
+> rendered in the output pane.
+> As far as I can see the 2 separate notifications (messages-added &
+> messages-updated) provide more information than a single one
+The existing events (messages-added & messages-updated) don't provide the response packet (with data) coming from the back end.
+
+> only used by tests and add-ons, so if they are not useful we should replace
+> them with messages-new, not duplicate their functionality.
+Good point, done.
+
+I removed both existing messages (messages-added & messages-updated) and kept only the new: "new-messages" event. The argument passed into the new event is an array of the following structures:
+
+node: the DOM element of the message.
+update: true if this is and update (repeated message)
+response: the response from the backend (or a console Message object with the response inside).
+
+I don't see how we can keep back compatibility, but search through the https://mxr.mozilla.org/addons/ doesn't show any addons that would use these events.
+
+Tests updated.
+
+> Where does that happen? I see in the patch that |result| is being used as
+> the payload, but that only contains the result of
+> WCF__outputMessageFromQueue, which is:
+> 
+> An object that holds the following properties:
+> - node: the DOM element of the message.
+> - isRepeated: the DOM element of the original message, if this is a repeated
+> message, otherwise null.
+> - visible: boolean that tells if the message is visible.
+And there is additional property:
+- message: the packet received from the back end
+
+
+
+Honza
+Comment on attachment 8491328
+bug1035707-2.patch
+
+Review of attachment 8491328:
+-----------------------------------------------------------------
+
+You forgot a couple of "messages-added" handlers in scratchpad and inspector tests. r=me with those fixed.
+Created attachment 8494290
+bug1035707-3.patch
+(In reply to Panos Astithas [:past] from comment #11)
+> You forgot a couple of "messages-added" handlers in scratchpad and inspector
+> tests. r=me with those fixed.
+Fixed (see bug1035707-3.patch), please commit (I don't have the commit access yet)
+
+Thanks Panos for the reviews!
+Honza
+https://hg.mozilla.org/integration/fx-team/rev/8ae27969b947
+https://hg.mozilla.org/mozilla-central/rev/8ae27969b947
+
+
+New API: Customizing webconsole logs
+
+
+
+Bug 1035707 - Implement new API for customizing webconsole logs; r=past 

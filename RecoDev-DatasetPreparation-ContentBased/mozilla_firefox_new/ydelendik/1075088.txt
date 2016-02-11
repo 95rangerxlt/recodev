@@ -1,0 +1,450 @@
+- Object Tag initialization count.
+
+- Object Tag initialization count.
+- Instantiations of the plugin process.
+- SWF dimensions.
+- Number of SWFs per page.
+Created attachment 8498856
+Initial probes to flash plugins content
+(In reply to Michael Bebenita [:mbx] from comment #1)
+> - Number of SWFs per page.
+
+This is a tricky one: we need to maintain state somewhere on the HTML page to track each flash object that is being constructed or removed. It maybe overcomplicated and affect page behavior -- probably John can recommend something. Also, we cannot report total amount of per page since they are loaded through the life of the page (may take up to minute), but we can report the index of the plugin loaded for a page (similar to SHUMWAY_SWF_INDEX_ON_PAGE).
+(In reply to Yury Delendik (:yury) from comment #3)
+> This is a tricky one: we need to maintain state somewhere on the HTML page
+> to track each flash object that is being constructed or removed. It maybe
+> overcomplicated and affect page behavior -- probably John can recommend
+> something. Also, we cannot report total amount of per page since they are
+> loaded through the life of the page (may take up to minute), but we can
+> report the index of the plugin loaded for a page (similar to
+> SHUMWAY_SWF_INDEX_ON_PAGE).
+
+Just briefly talked about this with Georg, and he says it's doable. Needinfo-ing him for hints on that.
+What is the specific question we want to ask here?
+How many Flash instances we used over a pages life-time?
+Or the max of how many Flash instances were alive simultaneously on a page?
+(In reply to Georg Fritzsche [:gfritzsche] from comment #5)
+> What is the specific question we want to ask here?
+> How many Flash instances we used over a pages life-time?
+> Or the max of how many Flash instances were alive simultaneously on a page?
+
+Let's go with "How many Flash instances we used over a pages life-time?", but if the solution will be complicated or affects the performance let's go with the latter.
+Comment on attachment 8498856
+Initial probes to flash plugins content
+
+Review of attachment 8498856:
+-----------------------------------------------------------------
+
+::: dom/plugins/base/nsPluginHost.cpp
+@@ +812,5 @@
+>  
+> +  if (nsPluginHost::IsFlashMIMEType(aMimeType)) {
+> +    Telemetry::Accumulate(Telemetry::FLASH_PLUGIN_REQUESTED, true);
+> +  }
+> +  
+
+nit: whitespace
+
+::: toolkit/components/telemetry/Histograms.json
+@@ +2559,5 @@
+>      "kind": "flag",
+>      "description": "A plugin object was successfully invoked as a function"
+>    },
+> +  "FLASH_PLUGIN_REQUESTED": {
+> +    "expires_in_version": "40",
+
+I think the probes shouldn't expire this soon. One motivation for having them is to understand medium- to long-term trends. For that, we need more than half a year of data.
+
+@@ +2561,5 @@
+>    },
+> +  "FLASH_PLUGIN_REQUESTED": {
+> +    "expires_in_version": "40",
+> +    "kind": "boolean",
+> +    "description": "A flash object was initialized."
+
+s/initialized/requested/
+
+@@ +2574,5 @@
+> +    "kind": "exponential",
+> +    "low": "256",
+> +    "high": "16777216",
+> +    "n_buckets": 50,
+> +    "description": "The flash object dimension: amount of pixels (width * height)"
+
+Can we have width and height in addition to this? Would be extremely useful for finding common formats.
+(In reply to Yury Delendik (:yury) from comment #6)
+> (In reply to Georg Fritzsche [:gfritzsche] from comment #5)
+> > What is the specific question we want to ask here?
+> > How many Flash instances we used over a pages life-time?
+> > Or the max of how many Flash instances were alive simultaneously on a page?
+> 
+> Let's go with "How many Flash instances we used over a pages life-time?",
+> but if the solution will be complicated or affects the performance let's go
+> with the latter.
+
+Ok, that seems like the simpler question to answer.
+On the front-end side we could just track this via the "PluginInstantiated" event and submit on navigation/unload/...:
+http://hg.mozilla.org/mozilla-central/annotate/af6c928893c0/browser/modules/PluginContent.jsm#l287
+
+This should be simpler than doing it in platform, but John may have input here.
+(In reply to Georg Fritzsche [:gfritzsche] from comment #8)
+> (In reply to Yury Delendik (:yury) from comment #6)
+> > (In reply to Georg Fritzsche [:gfritzsche] from comment #5)
+> > > What is the specific question we want to ask here?
+> > > How many Flash instances we used over a pages life-time?
+> > > Or the max of how many Flash instances were alive simultaneously on a page?
+> > 
+> > Let's go with "How many Flash instances we used over a pages life-time?",
+> > but if the solution will be complicated or affects the performance let's go
+> > with the latter.
+> 
+> Ok, that seems like the simpler question to answer.
+> On the front-end side we could just track this via the "PluginInstantiated"
+> event and submit on navigation/unload/...:
+> http://hg.mozilla.org/mozilla-central/annotate/af6c928893c0/browser/modules/
+> PluginContent.jsm#l287
+
+If we do this you may just want to track FLASH_PLUGIN_REQUESTED in the same place.
+Comment on attachment 8498856
+Initial probes to flash plugins content
+
+Review of attachment 8498856:
+-----------------------------------------------------------------
+
+This looks fine to me, optional comments below
+
+::: content/base/src/nsObjectLoadingContent.cpp
+@@ +915,5 @@
+> +      Telemetry::Accumulate(Telemetry::FLASH_PLUGIN_AREA,
+> +        nsPresContext::AppUnitsToIntCSSPixels(frameSize.width) *
+> +        nsPresContext::AppUnitsToIntCSSPixels(frameSize.height));
+> +    }
+> +  }
+
+Since this is occuring alongside the PluginInstantiated event, it might just be easier to track this in the JS code that handles it, but putting it here is fine as well.
+
+::: dom/plugins/base/nsPluginHost.cpp
+@@ +810,5 @@
+>      return NS_ERROR_FAILURE;
+>    }
+>  
+> +  if (nsPluginHost::IsFlashMIMEType(aMimeType)) {
+> +    Telemetry::Accumulate(Telemetry::FLASH_PLUGIN_REQUESTED, true);
+
+Am I right that the only difference between this and the other probe is every time flash tries to spawn vs every time it succeeds? It seems like it would make more sense to just have this before the pluginHost->InstantiatePluginInstance call in nsObjectLoadingContent (or, if it makes more sense to do this from js, have a else condition for the was-spawn-successful that fires a PluginInstantiateFailed event)
+
+::: dom/plugins/base/nsPluginHost.h
+@@ +164,5 @@
+>    // that does Java)
+>    static bool IsJavaMIMEType(const char *aType);
+>  
+> +  // checks whether aTag is a "flash" plugin tag
+> +  static bool IsFlashMIMEType(const char *aType);
+
+FWIW Bug 1061967 adds a better way to check this, so it might bitrot you slightly when it lands
+Comment on attachment 8498856
+Initial probes to flash plugins content
+
+Review of attachment 8498856:
+-----------------------------------------------------------------
+
+::: content/base/src/nsObjectLoadingContent.cpp
+@@ +909,5 @@
+>    }
+>  
+> +  if (nsPluginHost::IsFlashMIMEType(mContentType.get())) {
+> +    Telemetry::Accumulate(Telemetry::FLASH_PLUGIN_INITIALIZED, true);
+> +    if (frame) {
+
+Also: NotifyContentObjectWrapper can probably re-enter in weird ways, so re-using this weak pointer here might not be safe? I'm not sure, a layout person would know
+Created attachment 8501979
+Initial probes for flash plugins content
+
+(In reply to John Schoenick [:johns] from comment #10)
+> Comment on attachment 8498856
+> Initial probes to flash plugins content
+> 
+> Review of attachment 8498856:
+> -----------------------------------------------------------------
+
+> Am I right that the only difference between this and the other probe is
+> every time flash tries to spawn vs every time it succeeds? It seems like it
+> would make more sense to just have this before the
+> pluginHost->InstantiatePluginInstance call in nsObjectLoadingContent (or, if
+> it makes more sense to do this from js, have a else condition for the
+> was-spawn-successful that fires a PluginInstantiateFailed event)
+> 
+
+I replaced FLASH_PLUGIN_REQUESTED and _INTIALIZED by FLASH_PLUGIN_STATES and moved all code into PluginContent.jsm.
+
+FLASH_PLUGIN_STATES values: PluginInstantiated - 1, PluginCrashed - 2, PluginNotFound - 3, PluginBlocklisted - 4, PluginOutdated - 5, PluginVulnerableUpdatable - 6, PluginVulnerableNoUpdate - 7, PluginClickToPlay - 8, PluginPlayPreview - 9, PluginDisabled - 10. We are mostly interested in PluginInstantiated, PluginNotFound and PluginDisabled, but we can have all of them.
+Comment on attachment 8501979
+Initial probes for flash plugins content
+
+Review of attachment 8501979:
+-----------------------------------------------------------------
+
+Looks good! f=me with the descriptions changed.
+
+::: browser/modules/PluginContent.jsm
+@@ +397,5 @@
+>          break;
+>      }
+>  
+> +    let mimetype = this._getPluginInfo(plugin).mimetype;
+> +    if (mimetype === "application/x-shockwave-flash") {
+
+Personally, I'd just inline the mimetype.
+
+::: toolkit/components/telemetry/Histograms.json
+@@ +2562,5 @@
+> +  "FLASH_PLUGIN_STATES": {
+> +    "expires_in_version": "50",
+> +    "kind": "enumerated",
+> +    "n_values": 20,
+> +    "description": "A flash object initialization states."
+
+Nit: "Flash object's initialization state" is more grammatical, I think. (Also, looks like no period should go at the end.)
+
+@@ +2570,5 @@
+> +    "kind": "exponential",
+> +    "low": "256",
+> +    "high": "16777216",
+> +    "n_buckets": 50,
+> +    "description": "The flash object dimension: amount of pixels (width * height)"
+
+"Flash object area (width * height)"
+
+@@ +2578,5 @@
+> +    "kind": "linear",
+> +    "low": "1",
+> +    "high": "2000",
+> +    "n_buckets": 50,
+> +    "description": "The flash object dimension: width (in pixels)"
+
+"Flash object width" (I don't think the pixels are important to mention)
+
+@@ +2586,5 @@
+> +    "kind": "linear",
+> +    "low": "1",
+> +    "high": "2000",
+> +    "n_buckets": 50,
+> +    "description": "The flash object dimension: height (in pixels)"
+
+"Flash object height"
+
+@@ +2592,5 @@
+> +  "FLASH_PLUGIN_INDEX_ON_PAGE": {
+> +    "expires_in_version": "50",
+> +    "kind": "enumerated",
+> +    "n_values": 30,
+> +    "description": "Index of the SWF on the page (1 - first, 2 - second, etc.)"
+
+"Flash object's index on page (starting at 1)"
+Created attachment 8502026
+Initial probes for flash plugins content
+
+Feedback comments are addressed
+Created attachment 8502027
+Initial probes for flash plugins content
+Comment on attachment 8502027
+Initial probes for flash plugins content
+
+Review of attachment 8502027:
+-----------------------------------------------------------------
+
+::: browser/modules/PluginContent.jsm
+@@ +434,5 @@
+> +  _recordFlashPluginTelemetry: function (eventType, plugin) {
+> +     var state = ["PluginInstantiated", "PluginCrashed", "PluginNotFound",
+> +       "PluginBlocklisted", "PluginOutdated", "PluginVulnerableUpdatable",
+> +       "PluginVulnerableNoUpdate", "PluginClickToPlay", "PluginPlayPreview",
+> +       "PluginDisabled"].indexOf(eventType) + 1;
+
+|let| please. Can we have this split up into two variables (event names & state)?
+
+@@ +436,5 @@
+> +       "PluginBlocklisted", "PluginOutdated", "PluginVulnerableUpdatable",
+> +       "PluginVulnerableNoUpdate", "PluginClickToPlay", "PluginPlayPreview",
+> +       "PluginDisabled"].indexOf(eventType) + 1;
+> +     Services.telemetry.getHistogramById('FLASH_PLUGIN_STATES')
+> +                       .add(state);
+
+Note that you will have potentially multiple states recorded for each plugin element (e.g. "PluginClickToPlay" -> "PluginInstantiated" -> "PluginCrashed").
+This could potentially be fine, but what kind of questions do you want to answer with this?
+
+@@ +444,5 @@
+> +                       .add(pluginRect.width);
+> +     Services.telemetry.getHistogramById('FLASH_PLUGIN_HEIGHT')
+> +                       .add(pluginRect.height);
+> +     Services.telemetry.getHistogramById('FLASH_PLUGIN_AREA')
+> +                       .add(pluginRect.width * pluginRect.height);
+
+You are also potentially recording the dimensions multiple times per plugin element.
+
+@@ +458,5 @@
+> +       this.flashPluginStats.set(topDocument, documentFlashPluginStats);
+> +     }
+> +     documentFlashPluginStats.instancesCount++;
+> +     Services.telemetry.getHistogramById('FLASH_PLUGIN_INDEX_ON_PAGE')
+> +                       .add(documentFlashPluginStats.instancesCount);
+
+I see a few issues here:
+
+* "index on page" doesn't seem to describe what you are measuring here. You probably mean to record the Flash instantiation count, not what index they have in the page (Flash instances may go away etc.). We should fix the name to reflect that.
+
+* This is recorded into the histogram every time it is incremented, which means you won't actually be able to tell from that histogram how many Flash instances were used in pages. This count should only be submitted once per page.
+
+* You increment and submit this every time you encounter a plugin event for Flash, which means you can count plugin elements more than once. If we were e.g. just interested in live Flash elements, let's just count "PluginInstantiated".
+Created attachment 8502657
+Initial probes for flash plugins content
+
+Feedback address (see also http://logs.glob.uno/?c=mozilla%23shumway#c77496)
+Comment on attachment 8502657
+Initial probes for flash plugins content
+
+Review of attachment 8502657:
+-----------------------------------------------------------------
+
+Thanks, this look good, although we should change what we record for the state probe.
+
+::: browser/modules/PluginContent.jsm
+@@ +438,5 @@
+> +       instancesCount: 0,
+> +       plugins: new WeakMap()
+> +     };
+> +   }
+> +   if (eventType === "PluginInstantiated") {
+
+Nit: blank line before this for readability?
+
+@@ +439,5 @@
+> +       plugins: new WeakMap()
+> +     };
+> +   }
+> +   if (eventType === "PluginInstantiated") {
+> +     this.flashPluginStats.instancesCount++;
+
+You should clarify on the "FLASH_PLUGIN_INSTANCES_ON_PAGE" description that it counts "live" instances only.
+Alternatively you could now count instances regardless of state now by checking that |plugin| is not in |flashPluginStats.plugins| yet.
+
+@@ +449,5 @@
+> +     pluginStats = {
+> +       recordedStates: []
+> +     };
+> +     this.flashPluginStats.plugins.set(plugin, pluginStats);
+> +     reportSize = true;
+
+You only set this to true in one place. You could just as well move the size reporting here and get rid of the flag.
+
+@@ +451,5 @@
+> +     };
+> +     this.flashPluginStats.plugins.set(plugin, pluginStats);
+> +     reportSize = true;
+> +   }
+> +   let eventTypes = ["PluginInstantiated", "PluginCrashed", "PluginNotFound",
+
+Nit: Blank line before this for readability?
+
+@@ +459,5 @@
+> +   let state = eventTypes.indexOf(eventType) + 1;
+> +   if (!pluginStats.recordedStates[state]) {
+> +     Services.telemetry.getHistogramById('FLASH_PLUGIN_STATES')
+> +                       .add(state);
+> +     pluginStats.recordedStates[state] = true;
+
+Sorry for missing this before - you will want to submit the |_getPluginInfo(plugin).fallbackType|, which maps to these values:
+http://hg.mozilla.org/mozilla-central/annotate/e4cfacb76830/content/base/src/nsObjectLoadingContent.h#l69
+Created attachment 8502715
+Initial probes for flash plugins content
+Comment on attachment 8502715
+Initial probes for flash plugins content
+
+Review of attachment 8502715:
+-----------------------------------------------------------------
+
+r+ with the state reporting fixed as suggested.
+mconley, can you take a quick look for this looking sane? I should have the plugin specifics covered.
+
+::: browser/modules/PluginContent.jsm
+@@ +448,5 @@
+> +     this.flashPluginStats.plugins.set(plugin, pluginStats);
+> +
+> +     // Reporting plugin instance and its dimensions only once.
+> +     this.flashPluginStats.instancesCount++;
+> +     
+
+Nit: whitespace.
+
+@@ +461,5 @@
+> +
+> +   let state = this._getPluginInfo(plugin).fallbackType;
+> +   if (!pluginStats.recordedStates[state]) {
+> +     Services.telemetry.getHistogramById('FLASH_PLUGIN_STATES')
+> +                       .add(state);
+
+This possibly submits more than once per plugin. Your probe description says you want to record the initialization state - so you can just move this into the above reporting block, and get rid of |recordedStates| and make |plugins| a |WeakSet|.
+Created attachment 8502775
+Initial probes for flash plugins content
+Mike, can you review this soon-ish? It shouldn't take long at all, and has very high priority for us.
+Yeah, sorry - I've been on PTO. I'll do this now.
+Comment on attachment 8502775
+Initial probes for flash plugins content
+
+Review of attachment 8502775:
+-----------------------------------------------------------------
+
+This is fine - I just think we can probably skip collecting and dealing with Telemetry if !Services.telemetry.canSend. Do you agree?
+
+::: browser/modules/PluginContent.jsm
+@@ +92,5 @@
+>      if (!this.content || event.target != this.content.document) {
+>        return;
+>      }
+>  
+> +    this._finishRecordingFlashPluginTelemetry();
+
+Can we just not enter this if !Services.telemetry.canSend.
+
+@@ +399,5 @@
+>      }
+>  
+> +    if (this._getPluginInfo(plugin).mimetype ===
+> +        "application/x-shockwave-flash") {
+> +      this._recordFlashPluginTelemetry(eventType, plugin);
+
+Can we just not enter _recordFlashPluginTelemetry if !Services.telemetry.canSend?
+
+@@ +432,5 @@
+>      }
+>    },
+>  
+> +  _recordFlashPluginTelemetry: function (eventType, plugin) {
+> +   if (!this.flashPluginStats) {
+
+Nit - two-space indentation for this function definition please.
+
+@@ +460,5 @@
+> +   }
+> +  },
+> +
+> +  _finishRecordingFlashPluginTelemetry: function () {
+> +   if (this.flashPluginStats) {
+
+Nit - two-space indentation for this function definition please.
+Thanks for the review, Mike! And sorry for pushing, I didn't realize you were on PTO.
+
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/dc2d310c063c
+Hey till - don't worry.
+
+Though - I think there's a follow-up to land here; this is going to prevent telemetry from being recorded if it cannot be sent, even though that's often useful for testing. gfritzsche talked about it, and perhaps the change should be that we check the toolkit.telemetry.enabled pref to determine if we should gather the data.
+
+rs=me on that change, assuming it's as straight-forward as replacement as I assume it will be.
+https://hg.mozilla.org/mozilla-central/rev/dc2d310c063c
+
+
+Add telemetry probes for Flash content.
+
+
+
+Bug 1075088 - Add telemetry probes for Flash content. r=gfritzsche,mconley 

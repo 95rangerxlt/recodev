@@ -1,0 +1,241 @@
+Showing a number how many times a function was evaluated is very useful during development. (Think of how many times you had to console.log('got here').)
+
+As discussed in Bug 1047739.
+
+Showing a number how many times a function was evaluated is very useful during development. (Think of how many times you had to console.log('got here').)
+
+As discussed in Bug 1047739.
+Created attachment 8471288
+bug-1052220.patch
+
+This patch creates a new gutter in CodeMirror and uses CM markers to display trace count.
+
+This should probably have a mochitest as well, I'll write one when I figure out how to do so.
+
+Known issues (but GTM anyway, IMHO):
+* A breakpoint on the same line as a counter overlays it, so it is hard to read.
+* If a trace count is big (>1000), there is not enough space for it in the gutter.
+* I believe there is an off-by-one bug somewhere in the tracer code, unrelated to this patch (trace location is one line below function definition). I'll try to file and fix it in a separate bug.
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=e367201cef97
+Comment on attachment 8471288
+bug-1052220.patch
+
+Review of attachment 8471288:
+-----------------------------------------------------------------
+
+Asking victor to review the editor chunks, as I'm not very familiar with that code. Victor, might be nice to get a second pair of eyes on the debugger frontend changes as well.
+
+-----------------------------------------------------------------------------------
+
+Regarding breakpoints + hit counts as a follow up: sure.
+
+Regarding large hit counts: can we just say ">100" or some other maximum value? I don't think the hit counts continue to be super useful once you have that many anyways.
+
+-----------------------------------------------------------------------------------
+
+Needs test coverage for the behavior when you aren't tracing hit counts but are tracing other things, and then begin to trace them, that you get the expected results.
+
+Needs test coverage for multiple functions on the same line.
+
+Needs test coverage for the gutters/UI
+- What is the expected behavior for multiple functions on the same line here?
+- Clearing the gutters
+- Interaction between breakpoints and hit counts?
+- etc
+
+Reflag me for review when you've addressed these comments, and the comments below.
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +1573,5 @@
+>        arguments: args,
+>        frameId: item.id
+>      });
+> +
+> +    DebuggerController.HitCounts.updateEditorHitCount(location, hitCount);
+
+Seems strange to me that the hit counts are "updated" at both the traces event handler and inside _onCall. Can |set| just call |updateEditorHitCount|?
+
+@@ +2241,5 @@
+> +  /**
+> +   * Storage of hit counts for every location
+> +   * hitCount = _locations[url][line][column]
+> +   */
+> +  _locations: Object.create(null),
+
+This will cause all HitCounts instances to share the locations data until each instance has its clear method called. Instead, this should be set in the constructor, so each instance has its own locations.
+
+::: browser/devtools/sourceeditor/editor.js
+@@ +617,5 @@
+>      cm.lineInfo(line).gutterMarkers[gutterName].classList.remove(markerClass);
+>    },
+> +  /**
+> +   * Adds a marker with a specified class and an HTML content to a line's
+> +   * gutter. If another marker exists on that line, it is rewritter by a new
+
+Nit: I think "overwritten" would be a better choice of verb here.
+
+::: toolkit/devtools/server/actors/tracer.js
+@@ +81,5 @@
+>    this._startTime = 0;
+>    this._sequence = 0;
+>    this._bufferSendTimer = null;
+>    this._buffer = [];
+> +  this._hitCounts = Object.create(null);
+
+Rather than keying by URLs, we should use a Map (or WeakMap?) and key by Debugger.Source objects. Otherwise, it won't work for eval'd sources or new Function, etc. We have been doing a ton of work to start supporting eval'd sources and it would be great if we didn't make the same mistakes and wrong assumptions that we made with the debugger in the tracer too.
+
+@@ +281,4 @@
+>          url: aFrame.script.url,
+>          line: aFrame.script.getOffsetLine(aFrame.offset),
+>          column: getOffsetColumn(aFrame.offset, aFrame.script)
+>        };
+
+Now the tracer is always allocating this location object, even if !(this._requestsForTraceType.location || this._requestsForTraceType.hitCount), and it is always recording hit count related information even if the user hasn't requested (and won't ever request) hit count tracing. This is pretty significant overhead given the hotness of the tracer code.
+
+I think the tracer shouldn't record hit counts until it is actually requested to do so. Yes, you won't get historical data, but I think that is expected and even useful, so you can see how many times functions get called only within the period of time you care about.
+
+::: toolkit/devtools/server/tests/unit/test_trace_actor-10.js
+@@ +1,5 @@
+> +/* Any copyright is dedicated to the Public Domain.
+> + http://creativecommons.org/publicdomain/zero/1.0/ */
+> +
+> +/**
+> + * Test that self-hosted functions aren't traced and don't add depth.
+
+Nit: copy pasta
+Created attachment 8474934
+bug-1052220-2.patch
+Created attachment 8474939
+bug-1052220-3.patch
+
+Forgot to include one test.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #3)
+
+> Regarding large hit counts: can we just say ">100" or some other maximum
+> value? I don't think the hit counts continue to be super useful once you
+> have that many anyways.
+The exact value might not be useful, but it's still useful to know that the hit count is increasing (and at what rate).
+
+> Needs test coverage for the behavior when you aren't tracing hit counts but
+> are tracing other things, and then begin to trace them, that you get the
+> expected results.
+Done.
+
+> Needs test coverage for multiple functions on the same line.
+This was entirely missing in previous patch. It's done now, but in a bit hacky way. If there are multiple functions on the same line, it is shown as `2x|5x|10x`. Imho it's ok for now, given that we'll try to inline it in the near future (or move somewhere else).
+Btw, to do that, I needed to use getOffsetColumn from script.js.
+
+> Needs test coverage for the gutters/UI
+> - What is the expected behavior for multiple functions on the same line here?
+> - Clearing the gutters
+Done.
+
+> - Interaction between breakpoints and hit counts?
+I'm not sure how to test this. Breakpoint gutter has higher z-index, there should be no problem clicking it. Visually it looks weird, though.
+
+> I think the tracer shouldn't record hit counts until it is actually
+> requested to do so. Yes, you won't get historical data, but I think that is
+> expected and even useful, so you can see how many times functions get called
+> only within the period of time you care about.
+Makes sense, counting now begins only after hitCount traces are requested. Hit counts are cleared when all hitCount tracings are stopped.
+Do we want to isolate counters for each trace so that each new hitCount tracing starts from 0 without affecting other tracings?
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=ff837d50002c
+Created attachment 8474977
+bug-1052220-4.patch
+
+Fixing test_trace_actor-05.js.
+
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=762d6fbf6699
+Created attachment 8475639
+bug-1052220-5.patch
+
+Hopefully the last test fixes.
+
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=0dd1783e8ea6
+Created attachment 8478688
+bug-1052220-6.patch
+
+Hit counts are no longer limited by MAX_TRACES (Bug 1057545).
+
+Try: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=e6646164d01e
+Comment on attachment 8478688
+bug-1052220-6.patch
+
+Review of attachment 8478688:
+-----------------------------------------------------------------
+
+Looks great! Thanks for adding the expanded test coverage.
+
+r+ with comments below addressed.
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +1529,5 @@
+>    },
+>    onTraces: function (aEvent, { traces }) {
+>      const tracesLength = traces.length;
+>      let tracesToShow;
+> +    // Update hit counts.
+
+Nit: newline before this comment.
+
+@@ +1545,5 @@
+>        DebuggerView.Tracer.empty();
+>      } else {
+>        tracesToShow = traces;
+>      }
+> +    // Show traces in the log.
+
+Nit: newline before this comment.
+
+@@ -1539,5 @@
+>        } else {
+>          this._onReturn(t);
+>        }
+>      }
+> -
+
+Nit: leave this newline
+
+@@ +1558,5 @@
+>    },
+>    /**
+>     * Callback for handling a new call frame.
+>     */
+> +  _onCall: function({ name, location, hitCount, blackBoxed, parameterNames, depth, arguments: args }) {
+
+I don't think this change is needed anymore is it?
+
+::: browser/devtools/debugger/debugger-view.js
+@@ +224,5 @@
+>        mode: Editor.modes.text,
+>        readOnly: true,
+>        lineNumbers: true,
+>        showAnnotationRuler: true,
+> +      gutters: [ "hit-counts", "breakpoints" ],
+
+Does this gutter affect how the source editor looks even when the tracer isn't enabled? If so, can we conditionally add the second gutter based on if the pref is set, similar to how we only attach to the tracer if the pref is set?
+
+::: toolkit/devtools/server/tests/unit/test_trace_actor-05.js
+@@ +88,5 @@
+>        // XXX: foo's definition is at tracerlocations.js:3:0, but Debugger.Script
+>        // does not provide complete definition locations (bug 901138). Therefore,
+>        // we use the first statement in the function (tracerlocations.js:4:2) as
+>        // an approximation.
+> +      check_location(traces[1].location, { url: url, line: 4, column: 2 });
+
+Is this from the other startLine bug?
+Created attachment 8479515
+bug-1052220-7.patch
+
+Hit counts panel now adds 6px to the gutter only when devtools.debugger.tracer is enabled.
+
+Removing newline after
+>        } else {
+>          this._onReturn(t);
+>        }
+>      }
+was intentional, since |DebuggerView.Tracer.commit();| belongs to the "Show traces in the log" block of code.
+
+Again, no try push. :/
+https://hg.mozilla.org/integration/fx-team/rev/88847ed61a35
+https://hg.mozilla.org/mozilla-central/rev/88847ed61a35

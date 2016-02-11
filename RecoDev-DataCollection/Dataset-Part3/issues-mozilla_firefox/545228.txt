@@ -1,0 +1,150 @@
+Significant memory leaks are reported in Firefox after just launching and closing it on Windows 7, 32- and 64-bit, even in safe mode.  The problem is not seen in Windows XP.  The problem is not related to any specific url; it happens even when just loading about:blank and then closing the browser.
+
+Significant memory leaks are reported in Firefox after just launching and closing it on Windows 7, 32- and 64-bit, even in safe mode.  The problem is not seen in Windows XP.  The problem is not related to any specific url; it happens even when just loading about:blank and then closing the browser.
+Created attachment 426073
+leak log
+*** Bug 545435 has been marked as a duplicate of this bug. ***
+This makes it really hard to develop on win7 since I can never tell if I'm adding leaks or not.
+FWIW, you can build --with-windows-version=600 to stop leaking.
+The disables any windows 7 features, right?
+yes
+*** Bug 545964 has been marked as a duplicate of this bug. ***
+before i forget, yesterday i spent some time looking at these leaks. Sorry, i don't have a fix since i've not finished tracking it down. That said i've noticed something that could help in case anyone has ideas.
+
+Disabling tab previews (commenting it out its initialization) the biggest leak disappears, but there is still a leak due to the jumplists. What we leak in this case are instances of nsILocalHandlerApp, that are shortcuts added to the jumplist.
+
+  _buildTasks: function WTBJL__buildTasks() {
+...
+      var item = this._getHandlerAppItem(task.title, task.description,
+                                         task.args, task.iconIndex);
+...
+  },
+
+  _getHandlerAppItem: function WTBJL__getHandlerAppItem(name, description, args, icon) {
+...
+    var handlerApp = Cc["@mozilla.org/uriloader/local-handler-app;1"].
+                     createInstance(Ci.nsILocalHandlerApp);
+...
+    var item = Cc["@mozilla.org/windows-jumplistshortcut;1"].
+               createInstance(Ci.nsIJumpListShortcut);
+    item.app = handlerApp;
+...
+  },
+
+These are the interesting parts, when we set item.app = handlerApp, we create some sort of cycle, if i don't addref inside ::SetApp(aApp), there is no leak.
+
+About tab previews, i've only tracked down the fact that if we don't init any TabWindow object we don't leak the world. But that's not interesting enough since that means we don't show any preview.
+ps: a quick patch to avoid leaking witout touching mozconfig (in case you need some win7 code but not these features) is to change GetAvailable in WinTaskbar.cpp to always return PR_FALSE.
+Is this a problem on branches?  Should it be nominated to block releases?
+i think 3.6 has aeropeek optional (can be enabled through about:config) while
+jumplists only landed on trunk, so it should not be an issue on branches.
+Note that the leaks happen on mozilla-central no matter the pref settings.
+I suspect that the Aero Peek feature is leaking the world via cycles where PreviewController.preview.controller == PreviewController where .preview is a mozilla::widget::TaskbarTabPreview. Either we can add support for cycle collection to the TaskbarPreview implementation or we can break the cycle when the tab is destroyed in the frontend JS code. There is already frontend JS code that exists to do other teardown so it should not be hard to do and is rather less hairy than adding cycle collection support.
+i've attached a patch in bug 552934 to fix jumplists leak.
+Created attachment 433123
+patch v1.0
+
+so, this fixes the leak for me.
+the leak is deactivated by killing this.win, this.preview and this.dirtyregion in the controller destructor. the full cycles are not yet completely clear though.
+I can imagine the cycle between preview, window and controller, not sure how dirtyRegion is in the middle (but deleting it is needed from my testing).
+
+i also added some other minor change related to cleanup like removing observers and so.
+Comment on attachment 433123
+patch v1.0
+
+This does break the cycle. The dirtyRegion property is odd. I tried hoisting the lazy getter into the global scope but got errors on shutdown about the nsRegion being destroyed on a different thread (which was the main thread!). Either way, this patch adds some sane manual cleanup to Aero Peek so at least it should improve GC times.
+
+Also, I'm pretty sure this leak should occur on 1.9.2 (even with the pref off) so I'm requesting approval to put the fix there.
+http://hg.mozilla.org/mozilla-central/rev/002eb2e28e57
+backed out till we figure out what's up with the crash ratio increase in bug   530962. We have to fix that crash before fixing the leak.
+
+http://hg.mozilla.org/mozilla-central/rev/45338ed951a7
+Comment on attachment 433123
+patch v1.0
+
+clearing approval.
+So, the crash on shutdown has been fixed, there are still 3 reported crashes on 31 March build, but the stack is completely different.
+Thus i'm pushing this again to see the new effect on crash ratio.
+http://hg.mozilla.org/mozilla-central/rev/c8055a82b482
+
+Note: the new crash bug is bug 556524.
+the right fix is to add cycle collection. breaking cycles manually is fine, but not sufficient.
+half of the impl is cpp, part js, how do we add cycle collection though both parts? I actually did that in the cpp part, and no leak was fixed.
+And still, i think you should file a bug about adding cycle collection to aero peek instead of reopening this bug, that as it stands IS fixed. As i said, i did not notice any improvement in doing that, i could have done some error clearly, since due to high number of objects involved is not exactly trivial.
+(In reply to comment #22)
+> half of the impl is cpp, part js, how do we add cycle collection though both
+> parts? I actually did that in the cpp part, and no leak was fixed.
+
+If no leak was fixed, you probably missed something. Did you run with CC instrumentation on? You don't need to add anything to the JS part, since that is handled by the JS GC.
+
+The fix you have here does address the problem with the JS object graph created by our code, but fixing it this way leaves these objects as leak hazards for less carefully written code: extensions.
+In other words, the patch we have here is a band-aid. It's fine to manually break cycles and release resources promptly, but we need to understand exactly why this is leaking, so we can make sure it is fixed in the presence of as much code as possible, not just what we have right now.
+
+Also, how come we aren't catching this with leak tests? Are we missing Windows 7 leak testing?
+We don't have anything running on Windows 7 on tinderbox currently. That should be fixed pretty soon:
+http://armenzg.blogspot.com/2010/03/utont-project-unit-tests-on-talos.html
+I agree this is not "perfect" in the sense of "CC is the law", but:
+- as you can see in bug 552934 i always first try with CC (i used it in various pieces of code i touched in the past, and in new code, so i can't ensure you i'm not lazy from that point of view :))
+- the cycle involves preview that is a JS object and current window. I added CC practically to everything in the Cpp part of aero peek, but nothing changed (the patch was also quite large due to all added macros and whatever). Could be i missed a bit, as i said it's not trivial because there is a bunch of connections.
+- i doubt this is in somehow expandable by extensions.
+
+Thus, i think adding CC here involves major investigation, and has minor benefit atm looking at size of the involved changes, so imo it should have its own bug.
+ehm, i meant "i can ensure you" :p
+If the interface is available to Chrome JS, it is reachable by extensions. Anything reachable from JS should be cycle collected, whether or not it fixes this leak.
+
+You could be right that you have to break some JS cycles manually to fix this, but we need to make sure.
+
+We're not going to slap a couple deletes in there and call it good. Firefox 3.6 leaks after loading about:blank in safe mode on Windows 7. That is a total failure of our engineering and QA processes. That is why I am being a pain.
+I won't be able to try implementing CC again (first tentative failed) for the next 2 weeks. If anybody wants to do that, he's welcome.
+
+To reactivate the leak you just have to comment these 2 lines:
++    delete this.win;
++    delete this.preview;
+In its current state this bug doesn't block alpha any more, right?
+I can't tell if this is ready for branch landing or not - the bug is marked REOPENED, should it be FIXED (since it relanded in comment 20)?
+Looks to me like it shouldn't have been reopened. New bug should be filed for the more robust fix.
+(In reply to comment #33)
+> Looks to me like it shouldn't have been reopened. New bug should be filed for
+> the more robust fix.
+
+Well, who's going to file that? This was "fixed" in totally the wrong way.
+i filed bug 559326.
+Comment on attachment 433123
+patch v1.0
+
+Moving the approval to 1.9.2.5 since I don't think we want this on 1.9.2.4 in order to prevent churn.
+
+Rob: I take it that while this is fixed "totally in the wrong way," it was the way we wanted for branch?
+(In reply to comment #36)
+> (From update of attachment 433123 [details])
+> Moving the approval to 1.9.2.5 since I don't think we want this on 1.9.2.4 in
+> order to prevent churn.
+> 
+> Rob: I take it that while this is fixed "totally in the wrong way," it was the
+> way we wanted for branch?
+
+Fixed "totally in the wrong way" is a bit over-the-top (there are no addons on AMO using this API when I checked last week) but yes this is what we want for branch. Considering the severity of this leak, I think waiting for bug 559326 ("the right way") to be fixed rather than checking this in would do more harm than good.
+(In reply to comment #37)
+> (In reply to comment #36)
+> > (From update of attachment 433123 [details] [details])
+> > Moving the approval to 1.9.2.5 since I don't think we want this on 1.9.2.4 in
+> > order to prevent churn.
+> > 
+> > Rob: I take it that while this is fixed "totally in the wrong way," it was the
+> > way we wanted for branch?
+> 
+> Fixed "totally in the wrong way" is a bit over-the-top 
+
+The patch is not harmful, and will help at least one case we have here. So I don't see a problem with taking it on the branch.
+
+The root cause didn't really receive any serious analysis, so we don't know what exactly we're fixing. That doesn't seem to bother anyone else, though.
+(In reply to comment #38)
+> The root cause didn't really receive any serious analysis, so we don't know
+> what exactly we're fixing. That doesn't seem to bother anyone else, though.
+
+Please do not confuse my lack of action with lack of interest. I am very curious as to a) why this patch requires we delete the nsIScriptableRegion and b) why Marco's cycle collection implementation did not break the cycle. I hope that the bug on the cycle collection implementation will yield answers.
+Comment on attachment 433123
+patch v1.0
+
+a=beltzner for mozilla-1.9.2 default
+http://hg.mozilla.org/releases/mozilla-1.9.2/rev/843a6782d3f1

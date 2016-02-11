@@ -1,0 +1,283 @@
+If you're already connected, and then pick a runtime app, we open it for you.
+
+We should do the same if a runtime app was already selected at the time of connection.
+
+If you're already connected, and then pick a runtime app, we open it for you.
+
+We should do the same if a runtime app was already selected at the time of connection.
+Sole, this is related to bug 1055022, so I was curious what you thought.
+
+Instead of "deactivated" the selected runtime app, it would remain selected, unless the user changes it.  Then, if there is one selected still when connecting again, it's reopened, to get you closer to the state you had before with less steps.
+
+Does that seem good, or is it maybe too "magical"?
+Oh that would be neat... I guess! I think it sounds better than closing/unselecting apps as I suggested on bug 1055022
+Created attachment 8487324
+Initial Attempt
+
+Attaching Alex's patch from bug 1055279 as initial work here.
+Comment on attachment 8487324
+Initial Attempt
+
+Review of attachment 8487324:
+-----------------------------------------------------------------
+
+As with bug 1045660, let's move it to webide.js.
+
+::: browser/devtools/webide/modules/app-manager.js
+@@ +308,5 @@
+>              this.selectedProject.type == "hosted") {
+>            this.validateProject(this.selectedProject);
+>          }
+> +        // Remember the last selected project
+> +        let lastProject = "";
+
+We can do this work in a new method when webide.js gets the "project" event.
+
+@@ +310,5 @@
+>          }
+> +        // Remember the last selected project
+> +        let lastProject = "";
+> +        if (this.selectedProject.type == "runtimeApp") {
+> +          lastProject = this.selectedProject.app.manifestURL;
+
+Let's store the type name too.
+
+@@ +384,5 @@
+>      }, deferred.reject);
+>  
+> +    // Automatically reconnect to the previously selected project
+> +    if (!this.selectedProject) {
+> +      this.webAppsStore.once("store-ready", () => {
+
+AppManager emits the "runtime-apps-found" event for this case.
+
+webide.js doesn't do anything for that event yet, but you can add something for this purpose.
+Alex, I've added some comments above.  If you don't have time for this anymore, let me know.
+Created attachment 8490848
+patch v2
+
+Unfortunately for this patch, I wasn't able to easily provide a test.
+There is no test so far involving runtime apps
+and don't have a clear picture on how to fake one in a test.
+
+https://tbpl.mozilla.org/?tree=Try&rev=c548de9085ff
+https://tbpl.mozilla.org/?tree=Try&rev=c52bf2aae49b
+Comment on attachment 8490848
+patch v2
+
+Review of attachment 8490848:
+-----------------------------------------------------------------
+
+I'd like to check it again with the adjusted logic.
+
+::: browser/devtools/webide/content/webide.js
+@@ +560,5 @@
+> +      } else if (AppManager.selectedProject.type == "mainProcess") {
+> +        type = "mainProcess";
+> +      }
+> +    }
+> +    Services.prefs.setCharPref("devtools.webide.lastSelectedProject",
+
+It's a bit tricky to determine the right logic here...
+
+If there *is* a selected project, but the |type| is not "runtimeApp" or "mainProcess", we should clear the pref I think, as this means a local project was last selected.  Currently it gets set to ":", which then gives a TypeError during the match.
+
+Also, if there is no selected project (which happens if you disconnect the runtime), I think we should leave the pref alone and do nothing.  Currently we again are setting it to ":".
+
+@@ +572,5 @@
+> +    let pref = Services.prefs.getCharPref("devtools.webide.lastSelectedProject");
+> +    if (!pref) {
+> +      return;
+> +    }
+> +    let [_, type, project] = pref.match(/^(\w+):(.*)$/);
+
+Maybe try is needed?  Somehow we should prevent the TypeError in case of strings like ":".
+Created attachment 8491463
+patch v3
+
+https://tbpl.mozilla.org/?tree=Try&rev=30e7599a73cc
+
+(In reply to J. Ryan Stinnett [:jryans] from comment #8)
+> Comment on attachment 8490848
+> 
+> It's a bit tricky to determine the right logic here...
+> 
+> If there *is* a selected project, but the |type| is not "runtimeApp" or
+> "mainProcess", we should clear the pref I think, as this means a local
+> project was last selected.  Currently it gets set to ":", which then gives a
+> TypeError during the match.
+> 
+> Also, if there is no selected project (which happens if you disconnect the
+> runtime), I think we should leave the pref alone and do nothing.  Currently
+> we again are setting it to ":".
+
+I think having two distinct prefs for local and runtime is counter productive.
+So I ended up merging into just one, lastSelectedProject,
+which can handle runtime, mainprocess, package and hosted.
+
+And the pref is now set only if we support saving/restoring the selected project,
+otherwise we reset the pref to the default empty value.
+
+> 
+> @@ +572,5 @@
+> > +    let pref = Services.prefs.getCharPref("devtools.webide.lastSelectedProject");
+> > +    if (!pref) {
+> > +      return;
+> > +    }
+> > +    let [_, type, project] = pref.match(/^(\w+):(.*)$/);
+> 
+> Maybe try is needed?  Somehow we should prevent the TypeError in case of
+> strings like ":".
+
+Instead of try, I first return the match object and bail out if it is empty.
+New try, another patch assiociated in the run was failing:
+https://tbpl.mozilla.org/?tree=Try&rev=d7fe90600344
+Comment on attachment 8491463
+patch v3
+
+Review of attachment 8491463:
+-----------------------------------------------------------------
+
+::: browser/devtools/webide/content/webide.js
+@@ -79,5 @@
+>  
+>      this.setupDeck();
+>    },
+>  
+> -  openLastProject: function() {
+
+I assume this should not be in the diff...
+
+@@ +534,5 @@
+>        yield UI.createToolbox();
+>      });
+>    },
+>  
+> +  saveLastSelectedProject: function() {
+
+I believe the logic is still not right in the case that you:
+
+1. Connect to runtime
+2. Choose runtime app
+3. Disconnect manually
+4. Reconnect
+
+because it will clear the pref at disconnect time.  If you need to, you could test AppManager's connection state.
+
+@@ +538,5 @@
+> +  saveLastSelectedProject: function() {
+> +    // Remember the last selected project on the runtime
+> +    let project = "", type = "";
+> +    let selected = AppManager.selectedProject;
+> +    if (selected) {
+
+I hope to make all this conversion junk less depressing with project-agnostic work...
+
+@@ +554,5 @@
+> +    if (type) {
+> +      Services.prefs.setCharPref("devtools.webide.lastSelectedProject",
+> +                                 type + ":" + project);
+> +    } else {
+> +      Services.prefs.clearUserPref("devtools.webide.lastSelectedProject", "");
+
+No 2nd arg.
+
+@@ +562,5 @@
+> +  autoSelectProject: function() {
+> +    if (AppManager.selectedProject) {
+> +      return;
+> +    }
+> +    let shouldRestore = Services.prefs.getBoolPref("devtools.webide.restoreLastProject");
+
+This is to expose this as a user configurable option?  I think that's a good idea.  But then you should add a default value for this pref, and expose a control for it in WebIDE's settings.
+
+Also, you could check it when saving and skip that if it's disabled.
+(In reply to J. Ryan Stinnett [:jryans] from comment #11)
+> Comment on attachment 8491463
+> patch v3
+> 
+> Review of attachment 8491463:
+> -----------------------------------------------------------------
+> 
+> ::: browser/devtools/webide/content/webide.js
+> @@ -79,5 @@
+> >  
+> >      this.setupDeck();
+> >    },
+> >  
+> > -  openLastProject: function() {
+> 
+> I assume this should not be in the diff...
+> 
+
+No, no it is expected! See next comment.
+
+> @@ +562,5 @@
+> > +  autoSelectProject: function() {
+> > +    if (AppManager.selectedProject) {
+> > +      return;
+> > +    }
+> > +    let shouldRestore = Services.prefs.getBoolPref("devtools.webide.restoreLastProject");
+> 
+> This is to expose this as a user configurable option?  I think that's a good
+> idea.  But then you should add a default value for this pref, and expose a
+> control for it in WebIDE's settings.
+> 
+> Also, you could check it when saving and skip that if it's disabled.
+
+So I'm merging the existing "save last local project" with this new feature to "save last runtime project".
+"save last local project" already uses "restoreLastProject" pref and also "projectlocation" one.
+It is implemented within openLastProject that I removed in favor of autoSelectProject.
+In this patch, I'm still using restoreLastProject pref, but depecated projectlocation one in favor of lastSelectedProject one. So when updating, users are going to loose their last selected local project once. (I'm not sure it is worth putting migration code for that?)
+Created attachment 8493139
+patch v4
+
+https://tbpl.mozilla.org/?tree=Try&rev=f5d405f98414
+
+Fixed the issue when disconnecting manually.
+
+I also had to fix a bug within AppActorFront.
+When reconnecting to a simulator more than once,
+we were incorrectly caching AppActorFront.
+That ended up introducing exceptions for requests
+being made to the second instance of the simulator.
+(Because the client was the old one, for the closed simulator)
+Comment on attachment 8493139
+patch v4
+
+Review of attachment 8493139:
+-----------------------------------------------------------------
+
+::: browser/devtools/webide/content/webide.js
+@@ -79,5 @@
+>  
+>      this.setupDeck();
+>    },
+>  
+> -  openLastProject: function() {
+
+You should also remove the step to set "devtools.webide.lastprojectlocation" in |UI.openProject| and remove the pref from webide-prefs.js, since it is no longer used after this.
+
+@@ +586,5 @@
+> +      return;
+> +    }
+> +    let [_, type, project] = m;
+> +
+> +    if (type == "mainProcess" && AppManager.isMainProcessDebuggable()) {
+
+You need to wait until a runtime is connected before setting main process or runtime app projects, since this function is also called on WebIDE init and you may not yet be connected.
+Created attachment 8494471
+interdiff
+Created attachment 8494475
+patch v5
+
+https://tbpl.mozilla.org/?tree=Try&rev=3f1229154122
+https://hg.mozilla.org/integration/fx-team/rev/63f55a65977e
+https://hg.mozilla.org/mozilla-central/rev/63f55a65977e
+
+
+Re-select project on connect if last project is runtime app
+
+dev-doc-needed
+
+Bug 1055666 - Remember last selected project in WebIDE. r=jryans 

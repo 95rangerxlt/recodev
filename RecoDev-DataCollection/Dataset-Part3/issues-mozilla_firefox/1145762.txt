@@ -1,0 +1,156 @@
+Created attachment 8580858
+memory-report.json.gz
+
+User Agent: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:39.0) Gecko/20100101 Firefox/39.0
+Build ID: 20150320030211
+
+Steps to reproduce:
+
+1. Use your normal profile which has some downloaded items. ~30-40 should be enough.
+2. Open teh downloads window with "ctrl+j"  or by other means
+3. Scroll quickly through the list with the scroll bar.
+
+
+Actual results:
+
+Firefox memory usage fre to 1.8GB.  I got a "close this program to free memory" error on windows. However, Windows task manager still shows 300MB used memory.
+
+
+Expected results:
+
+no excessive memory.
+
+Created attachment 8580858
+memory-report.json.gz
+
+User Agent: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:39.0) Gecko/20100101 Firefox/39.0
+Build ID: 20150320030211
+
+Steps to reproduce:
+
+1. Use your normal profile which has some downloaded items. ~30-40 should be enough.
+2. Open teh downloads window with "ctrl+j"  or by other means
+3. Scroll quickly through the list with the scroll bar.
+
+
+Actual results:
+
+Firefox memory usage fre to 1.8GB.  I got a "close this program to free memory" error on windows. However, Windows task manager still shows 300MB used memory.
+
+
+Expected results:
+
+no excessive memory.
+
+just to add, to check the increase memory use, you will have to go to about:memory, and measure memory from there.
+the high memory goes down after some time if you close the downloads window.
+Created attachment 8580873
+memory-report.json.gz
+
+firefox in safe mode, but using the same profile.
+We're keeping the contents of every downloaded file in memory as the source of an image (because it could contain an icon or image I guess?). Wow. Thanks for finding this and filing it with memory reports. We should fix this asap.
+This is a serious matter, but I don't think this is actually a bug in ImageLib, is it?
+[Tracking Requested - why for this release]:
+Pushlog:
+https://hg.mozilla.org/integration/mozilla-inbound/pushloghtml?fromchange=53d0b45c24c5&tochange=daf8243cd190
+
+Regressed by: Bug 1079627
+Regardless of the regression range, I still strongly suspect this is a bug in the downloads panel code.
+Tracking for 38 and 39 since this is a recent regression. 
+
+Lawrence, do you want to track this, even if it may not block 37?
+I don't think this bug needs to block 37. If we have a simple fix, I'm happy to discuss whether we can include this as a ride along in a point release.
+Needinfo'ing some people familiar with the downloads panel. It'd be great to identify the root cause here.
+Can we have a brief description of what Bug 1079627 did, also at a low level, and how it might have changed memory management/ownership?
+
+https://bugzilla.mozilla.org/show_bug.cgi?id=1079627#c21 seems to point out that the same fix caused OOM in other test code, totally unrelated to downloads, and looks like the solution was to use fallible allocators.  Did you investigate if it was the patch to cause the OOM?
+My only suspect is that we don't discard images (there should only be icons and buttons) when they go out of the scroll area. I can't see any other way we could accumulate image data in such a list.
+The list has some tricks to lazy load its contents on scrolling, so scrolling we just keep reading and displaying more rows. Maybe we don't discard anymore image data for the above rows that go out of the view. I'm really guessing cause I don't know much about how our gfx layer work.
+(In reply to Marco Bonardo [::mak] from comment #12)
+> Can we have a brief description of what Bug 1079627 did, also at a low
+> level, and how it might have changed memory management/ownership?
+
+It didn't change anything related to memory management in a meaningful way. That bug allowed us to run multiple decoders for the same image at once.
+
+> https://bugzilla.mozilla.org/show_bug.cgi?id=1079627#c21 seems to point out
+> that the same fix caused OOM in other test code, totally unrelated to
+> downloads, and looks like the solution was to use fallible allocators.  Did
+> you investigate if it was the patch to cause the OOM?
+
+Yes, there was a bug where I was mistakenly using an infallible allocator. That's fixed. At any rate, fallible or infallible doesn't matter until we're already at the point of OOM, and we should not be getting anywhere near OOM when scrolling the downloads list.
+(In reply to Timothy Nikkel (:tn) from comment #4)
+> We're keeping the contents of every downloaded file in memory as the source
+> of an image (because it could contain an icon or image I guess?). Wow.
+> Thanks for finding this and filing it with memory reports. We should fix
+> this asap.
+
+While I don't have time to investigate this, I believe comment 4 is the closest to what the issue could be. Can this be a bug with "moz-icon:" URLs?
+
+Also, when an image scrolls out of view, even in chrome windows, is our code able to detect this and remove the image from memory?
+(In reply to :Paolo Amadini from comment #15)
+> While I don't have time to investigate this, I believe comment 4 is the
+> closest to what the issue could be. Can this be a bug with "moz-icon:" URLs?
+
+The fact is that we don't generate icons from images, afaik. we don't even use favicons here. We just use system icons based on file extension.
+(In reply to Seth Fowler [:seth] from comment #14)
+> Yes, there was a bug where I was mistakenly using an infallible allocator.
+> That's fixed. At any rate, fallible or infallible doesn't matter until we're
+> already at the point of OOM, and we should not be getting anywhere near OOM
+> when scrolling the downloads list.
+
+Yes, what I meant is that it could have been another case where the new code brought us closer to OOM, like in the downloads list. The fallible/infallible is indeed uninteresting, I mostly wondered _why_ we reached OOM there and if there could have been a relation with this OOM.
+This is where we generate the icons
+http://mxr.mozilla.org/mozilla-central/source/browser/components/downloads/DownloadsViewUI.jsm#53
+So. indeed the issue could be related to moz-icon when we generate an url like this
+"moz-icon://" + this.download.target.path + "?size=32"
+Created attachment 8584647
+memory-report.json.gz
+
+If this helps:
+
+Firefox is using memory for downloaded files that have been physically removed from the system (but which remain in the Downloads List). In the attached profile, the last couple of entries in the image list parent even on the system. In fact, i am using my old profile on a completely new system, with none of the previously downloaded files.
+then we can exclude we are doing anything with the files, if they don't exist.
+Sorry, I actually figured this out yesterday and typed out an explanation, but somehow didn't press "Save Changes" and actually post the comment.
+
+I initially thought that we were actually holding the _files_ in memory, which pointed to the download list as the culprit. However, that's not what's happening.
+
+What's actually happening is that we're tripping over a truly ancient bug here - it's so old it predates the switch to Mercurial. moz-icon's GetContentLength is implemented using this code:
+
+http://hg.mozilla.org/mozilla-central/annotate/44e454b5e93b/image/decoders/icon/mac/nsIconChannelCocoa.mm#l460
+
+(Well, that's the Mac implementation; there's a variant for every platform.)
+
+The problem is that mContentLength is never initialized anywhere. We're just returning uninitialized memory. (This isn't exploitable, or I would've turned this into a security bug.) It turns out that in practice the value is usually a very large number, which we clamp to 20MB in ImageFactory. That's why all of these icons are using 20MB of memory in mayankleoboy's bug report - the size has nothing to do with the file, it's just a result of this garbage value that moz-icon is returning for GetContentLength.
+
+That's the root cause, but why did we just notice it now? Well, in bug 1120271 I added new code to "compact" our in-memory representation of image data. Unfortunately that code did not anticipate a bug like the bug that moz-icon has, and it assumes that the first chunk of data - the chunk that we allocated based on the result of GetContentLength - was not too large. That's what this check implicitly does:
+
+https://dxr.mozilla.org/mozilla-central/source/image/src/SourceBuffer.cpp#124
+
+Of course, web content could also send a false value for the Content-Length header, and although we limit the amount of memory we'll waste on that because we won't allocate more than 20MB due to Content-Length no matter what, we should also be sure to free that memory if it turns out the Content-Length was wrong.
+
+So in summary, there are two bugs here: an ancient uninitialized memory read in the moz-icon GetContentLength code, and a newer change that made us (foolishly) trust GetContentLength a little bit more than we used to.
+
+I'll file bugs about both these issues and get them fixed.
+Good catch Seth!
+cannot reproduce this in nightly built from https://hg.mozilla.org/mozilla-central/rev/6082a98d3861
+(In reply to mayankleoboy1 from comment #24)
+> cannot reproduce this in nightly built from
+> https://hg.mozilla.org/mozilla-central/rev/6082a98d3861
+
+Thanks for verifying the fix!
+
+Resolving this one.
+Seth, can you fill the uplift request to beta? Thanks
+(In reply to Sylvestre Ledru [:sylvestre] from comment #26)
+> Seth, can you fill the uplift request to beta? Thanks
+
+It's already in 38. The uplift happened in bug 1148682 and bug 1148684.
+*** Bug 1152766 has been marked as a duplicate of this bug. ***
+This broke the addon FireFTP pretty badly, especially on Windows which uses moz-icon heavily.  I have many reports of users crashing and memory out-of-control.  Until Firefox 38 is released is there a workaround for current users?
+(In reply to Mime Čuvalo from comment #29)
+> This broke the addon FireFTP pretty badly, especially on Windows which uses
+> moz-icon heavily.  I have many reports of users crashing and memory
+> out-of-control.  Until Firefox 38 is released is there a workaround for
+> current users?
+
+No workaround is possible, I'm sorry to say. Current users could either install Firefox Beta or wait six days until Firefox 38 is released.

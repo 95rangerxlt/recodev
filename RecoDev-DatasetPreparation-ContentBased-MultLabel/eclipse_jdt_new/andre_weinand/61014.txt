@@ -1,0 +1,525 @@
+When restoring a crashed workspace the AllTypeCache Updater has shown-up 
+during the start-up sequence before an event loop is active.
+
+The suspicion is that this updating is triggered by a delta before the 
+runnable that triggers the initial population is executed.
+
+The solution we have discussed is that the all types cache should ignore 
+deltas and not start updating before the runnable is executed.
+
+When restoring a crashed workspace the AllTypeCache Updater has shown-up 
+during the start-up sequence before an event loop is active.
+
+The suspicion is that this updating is triggered by a delta before the 
+runnable that triggers the initial population is executed.
+
+The solution we have discussed is that the all types cache should ignore 
+deltas and not start updating before the runnable is executed.
+Created attachment 10286
+stacktrace with alltypes cache active during start up
+I've verified that the AllTypesCache thread gets only started after event processing has started (see 
+boolean flag fgAsyncMode).
+I don't think that the attached stacktrace contains enough evidence that no event processing has 
+begun. I suspect that some local event loop (which has already ended), has triggered the AllTypesCache 
+thread.
+in addition the updating doesn't happen in the UI thread, so not ideal, but 
+not critical. There might be more important bugs for 3.0 - adjusted milestone.
+It is currently running in the UI thread and taking up to 4 seconds on my fast 
+Windows machine.  Strangely, it takes no time on GTK.  What this means is that 
+the workspace comes up and you can't click because UI events are not being 
+dispatched.
+I needed an open editor in the Java perspective for it to run in the UI thread.
+Then this is a serious one... Steve or Kent is this easily reproducable.
+
+The intent is to start the all types cache thread once the UI is up and 
+running. This is done by posting an event to the event queue. This doesn't 
+work reliably since events can get dispatched before the workspace is up by 
+the EventLoopProgressMonitor.
+
+Kevin - is there a hook somewhere in the workbench that allows us to find out 
+when the workspace is up and running. With such a hook we could eliminate all 
+the other flags to determine when it is a good time to start.
+This is the stack trace I get when I have an open Java editor (without it, the 
+job runs in the background)... its reproduceable every time.
+
+Thread [main] (Suspended)
+  AllTypesCache.startBackgroundMode() line: 564
+  AllTypesCache.access$3() line: 555
+  AllTypesCache$4.run() line: 549
+  RunnableLock.run() line: 35
+  UISynchronizer(Synchronizer).runAsyncMessages() line: 112
+  Display.runAsyncMessages() line: 2693
+  Display.readAndDispatch() line: 2385
+  Workbench.runEventLoop(Window$IExceptionHandler, Display) line: 1353
+  Workbench.runUI() line: 1324
+  Workbench.createAndRunWorkbench(Display, WorkbenchAdvisor) line: 243
+  PlatformUI.createAndRunWorkbench(Display, WorkbenchAdvisor) line: 141
+  IDEApplication.run(Object) line: 90
+  PlatformActivator$1.run(Object) line: 298
+  EclipseStarter.run(Object) line: 249
+  EclipseStarter.run(String[], Runnable) line: 126
+  NativeMethodAccessorImpl.invoke0(Method, Object, Object[]) line: not 
+available [native method]
+  NativeMethodAccessorImpl.invoke(Object, Object[]) line: 39
+  DelegatingMethodAccessorImpl.invoke(Object, Object[]) line: 25
+  Method.invoke(Object, Object[]) line: 324
+  Main.basicRun(String[]) line: 269
+  Main.run(String[]) line: 722
+  Main.main(String[]) line: 706
+
+Kent - to reproduce it - all that is needed is an open editor and then to 
+start eclipse, correct?
+
+Can you please paste in a full thread dump. The excerpt shows that 
+startBackgroundMode() is waiting for the lock that synchronizes the cache 
+access. The question who is holding this lock when this happens. 
+I don't think that the all types cache runs in the UI thread. What's happening 
+is that the runnable actually starting the all types cache background thread 
+is waiting for a lock. It seems that it takes up to for seconds to get that 
+lock. "AllTypesCache.startBackgroundMode() line: 564" is "synchronized(fgLock) 
+{". 
+
+So we have to investigate who is holding the lock. A full VM dump would 
+definitelly help here. 
+
+This somehow explains why you don't see it on other machine. There we might 
+have a different time meaning that the back ground thread can be started 
+immediatelly.
+
+Switching to an org.eclipse.core.runtime.Job would probably remove all 
+problems related to the AllTypesCaching thread.
+Chris - let's first analyze and understand the problem.
+I looked into the AllTypesCache and here is my analysis:
+
+- the code that starts the all types cache populating thread can be blocked
+  by two things:
+  a.) another thread that asks for all types via getAllTypes
+  b.) another thread that reconciles working copies. 
+
+I looked at callers for a.) but none of them are active on start-up, even
+if editors are opened. Case b.) can happen since the editor reconciles the
+working copy shown in the editor on startup which can definitelly block the
+runnable which wants to start the all types cache thread. This can be even 
+worse if the reconciler waits for some JavaModel lock which is own by a auto 
+build triggered in background. 
+
+The problem is that the stack trace posted in comment #7 points to scenario 
+a.) To fully understand the issue we need to have a full VM dump. Kent, can 
+you reproduce the problem ?
+Dirk, you need to make the stack dump.  The problem seems to happen every time 
+on Windows for me and Kent.  Since Andre (the bug owner) is on vacation, 
+someone who understands the code (not me or Kent, how about you?) needs to 
+take ownership of this bug and simply get to the bottom of it.  If you have 
+any trouble reproduding the case or getting a stack dump that shows the 
+problem, give us a shout.  We won't be looking at this.  It's yours.
+I could reproduce the problem and it confirms Dirk's analysis. It is case b) -
+Here is the thread dump:
+
+"org.eclipse.jdt.internal.ui.text.JavaReconciler" daemon prio=2 tid=0x02eb5430 
+nid=0xaa8 runnable [3d3f000..3d3fd94]
+        at java.util.zip.ZipFile.getNextEntry(Native Method)
+        at java.util.zip.ZipFile.access$400(ZipFile.java:26)
+        at java.util.zip.ZipFile$2.nextElement(ZipFile.java:313)
+        - locked <0x13893848> (a java.util.zip.ZipFile)
+        at org.eclipse.jdt.internal.core.JarPackageFragmentRoot.computeChildren
+(JarPackageFragmentRoot.java:84)
+        at org.eclipse.jdt.internal.core.PackageFragmentRoot.buildStructure
+(PackageFragmentRoot.java:173)
+        at org.eclipse.jdt.internal.core.Openable.generateInfos
+(Openable.java:183)
+        at org.eclipse.jdt.internal.core.JavaElement.openWhenClosed
+(JavaElement.java:573)
+        at org.eclipse.jdt.internal.core.JavaElement.getElementInfo
+(JavaElement.java:310)
+        at org.eclipse.jdt.internal.core.JavaElement.getElementInfo
+(JavaElement.java:296)
+        at org.eclipse.jdt.internal.core.JavaElement.getChildren
+(JavaElement.java:251)
+        at 
+org.eclipse.jdt.internal.core.JavaProjectElementInfo.getPackageFragmentsInRoots
+(JavaProjectElementInfo.java:224)
+        at 
+org.eclipse.jdt.internal.core.JavaProjectElementInfo.getAllPackageFragments
+(JavaProjectElementInfo.java:180)
+        at org.eclipse.jdt.internal.core.JavaProject.newNameLookup
+(JavaProject.java:2188)
+        - locked <0x13611cd8> (a 
+org.eclipse.jdt.internal.core.JavaProjectElementInfo)
+        at org.eclipse.jdt.internal.core.JavaProject.newNameLookup
+(JavaProject.java:2199)
+        at org.eclipse.jdt.internal.core.SearchableEnvironment.<init>
+(SearchableEnvironment.java:64)
+        at 
+org.eclipse.jdt.internal.core.JavaProject.newSearchableNameEnvironment
+(JavaProject.java:2214)
+        at org.eclipse.jdt.internal.core.CompilationUnitProblemFinder.process
+(CompilationUnitProblemFinder.java:149)
+        at org.eclipse.jdt.internal.core.CompilationUnitProblemFinder.process
+(CompilationUnitProblemFinder.java:206)
+        at 
+org.eclipse.jdt.internal.core.ReconcileWorkingCopyOperation.executeOperation
+(ReconcileWorkingCopyOperation.java:76)
+        at org.eclipse.jdt.internal.core.JavaModelOperation.run
+(JavaModelOperation.java:700)
+        at org.eclipse.jdt.internal.core.JavaModelOperation.runOperation
+(JavaModelOperation.java:739)
+        at org.eclipse.jdt.internal.core.CompilationUnit.reconcile
+(CompilationUnit.java:1101)
+        at 
+org.eclipse.jdt.internal.ui.text.java.JavaReconcilingStrategy.reconcile
+(JavaReconcilingStrategy.java:88)
+        - locked <0x12929b40> (a org.eclipse.jdt.internal.core.CompilationUnit)
+        at 
+org.eclipse.jdt.internal.ui.text.java.JavaReconcilingStrategy.initialReconcile
+(JavaReconcilingStrategy.java:156)
+        at 
+org.eclipse.jdt.internal.ui.text.CompositeReconcilingStrategy.initialReconcile
+(CompositeReconcilingStrategy.java:114)
+        at 
+org.eclipse.jdt.internal.ui.text.JavaCompositeReconcilingStrategy.initialReconc
+ile(JavaCompositeReconcilingStrategy.jav
+        at org.eclipse.jface.text.reconciler.MonoReconciler.initialProcess
+(MonoReconciler.java:104)
+        at org.eclipse.jdt.internal.ui.text.JavaReconciler.initialProcess
+(JavaReconciler.java:280)
+        at 
+org.eclipse.jface.text.reconciler.AbstractReconciler$BackgroundThread.run
+(AbstractReconciler.java:155)
+
+"Worker-0" prio=5 tid=0x02e5d7a8 nid=0xeb0 runnable [3cff000..3cffd94]
+        at java.io.FileOutputStream.close0(Native Method)
+        at java.io.FileOutputStream.close(FileOutputStream.java:279)
+        at java.io.FilterOutputStream.close(FilterOutputStream.java:143)
+        at java.io.FilterOutputStream.close(FilterOutputStream.java:143)
+        at java.io.FilterOutputStream.close(FilterOutputStream.java:143)
+        at org.eclipse.core.internal.resources.SaveManager.visitAndSnap
+(SaveManager.java:1634)
+        at org.eclipse.core.internal.resources.SaveManager.visitAndSnap
+(SaveManager.java:1651)
+        at org.eclipse.core.internal.resources.SaveManager.save
+(SaveManager.java:1355)
+        at org.eclipse.core.internal.resources.DelayedSnapshotJob.run
+(DelayedSnapshotJob.java:42)
+        at org.eclipse.core.internal.jobs.Worker.run(Worker.java:66)
+
+"Java indexing" daemon prio=4 tid=0x030addb0 nid=0x4c0 in Object.wait() 
+[3cbf000..3cbfd94]
+        at java.lang.Object.wait(Native Method)
+        - waiting on <0x126eccf0> (a 
+org.eclipse.jdt.internal.core.search.indexing.IndexManager)
+        at java.lang.Object.wait(Object.java:429)
+        at org.eclipse.jdt.internal.core.search.processing.JobManager.run
+(JobManager.java:344)
+        - locked <0x126eccf0> (a 
+org.eclipse.jdt.internal.core.search.indexing.IndexManager)
+        at java.lang.Thread.run(Thread.java:534)
+
+"Thread-1" prio=7 tid=0x00a57420 nid=0x798 in Object.wait() [3c1f000..3c1fd94]
+        at java.lang.Object.wait(Native Method)
+        - waiting on <0x125f05b8> (a java.lang.ref.ReferenceQueue$Lock)
+        at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:111)
+        - locked <0x125f05b8> (a java.lang.ref.ReferenceQueue$Lock)
+        at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:127)
+        at 
+org.eclipse.jface.action.ActionContributionItem$ImageCache$ReferenceCleanerThre
+ad.run(ActionContributionItem.java:196)
+
+"Thread-0" prio=7 tid=0x00a567f0 nid=0xbf0 in Object.wait() [3bdf000..3bdfd94]
+        at java.lang.Object.wait(Native Method)
+        - waiting on <0x125f0628> (a java.lang.ref.ReferenceQueue$Lock)
+        at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:111)
+        - locked <0x125f0628> (a java.lang.ref.ReferenceQueue$Lock)
+        at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:127)
+        at 
+org.eclipse.jface.action.ActionContributionItem$ImageCache$ReferenceCleanerThre
+ad.run(ActionContributionItem.java:196)
+
+"Start Level Event Dispatcher" daemon prio=5 tid=0x02dd5468 nid=0x428 in 
+Object.wait() [2fff000..2fffd94]
+        at java.lang.Object.wait(Native Method)
+        - waiting on <0x1177b778> (a 
+org.eclipse.osgi.framework.eventmgr.EventThread)
+        at java.lang.Object.wait(Object.java:429)
+        at org.eclipse.osgi.framework.eventmgr.EventThread.getNextEvent
+(EventThread.java:149)
+        - locked <0x1177b778> (a 
+org.eclipse.osgi.framework.eventmgr.EventThread)
+        at org.eclipse.osgi.framework.eventmgr.EventThread.run
+(EventThread.java:107)
+
+"Framework Event Dispatcher" daemon prio=5 tid=0x02dd8c68 nid=0xea0 in 
+Object.wait() [2fbf000..2fbfd94]
+        at java.lang.Object.wait(Native Method)
+        - waiting on <0x1177b888> (a 
+org.eclipse.osgi.framework.eventmgr.EventThread)
+        at java.lang.Object.wait(Object.java:429)
+        at org.eclipse.osgi.framework.eventmgr.EventThread.getNextEvent
+(EventThread.java:149)
+        - locked <0x1177b888> (a 
+org.eclipse.osgi.framework.eventmgr.EventThread)
+        at org.eclipse.osgi.framework.eventmgr.EventThread.run
+(EventThread.java:107)
+
+"Signal Dispatcher" daemon prio=10 tid=0x00a39da0 nid=0xac4 waiting on 
+condition [0..0]
+
+"Finalizer" daemon prio=9 tid=0x00a01ee0 nid=0xbc0 in Object.wait() 
+[2c7f000..2c7fd94]
+        at java.lang.Object.wait(Native Method)
+        - waiting on <0x11741960> (a java.lang.ref.ReferenceQueue$Lock)
+        at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:111)
+        - locked <0x11741960> (a java.lang.ref.ReferenceQueue$Lock)
+        at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:127)
+        at java.lang.ref.Finalizer$FinalizerThread.run(Finalizer.java:159)
+
+"Reference Handler" daemon prio=10 tid=0x00a01c50 nid=0xf6c in Object.wait() 
+[2c3f000..2c3fd94]
+        at java.lang.Object.wait(Native Method)
+        - waiting on <0x11741818> (a java.lang.ref.Reference$Lock)
+        at java.lang.Object.wait(Object.java:429)
+        at java.lang.ref.Reference$ReferenceHandler.run(Reference.java:115)
+        - locked <0x11741818> (a java.lang.ref.Reference$Lock)
+
+"main" prio=7 tid=0x00034e60 nid=0xca0 waiting for monitor entry [7f000..7fc3c]
+        at org.eclipse.jdt.internal.corext.util.JavaModelUtil.reconcile
+(JavaModelUtil.java:754)
+        - waiting to lock <0x12929b40> (a 
+org.eclipse.jdt.internal.core.CompilationUnit)
+        at 
+org.eclipse.jdt.internal.corext.util.AllTypesCache.forceDeltaComplete
+(AllTypesCache.java:315)
+        at 
+org.eclipse.jdt.internal.corext.util.AllTypesCache.startBackgroundMode
+(AllTypesCache.java:534)
+        at org.eclipse.jdt.internal.corext.util.AllTypesCache.access$3
+(AllTypesCache.java:532)
+        at org.eclipse.jdt.internal.corext.util.AllTypesCache$4.run
+(AllTypesCache.java:526)
+        at org.eclipse.swt.widgets.RunnableLock.run(RunnableLock.java:35)
+        at org.eclipse.swt.widgets.Synchronizer.runAsyncMessages
+(Synchronizer.java:106)
+        - locked <0x128d1158> (a org.eclipse.swt.widgets.RunnableLock)
+        at org.eclipse.swt.widgets.Display.runAsyncMessages(Display.java:2702)
+        at org.eclipse.swt.widgets.Display.readAndDispatch(Display.java:2394)
+        at org.eclipse.ui.internal.Workbench.runEventLoop(Workbench.java:1353)
+        at org.eclipse.ui.internal.Workbench.runUI(Workbench.java:1324)
+        at org.eclipse.ui.internal.Workbench.createAndRunWorkbench
+(Workbench.java:243)
+        at org.eclipse.ui.PlatformUI.createAndRunWorkbench(PlatformUI.java:141)
+        at org.eclipse.ui.internal.ide.IDEApplication.run
+(IDEApplication.java:90)
+        at org.eclipse.core.internal.runtime.PlatformActivator$1.run
+(PlatformActivator.java:298)
+        at org.eclipse.core.runtime.adaptor.EclipseStarter.run
+(EclipseStarter.java:249)
+        at org.eclipse.core.runtime.adaptor.EclipseStarter.run
+(EclipseStarter.java:126)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke
+(NativeMethodAccessorImpl.java:39)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke
+(DelegatingMethodAccessorImpl.java:25)
+        at java.lang.reflect.Method.invoke(Method.java:324)
+        at org.eclipse.core.launcher.Main.basicRun(Main.java:269)
+        at org.eclipse.core.launcher.Main.run(Main.java:722)
+        at org.eclipse.core.launcher.Main.main(Main.java:706)
+
+Steve, as you can see from comment #12 I looked into the bug and I tried to 
+reproduce it but wasn't able to do so. That's why I asked Kent to provide a VM 
+dump. 
+
+Erich provided a stack dump for scenario b.) Kent, I still don't understand 
+scenario a.) to which your stack trace in comment #7 points. So if you can 
+easily reproduce the problem a VM dump would be appreciated. 
+I prune it a little but here it is... its waiting on the reconciler thread.
+Notice this also shows bug 62176 which may have side effects.
+
+
+Full thread dump Java HotSpot(TM) Client VM (1.4.2_02-b03 mixed mode):
+
+"Worker-3" prio=5 tid=0x03322e00 nid=0xe0 runnable [3a4f000..3a4fd8c]
+  at o.e.jdt.core.compiler.CharOperation.hashCode(CharOperation.java:1310)
+  at o.e.j.int.core.builder.NameSet.add(NameSet.java:31)
+  at o.e.j.int.core.builder.ReferenceCollection.internSimpleNames
+(ReferenceCollection.java:204)
+  at o.e.j.int.core.builder.ReferenceCollection.internQualifiedNames
+(ReferenceCollection.java:156)
+  at o.e.j.int.core.builder.ReferenceCollection.<init>
+(ReferenceCollection.java:22)
+  at o.e.j.int.core.builder.AdditionalTypeCollection.<init>
+(AdditionalTypeCollection.java:18)
+  at o.e.j.int.core.builder.State.read(State.java:282)
+  at o.e.j.int.core.builder.JavaBuilder.readState(JavaBuilder.java:113)
+  at o.e.j.int.core.JavaModelManager.readState(JavaModelManager.java:1401)
+  at o.e.j.int.core.JavaModelManager.getLastBuiltState
+(JavaModelManager.java:888)
+  at o.e.j.int.core.builder.JavaBuilder.getLastState(JavaBuilder.java:356)
+  at o.e.j.int.core.builder.JavaBuilder.build(JavaBuilder.java:138)
+  at o.e.c.int.events.BuildManager$2.run(BuildManager.java:532)
+  at o.e.c.int.runtime.InternalPlatform.run(InternalPlatform.java:607)
+  at o.e.core.runtime.Platform.run(Platform.java:668)
+  at o.e.c.int.events.BuildManager.basicBuild(BuildManager.java:148)
+  at o.e.c.int.events.BuildManager.basicBuild(BuildManager.java:225)
+  at o.e.c.int.events.BuildManager.basicBuild(BuildManager.java:178)
+  at o.e.c.int.events.BuildManager$1.run(BuildManager.java:205)
+  at o.e.c.int.runtime.InternalPlatform.run(InternalPlatform.java:607)
+  at o.e.core.runtime.Platform.run(Platform.java:668)
+  at o.e.c.int.events.BuildManager.basicBuild(BuildManager.java:208)
+  at o.e.c.int.events.BuildManager.basicBuildLoop(BuildManager.java:244)
+  at o.e.c.int.events.BuildManager.build(BuildManager.java:273)
+  at o.e.c.int.events.AutoBuildJob.doBuild(AutoBuildJob.java:150)
+  at o.e.c.int.events.AutoBuildJob.run(AutoBuildJob.java:196)
+  at o.e.c.int.jobs.Worker.run(Worker.java:66)
+
+"Worker-2" prio=5 tid=0x032310d0 nid=0x70c in Object.wait() [39cf000..39cfd8c]
+  at java.lang.Object.wait(Native Method)
+  - waiting on <0x12108e38> (a o.e.c.int.jobs.ThreadJob)
+  at o.e.c.int.jobs.ThreadJob.joinRun(ThreadJob.java:159)
+  - locked <0x12108e38> (a o.e.c.int.jobs.ThreadJob)
+  at o.e.c.int.jobs.ImplicitJobs.begin(ImplicitJobs.java:87)
+  at o.e.c.int.jobs.JobManager.beginRule(JobManager.java:167)
+  at o.e.ui.internal.editors.quickdiff.LastSaveReferenceProvider.readDocument
+(LastSaveReferenceProvider.java:225)
+  at o.e.ui.internal.editors.quickdiff.LastSaveReferenceProvider.getReference
+(LastSaveReferenceProvider.java:111)
+  at o.e.ui.internal.texteditor.quickdiff.DocumentLineDiffer$1.run
+(DocumentLineDiffer.java:370)
+  at o.e.c.int.jobs.Worker.run(Worker.java:66)
+
+"o.e.j.int.ui.text.JavaReconciler" daemon prio=2 tid=0x03180bf8 nid=0x5c4 
+runnable [38cf000..38cfd8c]
+  at o.e.jdt.core.dom.ASTNode.postReplaceChild(ASTNode.java:1959)
+  at o.e.jdt.core.dom.InfixExpression.setLeftOperand(InfixExpression.java:435)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1726)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:893)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:2004)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1787)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1860)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:2067)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1805)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1860)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1763)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1989)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:1784)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:767)
+  at o.e.jdt.core.dom.ASTConverter.buildBodyDeclarations(ASTConverter.java:333)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:271)
+  at o.e.jdt.core.dom.ASTConverter.convert(ASTConverter.java:149)
+  at o.e.jdt.core.dom.AST.convertCompilationUnit(AST.java:251)
+  at o.e.j.int.core.ReconcileWorkingCopyOperation.executeOperation
+(ReconcileWorkingCopyOperation.java:81)
+  at o.e.j.int.core.JavaModelOperation.run(JavaModelOperation.java:700)
+  at o.e.j.int.core.JavaModelOperation.runOperation
+(JavaModelOperation.java:739)
+  at o.e.j.int.core.CompilationUnit.reconcile(CompilationUnit.java:1101)
+  at o.e.j.int.ui.text.java.JavaReconcilingStrategy.reconcile
+(JavaReconcilingStrategy.java:88)
+  - locked <0x1159c690> (a o.e.j.int.core.CompilationUnit)
+  at o.e.j.int.ui.text.java.JavaReconcilingStrategy.initialReconcile
+(JavaReconcilingStrategy.java:156)
+  at o.e.j.int.ui.text.CompositeReconcilingStrategy.initialReconcile
+(CompositeReconcilingStrategy.java:114)
+  at o.e.j.int.ui.text.JavaCompositeReconcilingStrategy.initialReconcile
+(JavaCompositeReconcilingStrategy.java:122)
+  at o.e.jface.text.reconciler.MonoReconciler.initialProcess
+(MonoReconciler.java:104)
+  at o.e.j.int.ui.text.JavaReconciler.initialProcess(JavaReconciler.java:280)
+  at o.e.jface.text.reconciler.AbstractReconciler$BackgroundThread.run
+(AbstractReconciler.java:155)
+
+"Java indexing" daemon prio=4 tid=0x030e15a8 nid=0x724 runnable 
+[384f000..384fd8c]
+  at java.util.zip.ZipFile.getNextEntry(Native Method)
+  at java.util.zip.ZipFile.access$400(ZipFile.java:26)
+  at java.util.zip.ZipFile$2.nextElement(ZipFile.java:313)
+  - locked <0x10193ce0> (a java.util.zip.ZipFile)
+  at o.e.j.int.core.search.indexing.AddJarFileToIndex.execute
+(AddJarFileToIndex.java:132)
+  at o.e.j.int.core.search.processing.JobManager.run(JobManager.java:367)
+  at java.lang.Thread.run(Thread.java:534)
+
+"Thread-1" prio=7 tid=0x03049ea0 nid=0x6e4 in Object.wait() [37af000..37afd8c]
+  at java.lang.Object.wait(Native Method)
+  - waiting on <0x11385930> (a java.lang.ref.ReferenceQueue$Lock)
+  at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:111)
+  - locked <0x11385930> (a java.lang.ref.ReferenceQueue$Lock)
+  at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:127)
+  at 
+o.e.jface.action.ActionContributionItem$ImageCache$ReferenceCleanerThread.run
+(ActionContributionItem.java:196)
+
+"Thread-0" prio=7 tid=0x03021fc0 nid=0x4c0 in Object.wait() [376f000..376fd8c]
+  at java.lang.Object.wait(Native Method)
+  - waiting on <0x113859a0> (a java.lang.ref.ReferenceQueue$Lock)
+  at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:111)
+  - locked <0x113859a0> (a java.lang.ref.ReferenceQueue$Lock)
+  at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:127)
+  at 
+o.e.jface.action.ActionContributionItem$ImageCache$ReferenceCleanerThread.run
+(ActionContributionItem.java:196)
+
+"main" prio=7 tid=0x000350a0 nid=0x28c waiting for monitor entry [7f000..7fc3c]
+  at o.e.j.int.corext.util.JavaModelUtil.reconcile(JavaModelUtil.java:754)
+  - waiting to lock <0x1159c690> (a o.e.j.int.core.CompilationUnit)
+  at o.e.j.int.corext.util.AllTypesCache.forceDeltaComplete
+(AllTypesCache.java:331)
+  at o.e.j.int.corext.util.AllTypesCache.startBackgroundMode
+(AllTypesCache.java:557)
+  at o.e.j.int.corext.util.AllTypesCache.access$3(AllTypesCache.java:555)
+  at o.e.j.int.corext.util.AllTypesCache$4.run(AllTypesCache.java:549)
+  at o.e.swt.widgets.RunnableLock.run(RunnableLock.java:35)
+  at o.e.swt.widgets.Synchronizer.runAsyncMessages(Synchronizer.java:106)
+  - locked <0x11560320> (a o.e.swt.widgets.RunnableLock)
+  at o.e.swt.widgets.Display.runAsyncMessages(Display.java:2702)
+  at o.e.swt.widgets.Display.readAndDispatch(Display.java:2394)
+  at o.e.ui.internal.Workbench.runEventLoop(Workbench.java:1353)
+  at o.e.ui.internal.Workbench.runUI(Workbench.java:1324)
+  at o.e.ui.internal.Workbench.createAndRunWorkbench(Workbench.java:243)
+  at o.e.ui.PlatformUI.createAndRunWorkbench(PlatformUI.java:141)
+  at o.e.ui.internal.ide.IDEApplication.run(IDEApplication.java:90)
+  at o.e.c.int.runtime.PlatformActivator$1.run(PlatformActivator.java:298)
+  at o.e.core.runtime.adaptor.EclipseStarter.run(EclipseStarter.java:249)
+  at o.e.core.runtime.adaptor.EclipseStarter.run(EclipseStarter.java:126)
+  at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+  at sun.reflect.NativeMethodAccessorImpl.invoke
+(NativeMethodAccessorImpl.java:39)
+  at sun.reflect.DelegatingMethodAccessorImpl.invoke
+(DelegatingMethodAccessorImpl.java:25)
+  at java.lang.reflect.Method.invoke(Method.java:324)
+  at o.e.core.launcher.Main.basicRun(Main.java:269)
+  at o.e.core.launcher.Main.run(Main.java:722)
+  at o.e.core.launcher.Main.main(Main.java:706)
+Thanks Kent. 
+
+Your trace also points to case b.) (as Erich's does). This trace is different 
+than the one you posted under comment #7. Are you sure that the one under 
+comment #7 really showed the behavior of the UI thread hanging for a couple of 
+seconds? I couldn't find a code path that could case this. 
+Actual comment #7 was from a breakpoint that we put in to verify that it was 
+running in the UI thread. We wanted to make sure that it bypassed the async 
+check.
+I have changed the startup code. The code that ensure that all deltas are 
+processed is now no longer executed on startup. Additionally I added code to 
+enabled all types cache tracing.
+Kent, 
+
+Kevin asked me if you could verify that the code that starts the all types 
+cache thread doesn't block the UI thread anymore.
+
+To do so you can enable tracing support via the option
+
+# Turn on tracing of the all types cache
+org.eclipse.jdt.ui/debug/allTypesCache=true
+
+
+This will print a message with the time the runnable spent in the UI thread to 
+actually start the all types cache.
+I'm not around this week so if it can wait until next week, I'll do it then...
+Has been fixed by Dirk on 05/18 while I was on vacation.
+
+
+All types cache populated during start-up
+
+performance
+
+[61014] 

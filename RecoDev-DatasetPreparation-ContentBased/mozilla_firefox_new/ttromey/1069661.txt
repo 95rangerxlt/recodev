@@ -1,0 +1,520 @@
+Now bug 1050774 is happening, we really need a way to attach meta data to markers and show then in the timeline. For example, script markers can have the name of the function. Paint markers, the size of the painted area.
+
+Now bug 1050774 is happening, we really need a way to attach meta data to markers and show then in the timeline. For example, script markers can have the name of the function. Paint markers, the size of the painted area.
+Would be awesome to optionally use JS::CaptureCurrentStack to set current JS stack as the metadata for most (every?) marker.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #1)
+> Would be awesome to optionally use JS::CaptureCurrentStack to set current JS
+> stack as the metadata for most (every?) marker.
+
+Beside the case of synchronous reflows, wouldn't we always get an empty stack?
+Here are a couple of meta data we want to be able to record:
+- paint: x:34 y:35 width:1200 height:244
+- DOM event: "click"
+- restyle: foobar.js:44, Elements affected: 3
+- script: foobar.js:44 (foobar())
+- reflow: Nodes that need layout: 3, Layout tree size: 26, Layout scope: Whole document (not sure abot this one, copy/pasting Chrome's data)
+
+... so I don't know what kind of structure we should use for that. A js object?
+(In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from comment #2)
+> (In reply to Nick Fitzgerald [:fitzgen] from comment #1)
+> > Would be awesome to optionally use JS::CaptureCurrentStack to set current JS
+> > stack as the metadata for most (every?) marker.
+> 
+> Beside the case of synchronous reflows, wouldn't we always get an empty
+> stack?
+
+Yeah, and that's ok, JS::CaptureCurrentStack will return null when there isn't a current JS stack. So everything would be working correctly :)
+Ok. So we need to hold the stack as well.
+In bug 1051005, Benoit adds some meta data.
+(In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from comment #3)
+> Here are a couple of meta data we want to be able to record:
+> - paint: x:34 y:35 width:1200 height:244
+And along with that, we need to build a rect highlighter (bug 1076866).
+> - DOM event: "click"
+Also, the stack here would help.
+> - restyle: foobar.js:44, Elements affected: 3
+> - script: foobar.js:44 (foobar())
+> - reflow: Nodes that need layout: 3, Layout tree size: 26, Layout scope:
+> Whole document (not sure abot this one, copy/pasting Chrome's data)
+I filed bug 1090110 for this. We could dump the whole frame tree
+Created attachment 8519143
+add "detail" to timeline markers
+
+Here's an initial patch to show the direction I'm heading.
+It's easy to change anything though, so please speak up.
+
+The change looks bigger than one might expect:
+
+* I turned InternalProfileTimelineMarker into a public class so that
+  it is easy to subclass for marker emitters.
+
+* I got rid of the ProfilerBacktrace argument (never used and I think
+  not needed) and removed the use of ProfilerMarkerTracing (didn't
+  provide much value -- but this is a decision based on the idea of
+  handing out "real" JS objects and not going via JSON in some
+  internal layer; anyway changeable).
+
+* mProfileTimelineMarkers now uses nsAutoPtr to make the
+  error-handling cases in PopProfileTimelineMarkers more obvious.
+
+This patch converts Console and DOM Event markers to the new form.
+
+Console now adds "detail.causeName" internally, no more
+post-processing in the actor.
+
+DOM Event adds detail.causeName and detail.phase.  Perhaps more could
+be added here.
+
+Error handling in PopProfileTimelineMarkers has a latent bug.
+It ignores the result of ToJSValue.  (Seems like this should probably
+be a compiler error...)
+
+This patch fixes that latent bug.  But it also brings up some
+questions.  First, ErrorList.h has a huge number of error values --
+which one is correct here?  Second, do we get any value from
+ProfileTimelineMarker.webidl over just creating JS objects directly?
+nsIDocShell.idl just has:
+
+  [implicit_jscontext]
+  jsval popProfileTimelineMarkers();
+
+... not sequence<ProfileTimelineMarker> or anything like that.
+
+This matters in case you want to change the shape of the objects
+returned by PopProfileTimelineMarkers; like if you'd prefer
+"marker.causeName" over "marker.detail.causeName" -- flatter objects.
+
+The waterfall.js hunk is just a hack to make it obvious that the code
+works.
+
+What this is missing is a change to nsDocShell to have it participate
+in cycle collection.  With that in place we can add the necessary code
+to TimelineMarker to let it hold references to JS objects, and then
+finally capture the JS stack when relevant.
+
+TimelineMarker::Equals is a bit of a hack.  Relatedly, there's no
+really good reason to put the cause into TimelineMarker.  This is just
+because we don't have a good way to safely downcast in
+ConsoleTimelineMarker to ensure equality; so this approach is a
+compromise.
+(In reply to Tom Tromey :tromey from comment #8)
+
+> Error handling in PopProfileTimelineMarkers has a latent bug.
+> It ignores the result of ToJSValue.  (Seems like this should probably
+> be a compiler error...)
+
+See bug 1096329 for the fix for the latent bug.
+See bug 1095728 for the compiler error.
+
+> This patch fixes that latent bug.  But it also brings up some
+> questions.  First, ErrorList.h has a huge number of error values --
+> which one is correct here? 
+
+For bug 1096329 we agreed to just clear any pending exception,
+so I've updated my patch for this bug to do the same.
+(In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from comment #3)
+
+> - paint: x:34 y:35 width:1200 height:244
+
+I added this today.
+I still haven't added the cycle collection bits yet though.
+I'm starting to think this should go in piece-by-piece.
+(In reply to Tom Tromey :tromey from comment #10)
+> (In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from
+> comment #3)
+> 
+> > - paint: x:34 y:35 width:1200 height:244
+> 
+> I added this today.
+Awesome! I created the premise of RectHighlighter today in bug 1076866. Sounds like we should be able to integrate both our WIPs together next week and have painted rectangles highlighted in the page!
+Created attachment 8520910
+add "detail" to timeline markers
+
+Here's a new version.  I'm going to send this through "try".
+
+Much of the earlier description applies.  I've added some tests and a
+few comments.  I changed the error-handling in
+PopProfileTimelineMarkers to follow the final patch from bug 1096329.
+There was at least one bug fix as well.
+
+Also, (relative to the previous patch) I changed
+TimelineMarker::AddProperties to lazily create the "detail" object.
+This is handy for how a later patch treats the TimelineMarker object
+when handling paint markers.
+
+This patch adds the ClearException class to simplify error-handling
+logic in PopProfileTimelineMarkers.  This is the fourth such
+implementation of this class in tree; I would merge them but I don't
+know where to put the definition.  jsapi.h?
+https://tbpl.mozilla.org/?tree=Try&rev=3235c2955951
+https://tbpl.mozilla.org/?tree=Try&rev=31755ced409e
+Created attachment 8521624
+add "detail" to timeline markers
+
+Try to avoid a rooting hazard warning this time.
+https://tbpl.mozilla.org/?tree=Try&rev=1cb9c94d626e
+Created attachment 8521826
+add "detail" to timeline markers
+
+That one was a bit naive.  Now I know about RootedDictionary.
+This looks pretty straight forward. I like it.
+The cleaning of console.time markers feels food :)
+
+This + bug 1074106, it's gonna start to look pretty good.
+Comment on attachment 8521826
+add "detail" to timeline markers
+
+I think this version is ready for review.
+
+The try build seems clean -- one orange, an intermittent failure;
+and more importantly, passes the hazard analysis.
+
+Comment #8 in the bug still explains the patch reasonably well.
+
+I still don't know where, if anywhere, to merge the ClearException
+classes.  However this can be done as a follow-up as well.
+
+I wasn't sure if the Console.cpp change required another reviewer.
+Comment on attachment 8521826
+add "detail" to timeline markers
+
+>+nsDocShell::TimelineMarker::AddProperties(JSContext* aCx,
+>+                                          JS::MutableHandleObject aObj)
+>+{
+>+  if (mCause.IsEmpty()) {
+>+    return true;
+>+  }
+>+
+>+  // Create the enclosing object if necessary.
+>+  if (!aObj) {
+>+    aObj.set(JS_NewObject(aCx, nullptr, JS::NullPtr(), JS::NullPtr()));
+Really odd method. It is called "AddProperties", but it may actually create some new object and add stuff to it.
+
+Do we really need to use JSAPI manually so much?
+Couldn't we have a webidl dictionary for all the possible properties, and set the value to the
+relevant ones and then call ToJSValue
+(Remember, manual use of JSAPI should be avoided whenever possible. It is rather error prone to use.)
+
+>+class EventTimelineMarker : public nsDocShell::TimelineMarker
+>+{
+>+public:
+>+  EventTimelineMarker(nsDocShell* aDocShell, TracingMetadata aMetaData,
+>+                      uint16_t aPhase, const nsCString& aCause)
+The last param should be const nsACString& aCause
+(or const nsAString& aCause if 16bit strings could be used)
+
+
+>               nsDocShell* ds = static_cast<nsDocShell*>(docShell.get());
+>-              ds->AddProfileTimelineMarker("DOMEvent", TRACING_INTERVAL_START);
+>+              nsString typeStr;
+>+              (*aDOMEvent)->GetType(typeStr);
+>+              nsCString str = NS_ConvertUTF16toUTF8(typeStr);
+>+              uint16_t phase;
+>+              (*aDOMEvent)->GetEventPhase(&phase);
+>+              ds->AddProfileTimelineMarker(
+>+                new EventTimelineMarker(ds, TRACING_INTERVAL_START, phase, str));
+This looks rather heavy.
+On stack you should use nsAuto(C)String, and does (Event)TimelineMarker really need to use nsCString? What is wrong with nsString?
+(If CString is really needed, NS_ConvertUTF16toUTF8 str(typeStr); works.)
+Comment on attachment 8521826
+add "detail" to timeline markers
+
+Review of attachment 8521826:
+-----------------------------------------------------------------
+
+The changes to timeline.js and the 2 browser tests seem ok to me.
+(In reply to Olli Pettay [:smaug] from comment #20)
+
+> Do we really need to use JSAPI manually so much?
+> Couldn't we have a webidl dictionary for all the possible properties, and
+> set the value to the
+> relevant ones and then call ToJSValue
+
+I don't totally follow this.  Could you explain more?
+
+One idea I was considering was inheriting from the base
+dictionary:
+
+dictionary ConsoleTimelineMarker : ProfileTimelineMarker {
+  DOMString causeName;
+};
+
+dictionary DOMEventTimelineMaker : ProfileTimelineMarker {
+  DOMString type;
+  unsigned short eventPhase;
+};
+
+
+Then having a method on TimelineMarker to get the JS object for
+the particular subclass (and another method to fill in the base
+ProfileTimelineMarker in a consistent way).
+
+Is this what you were thinking?
+Created attachment 8523174
+add "detail" to timeline markers
+
+Here's a version that uses dictionary inheritance.
+
+It uses a flatter representation of markers -- no more
+"detail.causeName", just "causeName" now.  I also renamed the
+attributes for DOM Events to more closely follow Event.webidl.
+This necessitated some minor changes to the js.
+
+The CreateMarker / InitializeProfileTimelineMarker methods are a bit
+ugly due to the need to pass in the end time as a parameter.
+
+I think I've correctly cleaned up the string mess.
+I forgot to needinfo earlier.
+
+It occurred to me later that maybe you meant having a single dictionary:
+
+dictionary ProfileTimelineMarker {
+  DOMString name = "";
+  DOMHighResTimeStamp start = 0;
+  DOMHighResTimeStamp end = 0;
+  /* For console.  */
+  DOMString? causeName;
+  /* For DOM Events.  */
+  DOMString? type;
+  unsigned short? eventPhase;
+  /* ...etc */  
+};
+
+
+That's also quite easy to implement if that is what you'd prefer.
+It would make the dictionary initialization code a bit cleaner
+at the expense of a somewhat funny type definition.
+(In reply to Tom Tromey :tromey from comment #24)
+> I forgot to needinfo earlier.
+> 
+> It occurred to me later that maybe you meant having a single dictionary:
+Yes
+
+
+> That's also quite easy to implement if that is what you'd prefer.
+That should make us have less manual JSAPI usage, so yes.
+
+> It would make the dictionary initialization code a bit cleaner
+> at the expense of a somewhat funny type definition.
+Well the type definition is rather odd with the latest patch too.
+And if you want better type definition, perhaps have different variants of ProfileTimelineMarker:
+ProfileTimelineMarkerBase, ProfileTimelineMarkerEvents, ProfileTimelineMarkerConsole (this is what the patch seems to do).
+Though, handling all the variants might be a bit annoying.
+
+
+
+Another option is, if our webidl bindings can handle it, something like
+
+dictionary ProfileTimelineMarker {
+  DOMString name = "";
+  DOMHighResTimeStamp start = 0;
+  DOMHighResTimeStamp end = 0;
+  (ProfileTimelineMarkerEventData or ProfileTimelineMarkerConsoleData) data;
+}
+
+dictionary ProfileTimelineMarkerEventData {
+  DOMString? type;
+  unsigned short? eventPhase;
+};
+dictionary ProfileTimelineMarkerConsoleData {
+  DOMString? causeName;
+};
+
+But whatever makes the code simplest, and keeps JSAPI usage at minimum is fine.
+(In reply to Olli Pettay [:smaug] from comment #25)
+
+> > It would make the dictionary initialization code a bit cleaner
+> > at the expense of a somewhat funny type definition.
+> Well the type definition is rather odd with the latest patch too.
+
+Definitely agreed :)
+
+> Another option is, if our webidl bindings can handle it, something like
+> 
+> dictionary ProfileTimelineMarker {
+>   DOMString name = "";
+>   DOMHighResTimeStamp start = 0;
+>   DOMHighResTimeStamp end = 0;
+>   (ProfileTimelineMarkerEventData or ProfileTimelineMarkerConsoleData) data;
+> }
+
+I tried this last week but it runs into the "distinguishable" rule.
+From http://www.w3.org/TR/WebIDL/#idl-union:
+
+Each pair of flattened member types in a union type, T and U, MUST be distinguishable. 
+
+... and two dictionary types are not distinguishable.
+Created attachment 8524038
+add "detail" to timeline markers
+
+Here's a new version that "inlines" all the detail attributes.
+
+I removed the nsAutoPtr and ClearException changes as they are not
+strictly needed with this approach.  I think they may still be
+desirable later -- it seems to me that using nsTArray in
+PopProfileTimelineMarkers is not very robust (but does it matter?) --
+and if we add more error checking then this more automatic behavior is
+convenient.
+
+Also I think none of this code needs to check MOZ_ENABLE_PROFILER_SPS
+any more.  I believe that was only needed when this code used profiler
+types -- but this patch removes that dependency.  I was thinking to
+deal with this in a follow-up patch.
+
+I'll push to try to find out what I missed.
+https://tbpl.mozilla.org/?tree=Try&rev=4a90640b1ac8
+Comment on attachment 8524038
+add "detail" to timeline markers
+
+>+nsDocShell::AddProfileTimelineMarker(TimelineMarker* aMarker)
+> {
+> #ifdef MOZ_ENABLE_PROFILER_SPS
+>   if (mProfileTimelineRecording) {
+>-    DOMHighResTimeStamp delta;
+>-    Now(&delta);
+>-    ProfilerMarkerTracing* payload = new ProfilerMarkerTracing("Timeline",
+>-                                                               aMetaData,
+>-                                                               aCause);
+>-    mProfileTimelineMarkers.AppendElement(
+>-      new InternalProfileTimelineMarker(aName, payload, delta));
+>+    mProfileTimelineMarkers.AppendElement(aMarker);
+>+  } else {
+>+    delete aMarker;
+>   }
+> #endif
+> }
+Tiny bit scary from ownership management point of view. AddFoo may actually delete Foo...
+I'd prefer if the param type was nsAutoPtr<TimelineMarker>& or UniquePtr<TimelineMarker>&
+and if mProfileTimelineRecording is true, then forget()/release() and pass the return value of such
+method to AppendElement();
+This way the caller is guaranteed to not have a pointer to a deleted pointer.
+
+
+>+  /* For ConsoleTime markers.  */
+>+  DOMString? causeName;
+>+  /* For DOMEvent markers.  */
+>+  DOMString? type;
+>+  unsigned short? eventPhase;
+Why these are nullables?
+(In reply to Olli Pettay [:smaug] from comment #29)
+
+> Tiny bit scary from ownership management point of view. AddFoo may actually
+> delete Foo...
+> I'd prefer if the param type was nsAutoPtr<TimelineMarker>& or
+> UniquePtr<TimelineMarker>&
+> and if mProfileTimelineRecording is true, then forget()/release() and pass
+> the return value of such
+> method to AppendElement();
+> This way the caller is guaranteed to not have a pointer to a deleted pointer.
+
+Ok, will do.
+
+Just as a side note here, the method I'm replacing this with has a latent
+bug here... if it were ever called when profiling was disabled, it would
+leak memory.  Basically just history plus recognition of this bug is what
+drove this patch's apporach.
+
+> >+  /* For ConsoleTime markers.  */
+> >+  DOMString? causeName;
+> >+  /* For DOMEvent markers.  */
+> >+  DOMString? type;
+> >+  unsigned short? eventPhase;
+> Why these are nullables?
+
+I thought that was how one expressed that the attributes were optional.
+Is there some other way that I should use instead?  I did not see anything
+obvious looking through the WebIDL spec, but I may just not know the
+keyword to look for.
+(In reply to Tom Tromey :tromey from comment #30)
+> Just as a side note here, the method I'm replacing this with has a latent
+> bug here... if it were ever called when profiling was disabled, it would
+> leak memory.  
+Do we need to fix that bug in any branches?
+
+
+
+> > >+  /* For ConsoleTime markers.  */
+> > >+  DOMString? causeName;
+> > >+  /* For DOMEvent markers.  */
+> > >+  DOMString? type;
+> > >+  unsigned short? eventPhase;
+> > Why these are nullables?
+> 
+> I thought that was how one expressed that the attributes were optional.
+'?' means nullable, not optional. Properties in a dictionary are optional unless explicitly marked required.
+(In reply to Olli Pettay [:smaug] from comment #31)
+> (In reply to Tom Tromey :tromey from comment #30)
+> > Just as a side note here, the method I'm replacing this with has a latent
+> > bug here... if it were ever called when profiling was disabled, it would
+> > leak memory.  
+> Do we need to fix that bug in any branches?
+
+Nope, it is latent because nothing ever calls that method.
+ 
+> > > >+  /* For ConsoleTime markers.  */
+> > > >+  DOMString? causeName;
+> > > >+  /* For DOMEvent markers.  */
+> > > >+  DOMString? type;
+> > > >+  unsigned short? eventPhase;
+> > > Why these are nullables?
+> > 
+> > I thought that was how one expressed that the attributes were optional.
+> '?' means nullable, not optional. Properties in a dictionary are optional
+> unless explicitly marked required.
+
+Ok, thanks.  I will fix it up.
+Created attachment 8524853
+add "detail" to timeline markers
+
+This version uses UniquePtr and removes the "?"s from the dictionary.
+https://tbpl.mozilla.org/?tree=Try&rev=10ed507cefd7
+Comment on attachment 8524853
+add "detail" to timeline markers
+
+I wasn't sure if the r+ would carry over.
+
+Also I wasn't sure whether I should try to reformat the Console
+change so it didn't overflow 80 columns so much; and, if so,
+exactly how it would be done...
+Comment on attachment 8524853
+add "detail" to timeline markers
+
++            mozilla::UniquePtr<nsDocShell::TimelineMarker> marker
++              = MakeUnique<ConsoleTimelineMarker>(docShell,
+= could go to the previous line
+Created attachment 8524902
+add "detail" to timeline markers
+
+Fix the "=".
+https://hg.mozilla.org/integration/fx-team/rev/1c1aaebe9352
+https://hg.mozilla.org/mozilla-central/rev/1c1aaebe9352
+Created attachment 8537439
+add stack traces to timeline markers
+
+I forgot to mark the new test as not working on e10s.
+(Most of the timeline tests don't work there; I'll look into fixing
+this.)
+
+Try build here:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=0b5f306a3fe5
+Comment on attachment 8537439
+add stack traces to timeline markers
+
+Grr, attached this to the wrong bug.
+Tom, is manual QA coverage needed for this fix? If so, could you please provide a few details on how to verify it?
+(In reply to Andrei Vaida, QA [:avaida] from comment #42)
+> Tom, is manual QA coverage needed for this fix? If so, could you please
+> provide a few details on how to verify it?
+
+I don't think anything is needed.  Thanks!
+Sorry for the spam. Moving bugs to Firefox :: Developer Tools: Performance Tools (Profiler/Timeline).
+
+dkl
+
+
+Add a way to attach meta data to any marker
+
+
+
+Bug 1069661 - add "detail" to timeline markers. r=smaug 

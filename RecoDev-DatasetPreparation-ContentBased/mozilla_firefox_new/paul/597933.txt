@@ -1,0 +1,287 @@
+[STR]
+open some tabs (eg.10 tabs).
+focus/open 1st (left-most) tab.
+exit (just "quit") and restart.
+History > Restore Previous Session
+(10) tabs open and all tabs are loaded.
+
+but
+
+open some tabs (eg.10 tabs).
+focus/open 2nd tab (tab besides 1st tab)
+exit (just "quit") and restart.
+History > Restore Previous Session
+(10) tabs open and only 3 tabs are loaded.
+
+[STR]
+open some tabs (eg.10 tabs).
+focus/open 1st (left-most) tab.
+exit (just "quit") and restart.
+History > Restore Previous Session
+(10) tabs open and all tabs are loaded.
+
+but
+
+open some tabs (eg.10 tabs).
+focus/open 2nd tab (tab besides 1st tab)
+exit (just "quit") and restart.
+History > Restore Previous Session
+(10) tabs open and only 3 tabs are loaded.
+it si also broken when you reopen closed window
+We'll block for sure and it should probably be pretty urgent. I'll be looking into this in the morning.
+I'm finding that cascading loads will fail if tabs fails to load (timeout or whatever).  This halts the cascading aspect since it appears to be waiting for the tab to finish loading.
+
+I'm also seeing issues with trying to use a SessionStore API call to load a session while a cascading load is in progress.  I filed that as bug 598011
+Looks to be related to calling _openWindowWithState - seems like the progress
+listener isn't attached.
+
+(In reply to comment #3)
+> I'm finding that cascading loads will fail if tabs fails to load (timeout or
+> whatever).  This halts the cascading aspect since it appears to be waiting for
+> the tab to finish loading.
+
+I'll file that bug separately. Probably add a timer that will look at tabs' "stalled" attribute.
+
+> I'm also seeing issues with trying to use a SessionStore API call to load a
+> session while a cascading load is in progress.  I filed that as bug 598011
+
+I'm hoping that this is actually the same issue.
+seemed to see something similar after crash and oops... page but may just have been per c3 - seemed to complete correctly with same set of tabs on file exit / restore
+...would also be nice if auth required prompt didn't stall the process
+Created attachment 477050
+Patch v0.1 (WIP)
+
+So the problem was a missing progress listener. It was added properly, but it was immediately removed. We set the selected tab after we set __SS_needsRestore  on the tabs (in restoreHistoryPrecursor, when sorting the tabs), so that triggers TabSelect and so we call onTabSelect. From there we blindly call restoreTab regardless of if the tab was in tabsToRestore (which it isn't yet). We end up calling restoreNextTab with a still empty tabsToRestore and so we remove the progress listener.
+
+This patch moves the tab reordering & selection to be before setting __SS_needsRestore, so even when it does trigger TabSelect, we don't try to restore the tab.
+
+Not completely sure why we don't hit this case for an already open window...
+
+I'm going to add a test, so just looking for feedback right now to help get a speedier review tomorrow
+Comment on attachment 477050
+Patch v0.1 (WIP)
+
+
+>+    // mark the tabs as loading
+>+    for (t = 0; t < aTabs.length; t++) {
+
+there's a bunch of other stuff happening in this loop. please list everything in this comment at the top.
+
+one reason this code is so fragile is because so much work happens as a side-effect inside of megamethods like the ambiguously-named restoreHistoryPrecursor, instead of declaritively in narrowly-scoped methods. we can begin to mitigate the regression-prone nature of this code by excessive inline documentation. eventually we could break up the megamethods into discrete parts (or just change the approach altogether, though i'd not block incremental progress on a rewrite).
+ETA on an updated patch for review here, Paul?
+(In reply to comment #9)
+> ETA on an updated patch for review here, Paul?
+
+Soon today - writing a test now. I know dietrich's available time is running low
+In the process of running the test, I uncovered the same problem which I thought I'd fixed. It happens a different way though. I understand the problem, but the fix might involve a bit more dirty work, so pushing ETA to tomorrow.
+Created attachment 477425
+Patch v0.2
+
+Adds a fix for the problem I mentioned above. I think it's right (it makes tests pass at the least) and it makes sense.
+
+I kinda want to add another test though, setWindowState with tabs, then before they're all restored, setWindowState again both with overwrite and without to make sure the progress listener isn't removed too soon.
+Comment on attachment 477425
+Patch v0.2
+
+r=me. agreed on the need for a setWindowState test to accompany this.
+Ended up here from http://forums.mozillazine.org/viewtopic.php?p=9927845&sid=6d10845081023d7b19e1698530141b9a#p9927845
+
+From the time when I initially noticed this on Mozilla/5.0 (Windows NT 6.0; rv:2.0b7pre) Gecko/20100922 Firefox/4.0b7pre ID:20100922041040 at "22 Sep 2010 11:04 am" http://forums.mozillazine.org/viewtopic.php?p=9927539#p9927539 and I still have a tab that shows a stuck progress line as of now.
+
+In all fairness I should probably close that tab and forget about it, but you never know when you'd need an old tab right =)
+
+Am I bitten by this one or different?
+Created attachment 477841
+Patch v0.3
+
+Apart from the additional tests, the interdiff is pretty small, but there were some followup issues exposed by the tests, so requesting review again.
+Comment on attachment 477841
+Patch v0.3
+
+
+>@@ -2468,27 +2481,31 @@ SessionStoreService.prototype = {
+>         this._tabsToRestore.hidden.push(tab);
+>       else
+>         this._tabsToRestore.visible.push(tab);
+>       this.restoreNextTab();
+>     }
+>   },
+> 
+>   restoreTab: function(aTab) {
+>+    let window = aTab.ownerDocument.defaultView;
+>     let browser = aTab.linkedBrowser;
+>     let tabData = browser.__SS_data;
+> 
+>     // There are cases within where we haven't actually started a load and so we
+>     // should call restoreNextTab. We don't want to do it immediately though
+>     // since we might not set userTypedValue in a timely fashion.
+>     let shouldRestoreNextTab = false;
+> 
+>     // Increase our internal count.
+>     this._tabsRestoringCount++;
+> 
+>+    // Decrement the number of tabs this window needs to restore
+>+    window.__SS_tabsToRestore--;
+
+move this into _resetTabRestoringState, so that the manipulation of this value is centralized in that single method (outside of the value's initialization, anyway).
+
+>+  _resetTabRestoringState: function sss__resetTabRestoringState(aTab, aCanRestoreNext) {
+>+    let browser = aTab.linkedBrowser;
+>+
+>+    if (browser.__SS_restoring) {
+>+      delete browser.__SS_restoring;
+>+      if (aCanRestoreNext) {
+>+        this.restoreNextTab(true);
+>+      }
+>+      else {
+>+        // Even if we can't restore the next tab, we still need to decrement
+>+        // the restoring count manually.
+>+        this._tabsRestoringCount--;
+
+comments like this are usually a good indication that something's amiss :)
+
+r=me with this fixed.
+(In reply to comment #16)
+> Comment on attachment 477841 [details]
+> Patch v0.3
+> 
+> 
+> >@@ -2468,27 +2481,31 @@ SessionStoreService.prototype = {
+> >         this._tabsToRestore.hidden.push(tab);
+> >       else
+> >         this._tabsToRestore.visible.push(tab);
+> >       this.restoreNextTab();
+> >     }
+> >   },
+> > 
+> >   restoreTab: function(aTab) {
+> >+    let window = aTab.ownerDocument.defaultView;
+> >     let browser = aTab.linkedBrowser;
+> >     let tabData = browser.__SS_data;
+> > 
+> >     // There are cases within where we haven't actually started a load and so we
+> >     // should call restoreNextTab. We don't want to do it immediately though
+> >     // since we might not set userTypedValue in a timely fashion.
+> >     let shouldRestoreNextTab = false;
+> > 
+> >     // Increase our internal count.
+> >     this._tabsRestoringCount++;
+> > 
+> >+    // Decrement the number of tabs this window needs to restore
+> >+    window.__SS_tabsToRestore--;
+> 
+> move this into _resetTabRestoringState, so that the manipulation of this value
+> is centralized in that single method (outside of the value's initialization,
+> anyway).
+
+That's actually not an option without reorganizing a fair bit. We need to explicitly decrement when calling restoreTab since not all restores result in a call to _resetTabRestoringState. In fact, none do, it's only when we remove a tab or overwrite a tab.
+
+I can look at making the paths a bit DRYer so it all goes through here, but I don't think it's worth it right now.
+
+> >+  _resetTabRestoringState: function sss__resetTabRestoringState(aTab, aCanRestoreNext) {
+> >+    let browser = aTab.linkedBrowser;
+> >+
+> >+    if (browser.__SS_restoring) {
+> >+      delete browser.__SS_restoring;
+> >+      if (aCanRestoreNext) {
+> >+        this.restoreNextTab(true);
+> >+      }
+> >+      else {
+> >+        // Even if we can't restore the next tab, we still need to decrement
+> >+        // the restoring count manually.
+> >+        this._tabsRestoringCount--;
+> 
+> comments like this are usually a good indication that something's amiss :)
+
+Perhaps using "can't" was a mistake. "shouldn't" makes more sense. Since we decrement _tabsRestoringCount in restoreNextTab, we don't need to do it here first. But we do need to do it if we aren't calling restoreNextTab.
+
+I'll clear up the comment.
+Pushed http://hg.mozilla.org/mozilla-central/rev/f11e306526a8
+(In reply to comment #0)
+> [STR]
+> open some tabs (eg.10 tabs).
+> focus/open 1st (left-most) tab.
+> exit (just "quit") and restart.
+> History > Restore Previous Session
+> (10) tabs open and all tabs are loaded.
+> 
+> but
+> 
+> open some tabs (eg.10 tabs).
+> focus/open 2nd tab (tab besides 1st tab)
+> exit (just "quit") and restart.
+> History > Restore Previous Session
+> (10) tabs open and only 3 tabs are loaded.
+
+same result with
+http://ftp.mozilla.org/pub/mozilla.org/firefox/tinderbox-builds/mozilla-central-win32/1285312709/
+cset : c7ed283dda27
+
+so NOT fixed.
+
+both result should be "(10) tabs open and only 3 tabs are loaded." ?
+
+
+http://blog.zpao.com/post/1140456188/cascaded-session-restore-a-hidden-bonus
+"we don’t load all of your pages at once when we restore your session."
+Paul, you didn't merge correctly and basically backed out bug 598020.
+(In reply to comment #19)
+> both result should be "(10) tabs open and only 3 tabs are loaded." ?
+
+No, both results should be that all of your tabs are loaded. Is that not the case for you?
+http://mozillalinks.org/wp/2010/09/firefox-4-now-with-optimized-session-restore/
+"cascaded session restore (CSR), an optimized approach that loads a limited number of tabs at a time (3 by default) when Firefox restarts."
+"Favicons and titles are loaded for all tabs, and if you switch to a tab that is not loaded yet, it is loaded immediately."
+
+I think
+when there are some tabs, and restore them.
+3 tabs are loaded completely, and the other tabs are not loaded but show its favicon and title.
+then open not-loaded tabs, that tab is loaded completely.
+
+and you write "Switching tabs should cause the selected tab to start loading immediately" on http://blog.zpao.com/post/1140456188/cascaded-session-restore-a-hidden-bonus
+(In reply to comment #22)
+> http://mozillalinks.org/wp/2010/09/firefox-4-now-with-optimized-session-restore/
+> "cascaded session restore (CSR), an optimized approach that loads a limited
+> number of tabs at a time (3 by default) when Firefox restarts."
+> "Favicons and titles are loaded for all tabs, and if you switch to a tab that
+> is not loaded yet, it is loaded immediately."
+> 
+> I think
+> when there are some tabs, and restore them.
+> 3 tabs are loaded completely, and the other tabs are not loaded but show its
+> favicon and title.
+
+Nope, that's not the intended behaviour and not what Paul wrote in his blog post. Note that he said Firefox "loads a limited number of tabs *at a time*" (my emphasis). That means it eventually loads them all, but in any given moment only three tabs are loading.
+OK , then 
+at first, 3 tabs are loaded.
+after finish loading, next 3 tabs will start loading automatically.
+after finish loading, next 3 tabs .......
+finally all tabs are loaded. 
+right ?
+
+if so, "Switching tabs should cause the selected tab to start loading
+immediately" seems to be wrong.
+if all tabs are loaded, there is no tab that is not loaded.
+It's about when you switch to a not-yet-loaded tab _before_ all tabs are loaded.
+
+Let's say you start Firefox with 26 tabs, you have tabs a to z.
+While the contents of the first tabs, ie. a, b, c are being loaded, you switch to tab x, which leads to the content of tab x starts being loaded immediately, much sooner than it would have if you had waited till its turn before switching to it.
+OK,
+
+intended behavior is like below ?
+
+3 tabs are loaded, 3 tabs are loaded, 3tabs are loaded, ..... all tabs are loaded.
+I'm not sure what's so complicated about this. Three tabs start to load initially (with the default preference of 3 set). As each tab finishes another tab starts to load.  So for example if there are 10 tabs, 3 will start toload initially. When one of those 3 tabs finishes a fourth tab will load even if the other two haven't finished yet. When one of the other 2 tabs (or the 4th tab) finishes loading the fifth tab starts to load and so on and so forth. The 3 setting is the maximum number of loading tabs at a time. It doesn't mean tabs load 3 in batches of threes. 
+
+Also clicking on an unloaded tab will start it loading. At least that's what's supposed to happen.
+(In reply to comment #27)
+
+understand.
+thanks.
+
+
+"Cascade page loads when restoring" does not work properly in certain case.
+
+
+
+Bug 597933 - "Cascade page loads when restoring" does not work properly in certain case. [r=dietrich, a=blocking-b7] 

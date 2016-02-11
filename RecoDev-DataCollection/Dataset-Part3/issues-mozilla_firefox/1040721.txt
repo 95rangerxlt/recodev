@@ -1,0 +1,208 @@
+The details required for mapping an URL to a search engine and terms, such as the parameter name, search path and alternate domains listed in bug 1038225, should be exposed by nsSearchService.js so that the Places component can use them to identify the URL.
+
+The details required for mapping an URL to a search engine and terms, such as the parameter name, search path and alternate domains listed in bug 1038225, should be exposed by nsSearchService.js so that the Places component can use them to identify the URL.
+Created attachment 8458829
+Preliminary patch
+
+This does not have tests yet, but is a possible implementation of the design.
+
+The reason why the prefix and alternate domains are separated is to make it super-easy to import the data from the Google list. No processing is needed.
+
+See the patch I'll post in bug 959582 for how the consumer will use the API.
+Hi Paolo, can you provide a point value and if the bug should be marked as [qa+] or [qa-] for verification.
+Created attachment 8459595
+The patch
+
+This patch now includes tests for the functionality.
+Created attachment 8459613
+Updated patch
+
+This contains one additional browser-chrome test for the alternate domains addition to the Google engine.
+Comment on attachment 8459613
+Updated patch
+
+Discussed this Paolo, he will rework this patch to use a separate module for storing the engine name->engine URL maps.
+
+We also discussed an alternate interface where more of this logic lives in the search service - I will review that alternate interface proposal once he drafts it.
+Created attachment 8460215
+New approach
+
+In the end, I think that this alternate approach we discussed is better and the interface looks simpler, it should also be almost as fast as the other one.
+Comment on attachment 8460215
+New approach
+
+Review of attachment 8460215:
+-----------------------------------------------------------------
+
+::: netwerk/base/public/nsIBrowserSearchService.idl
+@@ +184,5 @@
+>    AString getResultDomain([optional] in AString responseType);
+>  };
+>  
+> +[scriptable, uuid(856a31ff-b451-4101-b12e-ff399485ac8a)]
+> +interface nsISearchParseSubmissionResult : nsISupports
+
+I just wanted to note that, to address the use case from bug 1034382 of coloring the search terms, in a follow-up bug we could just add properties to this interface, for example containing the offset and length of the match in the original URL, or containing three sections of the URL of which the central one is equal to the encoded search terms.
+Comment on attachment 8460215
+New approach
+
+>diff --git a/netwerk/base/public/nsIBrowserSearchService.idl b/netwerk/base/public/nsIBrowserSearchService.idl
+
+>+  /**
+>+   * The search engine associated with the submission, or null if the URL does
+>+   * not represent a search submission.
+>+   */
+>+  readonly attribute nsISearchEngine engine;
+
+How about: "The search engine associated with the URL passed in to nsISearchEngine::parseSubmissionURL, ..."
+
+>diff --git a/toolkit/components/search/SearchStaticData.jsm b/toolkit/components/search/SearchStaticData.jsm
+
+>+ * This module is also easily overridable in case a hotfix is needed.
+
+How would this hotfix override work in practice? Have you tested this?
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>+  _afterDataChanged: function () {
+
+This code would change if you use the approach I outline below, so I haven't reviewed this closely yet.
+
+>+const gEmptyParseSubmissionResult = new ParseSubmissionResult(null, "");
+
+I have a slight concern that returning the same empty object for all empty results is a bit odd, but I suppose it's unlikely to matter in practice.
+
+>+  parseSubmissionURL: function SRCH_SVC_parseSubmissionURL(aURL) {
+
+Some higher-level comments about this:
+- As written, this will match the first available engine with a matching domain, which might not be desirable in some edge cases (e.g. if you have multiple Google engines installed, particularly if one is a hijacked version!).
+- It would be nice to avoid having to iterate across all engines twice, and the O(N•M) behavior of the alternateDomains.indexOf inside the second engine loop
+
+It seems like both of these could be addressed by having SearchStaticData instead contain a map of domain->default engine name. Then this method can just extract the domain from the URL and get the engine name (and thus nsISearchEngine) directly. What do you think?
+
+>diff --git a/toolkit/components/search/tests/xpcshell/data/engine-ad.xml b/toolkit/components/search/tests/xpcshell/data/engine-ad.xml
+
+nit: using "ad" is a bit confusing because it's also a word. Maybe pick another TLD that isn't?
+(In reply to :Gavin Sharp [email: gavin@gavinsharp.com] from comment #8)
+> >diff --git a/toolkit/components/search/SearchStaticData.jsm b/toolkit/components/search/SearchStaticData.jsm
+> 
+> >+ * This module is also easily overridable in case a hotfix is needed.
+> 
+> How would this hotfix override work in practice? Have you tested this?
+
+I think it would quite easy to declare an override for the JSM in a manifest, but I haven't tested it. I've filed bug 1044577 to test this with a proof-of-concept add-on.
+
+> >+const gEmptyParseSubmissionResult = new ParseSubmissionResult(null, "");
+> 
+> I have a slight concern that returning the same empty object for all empty
+> results is a bit odd, but I suppose it's unlikely to matter in practice.
+
+It can be a good idea to freeze this, will do.
+
+> - As written, this will match the first available engine with a matching
+> domain, which might not be desirable in some edge cases (e.g. if you have
+> multiple Google engines installed, particularly if one is a hijacked
+> version!).
+
+I'm not familiar with the type of hijacking you are concerned about. The domain that is checked is always the target domain for the submission, and the URL path is checked, so processing engines in the order chosen by the user should assign them to the right engine.
+
+Engines whose main domain is an alternate domain of another engine will take precedence, but this is correct because this means the user installed a version of the same engine in another locale, to use it as a second language search engine on purpose.
+
+> - It would be nice to avoid having to iterate across all engines twice, and
+> the O(N•M) behavior of the alternateDomains.indexOf inside the second engine
+> loop
+
+Definitely, though to be fair in this O(N•M), M is > 0 only for a subset of N.
+
+> It seems like both of these could be addressed by having SearchStaticData
+> instead contain a map of domain->default engine name. Then this method can
+> just extract the domain from the URL and get the engine name (and thus
+> nsISearchEngine) directly. What do you think?
+
+I think a map can be a good idea, and can be easily built by joining the data from the available search engines with the static data. I think the static data should be limited to domain names only, because the engine names can vary across locales.
+Created attachment 8463124
+Using a map
+Comment on attachment 8463124
+Using a map
+
+Now I'm a little worried _parseSubmissionMap will get too big :) It's probably not significant, but I wonder:
+- does about:memory provide useful insight into its size?
+- can you reduce the size of the map by re-using a single object for each engine, rather than creating a new object for each invocation of processDomain?
+
+I.e.:
+
+    for (let engine of this._sortedEngines) {
+...
+      let engineObj = { engine: engine, termsParamName: urlParsingInfo.termsParameterName };
+
+      let processDomain = (domain, isAlternate) => {
+...
+         engineObj.isAlternate = isAlternate;
+         this._parseSubmissionMap.set(key, engineObj); 
+...
+Comment on attachment 8463124
+Using a map
+
+>diff --git a/toolkit/components/search/SearchStaticData.jsm b/toolkit/components/search/SearchStaticData.jsm
+
+>+ * This separate module is also easily overridable using an XPCOM manifest, in
+>+ * case a hotfix is needed.  No high-level processing logic is applied here.
+
+I would remove "using an XPCOM manifest" (somewhat of a misnomer).
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>+  _getTermsParameterName: function SRCH_EURL__getTermsParameterName() {
+>+    let queryParam = this.params.find(p => p.value == "{searchTerms}");
+
+I suppose you could use USER_DEFINED here.
+
+>+  parseSubmissionURL: function SRCH_SVC_parseSubmissionURL(aURL) {
+
+>+      // Exclude any URL that is not HTTP or HTTPS from the beginning.
+>+      if (soughtUrl.scheme != "http" && soughtUrl.scheme != "https") {
+
+Would be useful to document this behavior in the IDL.
+
+>+      LOG("The value does not look like a structured URL.");
+>+      return gEmptyParseSubmissionResult;
+
+I wonder whether this method should throw a useful error rather than always returning an empty object - it would make debugging certain failures easier.
+
+r=me with these comments addressed.
+(In reply to :Gavin Sharp [email: gavin@gavinsharp.com] from comment #11)
+> - does about:memory provide useful insight into its size?
+> - can you reduce the size of the map by re-using a single object for each
+> engine, rather than creating a new object for each invocation of
+> processDomain?
+
+The memory increase from the map is still in the "tiny" group, seems to be between 15-25 KB.
+
+This is the nsSearchService.js memory difference after using the location bar dropdown the first time:
+
+├──0.02 MB (00.27%) -- objects
+│  ├──0.01 MB (00.16%) ── malloc-heap/slots
+│  └──0.01 MB (00.10%) ++ gc-heap
+
+The optimization is still a good idea, and reduces this size to under 5 KB, I believe.
+
+├──0.00 MB (00.02%) ++ objects
+(In reply to :Gavin Sharp [email: gavin@gavinsharp.com] from comment #12)
+> >+      LOG("The value does not look like a structured URL.");
+> >+      return gEmptyParseSubmissionResult;
+> 
+> I wonder whether this method should throw a useful error rather than always
+> returning an empty object - it would make debugging certain failures easier.
+
+Error objects and exceptions are expensive to generate and process. Since this is used in the location bar and the non-match exit path is the most common, I believe we should leave this code as it is. The JavaScript debugger in release builds, or the log in debug builds, can still give insight in case of non-obvious reasons for missed matches.
+Created attachment 8464878
+Final patch
+
+This implements the optimization and adds the interface documentation.
+
+I'll land this version shortly if there aren't more comments.
+https://tbpl.mozilla.org/?tree=Try&rev=9f45cc6f451b
+Fixed typo in one test, rebased and pushed to fx-team:
+
+https://hg.mozilla.org/integration/fx-team/rev/482533cb9495
+https://hg.mozilla.org/mozilla-central/rev/482533cb9495

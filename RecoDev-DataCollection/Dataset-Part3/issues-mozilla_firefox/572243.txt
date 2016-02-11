@@ -1,0 +1,101 @@
+Private browsing mode isn't supposed to leave any local tracks of what's been done in PB mode. For example, the disk cache is disabled when in PB mode. (https://wiki.mozilla.org/User:Mconnor/PrivateBrowsing)
+
+Apparently we don't disable the special media cache when in PB mode, so any <audio> / <video> used in PB mode will remain on disk after exiting in PB mode.
+
+At the very least the media cache should be _cleared_ when exiting PB.
+
+Ideally we wouldn't write to the media (disk) cache at all, but I suspect that leads to extremely poor playback UX. Not sure if implementing a memory-backed cache would be worth the effort. Maybe investigate using delete-on-exit files, so that the cache self-destructs if we crash?
+
+Private browsing mode isn't supposed to leave any local tracks of what's been done in PB mode. For example, the disk cache is disabled when in PB mode. (https://wiki.mozilla.org/User:Mconnor/PrivateBrowsing)
+
+Apparently we don't disable the special media cache when in PB mode, so any <audio> / <video> used in PB mode will remain on disk after exiting in PB mode.
+
+At the very least the media cache should be _cleared_ when exiting PB.
+
+Ideally we wouldn't write to the media (disk) cache at all, but I suspect that leads to extremely poor playback UX. Not sure if implementing a memory-backed cache would be worth the effort. Maybe investigate using delete-on-exit files, so that the cache self-destructs if we crash?
+Hmm, maybe this isn't an issue.
+
+nsMediaCache::Init() opens the moz_media_cache file with nsILocalFile::DELETE_ON_CLOSE. [On Unix and OS X, the file is immediately unlinked, Windows does the special Windows thing.]
+
+I don't see any code interacting with private browsing or listening for requests to clear caches, but the file does get removed (on Windows) when exiting private browsing mode. Probably just a side effect of all PB documents (and thus media elements) being destroyed, and so the cache is essentially GC'd? [Could chrome using media thus cause the cache and content's data to persist across a PB exit?]
+Reading the code, it doesn't immediately seem to be that we're saving the URL of the media resource anywhere, is that right?
+
+If that's true, we don't need to disable the media cache at all!
+The media cache stores data for media elements. It doesn't contain URLs, but conceivably data in the cache could be traced back to particular resources.
+
+We clear the cache when all media elements are destroyed. But that might not happen if there's a media element in chrome.
+(In reply to comment #3)
+> The media cache stores data for media elements. It doesn't contain URLs, but
+> conceivably data in the cache could be traced back to particular resources.
+
+Is disabling it inside the private browsing mode an option at all (perf-wise)?
+
+> We clear the cache when all media elements are destroyed. But that might not
+> happen if there's a media element in chrome.
+
+Is it done when they're unbound from the tree, or when they're actually destroyed (as in C++-deleted)?  If the latter, things will remain in the cache until the next gc run.
+
+Is it possible to clear the media cache at arbitrary points in time?
+(In reply to comment #4)
+> (In reply to comment #3)
+> > The media cache stores data for media elements. It doesn't contain URLs, but
+> > conceivably data in the cache could be traced back to particular resources.
+> 
+> Is disabling it inside the private browsing mode an option at all (perf-wise)?
+
+No.
+
+> > We clear the cache when all media elements are destroyed. But that might not
+> > happen if there's a media element in chrome.
+> 
+> Is it done when they're unbound from the tree, or when they're actually
+> destroyed (as in C++-deleted)?  If the latter, things will remain in the cache
+> until the next gc run.
+
+Deleted.
+
+> Is it possible to clear the media cache at arbitrary points in time?
+
+Yeah, we could add API for that.
+OK.  I filed bug 584238 to get that API.
+Approving blocking request, since it sounds like it's confirmed that media from a pb-session could persist past the end of the pb-session.
+
+Can the media itself be accessed? Even if the originating URL is not accessible, the content of the media itself could expose assumed-private material in the case of invasive searches.
+It's on the disk.
+
+I'm not sure what degree of protection we're aiming for here. Are we doing secure-deletion of all temporary files? If not, blocks of temporary file data will remain around on disk that could be recovered almost as easily as someone reading blocks of data from the media cache file.
+OS-level file removal is OK.  We're not targeting to protect against attacks based on reading disk blocks.
+But we are worried about disk blocks in open temporary files?
+(In reply to comment #10)
+> But we are worried about disk blocks in open temporary files?
+
+No.
+Then why are we worried about the media cache?
+The temporary files are accessible through the OS file APIs, are they not?
+Yes.
+Hence the need to protect the contents of those files.  :-)
+OK, I'm confused by your answer in comment #11 then.
+In comment 11, I thought you meant if we're worried if people will read our data by opening the disk as a block device and looking at the raw data.  Here's the general idea:
+
+* We only try to protect against the ways that a normal user can find data.  This includes things such as looking at the profile directory, the temp directory, opening the files in some sort of an editor, doing a search on files contents using the tools provided by the OS, etc.
+
+* We do not attempt to protect our private data against low-level access to disk (such as trying to read the OS's page file which might be backing some of our memory pages containing private data).
+
+If the media cache is written as a regular file (which I take it is) to disk, then it's vulnerable to the first type of attack, so we need to protect against it.
+Created attachment 479235
+Patch (v1)
+
+I'm not sure how to test this code as an automated test.  I've tested this by manually inspecting the code under the debugger.
+Created attachment 479493
+Patch (v2)
+
+This version of the patch doesn't leak the flusher object, and improves its life-cycle management.
+Comment on attachment 479493
+Patch (v2)
+
+Boris, is this something which you can review?
+Comment on attachment 479493
+Patch (v2)
+
+I think so.  r=me
+http://hg.mozilla.org/mozilla-central/rev/a01b645e0037

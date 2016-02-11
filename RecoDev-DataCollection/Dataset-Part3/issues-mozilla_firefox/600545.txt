@@ -1,0 +1,747 @@
+getBrowserState() not work as expected when browser.sessionstore.resume_from_crash is false
+
+steps to reproduce:
+1. set browser.sessionstore.resume_from_crash to false
+2. close and open Firefox.
+3. open few tabs in current window
+4. open new window with few tabs
+5. open 3rd window with few tabs
+6. call getBrowserState() from 3rd window.
+
+in the sate result only the current window have tabs, the state for other windows tabs count 0 (zero)
+for example 
+{"tabs":[],"selected":6,"_closedTabs":[],"width":1280,"height":348,"screenX":0,"screenY":1,"sizemode":"normal"}
+
+getBrowserState() not work as expected when browser.sessionstore.resume_from_crash is false
+
+steps to reproduce:
+1. set browser.sessionstore.resume_from_crash to false
+2. close and open Firefox.
+3. open few tabs in current window
+4. open new window with few tabs
+5. open 3rd window with few tabs
+6. call getBrowserState() from 3rd window.
+
+in the sate result only the current window have tabs, the state for other windows tabs count 0 (zero)
+for example 
+{"tabs":[],"selected":6,"_closedTabs":[],"width":1280,"height":348,"screenX":0,"screenY":1,"sizemode":"normal"}
+I can confirm this.  Only the original window has any session data.  Type the following into the error console to see the browser state:
+
+Components.classes["@mozilla.org/browser/sessionstore;1"].getService(Components.interfaces.nsISessionStore).getBrowserState()
+
+I analyzed the problem and it's being caused by the fix to bug 580512.  I Think it would be fixed by the fix to 587873, but that's not going into Firefox 4.
+
+Basically the problem is being caused by the periodic call to the saveState function.  When the browser.sessionstore.resume_from_crash preference is set to false, the pinnedOnly flag will be set to true in the following call:
+
+var oState = this._getCurrentState(aUpdateAll, pinnedOnly);
+
+This trickles down to the _saveWindowHistory function, which contains the following code:
+
+  _saveWindowHistory: function sss_saveWindowHistory(aWindow, aPinnedOnly) {
+    var tabbrowser = aWindow.gBrowser;
+    var tabs = tabbrowser.tabs;
+    var tabsData = this._windows[aWindow.__SSi].tabs = [];
+    
+    for (var i = 0; i < tabs.length; i++) {
+      if (aPinnedOnly && !tabs[i].pinned)
+        break;
+      tabsData.push(this._collectTabData(tabs[i]));
+    }
+    
+    this._windows[aWindow.__SSi].selected = tabbrowser.mTabBox.selectedIndex + 1;
+  },
+
+
+Since aPinnedOnly is set, all tabs except pinned ones are stripped out.  Also since tabsData is copied from this._windows[aWindow.__SSi].tabs using a shallow copy, when tabsData is updated so to is this._windows[aWindow.__SSi].tabs.  So the result is that periodically this._windows[aWindow.__SSi].tabs has all non-pinned tabs stripped out of it.
+
+This wouldn't be an issue except when the getBrowserState function calls the _getCurrentState function, it does so with the "aUpdateAll" parameter being set to true.  As such only the active window is updated (since the other windows are not "dirty") resulting in a returned session with only one window containing data.
+
+The easiest fix to this is to change getBrowserState to the following:
+
+  getBrowserState: function sss_getBrowserState() {
+    return this._toJSONString(this._getCurrentState(true));
+  },
+
+There's a slight performance hit, but getBrowerState shouldn't be called all that often.
+I'll mention that while the small change to getBrowserState is very simple and fixes the problem with the API returning blank window data (I tested the fix and it works), I'm not sure that's the best fix since the real cause of the problem is the shallow copy in _saveWindowHistory.  There are a few other problems caused by shallow copies in SessionStore, such as bug 589246.  
+
+The "best" fix in the long run would be to go through SessionStore and fix all the recently shallow copying bugs that will take time. My proposed fix in comment #1 will work in the mean time.
+Actually it looks like bug 587299 is the actual culprit, not 580512.  
+
+If no one else has any objections, I'll attach a patch as soon as I'm able to create a proper patch file.
+Created attachment 479518
+Force an update of current browser state on getBrowserState API call if resume_from_crash is false
+
+I decided it would be better to pass "!this._resume_from_crash" instead of "true" as a parameter to _getCurrentState() since there's no reason to take the performance hit of forcing an update for all windows if the browser.sessionstore.resume_from_crash is set to true since the non-app tabs aren't stripped out in that case.
+
+Technically the tabs are only stripped out if both this._loadState == STATE_RUNNING and !this._resume_from_crash are true, but the non-app tabs may have already been stripped prior to the loadState changing so I think this is the "best" solution.
+Comment on attachment 479518
+Force an update of current browser state on getBrowserState API call if resume_from_crash is false
+
+First off, thanks a lot for looking into this! Second, thanks for the patch.
+
+Can you add a comment about why we're passing !_resume_from_crash? It wouldn't be entirely clear why unless you were looking at this bug and the history leading up to it.
+
+Also, we should add a test while we're here. Would you be willing to write it as well?
+
+This bug just goes to show why it's good to have unit test coverage instead of just regression tests.
+Created attachment 479585
+Patch plus tests (tests not yet verified)
+
+I added a comment.  
+
+I wrote a test, which itself wasn't all that tricky.  All I did was take the test_multiWindowState test from bug 586068 and instead of comparing the number of loaded tabs to the initial number of tabs, I set a notification for "sessionstore-state-write" and waited for it to fire, indicating that the saveState was called (and hence the tabs were stripped), and then got the state via the getBrowserState API call and compared the number of tabs to the initial number of tabs.  
+
+I'm not sure if leaving all the stuff that was in the test_multiWindowState test is overkill or not as I'm not sure how reliable the state data returned by the getBrowserState() function is when called during an actual cascading load.  It doesn't look like it would be accurate since the tab data hasn't actually been restored.  There should probably be another bug to have the getBrowserState and getWindowState functions return pending restore data if there is any.
+
+Unfortunately I don't have a compiled version of Minefield on my machine since it wasn't really needed to test nsSessionStore.js (I just replaced the real version with my patched version).  Compiling Minefield takes quite a while (I'm talking 4 or 5 hours) on my machine so it will be a while before I can run the test.  Add to the fact that I'm not even home right now and I probably couldn't test it until tomorrow.
+
+I'll attach what I have now with the hope that it'll work since I didn't change that much from the original test.  If someone could try and run the test I'd appreciate it, otherwise I'll run it when I get the chance and fix any issues with it then.
+I've spent 5 hours and I haven't even gotten to the point where I can start compiling.  Apparently the windows build info is out of date since all the references and scripts refer to the Windows 7 SDK, but the only one available is either 7.0a (comes with VC 10 express) or 7.1 (stand alone download).  Hopefully someone else can test this.
+I wanted to mention that I successfully compiled over night.  I didn't have time to run yet, but I should be able to get a verified working test done within a day or two.
+Created attachment 480034
+Fix, plus test.  Test currently times out because 2nd window immediately closes itself for unknown reasons
+
+I completely rewrote my test to match a different test I found, but even after that I found that I could never successfully complete the test because the 2nd window in my state variable passed into setBrowserState (or setWindowState), would immediately close without any tabs loading.  I determined that this only happens when the "browser.sessionstore.resume_from_crash" preference is set to false.  
+
+What I don't understand is that my Session Manager add-on can successfully restore multiple windows when "browser.sessionstore.resume_from_crash" preference is set to false so I don't know why the restored windows are immediately closing in this case.  There's must be something different in the test environment that's causing this to fail.  
+
+SessionStore isn't closing the window since SessionStore will only ever close a window on a setBrowserState call and this also happens with a setWindowState call.
+
+I'm not sure what to do about this in the mean time so I'm including the test as is in the hopes that someone can make sense of this.
+I can take a look soon. I would have chimed up earlier about being able to help, just got wrapped up with some beta blocker work.
+I actually managed to somewhat reproduce the problem with Session Manager running in the debug build I compiled.  When I load a specific session with the resume_from_crash preference is set to false, one of the windows loads as blank instead of the tab it should have.  It always loads correctly with resume_from_crash set to true.
+
+What appears to be happening is that the this._statesToRestore[aWindow.__SS_restoreID] is being correctly set in _openWindowWithState, but by the time the onLoad function is called the tabs have been stripped out of this._statesToRestore[aWindow.__SS_restoreID].   My guess is that this is another shallow copy problem.
+
+What's odd is I can't reproduce this in the nightly Minefield build.  Even if I revert out my patch (which should make the builds identical), the problem still happens in my debug build so either I have a bad build or there's some kind of timing issue with the debug build or what not.
+Actually it happens with all sessions with multiple windows.  I'm having trouble tracking this down, but there's really only one place in the code that could cause this and that's in _saveWindowHistory because that's where this._windows[aWindow.__SSi].tabs gets set to [].  I'm not how that ends up in this._statesToRestore[aWindow.__SS_restoreID] though.  
+
+I do see the following line in onClose, but that's never called:
+this._windows[aWindow.__SSi] = this._statesToRestore[aWindow.__SS_restoreID];
+
+saveWindowHistory is called several times when restoring the browser windows though.
+
+Like I said though, only in my debug build.  Very odd.
+Okay I found the spot.  It's in _getCurrentState(), specifically:
+
+    // collect the data for all windows yet to be restored
+    for (ix in this._statesToRestore) {
+      for each (let winData in this._statesToRestore[ix].windows) {
+        total.push(winData);
+        if (!winData.isPopup)
+          nonPopupCount++;
+      }
+    }
+
+...
+
+    if (aPinnedOnly) {
+      total = total.filter(function (win) {
+        win.tabs = win.tabs.filter(function (tab) tab.pinned);
+        return win.tabs.length > 0;
+      });
+      if (total.length == 0)
+        return null;
+
+      lastClosedWindowsCopy = [];
+    }
+
+
+
+Specifically that the this._statesToRestore entries get pushed into total (via WinData and a shallow copy).  Then total's tabs are filtered, hence so are this._statesToRestore's tabs.  I think the reason it only shows up in the debug build, is that that build runs slower than normal, giving _getCurrentState() a chance to run.  Basically it's a timing issue, but one that can't be dismissed.
+
+I'm not sure the best way of fixing this other than doing deep copies, but that's a fairly big performance hit.  You could store the results of the filter into something other than total.  Maybe total2 or something.  I think that would work.
+
+At this point I think you might want to rethink the way filtering of pinned tabs is done since this is the 3rd instance of a shallow copy gone wrong (two found here and one found in bug 589246.
+actually _getCurrentState() called by saveState with pinnedOnly false set to true when  this._loadState == STATE_RUNNING && !this._resume_from_crash.
+
+then if one calls _getCurrentState() from getBrowserState then it collect only current window data since aUpdateAll is null and this._dirtyWindows[aWindow.__SSi] is false so 
+
+...
+        if (aUpdateAll || this._dirtyWindows[aWindow.__SSi] || aWindow == activeWindow) {
+          this._collectWindowData(aWindow, aPinnedOnly);
+        }
+is true only for the current window.
+so i'm not sure that the problem is shallow copy in the case of this bug.
+maybe just in the case of the test.
+
+for this bug we can apply you patch or set this._dirtyWindows[aWindow.__SSi]= true when we filter the tabs from the window data.
+
+regarding the shallow copy why not passing to this._statesToRestore this._toJSONString(aState) ?
+What I posted in comment #13 isn't related to the bug you reported in comment #0.  The patch I put together will fix that.
+
+What I posted is actually caused by a race condition in the setBrowserState processing where the onLoad processing for a window opened by the setBrowserState call runs after the saveState processing does.  The only reason I mentioned it is that it causes the browser test I wrote to test the fix to this bug to fail.   Even though both caused by the code that added pinned tab processing to SessionStore, the setBrowserState race condition issue is really a separate bug though so I'll filed bug 601161 documenting it.
+
+
+The root of both of the problems is that saveState modifies SessionStore's stored browser state variables (_windows, _closedWindows and _statesToRestore) when doing periodic saveState processing.  This breaks any API usage since SessionStore's internal browser state doesn't match the real browser state at that point.  There's really no reason for the call from saveState to be modifying any of the session state variables.  It should just strip out the tabs before saving to disk.  
+
+I'm beginning to think that the "best" fix would be to remove all the code that filters out non-pinned tabs and move it to saveState, but I'm not sure what the ramifications of doing that would be.  There would be a performance hit on a periodic function which is bad, but that could be negated by keeping a separate "save state" variables as opposed to using the "active state" variables (_windows, _closedWindows and _statesToRestore).
+typo, need to be unpinned ?
+
+-  // Because pinned tabs are periodically stripped out of the state in saveState
++  // Because non-pinned tabs are periodically stripped out of the state in saveState
+I came up with a more thorough fix for this problem.  It fixes not only this bug, but also bug 601161, bug 589246 and bug 601198.  Basically it fixes all the regressions caused by bug 580512 and bug 587299.
+
+Basically it does what I originally thought should be done which is pull out the stripping of pinned tabs (basically reverting bug 587299) and properly fixing the problem by correctly the issue with stripping tabs as documented in bug 601161 (which is what I think was causing the dirty profile increase in the first place) This does require doing a deep copy via a JSON parse/stringify though, but I don't think there's any way around that.  At least not until bug 587873 is fixed.
+Oh and I'll post the patch later today when I have access to my "build" machine.
+Created attachment 480808
+New complete patch
+
+Here's my new patch.  It passes all tests except for "browser_586068-cascaded_restore.js", which seems to throw Assertions in the javascript component.  Though that test is also failing even without my patch applied (timing out, not asserting) so I don't think this patch is the problem.  
+
+The assertion appears to be being triggered by the JSON calls, though I have no idea why that should be.  My guess is it's a different bug.
+Created attachment 480958
+New complete patch 2.0 - fixed a few more issues.
+
+I found a few bugs in my last patch when testing.  Namely that the selected tab variable wouldn't be set correctly when tabs are stripped out.  Also the closed tabs weren't being removed.  Finally the resume_once preference was still being set in certain instances and wasn't saved in the case of crashes in other instances.  All of these should not happen now.  
+
+Also apparently the problem with the browser_586068-cascaded_restore.js failing has already been reported as bug 599253 so it's not a result of my patch.
+
+I've thrown everything I can think of at it when testing (crashing browser, doing a restore, saving sessions, etc) and everything is coming back as expected so I think it's ready for review/feedback.
+Created attachment 480962
+New complete patch 2.0 - fixed a few more issues (reupload as forgot to check patch)
+
+I'm re-uploading since I forgot to check the "patch" checkbox.  Sorry about that.
+Any chance of getting some feedback on my patch?  I basically have till next Tuesday to make any changes to it.  After that I'll be out of contact until early November.
+(In reply to comment #22)
+> Any chance of getting some feedback on my patch?  I basically have till next
+> Tuesday to make any changes to it.  After that I'll be out of contact until
+> early November.
+
+Sorry Michael. I gave it a quick once over yesterday and will look more closely at it later today.
+Comment on attachment 480962
+New complete patch 2.0 - fixed a few more issues (reupload as forgot to check patch)
+
+I think this makes sense. It avoids doing parse(stringify) to just when really needed. I need to look a bit more closely but here's something to start from.
+
+>diff --git a/browser/components/sessionstore/src/nsSessionStore.js
+>+  // The original "sessionstore.resume_session_once" preference value before it was 
+>+  // modified by saveState
+>+  _original_resume_session_once: null,
+
+Not super wild about this variable name, but it makes sense
+
+>     case "quit-application":
+>+      // restore original sessionstore.resume_session_once preference is overwritten in saveState
+>+      if (this._original_resume_session_once != null)
+>+        this._prefBranch.setBoolPref("sessionstore.resume_session_once", this._original_resume_session_once);
+
+line length
+
+>       case "sessionstore.resume_from_crash":
+>         this._resume_from_crash = this._prefBranch.getBoolPref("sessionstore.resume_from_crash");
+>+        // restore original resume_session_once preference if set in saveState
+>+        if (this._original_resume_session_once != null) {
+>+          this._prefBranch.setBoolPref("sessionstore.resume_session_once", this._original_resume_session_once);
+
+line length
+
+>         else { // always update the window features (whose change alone never triggers a save operation)
+>           this._updateWindowFeatures(aWindow);
+>         }
+>       });
+>       this._dirtyWindows = [];
+>     }
+>     
+>@@ -2058,32 +2066,39 @@ SessionStoreService.prototype = {
+>       // at startup we don't accidentally add them to a popup window
+>       do {
+>         total.unshift(lastClosedWindowsCopy.shift())
+>       } while (total[0].isPopup)
+>     }
+> #endif
+> 
+>     if (aPinnedOnly) {
+>+      // perform a deep copy so that existing session variables are not changed.
+>+      total = JSON.parse(this._toJSONString(total));
+>       total = total.filter(function (win) {
+>         win.tabs = win.tabs.filter(function (tab) tab.pinned);
+>+        // remove closed tabs
+>+        win._closedTabs = [];
+>+        // correct selected tab index if it was stripped out
+>+        if (win.selected > win.tabs.length) win.selected = 1;
+
+2 lines please.
+
+>+    if (pinnedOnly) {
+>+      // Save original resume_session_once preference for when quiting browser, 
+>+      // otherwise session will be restored next time browser starts and we
+>+      // only want it to be restored in the case of a crash.
+>+      if (this._original_resume_session_once == null) {
+>+        this._original_resume_session_once = this._prefBranch.getBoolPref("sessionstore.resume_session_once");
+
+line length
+
+>diff --git a/browser/components/sessionstore/test/browser/Makefile.in
+>+    waitForSaveState(function () {
+>+      let expectedNumberOfTabs = getStateTabCount(state);
+>+      let retrievedState = JSON.parse(ss.getBrowserState());
+>+      let actualNumberOfTabs = getStateTabCount(retrievedState);
+>+        
+>+      is(actualNumberOfTabs, expectedNumberOfTabs, "Number of tabs in retreived session data, matches number of tabs set.");
+
+line length again
+
+>+function getStateTabCount(aState) {
+>+  let tabCount = 0;
+>+  for (let i in aState.windows) tabCount += aState.windows[i].tabs.length;
+
+2 lines again
+Created attachment 481847
+New complete patch 2.1 - fixed feedback issues
+
+(In reply to comment #24)
+> Not super wild about this variable name, but it makes sense
+> 
+
+I decided to change it to "_resume_once_on_shutdown" since that's basically what its purpose is.
+
+I also corrected all the line length and 2 line comments.
+Comment on attachment 481847
+New complete patch 2.1 - fixed feedback issues
+
+Going to take this review from dietrich since he already has a lot to review between me and tab candy. Might as well use these reviewing powers.
+
+>diff --git a/browser/components/sessionstore/src/nsSessionStore.js
+>  * Simon BÃ¼nzli <zeniko@gmail.com>
+
+Be careful with encoding. Looks like this failed with unicode. Not a huge deal, but just annoyed me when reviewing since the patch failed to apply cleanly.
+
+>+  // The original "sessionstore.resume_session_once" preference value before it
+>+  // was modified by saveState.  This determines if the current session will be
+>+  // restored if the browser is properly shut down.
+
+Can you also add a little more about why saveState might
+
+>+  _resume_once_on_shutdown: null,
+
+How about we meet in the middle and call it _resume_session_once_on_shutdown (I know it's long, but more consistent with the pref name)
+
+>     case "quit-application":
+>+      // restore original sessionstore.resume_session_once preference is overwritten in saveState
+
+Can you clear up this comment.
+
+>+      if (this._resume_once_on_shutdown != null)
+>+        this._prefBranch.setBoolPref("sessionstore.resume_session_once", 
+>+          this._resume_once_on_shutdown);
+
+Nit: formatting. Please align the parameters like so:
+this.blah(foo,
+          bar);
+
+>       if (aData == "restart") {
+>         this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+>         this._clearingOnShutdown = false;
+>       }
+
+Since aData == restart is trumping in importance, how about you put your case in an else if here so we don't set the pref twice in succession.
+
+>       case "sessionstore.resume_from_crash":
+>         this._resume_from_crash = this._prefBranch.getBoolPref("sessionstore.resume_from_crash");
+>+        // restore original resume_session_once preference if set in saveState
+>+        if (this._resume_once_on_shutdown != null) {
+>+          this._prefBranch.setBoolPref("sessionstore.resume_session_once",
+>+            this._resume_once_on_shutdown);
+
+Nit: formatting again.
+
+>@@ -714,17 +729,18 @@ SessionStoreService.prototype = {
+>     else if (this._restoreLastWindow && aWindow.toolbar.visible &&
+>              this._closedWindows.length &&
+>              !this._inPrivateBrowsing) {
+>       // default to the most-recently closed window
+>       // don't use popup windows
+>       let state = null;
+>       let newClosedWindows = this._closedWindows.filter(function(aWinState) {
+>         if (!state && !aWinState.isPopup) {
+>-          state = aWinState;
+>+          // perform a deep copy so the original closed window object is not overwritten
+>+          state = JSON.parse(this._toJSONString(aWinState));
+
+So I understand that you did this while here, but this is actually the whole fix for bug 589246, right? Or am I not thinking about that right? (too many bugs going around!) I'd almost prefer this be seperate and have its own test (since the test you have here doesn't actually exercise this).
+
+>     if (activeWindow) {
+>       this.activeWindowSSiCache = activeWindow.__SSi || "";
+>     }
+>     ix = windows.indexOf(this.activeWindowSSiCache);
+>-    // We don't want to restore focus to a minimized window.
+>-    if (ix != -1 && total[ix].sizemode == "minimized")
+>+    // We don't want to restore focus to a minimized window or a window which had all its 
+>+    // tabs stripped out (doesn't exist).
+>+    if (ix != -1 && (typeof total[ix] == "undefined" || total[ix].sizemode == "minimized"))
+>       ix = -1;
+
+So you're change is more correct, so I'm going to say we just take it.
+We might actually set ix to an incorrect value. Take this:
+
+Window 1 is focused (activeWindow), has no app tabs. Window 2 has app tabs.
+ix will be 0, thinking it found window 1, however total[ix] is actually window 2.
+
+Actually, I guess that's just fine. We'll always end up with a selected window regardless since check typeof total[ix]. That said... let's just make it
+> if (ix != -1 && total[ix] && total[ix].sizemode == "minimized")
+I'm not a fan of using typeof to check existence.
+
+
+>-    if (pinnedOnly)
+>-      this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+>+    if (pinnedOnly) {
+>+      // Save original resume_session_once preference for when quiting browser, 
+
+Nit: Avoid whitespace at the end of the line ^^
+
+>+      // otherwise session will be restored next time browser starts and we
+>+      // only want it to be restored in the case of a crash.
+>+      if (this._resume_once_on_shutdown == null) {
+>+        this._resume_once_on_shutdown = 
+>+          this._prefBranch.getBoolPref("sessionstore.resume_session_once");
+>+        this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+>+        // flush the preference file so preference will be saved in case of a crash
+>+        Services.prefs.savePrefFile(null);
+
+I'm not sure that's strictly necessary. If we crash right now we won't have a sessionstore.js to restore anyway. I don't know what causes the pref file to be written though, so perhaps it is needed.
+
+>diff --git a/browser/components/sessionstore/test/browser/browser_600545.js
+>+function test() {
+>+  /** Test for Bug 600545 **/
+>+  waitForExplicitFinish();
+>+  executeSoon(testBug600545);
+
+We don't really need the executeSoon do we?
+
+>+function testBug600545() {
+>+  info("This test can take a while to complete");
+
+This isn't really necessary. If the test takes longer than the default timeout (30s) then we can extend it.
+
+>+  let state = { windows: [
+>+    {
+>+      tabs: [
+>+        { entries: [{ url: "http://example.org#0" }], extData: { "uniq": r() }, pinned:true },
+
+Unless you're actually using extData, might as well get rid of it. I know you copied this from 586068 and I might not have followed my own rule there 100% of the time, but this is what happens when I review :)
+
+>+      is(actualNumberOfTabs, expectedNumberOfTabs, 
+>+        "Number of tabs in retreived session data, matches number of tabs set.");
+
+Nit: one more space in (align inside the paren). There are also a couple trailing whitespace issues. If you find them awesome, but I don't care as much in tests.
+
+It looks good overall. Just a few things to address and questions above. So r- for now.
+
+I know you're on a tight schedule. I'll be unavailable to follow up tomorrow, but I'll check mail on Sunday. I can take another look then & push a new patch to try server if there is one.
+(In reply to comment #26)
+> >+  // The original "sessionstore.resume_session_once" preference value before it
+> >+  // was modified by saveState.  This determines if the current session will be
+> >+  // restored if the browser is properly shut down.
+> 
+> Can you also add a little more about why saveState might
+
+... might modify the pref (mention something about pinned tabs, resume_from_crash)
+Created attachment 482070
+Patch 2.1 with review fixes.
+
+(In reply to comment #26)
+> >diff --git a/browser/components/sessionstore/src/nsSessionStore.js
+> >  * Simon BÃ¼nzli <zeniko@gmail.com>
+> 
+> Be careful with encoding. Looks like this failed with unicode. Not a huge deal,
+> but just annoyed me when reviewing since the patch failed to apply cleanly.
+> 
+
+I'm not sure why this is happening.  I'm using UTF-8 without BOM encoding and it looks fine in my editor (Notepad++) as well as Microsoft Visual C++ 2010 Express.  It did look wrong in WordPad so I corrected it there by copying it from the original nsSessionStore.js as it displays in Firefox and pasting it into my file in Wordpad. That ended up marking the entire file as changed when I used "hg diff -p -U 8" since WordPad doesn't support Unicode (it changed the file to ANSI) and the original file is in UTF-8 without BOM encoding format.  I tried correcting it by hand in the patch file, but then the patch file wouldn't apply.  The problem actually appears to be in the existing nsSessionStore.js file in Mercury since if I load that I also see the weird "Ã¼ character.  I gave up trying to fix this since there doesn't seem to be anything wrong on my end from what I can tell and any attempt to correct it makes things worse.  The patch as is applies cleaning on my system so there's not much else I can do.  Maybe it's an issue with Mozilla Build for Windows?
+
+> >+  // The original "sessionstore.resume_session_once" preference value before it
+> >+  // was modified by saveState.  This determines if the current session will be
+> >+  // restored if the browser is properly shut down.
+> 
+> Can you also add a little more about why saveState might
+> 
+
+Done
+
+> >+  _resume_once_on_shutdown: null,
+> 
+> How about we meet in the middle and call it _resume_session_once_on_shutdown (I
+> know it's long, but more consistent with the pref name)
+
+Sounds good to me.
+
+> 
+> >     case "quit-application":
+> >+      // restore original sessionstore.resume_session_once preference is overwritten in saveState
+> 
+> Can you clear up this comment.
+> 
+
+Okay, hopefully what I came up with is better.
+
+> >+      if (this._resume_once_on_shutdown != null)
+> >+        this._prefBranch.setBoolPref("sessionstore.resume_session_once", 
+> >+          this._resume_once_on_shutdown);
+> 
+> Nit: formatting. Please align the parameters like so:
+> this.blah(foo,
+>           bar);
+> 
+
+okay.
+
+> >       if (aData == "restart") {
+> >         this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+> >         this._clearingOnShutdown = false;
+> >       }
+> 
+> Since aData == restart is trumping in importance, how about you put your case
+> in an else if here so we don't set the pref twice in succession.
+> 
+
+Makes sense to me.  Done.
+
+> >       case "sessionstore.resume_from_crash":
+> >         this._resume_from_crash = this._prefBranch.getBoolPref("sessionstore.resume_from_crash");
+> >+        // restore original resume_session_once preference if set in saveState
+> >+        if (this._resume_once_on_shutdown != null) {
+> >+          this._prefBranch.setBoolPref("sessionstore.resume_session_once",
+> >+            this._resume_once_on_shutdown);
+> 
+> Nit: formatting again.
+> 
+
+fixed.
+
+> >@@ -714,17 +729,18 @@ SessionStoreService.prototype = {
+> >     else if (this._restoreLastWindow && aWindow.toolbar.visible &&
+> >              this._closedWindows.length &&
+> >              !this._inPrivateBrowsing) {
+> >       // default to the most-recently closed window
+> >       // don't use popup windows
+> >       let state = null;
+> >       let newClosedWindows = this._closedWindows.filter(function(aWinState) {
+> >         if (!state && !aWinState.isPopup) {
+> >-          state = aWinState;
+> >+          // perform a deep copy so the original closed window object is not overwritten
+> >+          state = JSON.parse(this._toJSONString(aWinState));
+> 
+> So I understand that you did this while here, but this is actually the whole
+> fix for bug 589246, right? Or am I not thinking about that right? (too many
+> bugs going around!) I'd almost prefer this be seperate and have its own test
+> (since the test you have here doesn't actually exercise this).
+> 
+
+Yes this is the fix for bug 589246. The fix came from what you posted as a fix to that bug.  I put it here simply because it was a one line fix and basically fit in with the rest of the patch since this patch also fixes bug 601161 and bug 601198 (all the bugs are related), but you're probably right in that it should be in it's own bug so I'll take it out of this patch.  
+
+I won't have time to put a test together for bug 589246 so someone else will need to do that.  Actually I'm not sure how this can be tested though since it requires closing all browser windows. Hopefully it makes it into Firefox 4.0
+
+> >     if (activeWindow) {
+> >       this.activeWindowSSiCache = activeWindow.__SSi || "";
+> >     }
+> >     ix = windows.indexOf(this.activeWindowSSiCache);
+> >-    // We don't want to restore focus to a minimized window.
+> >-    if (ix != -1 && total[ix].sizemode == "minimized")
+> >+    // We don't want to restore focus to a minimized window or a window which had all its 
+> >+    // tabs stripped out (doesn't exist).
+> >+    if (ix != -1 && (typeof total[ix] == "undefined" || total[ix].sizemode == "minimized"))
+> >       ix = -1;
+> 
+> So you're change is more correct, so I'm going to say we just take it.
+> We might actually set ix to an incorrect value. Take this:
+> 
+> Window 1 is focused (activeWindow), has no app tabs. Window 2 has app tabs.
+> ix will be 0, thinking it found window 1, however total[ix] is actually window
+> 2.
+> 
+> Actually, I guess that's just fine. We'll always end up with a selected window
+> regardless since check typeof total[ix]. That said... let's just make it
+> > if (ix != -1 && total[ix] && total[ix].sizemode == "minimized")
+> I'm not a fan of using typeof to check existence.
+> 
+
+I changed it to what you suggested.  I actually put this in because I was getting exceptions in the case where Window 2 is focused (activeWindow) and had no app tabs and Window 1 has app tabs.  This resulted in ix being 1 but the length of the total array was only 1 since the second window was stripped out.  That caused total[ix].sizemode to throw.
+
+> 
+> >-    if (pinnedOnly)
+> >-      this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+> >+    if (pinnedOnly) {
+> >+      // Save original resume_session_once preference for when quiting browser, 
+> 
+> Nit: Avoid whitespace at the end of the line ^^
+> 
+
+I tried running nsSessionStore.js through a trailing whitespace trimmer, but ended up with a 1523 lines worth of changes because of existing trailing whitespace in the file so I simply fixed this by hand.  At some point someone else can trim the rest of the white space in the file.  :)
+
+> >+      // otherwise session will be restored next time browser starts and we
+> >+      // only want it to be restored in the case of a crash.
+> >+      if (this._resume_once_on_shutdown == null) {
+> >+        this._resume_once_on_shutdown = 
+> >+          this._prefBranch.getBoolPref("sessionstore.resume_session_once");
+> >+        this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+> >+        // flush the preference file so preference will be saved in case of a crash
+> >+        Services.prefs.savePrefFile(null);
+> 
+> I'm not sure that's strictly necessary. If we crash right now we won't have a
+> sessionstore.js to restore anyway. I don't know what causes the pref file to be
+> written though, so perhaps it is needed.
+> 
+
+When I was testting I found that the sessionstore.resume_session_once preference wasn't always being saved to the prefs.js file.  Actually it usually wasn't which is the reason I put the savePrefFile call there.  Maybe that's just a Windows caching thing, but since I saw it I figured others would as well.
+
+> >diff --git a/browser/components/sessionstore/test/browser/browser_600545.js
+> >+function test() {
+> >+  /** Test for Bug 600545 **/
+> >+  waitForExplicitFinish();
+> >+  executeSoon(testBug600545);
+> 
+> We don't really need the executeSoon do we?
+> 
+
+Dunno, probably not.  This was just copy and pasted from another test.  I removed it.
+
+> >+function testBug600545() {
+> >+  info("This test can take a while to complete");
+> 
+> This isn't really necessary. If the test takes longer than the default timeout
+> (30s) then we can extend it.
+> 
+
+Okay got rid of this.  I really only added it because it looks like the test hangs when it is just waiting.
+
+> >+  let state = { windows: [
+> >+    {
+> >+      tabs: [
+> >+        { entries: [{ url: "http://example.org#0" }], extData: { "uniq": r() }, pinned:true },
+> 
+> Unless you're actually using extData, might as well get rid of it. I know you
+> copied this from 586068 and I might not have followed my own rule there 100% of
+> the time, but this is what happens when I review :)
+> 
+
+Okay, you're the boss.  :)
+
+> >+      is(actualNumberOfTabs, expectedNumberOfTabs, 
+> >+        "Number of tabs in retreived session data, matches number of tabs set.");
+> 
+> Nit: one more space in (align inside the paren). There are also a couple
+> trailing whitespace issues. If you find them awesome, but I don't care as much
+> in tests.
+
+I ran this through the trim trailing space function since it's new.
+Created attachment 482074
+Patch 2.1 with review fixes (take 2)
+
+Sorry about the double upload, but when I in the attempt to recover my original patch after screwing it up with the Unicode to ANSI conversion I accidentally reverted the indentation of an existing line in saveState.  The new patch re-indents the line.
+
+Also I notice that when doing a "diff" here that Simon's name displays correctly.  It's only when looking at the raw patch file that it has issues.  I still don't know why this happens.
+(In reply to comment #28)
+> Created attachment 482070 [details]
+> Patch 2.1 with review fixes.
+> I'm not sure why this is happening.  I'm using UTF-8 without BOM encoding and
+> it looks fine in my editor (Notepad++) as well as Microsoft Visual C++ 2010
+> Express.  It did look wrong in WordPad so I corrected it there by copying it
+> from the original nsSessionStore.js as it displays in Firefox and pasting it
+> into my file in Wordpad. That ended up marking the entire file as changed when
+> I used "hg diff -p -U 8" since WordPad doesn't support Unicode (it changed the
+> file to ANSI) and the original file is in UTF-8 without BOM encoding format.  I
+> tried correcting it by hand in the patch file, but then the patch file wouldn't
+> apply.  The problem actually appears to be in the existing nsSessionStore.js
+> file in Mercury since if I load that I also see the weird "Ã¼ character.  I
+> gave up trying to fix this since there doesn't seem to be anything wrong on my
+> end from what I can tell and any attempt to correct it makes things worse.  The
+> patch as is applies cleaning on my system so there's not much else I can do. 
+> Maybe it's an issue with Mozilla Build for Windows?
+
+Bah, I was hoping it would be easy on your side. Sorry to put you through that trouble for something so minor. Silly unicode... It's not the first time I've seen this issue and it's typically from windows, so it could be mozilla build or bugzilla or something silly. Don't worry about in the future.
+
+> Yes this is the fix for bug 589246. The fix came from what you posted as a fix
+> to that bug.  I put it here simply because it was a one line fix and basically
+> fit in with the rest of the patch since this patch also fixes bug 601161 and
+> bug 601198 (all the bugs are related), but you're probably right in that it
+> should be in it's own bug so I'll take it out of this patch.  
+> 
+> I won't have time to put a test together for bug 589246 so someone else will
+> need to do that.  Actually I'm not sure how this can be tested though since it
+> requires closing all browser windows. Hopefully it makes it into Firefox 4.0
+
+It's a blocker so it will make it. As for the test, I think that you're right it can't be properly tested with mochitest. Perhaps mozmill though. Regardless, put the patch up there and I'll review it.
+
+> I changed it to what you suggested.  I actually put this in because I was
+> getting exceptions in the case where Window 2 is focused (activeWindow) and had
+> no app tabs and Window 1 has app tabs.  This resulted in ix being 1 but the
+> length of the total array was only 1 since the second window was stripped out. 
+> That caused total[ix].sizemode to throw.
+
+Like I said, the change is more correct, just nits on the comparison :)
+
+> I tried running nsSessionStore.js through a trailing whitespace trimmer, but
+> ended up with a 1523 lines worth of changes because of existing trailing
+> whitespace in the file so I simply fixed this by hand.  At some point someone
+> else can trim the rest of the white space in the file.  :)
+
+Indeed - there is a lot of extra whitespace. It's on my todo list, but other things end up taking precedence. So I've been trying to stick to the "no new trailing whitespace" rule and I appreciate your help in that.
+
+> When I was testting I found that the sessionstore.resume_session_once
+> preference wasn't always being saved to the prefs.js file.  Actually it usually
+> wasn't which is the reason I put the savePrefFile call there.  Maybe that's
+> just a Windows caching thing, but since I saw it I figured others would as
+> well.
+
+Fair enough. It shouldn't hurt (and I'll stick to my theory that the number of people with resume_from_crash == false is small, so it should affect a small number of people)
+Comment on attachment 482074
+Patch 2.1 with review fixes (take 2)
+
+>diff --git a/browser/components/sessionstore/src/nsSessionStore.js
+>     case "quit-application":
+>       if (aData == "restart") {
+>         this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+>         this._clearingOnShutdown = false;
+>       }
+>+      // if the sessionstore.resume_session_once preference was changed by
+>+      // saveState because crash recovery is disabled then restore the
+>+      // preference back to the value it was prior to that.  This will prevent
+>+      // SessionStore from always restoring the session when crash recovery is
+>+      // disabled.
+>+      else if (this._resume_session_once_on_shutdown != null)
+>+        this._prefBranch.setBoolPref("sessionstore.resume_session_once",
+>+                                     this._resume_session_once_on_shutdown);
+
+One last nit here: please use braces for this else if and move the comment inside those braces.
+
+I pushed this to try server last night. Everything passed (just hit a couple known random oranges) so it looks like we're good to go. With the above nit fixed, r=me. Thanks a lot Michael!
+Created attachment 482302
+Patch 2.2 with last review nit fixed
+
+(In reply to comment #31)
+> Comment on attachment 482074 [details]
+> Patch 2.1 with review fixes (take 2)
+> 
+> >diff --git a/browser/components/sessionstore/src/nsSessionStore.js
+> >     case "quit-application":
+> >       if (aData == "restart") {
+> >         this._prefBranch.setBoolPref("sessionstore.resume_session_once", true);
+> >         this._clearingOnShutdown = false;
+> >       }
+> >+      // if the sessionstore.resume_session_once preference was changed by
+> >+      // saveState because crash recovery is disabled then restore the
+> >+      // preference back to the value it was prior to that.  This will prevent
+> >+      // SessionStore from always restoring the session when crash recovery is
+> >+      // disabled.
+> >+      else if (this._resume_session_once_on_shutdown != null)
+> >+        this._prefBranch.setBoolPref("sessionstore.resume_session_once",
+> >+                                     this._resume_session_once_on_shutdown);
+> 
+> One last nit here: please use braces for this else if and move the comment
+> inside those braces.
+> 
+> I pushed this to try server last night. Everything passed (just hit a couple
+> known random oranges) so it looks like we're good to go. With the above nit
+> fixed, r=me. Thanks a lot Michael!
+
+Okay fixed this last nit.  Thanks for reviewing.
+
+One last thing.  I'm not sure what to do about bug 601161 and bug 601198.  They aren't technically dupes of this bug, but this patch fixes both of them so they can be closed out once this bug is closed out.  For now I made them dependent on this bug and added a comment.
+Pushed http://hg.mozilla.org/mozilla-central/rev/9bb000fc3c3a
+Is it just me or does this test always fail when run on its own?
+(In reply to comment #34)
+> Is it just me or does this test always fail when run on its own?
+
+Seems to run just fine for me (osx & win7)

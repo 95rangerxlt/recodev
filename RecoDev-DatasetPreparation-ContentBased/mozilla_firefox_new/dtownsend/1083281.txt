@@ -1,0 +1,285 @@
+We currently have a hardcoded list but I expect eventually extension developers will want to be able to declare whether their about: URIs load in the main or the content process. We can do this easily with a couple of new flags on nsIAboutModule. I think there are three states we care about:
+
+* Must load in the main process
+* Must load in the content process
+* Can load in any process (about:blank, about:neterror and about:certerror probably fall here).
+
+The default for backwards compatibility should probably be the first option as that is where they load now. So maybe we just add:
+
+URI_MUST_LOAD_IN_CHILD
+URI_CAN_LOAD_IN_CHILD
+
+We currently have a hardcoded list but I expect eventually extension developers will want to be able to declare whether their about: URIs load in the main or the content process. We can do this easily with a couple of new flags on nsIAboutModule. I think there are three states we care about:
+
+* Must load in the main process
+* Must load in the content process
+* Can load in any process (about:blank, about:neterror and about:certerror probably fall here).
+
+The default for backwards compatibility should probably be the first option as that is where they load now. So maybe we just add:
+
+URI_MUST_LOAD_IN_CHILD
+URI_CAN_LOAD_IN_CHILD
+Waiting for some workaround cause some addons do not work on Nightly nor e10s.
+Created attachment 8556084
+about protocol patch
+
+This patch defines new flags for nsIAboutModule to return saying which process a URL should load in. The default (no new flags) is to load in the main process. One new flag forces loading in a remote process, another allows it if the browser performing the load is already remote.
+
+Not sure who is a good reviewer for this code.
+Created attachment 8556087
+chrome protocol patch
+
+This allows manifests to declare which process a chrome: package should load in if loaded in a browser. The default is to load in the main process, new flags either force loading in a remote process or allow loading in a remote process if the browser performing the load is already remote.
+
+I've also cleaned up the manifest parsing callback functions to just take a flags argument rather than having to extend the arguments each time a new flag is added.
+Created attachment 8556088
+frontend patch
+
+This updates the code that determines which process URLs are loaded in to test the about: and chrome: flags and adds a number of tests verifying the behaviour. In the about case we just test the E10SUtils function because it's more difficult to make an about protocol work in the child process.
+
+This ended up fixing a bug I hadn't noticed before where about urls with queries or refs didn't load in the right place and a few tests relied on that so I fixed them.
+
+Also defines two new chrome packages for tests which might want to load chrome pages in the remote process.
+Comment on attachment 8556084
+about protocol patch
+
+jason is a better reviewer on this one
+Comment on attachment 8556088
+frontend patch
+
+Review of attachment 8556088:
+-----------------------------------------------------------------
+
+This looks pretty good to me! See below.
+
+::: browser/base/content/tabbrowser.xml
+@@ +1690,5 @@
+>              t.setAttribute("crop", "end");
+>              t.setAttribute("onerror", "this.removeAttribute('image');");
+>              t.className = "tabbrowser-tab";
+>  
+> +
+
+Nit - remove extra line
+
+::: browser/base/content/test/general/browser_aboutAccounts.js
+@@ +219,5 @@
+>  
+> +    // this is a little subtle - we load about:robots so we get a non-remote
+> +    // tab, then we send a message which does both (a) load the URL we want and
+> +    // (b) mocks the default profile path used by about:accounts.
+> +    let tab = yield promiseNewTabLoadEvent("about:robots");
+
+Why did this need to change? Is this subtle mocking stuff dependent on things being in the same process? Can we assume that's not a user-facing restriction?
+
+::: browser/base/content/test/general/browser_bug1025195_switchToTabHavingURI_aOpenParams.js
+@@ +13,5 @@
+>  
+>    switchTab("about:home#1", true);
+>    switchTab("about:mozilla", true);
+> +
+> +  let promise = new Promise(resolve => {
+
+Let's be specific and call this hashChangePromise.
+
+::: browser/base/content/test/general/browser_e10s_about_process.js
+@@ +1,1 @@
+> +const CHROME_PROCESS = Ci.nsIXULRuntime.PROCESS_TYPE_DEFAULT;
+
+Missing license.
+
+@@ +79,5 @@
+> +  }
+> +});
+> +
+> +function test_url(url, chromeResult, contentResult) {
+> +  is(E10SUtils.canLoadURIInProcess(url, CHROME_PROCESS), chromeResult, "Check URL in chrome process.");
+
+Nit - please break these lines up so they're not so long.
+
+::: browser/base/content/test/general/browser_e10s_chrome_process.js
+@@ +1,1 @@
+> +function makeTest(name, startURL, startProcessIsRemote, endURL, endProcessIsRemote, transitionTask) {
+
+Missing license at the top of this file.
+
+Some documentation on what this function returns would be lovely. :)
+
+@@ +10,5 @@
+> +    }
+> +
+> +    // Load the initial URL and make sure we are in the right initial process
+> +    info("Loading initial URL");
+> +    browser.loadURI(startURL);
+
+Alternative:
+
+yield promiseTabLoadEvent(gBrowser.selectedTab, startURL);
+
+@@ +16,5 @@
+> +
+> +    is(browser.currentURI.spec, startURL, "Shouldn't have been redirected");
+> +    is(browser.isRemoteBrowser, startProcessIsRemote, "Should be displayed in the right process");
+> +
+> +    let promise = waitForDocLoadComplete();
+
+Let's call this "docLoadedPromise", or something similar.
+
+@@ +45,5 @@
+> +registerCleanupFunction(() => {
+> +  gBrowser.removeCurrentTab();
+> +});
+> +
+> +function test_url(url, chromeResult, contentResult) {
+
+I guess there's no way of de-duping this with the stuff in the other test? Is it too specialized to put into head.js?
+
+@@ +130,5 @@
+> +  return false;
+> +},
+> +];
+> +
+> +for (let test of TESTS) {
+
+This is awesome stuff, but it needs to be better documented. It takes a few reads to figure out what's happening and how.
+
+::: browser/modules/E10SUtils.jsm
+@@ +10,5 @@
+>  
+>  Cu.import("resource://gre/modules/Services.jsm");
+>  
+> +function getAboutModule(aURL) {
+> +  let moduleName = aURL.path.replace(/[#?].*/, "").toLowerCase();
+
+can you use nsIURI.specIgnoringRef instead?
+
+@@ +28,5 @@
+> +    let mustLoadRemote = true;
+> +
+> +    if (aURL.startsWith("about:")) {
+> +      let url = Services.io.newURI(aURL, null, null);
+> +      let flags = getAboutModule(url).getURIFlags(url);
+
+What if we can't find a module for this about: address? We're going to throw an exception here. We should probably account for the possibility that no such module exists.
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #6)
+> ::: browser/base/content/test/general/browser_aboutAccounts.js
+> @@ +219,5 @@
+> >  
+> > +    // this is a little subtle - we load about:robots so we get a non-remote
+> > +    // tab, then we send a message which does both (a) load the URL we want and
+> > +    // (b) mocks the default profile path used by about:accounts.
+> > +    let tab = yield promiseNewTabLoadEvent("about:robots");
+> 
+> Why did this need to change? Is this subtle mocking stuff dependent on
+> things being in the same process? Can we assume that's not a user-facing
+> restriction?
+
+Previously "about:blank?" would load in the main process but my patch fixes that and this test isn't quite up to handling the process switch. Looks like a test issue that could be fixed but it was quicker to just give it a URL that still loads in the main process.
+
+> @@ +45,5 @@
+> > +registerCleanupFunction(() => {
+> > +  gBrowser.removeCurrentTab();
+> > +});
+> > +
+> > +function test_url(url, chromeResult, contentResult) {
+> 
+> I guess there's no way of de-duping this with the stuff in the other test?
+> Is it too specialized to put into head.js?
+
+It's a little too specialized I think. For just two tests I don't think it's worth it.
+
+> ::: browser/modules/E10SUtils.jsm
+> @@ +10,5 @@
+> >  
+> >  Cu.import("resource://gre/modules/Services.jsm");
+> >  
+> > +function getAboutModule(aURL) {
+> > +  let moduleName = aURL.path.replace(/[#?].*/, "").toLowerCase();
+> 
+> can you use nsIURI.specIgnoringRef instead?
+
+No, that wouldn't strip the query part. For safety this is basically just what the C++ does: http://mxr.mozilla.org/mozilla-central/source/netwerk/protocol/about/nsAboutProtocolUtils.h#15
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #6)
+> @@ +10,5 @@
+> > +    }
+> > +
+> > +    // Load the initial URL and make sure we are in the right initial process
+> > +    info("Loading initial URL");
+> > +    browser.loadURI(startURL);
+> 
+> Alternative:
+> 
+> yield promiseTabLoadEvent(gBrowser.selectedTab, startURL);
+
+This seems to resolve sooner while the load isn't quite yet done and the subsequent waitForDocLoadComplete resolves for the first load rather than the second so I left it alone.
+Created attachment 8556766
+frontend patch
+Comment on attachment 8556766
+frontend patch
+
+Review of attachment 8556766:
+-----------------------------------------------------------------
+
+Looks good. Thanks Mossop! \o/
+Comment on attachment 8556084
+about protocol patch
+
+Review of attachment 8556084:
+-----------------------------------------------------------------
+
+I don't know much about about:// but the necko bits here seem simple enough.
+https://hg.mozilla.org/integration/fx-team/rev/580a54390e83
+Backed out due to devtools test failures: https://hg.mozilla.org/integration/fx-team/rev/3b78986683e1
+For me now -38.0a1 (2015-02-03)- the addons are working so I can say the bug (for me )is fixed.
+Created attachment 8559195
+devtools patch
+
+One of the devtools tests seems to rely on the page it loads being in the content process when in e10s and as it currently loads from chrome that switched. Switching it to http solves the test failure. As far as I can see there is no particular reason why this page should be loaded from chrome:, Mike?
+Comment on attachment 8559195
+devtools patch
+
+Review of attachment 8559195:
+-----------------------------------------------------------------
+
+Yes, that makes sense.
+Hi Dave, can you provide a point value.
+https://hg.mozilla.org/integration/fx-team/rev/5dcd284d63af
+https://hg.mozilla.org/mozilla-central/rev/5dcd284d63af
+For the chrome.manifest changes in particular.
+I've added a new page for this:
+https://developer.mozilla.org/en-US/Firefox/Multiprocess_Firefox/about:_and_chrome:_URIs
+
+and updated these:
+https://developer.mozilla.org/en-US/docs/Chrome_Registration#remoteenabled
+https://developer.mozilla.org/en-US/Firefox/Multiprocess_Firefox/Limitations_of_chrome_scripts#nsIAboutModule
+https://developer.mozilla.org/en-US/Firefox/Multiprocess_Firefox/Limitations_of_frame_scripts#nsIAboutModule
+
+Please let me know if this looks OK.
+(In reply to Will Bamberg [:wbamberg] from comment #21)
+> I've added a new page for this:
+> https://developer.mozilla.org/en-US/Firefox/Multiprocess_Firefox/about:
+> _and_chrome:_URIs
+
+Looks good. It might be worth extending this page to talk about where all the different URIs load. file: load in the content process, so do (I think!) resource:.
+(In reply to Dave Townsend [:mossop] from comment #22)
+> (In reply to Will Bamberg [:wbamberg] from comment #21)
+> > I've added a new page for this:
+> > https://developer.mozilla.org/en-US/Firefox/Multiprocess_Firefox/about:
+> > _and_chrome:_URIs
+> 
+> Looks good. It might be worth extending this page to talk about where all
+> the different URIs load. file: load in the content process, so do (I think!)
+> resource:.
+
+Thanks Mossop. I've reworked the page to be more general, and included file: and resource:. Marking as dev-doc-complete, but please let me know if you see any problems.
+
+
+Use flags to define which about: and chrome: URIs should be loaded in the content process.
+
+dev-doc-complete
+
+Bug 1083281: Use flags to determine which chrome and about URIs are loaded in the content process. r=mconley, r=bsmedberg, r=jduell 
+
+Backing out 580a54390e83 from bug 1083281 due to devtools test failures. CLOSED TREE 
+
+Bug 1083281: Use flags to determine which chrome and about URIs are loaded in the content process. r=mconley, r=bsmedberg, r=jduell, r=mratcliffe 

@@ -1,0 +1,362 @@
+Spin-off from bug 1078808.
+
+Spin-off from bug 1078808.
+Andrea, from what I understand of the ServiceWorkerRegistrar, since the sanitize script runs with chrome privileges on the parent process, can I just add a nsIServiceWorkerRegistrar over it and then a function clear() which calls DeleteData()?
+Well... it depends. In general no. I think a better approach is to add a method that does:
+
+1. use PBackground in case you are in the child process.
+2. DeleteData should not run on the main-thread.
+
+ServiceWorkerRegistrar is a singleton. Can we add this functionality in nsIServiceWorkerManager and from there call ServiceWorkerRegistar?
+Created attachment 8573641
+Clear ServiceWorkers when clearing history or forgetting about site
+
+I've to figure out a nice way to write tests for this, but we can start reviewing the patch.
+How would this work on e10s/b2g where the SWM runs in the child? it seems we need some sanitize.js sends message to all children to clear sws and then they can each deal with their registrations?
+From what I understand of the PBackground stuff, in case of SWM being created in the parent process, all the registrations for all domains are loaded into memory. Is that correct? In that case, don't we want something like this:
+1) Send a message to all child processes to clear their in-memory state and invalidate ServiceWorkers etc?
+2) Then clear the data like this current patch does, which will lead to all records being erased from disk but nothing else happening since the SWM will have in-memory records, but no active documents.
+
+Should (1) be done via pbackground or just use child process message manager?
+Comment on attachment 8573641
+Clear ServiceWorkers when clearing history or forgetting about site
+
+Review of attachment 8573641:
+-----------------------------------------------------------------
+
+::: dom/workers/ServiceWorkerManager.cpp
+@@ +494,4 @@
+>    { }
+>  
+> +  bool
+> +  IsRegisterJob() MOZ_OVERRIDE
+
+it seems to me that this should be 'const'.
+
+@@ +858,5 @@
+> +  // We have to treat the first job specially. It is the running job and needs
+> +  // to be notified correctly.
+> +  nsRefPtr<ServiceWorkerJob> runningJob = mJobs[0];
+> +  // We can just let an Unregister job run to completion.
+> +  if (runningJob->IsRegisterJob()) {
+
+Wondering if you can implement a Cancel() method in ServiceWorkerJob and then overwrite it just for the RegisterJob.
+Maybe it's cleaner.
+
+@@ +2778,5 @@
+> +RemoveIfMatchesHost(const nsACString& aScope,
+> +                    nsRefPtr<ServiceWorkerRegistrationInfo>& aReg,
+> +                    void* aData)
+> +{
+> +  NS_WARNING(__PRETTY_FUNCTION__);
+
+Why this?
+
+@@ +2783,5 @@
+> +  ServiceWorkerRegistrationInfo* toRemove = nullptr;
+> +  if (aData) {
+> +    const nsACString& host = *static_cast<nsACString*>(aData);
+> +    nsCOMPtr<nsIURI> scopeURI;
+> +    nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScope, nullptr, nullptr);
+
+What about a simple:
+
+if (NS_WARN_IF(NS_FAILED(rv))) {
+  return PL_DHASH_NEXT;
+}
+
+@@ +2786,5 @@
+> +    nsCOMPtr<nsIURI> scopeURI;
+> +    nsresult rv = NS_NewURI(getter_AddRefs(scopeURI), aScope, nullptr, nullptr);
+> +    if (NS_SUCCEEDED(rv)) {
+> +      nsAutoCString scopeHost;
+> +      rv = scopeURI->GetHost(scopeHost);
+
+same here.
+
+@@ +2814,5 @@
+> +
+> +// MUST ONLY BE CALLED FROM RemoveIfMatchesHost!
+> +void
+> +ServiceWorkerManager::ForceRemove(ServiceWorkerRegistrationInfo* aRegistration)
+> +{
+
+Assert the main-thread.
+
+@@ +2849,5 @@
+> +NS_IMETHODIMP
+> +ServiceWorkerManager::RemoveAll()
+> +{
+> +  AssertIsOnMainThread();
+> +  NS_WARNING(__PRETTY_FUNCTION__);
+
+Why this?
+
+::: dom/workers/ServiceWorkerManager.h
+@@ +59,5 @@
+>  
+>    virtual void Start() = 0;
+>  
+> +  virtual bool
+> +  IsRegisterJob() { return false; }
+
+const
+
+::: toolkit/forgetaboutsite/ForgetAboutSite.jsm
+@@ +227,5 @@
+> +
+> +    // Service Workers
+> +    let swm = Cc["@mozilla.org/serviceworkers/manager;1"].
+> +              getService(Ci.nsIServiceWorkerManager);
+> +    swm.remove(aDomain);
+
+Find somebody else to review this part of the patch :)
+Andrea - Please see comment 5 and 6
+> 1) Send a message to all child processes to clear their in-memory state and
+> invalidate ServiceWorkers etc?
+
+Right. I would not use PBackground for this. Let's use child process massages: we don't have PBackground actor ready to receive this notification, plus we are ready on the main-thread.
+
+Do you want to file a follow up? If you submit a new patch I can work on it.
+Created attachment 8596850
+Clear ServiceWorkers when clearing history or forgetting about site
+
+I'd like review on the tests and IPC, but if you can take a look at the rest that would be great.
+The forcible unregistration is 'non-standard', so the more eyes the better about if we are being consistent with it.
+Comment on attachment 8596850
+Clear ServiceWorkers when clearing history or forgetting about site
+
+Review of attachment 8596850:
+-----------------------------------------------------------------
+
+The current patch has a number of serious issues, which is why I'm minusing, but I'm also curious to know why you chose to unregister in this weird way.  Some of the things that you are doing here violate the expectations that the spec has gone to great lengths to preserve.  For example, I doubt that anybody will program their SW using web sites in a way that makes it OK for an existing document to suddenly become uncontrolled.
+
+Why not do the much simpler thing of just simulating a call to SWR.unregister() when clearing the domain/browsing data?
+
+::: browser/base/content/sanitize.js
+@@ +235,5 @@
+>          }
+>  
+> +        // Clear Service Workers. Does not support time ranges, so just clear
+> +        // everything.
+> +        Services.obs.notifyObservers(null, "remove-all-serviceworker-data", null);
+
+We already have the browser:purge-session-history notification for the purpose of components which would like to use the observer service to know to clear themselves out.  Please do not reinvernt a new notification just for service workers.
+
+::: dom/interfaces/base/nsIServiceWorkerManager.idl
+@@ +119,5 @@
+> +   * - All documents will immediately stop being controlled.
+> +   * - Unregister jobs will be queued for all registrations.
+> +   *   This eventually results in the registration being deleted from disk too.
+> +   */
+> +  void remove(in AUTF8String aHost);
+
+You need to rev the uuid here.
+
+::: dom/workers/ServiceWorkerManager.cpp
+@@ +249,5 @@
+>  {
+>    // The map will assert if it is not empty when destroyed.
+>    mServiceWorkerRegistrationInfos.Clear();
+> +
+> +  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+
+Does this actually work?  If I'm reading the code right, you are making the observer service hold the service worker manager alive, so the SWM object can never be destroyed until the observer service shuts down, which will very likely cause a leak until very late during shutdown.
+
+Typically you need to also handle the NS_XPCOM_SHUTDOWN_OBSERVER_ID notification and remove yourself from the observer service at xpcom shutdown.
+
+@@ +715,5 @@
+> +    // from another object like a stream loader or something.
+> +    // UpdateFailed may do something with that, so hold a ref to ourself since
+> +    // FailCommon relies on it.
+> +    // FailCommon does check for cancellation, but let's be safe here.
+> +    nsRefPtr<ServiceWorkerRegisterJob> kungFuDeathGrip = this;
+
+Hmm, shouldn't you hold this death grip in the callers of Fail()?  Without that, if someone adds anything touching |this| after Fail() returns, we have a potential UAF on our hands.  It is usually better to hold death grips as high on the call stack as we possibly can.
+
+@@ +873,5 @@
+> +    // from another object like a stream loader or something.
+> +    // UpdateFailed may do something with that, so hold a ref to ourself since
+> +    // FailCommon relies on it.
+> +    // FailCommon does check for cancellation, but let's be safe here.
+> +    nsRefPtr<ServiceWorkerRegisterJob> kungFuDeathGrip = this;
+
+Ditto.
+
+@@ +3150,5 @@
+> +      nsAutoCString scopeHost;
+> +      rv = scopeURI->GetHost(scopeHost);
+> +      nsAutoCString foo(host);
+> +      // This way subdomains are also cleared.
+> +      if (NS_SUCCEEDED(rv) && StringEndsWith(scopeHost, host)) {
+
+This is wrong!  For example, if I have a SW registered for bar.com, clearing the SWs for foobar.com will also clear the ones from bar.com, right?
+
+(Please add a test for this case in the next version of the patch.)
+
+@@ +3153,5 @@
+> +      // This way subdomains are also cleared.
+> +      if (NS_SUCCEEDED(rv) && StringEndsWith(scopeHost, host)) {
+> +          toRemove = aReg;
+> +      } else {
+> +        if (NS_WARN_IF(NS_FAILED(rv))) {
+
+Nit: else if.
+
+@@ +3160,5 @@
+> +    } else {
+> +      NS_WARNING("Could not create scope URI.");
+> +    }
+> +  } else {
+> +    toRemove = aReg;
+
+Nit: you could initialize toRemove to aReg and remove this branch.
+
+::: dom/workers/ServiceWorkerManager.h
+@@ +60,5 @@
+>  
+>    virtual void Start() = 0;
+>  
+> +  virtual bool
+> +  IsRegisterJob() { return false; }
+
+Nit: const
+
+@@ +131,5 @@
+>      mJobs.RemoveElementAt(0);
+>      if (!mJobs.IsEmpty()) {
+>        mJobs[0]->Start();
+>      }
+> +    mPopping = false;
+
+Nit: use AutoRestore.
+
+::: dom/workers/test/serviceworkers/sanitize/frame.html
+@@ +1,5 @@
+> +<!DOCTYPE html>
+> +<script>
+> +  fetch("intercept-this").then(function(r) {
+> +    if (!r.ok) {
+> +      return "FAIL";
+
+Hmm, does this work well with promise chains?  (Mainly asking for my own knowledge, since you're the promise expert. :)
+
+::: dom/workers/test/serviceworkers/test_sanitize.html
+@@ +40,5 @@
+> +    }).then(function() {
+> +      return navigator.serviceWorker.getRegistration("sanitize/foo");
+> +    }).then(function(reg) {
+> +      reg.active.onstatechange = function(e) {
+> +        ok(e.target.state, "redundant", "On clearing data, serviceworker should become redundant");
+
+Do you need to protect against future statechange events here, by nulling out the handler or something?
+
+::: dom/workers/test/serviceworkers/test_sanitize_domain.html
+@@ +44,5 @@
+> +        ok(e.target.state, "redundant", "On clearing data, serviceworker should become redundant");
+> +        testNotIntercepted();
+> +      };
+> +    }).then(function() {
+> +      SpecialPowers.removeServiceWorkerDataForMochitestDomain();
+
+It would be nice if you modified this test to also register a SW from example.com and verified that SW survives the forget about this site op.
+
+::: toolkit/forgetaboutsite/ForgetAboutSite.jsm
+@@ +169,5 @@
+>               getService(Ci.nsINetworkPredictor);
+>      np.reset();
+> +
+> +    // Service Workers
+> +    Services.obs.notifyObservers(null, "remove-serviceworker-data-for-domain", aDomain);
+
+Again, we already have browser:purge-domain-data for this purpose.  Please do not reinvent that either.
+Created attachment 8597506
+MozReview Request: bz://1080109/nsm
+
+/r/7651 - Bug 1080109 - Clear ServiceWorkers when clearing history or forgetting about site.
+
+Pull down this commit:
+
+hg pull -r b434afe401e18ffcd4e59f97937eb9ac11d9047f https://reviewboard-hg.mozilla.org/gecko/
+https://reviewboard.mozilla.org/r/7649/#review6425
+
+::: dom/workers/ServiceWorkerManager.cpp:239
+(Diff revision 1)
+> +      rv = obs->AddObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID, false /* ownsWeak */);
+
+Added shutdown observer
+
+::: dom/workers/ServiceWorkerManager.cpp:720
+(Diff revision 1)
+> +    nsRefPtr<ServiceWorkerRegisterJob> kungFuDeathGrip = this;
+
+Callers of Fail() always return, so I'm not concerned about a UAF right of the bat. That said, happy to put this death grip up the stack, as well as adding comments to Fail to ask callers to hold a grip.
+
+::: dom/workers/ServiceWorkerManager.cpp:3291
+(Diff revision 1)
+> +
+> +  // Since Unregister is async, it is ok to call it in an enumeration.
+> +  Unregister(aRegistration->mPrincipal, nullptr, NS_ConvertUTF8toUTF16(aRegistration->mScope));
+
+Changed to just call unregister.
+
+::: dom/workers/test/serviceworkers/sanitize/frame.html:5
+(Diff revision 1)
+> +      return "FAIL";
+
+Yes, if a promise handler returns a value instead of a promise, it is converted to a resolved promise.
+
+::: dom/workers/test/serviceworkers/test_sanitize_domain.html:86
+(Diff revision 1)
+> +              return testFrame("http://example.com/tests/dom/workers/test/serviceworkers/sanitize/register.html");
+
+Added a test for another domain and ensuring it is still around, but I'm not sure how I'd test for foobar.com / bar.com on mochitest.
+Before I review the new patch, can you please answer the question at the top of comment 10?
+(In reply to :Ehsan Akhgari (not reading bugmail, needinfo? me!) from comment #10)
+> Comment on attachment 8596850
+> Clear ServiceWorkers when clearing history or forgetting about site
+> 
+> Review of attachment 8596850:
+> -----------------------------------------------------------------
+> 
+> The current patch has a number of serious issues, which is why I'm minusing,
+> but I'm also curious to know why you chose to unregister in this weird way. 
+> Some of the things that you are doing here violate the expectations that the
+> spec has gone to great lengths to preserve.  For example, I doubt that
+> anybody will program their SW using web sites in a way that makes it OK for
+> an existing document to suddenly become uncontrolled.
+> 
+> Why not do the much simpler thing of just simulating a call to
+> SWR.unregister() when clearing the domain/browsing data?
+> 
+That is what I did now :) I was trying to be more aggressive about immediately clearing relevant data, but I guess sticking to the spec is more important. I have annotated the rest of your feedback on reviewboard where appropriate.
+Comment on attachment 8597506
+MozReview Request: bz://1080109/nsm
+
+https://reviewboard.mozilla.org/r/7649/#review6489
+
+Ship It!
+
+::: dom/workers/ServiceWorkerManager.cpp:3147
+(Diff revision 1)
+> +  return (prevChar == '.' || prevChar == '/');
+
+I don't think you need the '/' case here.
+https://reviewboard.mozilla.org/r/7649/#review6491
+
+> Callers of Fail() always return, so I'm not concerned about a UAF right of the bat. That said, happy to put this death grip up the stack, as well as adding comments to Fail to ask callers to hold a grip.
+
+I would still sleep better if you did that.  :-)
+
+> Added a test for another domain and ensuring it is still around, but I'm not sure how I'd test for foobar.com / bar.com on mochitest.
+
+Either using one of these <https://dxr.mozilla.org/mozilla-central/source/build/pgo/server-locations.txt#99> or adding your own.
+I think I messed up the RB usage...  What I meant was r+ with the comments addressed.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=cbca4e2754cb
+https://hg.mozilla.org/integration/mozilla-inbound/rev/a003c1905b9a
+https://hg.mozilla.org/mozilla-central/rev/a003c1905b9a
+*** Bug 1080110 has been marked as a duplicate of this bug. ***
+Comment on attachment 8597506
+MozReview Request: bz://1080109/nsm
+Created attachment 8618397
+MozReview Request: Bug 1080109 - Clear ServiceWorkers when clearing history or forgetting about site.

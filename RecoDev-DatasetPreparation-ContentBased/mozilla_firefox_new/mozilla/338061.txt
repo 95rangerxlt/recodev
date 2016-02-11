@@ -1,0 +1,649 @@
+The suggest-based autocomplete entries for the search box fail to work well in one particular not-uncommon use case: doing a search you've already done before.  The old history-based list of suggestions was exactly what was desired in this case.
+
+A first cut at doing "something nice" here would be to show history-based and suggest-based entries with the history-based ones first.  Something you've typed before is probably a more likely entry than something you've never typed, all else being equal.
+
+A finer heuristic might be able to give even better results (something based on what the user has typed recently or frequently), but I'm not sure about the tuning parameters on this.
+
+The suggest-based autocomplete entries for the search box fail to work well in one particular not-uncommon use case: doing a search you've already done before.  The old history-based list of suggestions was exactly what was desired in this case.
+
+A first cut at doing "something nice" here would be to show history-based and suggest-based entries with the history-based ones first.  Something you've typed before is probably a more likely entry than something you've never typed, all else being equal.
+
+A finer heuristic might be able to give even better results (something based on what the user has typed recently or frequently), but I'm not sure about the tuning parameters on this.
+A counter saving the number of a specific search would be enough, no? Then the search suggestions can be listed chronologically.
+
+Or would that be to confusing compared to the now alphabetical order?
+MFU is probably better than MRU, but regardless, autocomplete already has some kind of ordering.  Let's just use that and put up the exact results as before, with the suggest entries below them.  This has the nice property of suggesting things when you're typing a brand new query (when you're more likely to use the suggestions) and yet still showing you your historical searches prominently when they match (when you're likely to use one).
+Created attachment 222450
+Patch that adds local searchbox history results to the search suggest results (not necessarily final presentation)
+Whichever presentation (see URL for Google Groups link to current UI discussion) ends up being final, we'll want it for beta1 to get some good feedback.
+Created attachment 222569
+Update that fixes bug in previous patch when current search engine doesn't support suggest
+Comment on attachment 222569
+Update that fixes bug in previous patch when current search engine doesn't support suggest
+
+I'm not really familiar with all of this code, so bear with me :). It's hard to follow, with the timers and callbacks.
+
+http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/browser/components/search/content/search.xml&rev=1.59#386 ensures that this code is never reached if the engine has no suggestionURI, right? Seems to me like you could remove most of code that handles a null suggestionURI.
+
+>Index: browser/components/search/nsSearchSuggestions.js
+
+>+  /**
+>+   * This is the callback for that the form history service uses to
+>+   * send us results.
+>+   */
+>+  onSearchResult: function SAC_onSearchResult(search, result) {
+>+    this._formHistoryResults = result;
+>+
+>+    if (!this._request) {
+>+      this._sendHistoryOnlyResponse();
+>+    } else {
+>+      this._formHistoryTimer =
+>+      Components.classes["@mozilla.org/timer;1"].createInstance(Components.interfaces.nsITimer);
+>+      this._formHistoryTimer.initWithCallback(this, 500, Components.interfaces.nsITimer.TYPE_ONE_SHOT);
+>+    }
+
+Can you put the timeout value in it's own property so that it's easy to change and identify? You can remove the test for ._request if you remove the null suggestionURI handling code from startSearch as mentioned above.
+
+>+  /**
+>+   * Call this function to send back an autocomplete response that contains
+>+   * only form history autocompletions.  We do this if we couldn't
+>+   * send a suggest request, or if we've given up on getting a response
+>+   * from the suggest server.
+>+   */
+>+  _sendHistoryOnlyResponse: function SAC__sendHistoryOnlyResponse() {
+>+    if (!this._listener) return;
+
+nit: put the return on it's own line? This check exists to make sure we don't send history-only if we've already sent history+suggest, right? I think it would be clearer for this check to be in the timer callback (notify). If you do the null suggestionURI code removal you can just move this entire method into notify, since it will then be the only caller.
+
+>+  /**
+>+   * This sends an autocompletion request to the form history service.
+>+   * It will call onSearchResults with the results of the query.
+>+   */
+>+  _startFormHistorySearch: function SAC__startFormHistorySearch(
+>+      searchString, searchParam, previousResult) {
+>+    var formHistory = Components.classes["@mozilla.org/autocomplete/search;1?name=form-history"].createInstance(Components.interfaces.nsIAutoCompleteSearch);
+
+Wrap the long line?
+
+>@@ -248,12 +327,32 @@
+>             comments[i] = comments[i].substr(1, comments[i].length - 2);
+>           }
+>         }
+>+
+>+        // If form history is enabled and has results, add them to the list.
+>+        if (this._includeFormHistory && this._formHistoryResults &&
+>+            (this._formHistoryResults.searchResult ==
+>+             Components.interfaces.nsIAutoCompleteResult.RESULT_SUCCESS)) {
+...
+>+
+>+            results.splice(0, 0, term);
+>+            comments.splice(0, 0, this._formHistoryResults.getCommentAt(i));
+
+unshift() instead of splice() ?
+
+>@@ -301,25 +400,36 @@
+>     var searchService = 
+>       Components.classes["@mozilla.org/browser/search-service;1"]
+>                 .getService(Components.interfaces.nsIBrowserSearchService);
+>+
+>+    if (this._request)
+>+      this.stopSearch();
+>+
+>+    this._listener = listener;
+>+
+>     // If the service URL is empty, bail.
+>-    var serviceURL = searchService.currentEngine.suggestionURI.spec;
+>-    if (serviceURL == "") 
+>+    var serviceURL = "";
+>+    if (searchService.currentEngine.suggestionURI)
+>+      serviceURL = searchService.currentEngine.suggestionURI.spec;
+>+    if (serviceURL == "") {
+>+      if (this._includeFormHistory)
+>+        this._startFormHistorySearch(searchString, searchParam, previousResult);
+
+I think that this call to _startFormHistorySearch should be removed. We shouldn't ever get here if the engine's suggestionURI is null.
+
+>     // If there's an existing request, stop it. There is no smart filtering here
+>     // as there is when looking through history/form data because the result set
+>     // returned by the server is different for every typed value - "ocean breathes"
+>     // does not return a subset of the results returned for "ocean", for example.
+>-    if (this._request)
+>-      this.stopSearch();
+
+Looks like you forgot to move the comment too.
+
+>     // Actually do the search
+>     this._request = Components.classes["@mozilla.org/xmlextras/xmlhttprequest;1"]
+>                               .createInstance(Components.interfaces.nsIXMLHttpRequest);
+>     this._request.open("GET", serviceURL + searchString, true);
+>     
+>-    this._listener = listener;
+>-    
+>+    if (this._includeFormHistory)
+>+      this._startFormHistorySearch(searchString, searchParam, previousResult);
+
+Any reason why this splits up the creation of the request and the assignment of the event handlers? I'd just move it up above the this._request assignment if it doesn't matter.
+
+Now that the form history results are sent if the XMLHTTPRequest fails, I don't think there is a need for onError anymore. In fact, it may cause trouble, if the XMLHTTPRequest fails during the 500 ms "waiting time", onError will be called and send a FAIL, and then the timer will run out and send the form history results and a SUCCESS.
+
+I must admit I'm still a little confused as to the possible code paths this can follow given the all the asynchronous behavior, but it's getting late, so I'll look at this again some time later.
+(In reply to comment #6)
+http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/browser/components/search/content/search.xml&rev=1.59#386
+> ensures that this code is never reached if the engine has no suggestionURI,
+> right? Seems to me like you could remove most of code that handles a null
+> suggestionURI.
+
+As it turns out, the code that you pointed to doesn't actually work--try starting up with a non-suggest engine selected and then switch to a suggest engine.  We just never noticed it because most people start up with Google.  I'm going to look into the issue--if we can sort that out, then you're right about removing some of the checks in the suggestion code.
+Created attachment 222654
+Addresses most of Gavin's comments (except the timeout property, which is coming)
+
+Aha, it turns out that the engine autocomplete setting was only getting updated when the engine got switched via keyboard shortcuts, but not by menu selection.  So I fixed that and made most of the changes that Gavin asked for.  (I didn't get to the timeout property yet, but it's coming.)
+
+This patch also experimentally adds a "History" and "Suggest" notation in the comments column when the results have both.
+(In reply to comment #8)
+> (I didn't get to the timeout property yet, but it's coming.)
+
+Just to be sure I was clear, I meant just making it this._suggestTimeout or something like that, with a comment explaining what it is, just so that it's clear why that value was chosen and easier to tweak if needed.
+Created attachment 222960
+Screenshot with history/suggest hinting column from current patch
+Created attachment 222964
+Adds property that Gavin wanted
+
+OK, added that JS property (I thought you had meant about:config property).
+Comment on attachment 222964
+Adds property that Gavin wanted
+
+This approach is a good start (yes, this means I've been convinced out of interleaving :). 
+
+Thoughts for the future:
+
+- we don't really need a label for "history", since that's the default autocomplete behaviour, and for the case where there are no suggestion results, it would be a bit redundant. 
+
+- the notation should eventually become a single line between the history and suggests results, only shown when suggest results exist, and use a label like "or did you mean ..." or "similar search terms ..."
+Created attachment 222994
+Screenshot of version with smaller hint text, horizontal rule, and no "History" hint
+(oops - comment 12 was actually made by me, but vlad had been using my browser so it used his login ... sorry!)
+Comment on attachment 222994
+Screenshot of version with smaller hint text, horizontal rule, and no "History" hint
+
+I like the rule, and the smaller hint text, although maybe use grey text.
+Created attachment 223064
+mockups of possible UI treatments
+
+Just putting some sketches to my earlier comments.
+Comment on attachment 222964
+Adds property that Gavin wanted
+
+Could have used more context in this diff :).
+
+>Index: browser/components/search/nsSearchSuggestions.js
+
+>+  /**
+>+   * Autocomplete results from the form history service get stored here.
+>+   */
+>+  _formHistoryResults: null,
+
+nit: formHistoryResult, singular, to match the autocomplete terminology?
+
+>   /** 
+>    * Called when the 'readyState' of the XMLHttpRequest changes. We only care 
+>    * about state 4 (COMPLETED) - handle the response data.
+
+(Out of context) seems like you could remove |comments = parts[2] ? parts[2].split(",") : [];| since you're not using that now.
+
+>+        for (var i = 0; i < results.length; ++i) {
+>+          if (i == 0) {
+>+            comments[i] = "Suggest";
+>+          } else {
+>+            comments[i] = "";
+>+          }
+
+nit: unnecessary brackets
+
+>+            results.unshift(term);
+>+            var comment = "";
+>+            if (i == 0)
+>+              comment = "History";
+>+            comments.unshift(comment/*this._formHistoryResults.getCommentAt(i)*/);
+
+Guess you can remove that commented out getCommentAt? These results don't have comments, right? "History" here needs to be localizable, of course (same with "Suggest" above).
+
+>+// If there's an existing request, stop it. There is no smart filtering here
+>+// as there is when looking through history/form data because the result set
+>+// returned by the server is different for every typed value - "ocean breathes"
+>+// does not return a subset of the results returned for "ocean", for example.
+
+Why change the indent?
+
+>     if (this._request)
+>       this.stopSearch();
+
+stopSearch already checks |if (this._request)|, so could you remove this check?. Maybe just inline the code since there's only one caller, and it's only two lines.
+
+>+    this._listener = listener;
+>+
+>+    // this should always work, since this autocomplete implementation
+>+    // doesn't get chosen in search.xml for engines that have no
+>+    // suggestionURI
+>+    var serviceURL = searchService.currentEngine.suggestionURI.spec;
+>+
+>     // Actually do the search
+>-    this._request = Components.classes["@mozilla.org/xmlextras/xmlhttprequest;1"]
+>-                              .createInstance(Components.interfaces.nsIXMLHttpRequest);
+>+    this._request = Components
+>+      .classes["@mozilla.org/xmlextras/xmlhttprequest;1"]
+>+      .createInstance(Components.interfaces.nsIXMLHttpRequest);
+
+Why change the wrapping style? I prefer the existing style, with a newline before Components if needed to stay under 80 chars.
+
+>     this._request.open("GET", serviceURL + searchString, true);
+>     
+>-    this._listener = listener;
+>-    
+>+    if (this._includeFormHistory)
+>+      this._startFormHistorySearch(searchString, searchParam, previousResult);
+
+Move this up to before the createInstance call?
+
+This code relies on the onSearchResult callback always happening before the XMLHTTPRequest calls onReadyStateChange with state = 4. That probably won't ever happen, and even if it does, the only bad side effect would be that history entries don't show up, so I guess this doesn't matter.
+Created attachment 223107
+Mockup with gray text, "start" crop on value
+
+Is this start-crop worth doing?
+(In reply to comment #17)
+> (From update of attachment 222964 [edit])
+> Could have used more context in this diff :).
+
+Oops, I keep forgetting that parameter, sorry. :]
+
+> >+// If there's an existing request, stop it. There is no smart filtering here
+> >+// as there is when looking through history/form data because the result set
+> >+// returned by the server is different for every typed value - "ocean breathes"
+> >+// does not return a subset of the results returned for "ocean", for example.
+> 
+> Why change the indent?
+
+Every line of that comment was wrapping.
+
+> >     if (this._request)
+> >       this.stopSearch();
+> 
+> stopSearch already checks |if (this._request)|, so could you remove this
+> check?. Maybe just inline the code since there's only one caller, and it's only
+> two lines.
+
+stopSearch is part of the nsIAutoCompleteSearch implementation, so I'm keeping it there, but I removed the check before the call.
+
+Also added the smaller label text & rule at beginning of suggestion list.
+Created attachment 223112
+Addresses Gavin's further comments, adjust visual style
+Created attachment 223113
+Let's try that again with more context :]
+I've been playing with this patch installed, and think I found a small bug. As you type your search term, if you go from a state where there are history & suggest results to one where there are only suggest results, the horizontal rule and "suggest" hint disappear.
+
+For example ..:
+
+    ([G] foo            v)   state 1, typed "foo"
+    | foo                |
+    | football           |
+    |--------------------|
+    | food network   sgst|
+    | food standards ... |
+
+
+    ([G] foot            v)   state 2, typed "foot"
+    | football            |
+    | footlocker          |  <-- these are all suggestions
+    | foot locker         | 
+
+
+Note that this doesn't happen when there are no history results for the search term; in that case, I do see the "suggests" hint as I would expect.
+Created attachment 223333
+Fixes Beltzner's bug
+Created attachment 223335
+Screenshot of current appearance of suggest (also demonstrating that the current patch fixes Beltzner's bug)
+Why does it say 'Suggest' instead of either 'Suggestions' or 'Suggested'? It doesn't sound right, and most users won't know that it's called Google Suggest.
+
+Comment on attachment 223333
+Fixes Beltzner's bug
+
+>Index: browser/components/search/nsSearchSuggestions.js
+
+>   getStyleAt: function(index) {
+>+    if (this._comments[index]) {
+>+      if (index == 0) {
+>+        return "suggestfirst";  // category label on first line of results
+>+      } else {
+>+        return "suggesthint";   // category label on any other line of results
+>+      }
+>+    }
+
+Extra braces, and else-after-return:
+if (index == 0)
+  return "suggestfirst"
+
+return "suggesthint";
+
+I don't understand how this works if there are multiple history based results. Doesn't this object's _comments include both history and suggest-based comments? Why would index==0 be significant, when there can be any number of history results at the beginning of the array? I think you need to remove the index==0 check, and just return the special style for any entry with a non-empty comment, which given the current setup would be only the first suggest result. Maybe I'm missing something (I haven't tested any of these patches yet).
+
+>+  _strings getter: function SAC__strings_getter() {
+>+    if (!this.__strings) {
+>+      var sbs = Components.classes["@mozilla.org/intl/stringbundle;1"]
+>+                .getService(Components.interfaces.nsIStringBundleService);
+>+
+>+      this.__strings = sbs.createBundle(SEARCH_BUNDLE);
+>+    }
+>+    return this.__strings;
+>+  },
+>+  __strings: null,
+
+Use |get _strings() {}| instead of |_strings getter: function|, see green box at http://developer.mozilla.org/en/docs/Core_JavaScript_1.5_Guide:Working_with_Objects#Defining_Getters_and_Setters .
+
+>+  /**
+>+   * This sends an autocompletion request to the form history service.
+>+   * It will call onSearchResults with the results of the query.
+
+s/. It will call/, which calls/ ?
+
+>+  _startFormHistorySearch: function SAC__startFormHistorySearch(
+>+      searchString, searchParam, previousResult) {
+>+    var formHistory = Components
+>+      .classes["@mozilla.org/autocomplete/search;1?name=form-history"]
+>+      .createInstance(Components.interfaces.nsIAutoCompleteSearch);
+
+I still don't like this alignment/indentation ;). I'll stop complaining about this now, though.
+
+>@@ -211,83 +311,111 @@ SuggestAutoComplete.prototype = {
+
+>+        for (var i = 0; i < results.length; ++i) {
+>+          if (i == 0)
+>+            comments[i] = this._strings.GetStringFromName("suggestion_label");
+>+          else
+>+            comments[i] = "";
+>+        }
+>+
+>+        // If form history is enabled and has results, add them to the list.
+>+        if (this._includeFormHistory && this._formHistoryResult &&
+>+            (this._formHistoryResult.searchResult ==
+>+             Components.interfaces.nsIAutoCompleteResult.RESULT_SUCCESS)) {
+>+          for (var i = this._formHistoryResult.matchCount - 1; i >= 0; --i) {
+>+            var term = this._formHistoryResult.getValueAt(i);
+>+
+>+            // remove duplicates from suggest list
+>+            var dupIndex = results.indexOf(term);
+>+            if (dupIndex >= 0) {
+>+
+>+              // if we'd be deleting the section hint here,
+>+              // move it to the next entry if necessary
+>+              if (comments[dupIndex] &&  // removed item has hint
+>+                  ((dupIndex + 1) < results.length) &&  // have more items
+>+                  !comments[dupIndex + 1])  // next item doesn't already hint
+>+                comments[dupIndex + 1] = comments[dupIndex];
+>+
+>+              results.splice(dupIndex, 1);
+>+              comments.splice(dupIndex, 1);
+>+            }
+>+
+>+            // Insert history results; insert blank comments for alignment.
+>+            results.unshift(term);
+>+            comments.unshift("");
+>+          }
+>+          this._formHistoryResult = null;
+>+        }
+
+That big if check seems kinda awkward, even with the comments. How about something like this (with better variable names, too):
+
+var suggestResults = /* gotten above */;
+var suggestComments = [];
+var historyResults = [];
+var historyComments = [];
+
+// Create an array of form history results
+for (var i = this._formHistoryResult.matchCount - 1; i >= 0; --i) {
+  var term = this._formHistoryResult.getValueAt(i);
+  
+  // Remove this result from the suggest results if it's a duplicate.
+  var dupIndex = suggestResults.indexOf(term);
+  if (dupIndex != -1)
+    suggestResults.splice(dupIndex, 1);
+
+  historyResults.unshift(term);
+  historyComments.unshift("");
+}
+
+// Give each of the remaining suggest results a blank comment
+for (var i = 0; i < suggestResults.length; ++i)
+  suggestComments[i] = "";
+
+// Give the first suggest result a comment to identify the beginning of
+// suggest results.
+suggestComments[0] = this._strings.GetStringFromName("suggestion_label");
+
+var finalResults = historyResults.concat(suggestResults);
+var finalComments = historyComments.concat(suggestComments);
+
+>@@ -296,56 +424,56 @@ SuggestAutoComplete.prototype = {
+
+>+// If there's an existing request, stop it. There is no smart filtering here
+>+// as there is when looking through history/form data because the result set
+>+// returned by the server is different for every typed value - "ocean breathes"
+>+// does not return a subset of the results returned for "ocean", for example.
+
+Instead of messing with the indent, just refactor this into multiple lines so that it wraps at 80 even with the indent.
+
+>     var self = this;
+>     function onReadyStateChange() {
+>       self.onReadyStateChange();
+>     }
+>-    function onError() {
+>-      self.onError();
+>-    }
+>     this._request.onreadystatechange = onReadyStateChange;
+>-    this._request.onerror = onError;
+>     this._request.send(null);
+
+I think Darin said something about this leaking if .send() throws, and recomended setting the handlers after calling .send() to get around that. Not very likely to happen, I guess, and not really relevant to this patch anyways.
+
+>Index: browser/locales/en-US/chrome/browser/search.properties
+
+>+suggestion_label=Suggest
+
+I think Daniel is right that this isn't the best label for this, Beltzner will surely advise. His mockup had a few different ideas.
+(In reply to comment #26)
+> >@@ -211,83 +311,111 @@ SuggestAutoComplete.prototype = {
+> 
+> >+        for (var i = 0; i < results.length; ++i) {
+> >+          if (i == 0)
+> >+            comments[i] = this._strings.GetStringFromName("suggestion_label");
+> >+          else
+> >+            comments[i] = "";
+> >+        }
+> >+
+> >+        // If form history is enabled and has results, add them to the list.
+> >+        if (this._includeFormHistory && this._formHistoryResult &&
+> >+            (this._formHistoryResult.searchResult ==
+> >+             Components.interfaces.nsIAutoCompleteResult.RESULT_SUCCESS)) {
+> >+          for (var i = this._formHistoryResult.matchCount - 1; i >= 0; --i) {
+> >+            var term = this._formHistoryResult.getValueAt(i);
+> >+
+> >+            // remove duplicates from suggest list
+> >+            var dupIndex = results.indexOf(term);
+> >+            if (dupIndex >= 0) {
+> >+
+> >+              // if we'd be deleting the section hint here,
+> >+              // move it to the next entry if necessary
+> >+              if (comments[dupIndex] &&  // removed item has hint
+> >+                  ((dupIndex + 1) < results.length) &&  // have more items
+> >+                  !comments[dupIndex + 1])  // next item doesn't already hint
+> >+                comments[dupIndex + 1] = comments[dupIndex];
+> >+
+> >+              results.splice(dupIndex, 1);
+> >+              comments.splice(dupIndex, 1);
+> >+            }
+> >+
+> >+            // Insert history results; insert blank comments for alignment.
+> >+            results.unshift(term);
+> >+            comments.unshift("");
+> >+          }
+> >+          this._formHistoryResult = null;
+> >+        }
+> 
+> That big if check seems kinda awkward, even with the comments. How about
+> something like this (with better variable names, too):
+> 
+> var suggestResults = /* gotten above */;
+> var suggestComments = [];
+> var historyResults = [];
+> var historyComments = [];
+> 
+> // Create an array of form history results
+> for (var i = this._formHistoryResult.matchCount - 1; i >= 0; --i) {
+>   var term = this._formHistoryResult.getValueAt(i);
+> 
+>   // Remove this result from the suggest results if it's a duplicate.
+>   var dupIndex = suggestResults.indexOf(term);
+>   if (dupIndex != -1)
+>     suggestResults.splice(dupIndex, 1);
+> 
+>   historyResults.unshift(term);
+>   historyComments.unshift("");
+> }
+> 
+> // Give each of the remaining suggest results a blank comment
+> for (var i = 0; i < suggestResults.length; ++i)
+>   suggestComments[i] = "";
+> 
+> // Give the first suggest result a comment to identify the beginning of
+> // suggest results.
+> suggestComments[0] = this._strings.GetStringFromName("suggestion_label");
+> 
+> var finalResults = historyResults.concat(suggestResults);
+> var finalComments = historyComments.concat(suggestComments);
+
+OK, made it something like this...
+
+> 
+> >     var self = this;
+> >     function onReadyStateChange() {
+> >       self.onReadyStateChange();
+> >     }
+> >-    function onError() {
+> >-      self.onError();
+> >-    }
+> >     this._request.onreadystatechange = onReadyStateChange;
+> >-    this._request.onerror = onError;
+> >     this._request.send(null);
+> 
+> I think Darin said something about this leaking if .send() throws, and
+> recomended setting the handlers after calling .send() to get around that. Not
+> very likely to happen, I guess, and not really relevant to this patch anyways.
+
+If you set up the handlers after the send, don't you run the risk of getting a response before a handler exists?
+
+> >Index: browser/locales/en-US/chrome/browser/search.properties
+> 
+> >+suggestion_label=Suggest
+> 
+> I think Daniel is right that this isn't the best label for this, Beltzner will
+> surely advise. His mockup had a few different ideas.
+
+Believe me, Beltzner and I agree that this isn't an ideal implementation (Beltzner's sketches match where I'd like to go with this pretty well).  But I want to get at least this level of functionality landed before doing more drastic changes to the control to get better rendering.  I picked "Suggest" (reluctantly) because it didn't get truncated on smaller screens, but I've changed it back to "Suggestions" for now so you can play with the behavior if you want.
+
+Stay tuned for updated patch.
+
+Created attachment 223378
+'nother go-round
+Comment on attachment 223378
+'nother go-round
+
+Two little things:
+>   getStyleAt: function(index) {
+>-    return null;
+>+    if (!this._comments[index])
+>+      return null;
+>+
+>+    if (index == 0)
+>+      return "suggestfirst";  // category label on first line of results
+>+
+>+    return "suggesthint";   // category label on any other line of results
+>   },
+
+Can you add |// not a category label| on the return null case?
+
+>       var responseText = this._request.responseText;
+>       if (status == 200 && responseText != "") {
+>-        var searchString, results, comments, queryURLs;
+>+        var searchString, results, queryURLs;
+>+        var comments = [];
+
+Declare "comments " right before it's used instead of all the way up here?
+
+This is pretty slick, now that I've tried it. I like it!
+> If you set up the handlers after the send, don't you run 
+> the risk of getting a response before a handler exists?
+
+That's possible in IE, when the object is cached.  Gecko on the other hand always dispatches the load event asynchronously.  See also bug 206520 where the core problem is fixed (trunk only).
+Created attachment 223397
+Addresses Gavin's last two comments
+I'd love to see this in A3, and assuming that it only touches the code that mconnor wrote for suggests, the chances of it bringing down the house are pretty slim even this close to deadline. He and I will discuss it in the morning.
+Comment on attachment 223397
+Addresses Gavin's last two comments
+
+
+>-function SuggestAutoComplete() { }
+>+function SuggestAutoComplete() {}
+> SuggestAutoComplete.prototype = {
+>+
+>+  /**
+>+   * this._strings is the string bundle for message internationalization.
+>+   */
+>+  
+>+  get _strings() {
+>+    if (!this.__strings) {
+>+      var sbs = Components.classes["@mozilla.org/intl/stringbundle;1"]
+>+                .getService(Components.interfaces.nsIStringBundleService);
+
+
+so, since we're not using the shortcut stuff that breaks all of our conventions, line up the periods right, like this:
+
+    var sbs = 
+     Components.classes["@mozilla.org/intl/stringbundle;1"]
+               .getService(Components.interfaces.nsIStringBundleService);
+
+
+>+    this._formHistoryTimer =
+>+      Components.classes["@mozilla.org/timer;1"]
+>+      .createInstance(Components.interfaces.nsITimer);
+
+nit: line up periods
+
+>+  /**
+>+   * This sends an autocompletion request to the form history service,
+>+   * which will call onSearchResults with the results of the query.
+>+   */
+>+  _startFormHistorySearch: function SAC__startFormHistorySearch(
+>+      searchString, searchParam, previousResult) {
+>+    var formHistory = Components
+>+      .classes["@mozilla.org/autocomplete/search;1?name=form-history"]
+>+      .createInstance(Components.interfaces.nsIAutoCompleteSearch);
+>+    formHistory.startSearch(searchString, searchParam, previousResult, this);
+>+  },
+
+zany style here... I think we need to just clean up this file, some of the stuff I remember is weird, could stand some Cc/Ci loving.
+
+Let's do that as a followup though
+Created attachment 223470
+As landed on branch (adds string escaping to the request)
+Created attachment 223483
+fix minor encoding issue
+
+I just checked this in on the branch with r+a=mconnor.
+Landed (with Gavin's tweak) on trunk.
+See bug 339363 for additional UI followup work on this.
+
+
+Properly sort history-based and suggest-based entries in search autocomplete
+
+fixed1.8.1
+
+Integrated local form history results into searchbox suggest results. bug=338061 r=gavin sr=mconnor 

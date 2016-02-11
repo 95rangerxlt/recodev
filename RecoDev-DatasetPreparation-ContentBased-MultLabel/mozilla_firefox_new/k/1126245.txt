@@ -1,0 +1,146 @@
+User Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0
+Build ID: 20150126030202
+
+Steps to reproduce:
+
+Access this URL:http://blog.butecopensource.com/2015/01/26/introducao-a-api-do-youtube-com-jquery/
+
+Click to "Login" with Disqus.
+It will prompt a new window.
+Click "Forgot password".
+
+
+
+
+Actual results:
+
+All tabs crashed.
+
+fcf585b8-e303-4c1d-8b98-f457b81cc2bd
+fa17f998-3a44-4c41-9193-6b886dfb1a23
+
+
+Expected results:
+
+Not crash.
+
+User Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0
+Build ID: 20150126030202
+
+Steps to reproduce:
+
+Access this URL:http://blog.butecopensource.com/2015/01/26/introducao-a-api-do-youtube-com-jquery/
+
+Click to "Login" with Disqus.
+It will prompt a new window.
+Click "Forgot password".
+
+
+
+
+Actual results:
+
+All tabs crashed.
+
+fcf585b8-e303-4c1d-8b98-f457b81cc2bd
+fa17f998-3a44-4c41-9193-6b886dfb1a23
+
+
+Expected results:
+
+Not crash.
+bp-ffc19c06-a578-4479-a668-c39e62150127
+Pushlog:
+https://hg.mozilla.org/integration/mozilla-inbound/pushloghtml?fromchange=68b90a5407b2&tochange=8798cd000e6b
+
+Suspect: Bug 567058
+Created attachment 8555235
+testcase
+
+Steps
+1. Open attached
+2. Click a button to open popup window
+3. Click a link in the popup
+Noting that this has the same crash signature as bug 1116884.
+Thanks Alice. This looks like a great test case.
+Agree, this is reproducible with testcase.
+
+But I could not reproduce in my one attempt with http://blog.butecopensource.com/2015/01/26/introducao-a-api-do-youtube-com-jquery/ on vista laptop (where I am perhaps seeing bug 1116884)
+Created attachment 8557406
+window-test
+
+This tests various ways of opening windows. Mostly we just want to avoid crashing, so it doesn't check much.
+Created attachment 8557408
+crash.html
+
+Here's a testcase similar to Alice's but with a couple variations. It's similar to the automated test, but it's easier to run it manually.
+Created attachment 8557414
+window-fix
+
+This turned out to be a real rat's nest. The basic problem is that window closing is very racy in e10s. Bug 567058 changed the timing a bit so that these bugs are easier to hit, but I don't think it changed anything fundamental.
+
+The test case runs as follows:
+1. User clicks on a link whose onclick handler closes the current window (but doesn't do preventDefault()).
+2. The window.close() call sends a message to the parent asking it to close the tab.
+3. Since the tab is the last one in the chrome window, the parent closes the chrome window.
+4. Closing the chrome window is not immediate. Instead we spins the event loop twice and then actually close it:
+http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.cpp#8572
+(notice the indirect parameter).
+5. Meanwhile in the child process, the onclick handler returns and we try to open the link in a new tab. Doing so takes a few messages: we need to make a PBrowser, send CreateWindow, and then create a PRenderFrame. This stuff needs to finish before the chrome window is closed in the parent or else the parent's message handler will return false and we'll intentionally kill the child.
+
+There are a few things we can depend on. Because messages are dispatched in the order sent, the parent will call window.close() on chrome window before it dispatches the CreateWindow message. Also, although the chrome window won't be closed right away (because the two spins of the event loop), at least GetClosed() will return true starting when window.close() is called.
+
+Therefore, CreateWindow can at least detect when we're in this bad situation (by calling GetClosed). However, it then needs to decide what to do. Non-e10s Firefox's behavior here is a little strange in my opinion. In the crash.html test I attached, there are three variations of the test. In the first two variations, non-e10s Firefox opens the link in a new tab and that tab stays open. In the last variation, the link is never opened [1]. Chrome's behavior seems more reasonable to me. It always opens the link in a new tab and leaves the tab open. If there isn't an obvious window to open it in, it picks the most recent window.
+
+I decided to copy Chrome's behavior in this patch. If CreateWindow detects that we're trying to open a new tab in a window that has been closed, then it finds the most recent open window and opens the tab there instead. This fixes the crash.
+
+Olli, I asked you for feedback to see if this behavior change is okay.
+
+Note that there's still a race here. If the user closes a window at just the time that something in the child calls window.open(), then the parent might still terminate the child. For example, if the window gets closed after CreateWindow returns but before the PRenderFrame constructor is processed, then AllocPRenderFrameParent will return null since it can't find a frameloader. Then the child will be killed. I think this should probably be addressed in a follow-up bug.
+
+[1] It's not opened because we return early here:
+http://mxr.mozilla.org/mozilla-central/source/docshell/base/nsDocShell.cpp#13248
+Comment on attachment 8557414
+window-fix
+
+I guess this should be fine.
+Comment on attachment 8557414
+window-fix
+
+Review of attachment 8557414:
+-----------------------------------------------------------------
+
+::: dom/ipc/TabParent.cpp
+@@ +505,5 @@
+> +
+> +  nsCOMPtr<nsIDOMWindow> latest;
+> +
+> +  bool hasMore = false;
+> +  windowEnumerator->HasMoreElements(&hasMore);
+
+Maybe MOZ_ALWAYS_TRUE(NS_SUCCEEDED(...)) here
+
+@@ +508,5 @@
+> +  bool hasMore = false;
+> +  windowEnumerator->HasMoreElements(&hasMore);
+> +  while (hasMore) {
+> +    nsCOMPtr<nsISupports> item;
+> +    windowEnumerator->GetNext(getter_AddRefs(item));
+
+and here
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/8ff77bd75cad
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/1a49a285e08e
+
+I had to disable the test on b2g because it crashes there (probably for the same reason). Filed bug 1129014.
+https://hg.mozilla.org/mozilla-central/rev/8ff77bd75cad
+https://hg.mozilla.org/mozilla-central/rev/1a49a285e08e
+Mistakenly filed against Firefox 38 and should be instead 38 Branch. Sorry for the spam. dkl
+
+
+[e10s] Crash on Disqus Password Change
+
+crash, regression, reproducible
+
+Bug 1126245 - [e10s] Don't crash when opening new tabs from closed windows (r=bent) 
+
+Bug 1126245 - Add test (r=bent) 

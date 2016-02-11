@@ -1,0 +1,156 @@
+https://dxr.mozilla.org/mozilla-central/source/docshell/base/nsDocShell.cpp#3073,3076
+
+  void
+  nsDocShell::AddProfileTimelineMarker(UniquePtr<TimelineMarker>& aMarker)
+  {
+    if (mProfileTimelineRecording) {
+      mProfileTimelineMarkers.AppendElement(aMarker.release());
+  ...
+
+Usually, a reference to a UniquePtr means that it isn't taking ownership. But that is not the case here.
+
+To be clear that AddProfileTimelineMarker is taking ownership, this method should take a `UniquePtr<TimelineMarker>&&` and we should `mozilla::Move` the marker at the callsite. Additionally, if `mProfileTimelineMarkers` was an array of `UniquePtr`s, then we would get clean up For Free as well. (I don't know if nsTArray can hold move-only types, but mozilla::Vector can).
+
+Thanks, Tromey!
+
+https://dxr.mozilla.org/mozilla-central/source/docshell/base/nsDocShell.cpp#3073,3076
+
+  void
+  nsDocShell::AddProfileTimelineMarker(UniquePtr<TimelineMarker>& aMarker)
+  {
+    if (mProfileTimelineRecording) {
+      mProfileTimelineMarkers.AppendElement(aMarker.release());
+  ...
+
+Usually, a reference to a UniquePtr means that it isn't taking ownership. But that is not the case here.
+
+To be clear that AddProfileTimelineMarker is taking ownership, this method should take a `UniquePtr<TimelineMarker>&&` and we should `mozilla::Move` the marker at the callsite. Additionally, if `mProfileTimelineMarkers` was an array of `UniquePtr`s, then we would get clean up For Free as well. (I don't know if nsTArray can hold move-only types, but mozilla::Vector can).
+
+Thanks, Tromey!
+Created attachment 8579590
+use rvalue reference in AddProfileTimelineMarker
+Created attachment 8579591
+use nsTArray<UniquePtr<>> to hold timeline markers
+
+I pulled this out to a separate patch because the last time around a
+smart-pointer array was not wanted.
+Created attachment 8579594
+use nsTArray<UniquePtr<>> to hold timeline markers
+
+Sigh, forgot to back out an include from when I thought I'd need
+Vector.
+Comment on attachment 8579590
+use rvalue reference in AddProfileTimelineMarker
+
+Review of attachment 8579590:
+-----------------------------------------------------------------
+
+Great!
+Comment on attachment 8579594
+use nsTArray<UniquePtr<>> to hold timeline markers
+
+Review of attachment 8579594:
+-----------------------------------------------------------------
+
+Yay!
+
+::: docshell/base/nsDocShell.cpp
+@@ +2965,3 @@
+>  
+>    for (uint32_t i = 0; i < mProfileTimelineMarkers.Length(); ++i) {
+> +    TimelineMarker* startPayload = mProfileTimelineMarkers[i].get();
+
+Can we get away with a reference to the UniquePtr, so that it is clear that SomeoneElseWillFreeThis (a subclass of SomeoneElsesProblem)?
+
+  UniquePtr<TimelineMarker>& startPayload = ...;
+
+I don't think this would require cascading changes below, because of the -> overloading. If, however, it does require cascading changes, then just ignore this comment.
+
+Same for other .get() uses below.
+Created attachment 8579643
+use nsTArray<UniquePtr<>> to hold timeline markers
+
+Here's a version that removes the .get()s.  To totally do this I had
+to change TimelineMarker::Equals to take a reference, but I think
+that's an improvement as well, as it makes it clear that the argument
+cannot be null.
+(Did you mean to either carry over the r+ or reflag for review?)
+(In reply to Nick Fitzgerald [:fitzgen] from comment #7)
+> (Did you mean to either carry over the r+ or reflag for review?)
+
+I was going to mark them for smaug to review, as he's reviewed the other
+patches in this area.
+Comment on attachment 8579590
+use rvalue reference in AddProfileTimelineMarker
+
+But you still call release(). Do we need it?
+
+(In general I'm not a fan of Move + &&. Tends to make code harder to read.)
+(In reply to Olli Pettay [:smaug] from comment #9)
+> Comment on attachment 8579590
+> use rvalue reference in AddProfileTimelineMarker
+> 
+> But you still call release(). Do we need it?
+
+Yeah, because this first patch doesn't change the type of mProfileTimelineMarkers.
+I split that into a separate patch because in some earlier bug a similar idea
+was rejected (though it wasn't clear why -- and it wasn't your review).
+
+> (In general I'm not a fan of Move + &&. Tends to make code harder to read.)
+
+I think Nick was surprised that this API took a non-const reference and then mutated it.
+Move makes this more clear by requiring the call sites to be explicit.
+(In reply to Tom Tromey :tromey from comment #10)
+> (In reply to Olli Pettay [:smaug] from comment #9)
+> > (In general I'm not a fan of Move + &&. Tends to make code harder to read.)
+> 
+> I think Nick was surprised that this API took a non-const reference and then
+> mutated it.
+> Move makes this more clear by requiring the call sites to be explicit.
+
+It also makes ownership abundantly clear, which jives really well with UniquePtr in general, which exists to make lifetimes and clean up easier.
+Comment on attachment 8579590
+use rvalue reference in AddProfileTimelineMarker
+
+What if one passes a marker without Move()?
+I mean, what does the patch help here? I guess I'm missing something.
+(In reply to Olli Pettay [:smaug] from comment #13)
+> I mean, what does the patch help here? I guess I'm missing something.
+
+If you use a UniquePtr at the call site but leave off the Move, you get
+an error.
+
+            docShell->AddProfileTimelineMarker(marker);
+
+=>
+
+In file included from /home/tromey/firefox-git/workdir-rebase-debugger/obj-x86_64-unknown-linux-gnu/dom/base/Unified_cpp_dom_base0.cpp:47:0:
+/home/tromey/firefox-git/workdir-rebase-debugger/dom/base/Console.cpp: In member function ‘void mozilla::dom::Console::Method(JSContext*, mozilla::dom::Console::MethodName, const nsAString_internal&, const mozilla::dom::Sequence<JS::Value>&)’:
+/home/tromey/firefox-git/workdir-rebase-debugger/dom/base/Console.cpp:1060:54: error: cannot bind ‘mozilla::UniquePtr<TimelineMarker>’ lvalue to ‘mozilla::UniquePtr<TimelineMarker>&&’
+             docShell->AddProfileTimelineMarker(marker);
+                                                      ^
+In file included from /home/tromey/firefox-git/workdir-rebase-debugger/dom/base/Console.cpp:25:0,
+                 from /home/tromey/firefox-git/workdir-rebase-debugger/obj-x86_64-unknown-linux-gnu/dom/base/Unified_cpp_dom_base0.cpp:47:
+/home/tromey/firefox-git/workdir-rebase-debugger/docshell/base/nsDocShell.h:275:8: error:   initializing argument 1 of ‘void nsDocShell::AddProfileTimelineMarker(mozilla::UniquePtr<TimelineMarker>&&)’
+   void AddProfileTimelineMarker(mozilla::UniquePtr<TimelineMarker>&& aMarker);
+        ^
+
+
+The net effect is that the caller must be explicit about the transfer of ownership.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=4f11b63a37a2
+That try run has a failure, but I don't see how it could be caused by this patch.
+I'll rebase & try again when I'm back.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=2e119888568b
+Created attachment 8584571
+use rvalue reference in AddProfileTimelineMarker
+
+Rebased.  Carrying over r+.
+Created attachment 8584574
+use nsTArray<UniquePtr<>> to hold timeline markers
+
+Rebased and updated for MOZ_OVERRIDE removal.
+Carrying over r+.
+https://hg.mozilla.org/integration/fx-team/rev/0af707c2229d
+https://hg.mozilla.org/integration/fx-team/rev/d8a86f570ca9
+https://hg.mozilla.org/mozilla-central/rev/0af707c2229d
+https://hg.mozilla.org/mozilla-central/rev/d8a86f570ca9

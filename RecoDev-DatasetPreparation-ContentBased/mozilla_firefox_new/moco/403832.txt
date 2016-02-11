@@ -1,0 +1,110 @@
+js error, this.tree.view has no properties (fall out from bug #402668?)
+
+in my console, with a new profile, I saw:
+
+************************************************************
+* Call to xpconnect wrapped JSObject produced this error:  *
+[Exception... "'[JavaScript Error: "this.tree.view has no properties" {file: "chrome://global/content/bindings/autocomplete.xml" line: 510}]' when calling method: [nsIAutoCompletePopup::selectedIndex]"  nsresult: "0x80570021 (NS_ERROR_XPC_JAVASCRIPT_ERROR_WITH_DETAILS)"  location: "<unknown>"  data: yes]
+************************************************************
+
+I'm not sure what I did, and I don't remember seeing any problems, but something could be lurking.
+
+note, this tree does not have the change for bug #399664 but it does have the perf fix for bug #402668.
+
+keeping an eye out...
+
+js error, this.tree.view has no properties (fall out from bug #402668?)
+
+in my console, with a new profile, I saw:
+
+************************************************************
+* Call to xpconnect wrapped JSObject produced this error:  *
+[Exception... "'[JavaScript Error: "this.tree.view has no properties" {file: "chrome://global/content/bindings/autocomplete.xml" line: 510}]' when calling method: [nsIAutoCompletePopup::selectedIndex]"  nsresult: "0x80570021 (NS_ERROR_XPC_JAVASCRIPT_ERROR_WITH_DETAILS)"  location: "<unknown>"  data: yes]
+************************************************************
+
+I'm not sure what I did, and I don't remember seeing any problems, but something could be lurking.
+
+note, this tree does not have the change for bug #399664 but it does have the perf fix for bug #402668.
+
+keeping an eye out...
+ok, I've found steps to reproduce this:
+
+1)  create a new profile, or clear your "saved form and search history"
+2) set your home page to google.com
+3) exit, restart (so we load google.com, the home page)
+4) immediately put focus into the input in google.com
+5) type a letter, you'll get this error in the console
+
+note, if I have saved form history, I don't get this error.
+note, I think I've also see this with the url bar.  (will look into steps to reproduce).
+
+the problem is that we call selectedIndex setter (with -1), but in the case of no form history, we haven't unhidden the panel yet.
+
+so, tree.view is null, so accessing this.tree.view.selection gives us the error.
+
+working on a patch.
+Created attachment 288958
+patch
+hmm, maybe it would be cleaner to just check if this.input.popup.hidden, and if so, bail out.
+actually, that's not ideal, as we still want to execute the code if the popup is hidden (say, you had autocomplete results with "abc" but you don't with "abcd".  the popup will be hidden, but we still want to set the selected index to 1.
+
+gavin, any suggestions on what would be cleaner?
+Created attachment 288960
+updated patch, I think this is cleaner.
+I'm not sure I really follow what's going on here - who's calling the selectedIndex setter before the popup is unhidden? The only callers I see from the autocompletecontroller are HandleDelete and ClosePopup, and it's not immediately obvious why either those would be called given your STR.
+it's the caller from ClosePopup().
+
+here's what's going on:
+
+we search (in this case, from nsFormFillController::StartSearch(), and then call nsAutoCompleteController::ProcessResult(), but we have no results (mRowCount is 0)
+
+Then, because of this code:
+
+1227      // Make sure the popup is open, if necessary, since we now
+1228      // have at least one search result ready to display
+1229      if (mRowCount)
+1230        OpenPopup();
+1231      else
+1232        ClosePopup();
+
+we make sure the popup is closed.  But, we've never opened it (so it is still hidden)
+
+ClosePopup() calls SetSelectedIndex(-1), which is why in one of my previous patches I also checked that val was -1.
+Oh, I see... perhaps we should make nsAutoCompleteController::ClosePopup check whether the popup is actually open (popup->GetPopupOpen()) before it calls SetPopupOpen/SetSelectedIndex?
+Created attachment 289091
+patch, bail out of ClosePopup() early if the popup is closed (gavin's suggestion)
+Comment on attachment 289091
+patch, bail out of ClosePopup() early if the popup is closed (gavin's suggestion)
+
+>Index: toolkit/components/autocomplete/src/nsAutoCompleteController.cpp
+
+>+  mInput->GetPopupOpen(&isOpen);
+
+Weird, I didn't realize that there was a "popupOpen" on both nsIAutocompleteInput and nsIAutocompletePopup, I would have expected it only on the latter. These autocomplete interfaces are strange :)
+fixed.
+
+Checking in toolkit/components/autocomplete/src/nsAutoCompleteController.cpp;
+/cvsroot/mozilla/toolkit/components/autocomplete/src/nsAutoCompleteController.cpp,v  <--  nsAutoCompleteController.cpp
+new revision: 1.69; previous revision: 1.68
+done
+this patch might be causing problems, see bug #399664 comment #99
+(In reply to comment #13)
+> this patch might be causing problems, see bug #399664 comment #99
+
+I commented in bug 399664, but I should have commented here. Perhaps we should use the first patch in this bug.
+upon further investigation, it appears my initial assumption was incorrect.
+
+in both scenarios, even with this fix reverted, we aren't calling SetSelectedIndex(-1).
+
+I think what is happening is that, unlike the tree implementation, for the richlist implementation, when the "row" values change, we aren't deleting them.  instead, we're re-setting the attributes.
+
+with the tree, the removal of the row will adjust the selection, and then the selected row will be gone.
+
+If this is indeed what is going on, this is really a problem with the patch in bug #399664 (and this fix can remain "as is").
+
+
+js error, this.tree.view has no properties (regression from bug #402668)
+
+regression
+
+fix for bug #403832 js error, this.tree.view has no properties (regression from bug #402668) r=gavin, a=schrep 

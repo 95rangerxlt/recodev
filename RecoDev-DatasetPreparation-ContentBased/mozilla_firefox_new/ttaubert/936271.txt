@@ -1,0 +1,414 @@
+Spun off from bug 934935...
+
+I was talking to Olli on IRC today and it sounds like it might be okay to avoid storing any data for dynamically-generated frames. The history code makes it pretty easy to check for this:
+
+http://mxr.mozilla.org/mozilla-central/source/docshell/shistory/public/nsISHEntry.idl?mark=220-230#200
+
+There are two approaches we could try:
+1. Don't store any information for child frames if there are any dynamically generated frames on the page.
+2. Skip dynamically generated frames when serializing entries.
+
+Here's a page we can test with: http://mozilla.pettay.fi/moztests/history6/
+
+This would fix the session store problems with Facebook. It won't fix the memory leak aspect.
+
+Spun off from bug 934935...
+
+I was talking to Olli on IRC today and it sounds like it might be okay to avoid storing any data for dynamically-generated frames. The history code makes it pretty easy to check for this:
+
+http://mxr.mozilla.org/mozilla-central/source/docshell/shistory/public/nsISHEntry.idl?mark=220-230#200
+
+There are two approaches we could try:
+1. Don't store any information for child frames if there are any dynamically generated frames on the page.
+2. Skip dynamically generated frames when serializing entries.
+
+Here's a page we can test with: http://mozilla.pettay.fi/moztests/history6/
+
+This would fix the session store problems with Facebook. It won't fix the memory leak aspect.
+It'll fix sessionstore.js size problems, but will it fix the increased UI pauses when collecting session store data? If you still have to loop over all of these iframes to ignore them...
+Looping over 2000 frames in JavaScript is pretty cheap, so I don't think this will be too bad. Obviously it would be better if Facebook were fixed, but this would be a nice optimization either way.
+I don't understand the rationale behind approach #1, but approach #2 definitely makes sense.
+
+C: This should improve collection speed, we'll see how much. We are also working on other optimizations that should also help.
+Created attachment 829170
+Don't collect dynamically created iframes
+
+Here's a first prototype.
+I like the idea and the patch is looking good. This may break some tests that deal with children of dynamic frames but we can fix those.
+
+However, wouldn't that mean we lose data for sites that are dynamically generated? Anything that creates (i)frames with ids while the page is loading? Like a single-page app that for some reason has an iframe with a contact form. If we crash while typing the whole form data will be lost.
+
+This may be negligible if it doesn't occur very often and we could shift the responsibility to website owners but on the other hand crashes are mostly our fault and we might want to take responsibility for lost data.
+(In reply to Tim Taubert [:ttaubert] from comment #5)
+> I like the idea and the patch is looking good. This may break some tests
+> that deal with children of dynamic frames but we can fix those.
+> 
+> However, wouldn't that mean we lose data for sites that are dynamically
+> generated? Anything that creates (i)frames with ids while the page is
+> loading? Like a single-page app that for some reason has an iframe with a
+> contact form. If we crash while typing the whole form data will be lost.
+
+In the current state of things, are we able to recover frame data if an application creates an iframe dynamically?
+
+> This may be negligible if it doesn't occur very often and we could shift the
+> responsibility to website owners but on the other hand crashes are mostly
+> our fault and we might want to take responsibility for lost data.
+
+I suppose we could have some heuristic and only take the first n (with n~3) dynamically created iframes or so.
+I think we need to understand how the history code in Gecko actually restores things. The reason Olli proposed the first approach in comment 0 is that he was worried about the idea of having nsISHEntrys sitting around that don't actually match up to any existing frame. It's not clear what that actually does right now.
+
+To address Tim's question, maybe we would only throw away dynamically generated children if there's no form data to save for them. I'm guessing that this would be the majority of cases.
+I also kind of wonder if we can rely on dynamically generated frames always coming after regular frames. That is, will we ever have frame i be dynamic and frame i+1 be non-dynamic? The only way I could imagine that happening is if JS code is allowed to reorder frames. I don't know if that's possible though.
+That strategy works for me. I won't be available early next week due to PTO + Mozilla Education, so if someone could check out how restoration works in these cases, this would be great.
+(In reply to Bill McCloskey (:billm) from comment #8)
+
+> I also kind of wonder if we can rely on dynamically generated frames always
+> coming after regular frames. That is, will we ever have frame i be dynamic
+> and frame i+1 be non-dynamic? The only way I could imagine that happening is
+> if JS code is allowed to reorder frames. I don't know if that's possible
+> though.
+
+I think all of this is possible, we cannot suppose that dynamic frames always come at the end.
+I'll try and investigate how restoration works in dynamic iframes.
+I have put together a trivial test here: http://yoric.github.io/Bug-936271/ (source: http://github.com/Yoric/Bug-936271) that spawns a dynamic iframe just to determine whether its data is saved in sessionstore.
+
+According to my tests, that data is saved.
+
+This means that not saving dynamically generated iframes will change our semantics.
+Iframes created before the load event will be restored. Iframes created after the load event will (as far as I know) not be restored. I don't see the text in the second iframe in your test getting restored (the one that's created on a 100ms timer). Whether it's restored or not is non-deterministic based on when the load event happens, so this makes sense.
+
+More importantly, though, I tried adding a link to the iframes. If I navigate in them, the navigation is not restored by session restore. I presume that's because the restoration of the history happens even earlier, and the iframes don't exist at that time.
+
+If we continue to save dynamic iframes with form information, I think we'll preserve our current semantics. The only thing to restore for iframes without form information is the history, and it appears that's not getting restored right now.
+(In reply to Bill McCloskey (:billm) from comment #13)
+> Iframes created before the load event will be restored. Iframes created
+> after the load event will (as far as I know) not be restored.
+
+That's also my understanding.
+
+> More importantly, though, I tried adding a link to the iframes. If I
+> navigate in them, the navigation is not restored by session restore. I
+> presume that's because the restoration of the history happens even earlier,
+> and the iframes don't exist at that time.
+
+I have integrated this in the test, thanks.
+
+> If we continue to save dynamic iframes with form information, I think we'll
+> preserve our current semantics. The only thing to restore for iframes
+> without form information is the history, and it appears that's not getting
+> restored right now.
+
+Ok, so we can save form but not history, which is basically what my patch is doing. That should already be an improvement.
+
+Tim, does this sound good to you, too?
+It sounds weird that we only restore form data but if that's the current behavior we might as well trash all those useless child entries if none of them has form data attached.
+Created attachment 8337030
+Don't save history for dynamically generated iframes
+Created attachment 8337031
+Tests
+Try: https://tbpl.mozilla.org/?tree=Try&rev=95e1d31b3ea2
+Comment on attachment 8337030
+Don't save history for dynamically generated iframes
+
+Review of attachment 8337030:
+-----------------------------------------------------------------
+
+LGTM
+Created attachment 8337076
+Tests, v2
+
+Sorry, forgot to fold a patch. Here's the full patch.
+Comment on attachment 8337030
+Don't save history for dynamically generated iframes
+
+Review of attachment 8337030:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ +225,5 @@
+> +    if (shEntry.parent && shEntry.isDynamicallyAdded()) {
+> +      // shEntry.isDynamicallyAdded() is true for dynamically
+> +      // added <iframe> and <frameset>, but also for <html>,
+> +      // so we use shEntry.parent to ensure that we're not
+> +      // dealing with <html>.
+
+Sorry, I don't quite follow that comment. What do you mean by <html>? How can we add that dynamically?
+
+Shouldn't shEntry.parent always be defined/truthy?
+(In reply to Tim Taubert [:ttaubert] from comment #21)
+> Comment on attachment 8337030
+> Don't save history for dynamically generated iframes
+> 
+> Review of attachment 8337030:
+> -----------------------------------------------------------------
+> 
+> ::: browser/components/sessionstore/src/SessionHistory.jsm
+> @@ +225,5 @@
+> > +    if (shEntry.parent && shEntry.isDynamicallyAdded()) {
+> > +      // shEntry.isDynamicallyAdded() is true for dynamically
+> > +      // added <iframe> and <frameset>, but also for <html>,
+> > +      // so we use shEntry.parent to ensure that we're not
+> > +      // dealing with <html>.
+> 
+> Sorry, I don't quite follow that comment. What do you mean by <html>? How
+> can we add that dynamically?
+
+I mean the root of the html document. As far as docShells are concerned, it is added dynamically to the (XUL) document.
+
+> Shouldn't shEntry.parent always be defined/truthy?
+
+shEntry.parent is false for the root of the html document.
+Comment on attachment 8337030
+Don't save history for dynamically generated iframes
+
+Review of attachment 8337030:
+-----------------------------------------------------------------
+
+Oops, I read that wrong. LGTM.
+This will make us throw away form data for dynamically generated iframes too, right?
+Yes, that's certainly not what we want. Sorry, I totally forgot about that.
+(In reply to Bill McCloskey (:billm) from comment #24)
+> This will make us throw away form data for dynamically generated iframes
+> too, right?
+
+Good point.
+Comment on attachment 8337030
+Don't save history for dynamically generated iframes
+
+We of course want to save dynamic shentries if they have form data. Another thing that came to mind is that skipping shentries will break TextAndScrollData.updateFrame() right? That just uses window.frames[] and would possibly assign form data to the wrong frame.
+Actually, while I can imagine the TextAndScrollData.updateFrame() issue, I'm not sure I see why my patch throws away form data.
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #28)
+> Actually, while I can imagine the TextAndScrollData.updateFrame() issue, I'm
+> not sure I see why my patch throws away form data.
+
+TextAndScrollData.updateFrame() is where we save form data. It assumes that SessionHistory.collect will have created the entry; if there's no entry, it skips the iframe.
+
+http://mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/TextAndScrollData.jsm#51
+Ok, so we might need to do things differently, i.e. collect everything and prune hierarchies that are dynamic and without any form data.
+
+However, there's something I don't understand: how do we reuse the form data that we save in sessionstore.js if we can't restore the frame because it's dynamic?
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #30)
+> However, there's something I don't understand: how do we reuse the form data
+> that we save in sessionstore.js if we can't restore the frame because it's
+> dynamic?
+
+Hmm. This bug confuses me more than it should.
+
+(In reply to Bill McCloskey (:billm) from comment #13)
+> Iframes created before the load event will be restored. Iframes created
+> after the load event will (as far as I know) not be restored. I don't see
+> the text in the second iframe in your test getting restored (the one that's
+> created on a 100ms timer).
+
+So we don't actually manage to restore form data in that case, which makes sense. It seems like in theory, restoreDocument() *can* restore text data for dynamic frames but in practice it doesn't because restoreDocument() is called when the load event is fired.
+
+> If we continue to save dynamic iframes with form information, I think we'll
+> preserve our current semantics. The only thing to restore for iframes
+> without form information is the history, and it appears that's not getting
+> restored right now.
+
+It seems that for anything created after the load event, we can throw away form and history data by keeping the current semantics, right?
+(In reply to Tim Taubert [:ttaubert] from comment #31)
+> It seems that for anything created after the load event, we can throw away
+> form and history data by keeping the current semantics, right?
+
+That should have said "and keep the current semantics".
+(In reply to Tim Taubert [:ttaubert] from comment #31)
+> > If we continue to save dynamic iframes with form information, I think we'll
+> > preserve our current semantics. The only thing to restore for iframes
+> > without form information is the history, and it appears that's not getting
+> > restored right now.
+> 
+> It seems that for anything created after the load event, we can throw away
+> form and history data by keeping the current semantics, right?
+
+That is my understanding. Now, I'm not 100% sure that "after the load event" == isDynamicallyCreated().
+So I just check with the example from comment #12 [1] again and it seems that all three of them are marked as dynamically added and would be skipped.
+
+[1] http://yoric.github.io/Bug-936271/
+In that case, we can fall back to plan B: annotate frames that have been inserted dynamically, prune them later if they do not have children with form data.
+Now, since Facebook seems to have fixed their bug, this is not highest priority. Maybe we'll want to wait for bug 942340 data first.
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #35)
+> Now, since Facebook seems to have fixed their bug, this is not highest
+> priority. Maybe we'll want to wait for bug 942340 data first.
+
+I agree.
+The problem seems to appear again in bug 942601, with the "help" of both Twitter and Facebook. I believe that we should pursue this work.
+So, my current approach is the following: in SessionHistory.jsm, we start by walking the tree to determine which entries have descendants that contain forms. Entries that are dynamic and have no descendants that contain forms are never serialized.
+Created attachment 8340382
+Don't save history for dynamically generated iframes except on the current history entry
+
+Here's another approach. This probably won't help with Facebook or Path of Exile, though.
+Comment on attachment 8340382
+Don't save history for dynamically generated iframes except on the current history entry
+
+Review of attachment 8340382:
+-----------------------------------------------------------------
+
+This looks like a good first measure while we transition scroll and form data out of tabData.entries[].
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ -56,5 @@
+>     *
+>     * @param docShell
+>     *        The docShell that owns the session history.
+> -   * @param includePrivateData (optional)
+> -   *        True to always include private data and skip any privacy checks.
+
+You're right that this is currently unused, it was my fault back when we moved shistory collection to a JSM. We should put the privacy level check back for post data:
+
+http://hg.mozilla.org/mozilla-central/rev/3caa785122bf#l4.111
+
+@@ +219,5 @@
+>              children.length = 0;
+>              break;
+>            }
+>  
+> +          children.push(this.serializeEntry(child, isPinned, aIncludeDynamic));
+
+We should check for null entries here and don't push them.
+Is this bug still needed?
+Yeah I think we want to keep this around although it might be fixed at the same time we broadcast session history data.
+Created attachment 8365383
+0001-Bug-936271-Ignore-dynamic-session-history-entries.patch
+
+Stealing. Let's keep your patch that rewrites and renames the test.
+Created attachment 8365384
+0003-Bug-936271-Add-tests-to-ensure-we-ignore-dynamic-his.patch
+
+Adding another test specifically to ensure we ignore dynamic session history entries.
+Gosh, I knew I should have uploaded my updated patch.
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #45)
+> Gosh, I knew I should have uploaded my updated patch.
+
+Why? What's wrong with my patch? I don't understand.
+(In reply to Tim Taubert [:ttaubert] from comment #46)
+> (In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from
+> comment #45)
+> > Gosh, I knew I should have uploaded my updated patch.
+> 
+> Why? What's wrong with my patch? I don't understand.
+
+No problem, just duplication of work, we both updated the patch simultaneously.
+Ugh sorry, duplicating work sucks. I was sure you told me to take that bug some time ago but maybe I misremembered.
+
+The current patch has some only intermittent problems, need to investigate:
+
+https://tbpl.mozilla.org/?tree=Try&rev=43002d48d524
+I'm assuming this is somehow related to browser_597315.js being moved to after browser_599909.js. And maybe some of the recent e10s support changes.
+Comment on attachment 8365383
+0001-Bug-936271-Ignore-dynamic-session-history-entries.patch
+
+Review of attachment 8365383:
+-----------------------------------------------------------------
+
+Remind me, when |SessionHistory.collect(docShell)| is called, are we certain that this docshell is the root docshell?
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ +88,5 @@
+>      return data;
+>    },
+>  
+>    /**
+> +   * Tells whether a given session history entry has been added dynamically.
+
+Nit: It doesn't "tell" anything. Maybe "determines"?
+Comment on attachment 8365384
+0003-Bug-936271-Add-tests-to-ensure-we-ignore-dynamic-his.patch
+
+Review of attachment 8365384:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_dynamic_frames.js
+@@ +12,5 @@
+> +              "<frameset cols=50%25,50%25><frame src=about%3Amozilla>" +
+> +              "<frame src=about%3Arobots></frameset>" +
+> +              "<script>var i=document.createElement('iframe');" +
+> +              "i.setAttribute('src', 'about%3Arights');" +
+> +              "document.body.appendChild(i);</script>";
+
+Nit: Can you mention in cleartext that this URL has:
+- a static frame "about:mozilla";
+- a static frame "about:robots";
+- a dynamic frame "about:rights"
+?
+
+@@ +14,5 @@
+> +              "<script>var i=document.createElement('iframe');" +
+> +              "i.setAttribute('src', 'about%3Arights');" +
+> +              "document.body.appendChild(i);</script>";
+> +
+> +  // Add a new tab with one "static" and one "dynamic" frame.
+
+Well, actually, two static frames.
+
+@@ +43,5 @@
+> + */
+> +add_task(function () {
+> +  const URL = "data:text/html;charset=utf-8," +
+> +              "<iframe name=t src=about%3Amozilla></iframe>" +
+> +              "<a id=a href=about%3Arobots target=t>clickme</a>" +
+
+Could you use another id than 'a'? That's confusing in a <a> tag.
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #50)
+> Remind me, when |SessionHistory.collect(docShell)| is called, are we certain
+> that this docshell is the root docshell?
+
+Yes, the frame script's docShell is always the root docShell for the containing frame loader. There's nothing that prevent's anyone else from using SessionHistory.collect() with any other docShell but sessionstore code doesn't do that.
+
+> > +   * Tells whether a given session history entry has been added dynamically.
+> 
+> Nit: It doesn't "tell" anything. Maybe "determines"?
+
+Meh, we use that wording in other places but I don't mind changing that.
+Created attachment 8365962
+0001-Bug-936271-Ignore-dynamic-session-history-entries-r-.patch, v2
+Created attachment 8365964
+0003-Bug-936271-Add-tests-to-ensure-we-ignore-dynamic-his.patch, v2
+Now what's left to figure out is the weird browser_599909.js failure.
+Created attachment 8366138
+0006-Bug-936271-Flush-frame-script-data-in-browser_819510.patch
+
+I ran into some other intermittent issue on my Windows VM which seems worth fixing.
+Created attachment 8366227
+0005-Bug-936271-Remove-load-event-handling-from-SessionSt.patch
+
+With this patch, the previous patch, and bug 964349 I don't see any failures:
+
+https://tbpl.mozilla.org/?tree=Try&rev=cf13a9a478d3
+
+Also, great to get rid of some more old code that we don't need anymore since we broadcast shistory data.
+https://hg.mozilla.org/integration/fx-team/rev/81a3b56a4147
+https://hg.mozilla.org/integration/fx-team/rev/c5505e97155f
+https://hg.mozilla.org/integration/fx-team/rev/392c8cf7a623
+Backed out in https://hg.mozilla.org/integration/fx-team/rev/d1223e424134 https://hg.mozilla.org/integration/fx-team/rev/bd46860e441d and https://hg.mozilla.org/integration/fx-team/rev/d2c4e022d5ac alongside a backout for the patch from bug 964349 for breaking mochitest-browser-chrome like this: https://tbpl.mozilla.org/php/getParsedLog.php?id=33845117&tree=Fx-Team
+https://hg.mozilla.org/integration/fx-team/rev/f46c65cde5af
+https://hg.mozilla.org/integration/fx-team/rev/007345409abf
+https://hg.mozilla.org/integration/fx-team/rev/e6cf021cd5e6
+https://hg.mozilla.org/mozilla-central/rev/f46c65cde5af
+https://hg.mozilla.org/mozilla-central/rev/007345409abf
+https://hg.mozilla.org/mozilla-central/rev/e6cf021cd5e6
+https://hg.mozilla.org/mozilla-central/rev/007345409abf
+
+
+[Session Restore] Don't save history for dynamically generated iframes
+
+
+
+Bug 936271 - Ignore dynamic session history entries r=yoric 
+
+Bug 936271 - Add tests to ensure we ignore dynamic history entries r=yoric 
+
+Bug 936271 - Remove load event handling from SessionStore.jsm r=yoric 
+
+Backed out changeset 392c8cf7a623 (bug 936271) 
+
+Backed out changeset c5505e97155f (bug 936271) 
+
+Backed out changeset 81a3b56a4147 (bug 936271) 
+
+Bug 936271 - Ignore dynamic session history entries r=yoric 
+
+Bug 936271 - Add tests to ensure we ignore dynamic history entries r=yoric 
+
+Bug 936271 - Remove load event handling from SessionStore.jsm r=yoric 

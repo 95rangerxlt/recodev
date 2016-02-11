@@ -1,0 +1,215 @@
+This is just a hack so far and doesn't completely work yet, but applies labels to things not provided via the profiler, like chrome JS (is location in a devtools frame? tag as "Tools"), and special case with the Startup::XRE frame (but needs to ensure only when this is in the root)
+
+This is just a hack so far and doesn't completely work yet, but applies labels to things not provided via the profiler, like chrome JS (is location in a devtools frame? tag as "Tools"), and special case with the Startup::XRE frame (but needs to ensure only when this is in the root)
+Created attachment 8609879
+1167976-categories.patch
+
+general idea here
+Comment on attachment 8609879
+1167976-categories.patch
+
+Review of attachment 8609879:
+-----------------------------------------------------------------
+
+very nice
+
+::: browser/devtools/performance/modules/global.js
+@@ +367,5 @@
+>  exports.CATEGORY_MASK_LIST = CATEGORY_MASK_LIST;
+>  exports.CATEGORY_OTHER = CATEGORY_OTHER;
+>  exports.CATEGORY_JIT = CATEGORY_JIT;
+> +exports.CATEGORY_IDLE = CATEGORY_IDLE;
+> +exports.CATEGORY_DEVTOOLS = CATEGORY_DEVTOOLS;
+
+Can we just remove CATEGORY_FOO exports, and just call CATEGORY_MASK("foo") everywhere? What do you think?
+Comment on attachment 8609879
+1167976-categories.patch
+
+Review of attachment 8609879:
+-----------------------------------------------------------------
+
+Issues with this where we should check "Idle" is a leaf node, otherwise should be Gecko, as these are the roots of all calls. The times do not all match up, so should probably wait for other profile call tree patches to continue here; I mainly just wanted to see overhead of DT when recording
+
+::: browser/devtools/performance/modules/global.js
+@@ +367,5 @@
+>  exports.CATEGORY_MASK_LIST = CATEGORY_MASK_LIST;
+>  exports.CATEGORY_OTHER = CATEGORY_OTHER;
+>  exports.CATEGORY_JIT = CATEGORY_JIT;
+> +exports.CATEGORY_IDLE = CATEGORY_IDLE;
+> +exports.CATEGORY_DEVTOOLS = CATEGORY_DEVTOOLS;
+
+yes please
+Created attachment 8613333
+1167976-categories.patch
+
+This patch adds categories to platform JS code -- so we can have a category like "Tools" now, so we can see the overhead of instrumenting this code, for example.
+
+Also adds an "Idle" category for when "Startup::XRE_InitChildProcess" is a leaf node. We have to specify the difference when it's a leaf node vs at the bottom of the stack, because every frame will have this as a root most likely. I'm not sure the best way to do this, and I don't love this solution, but maybe there's a more straight forward way.
+Comment on attachment 8613333
+1167976-categories.patch
+
+Review of attachment 8613333:
+-----------------------------------------------------------------
+
+::: browser/devtools/performance/modules/logic/frame-utils.js
+@@ +450,5 @@
+> +}
+> +
+> +function isIdleFrame (frame) {
+> +  return frame.location == "Startup::XRE_InitChildProcess" ||
+> +         frame.location == "Startup::XRE_Main"; // Remove "Startup::XRE_Main" once non-e10s is gone
+
+Drive by f?: We could (should?) add these to platform directly instead of translating them in the frontend. Adding them to the "Category" enum in ProfiingStack.h [0] and then changing the places where entries are added to the pseudostack, like [1].
+
+I'd prefer doing this in platform code to minimize frontend massaging and string dependency. Might wanna ping :djvj and ask for his opinion. He reviewed this stuff when I wrote it.
+
+[0] https://dxr.mozilla.org/mozilla-central/source/js/public/ProfilingStack.h?from=profilingstack.h&case=true#74
+[1] https://dxr.mozilla.org/mozilla-central/source/toolkit/xre/nsEmbedFunctions.cpp?from=nsEmbedFunctions.cpp&case=true#353
+We have a bug for identifying idle nodes, (bug 1152839), but not sure if that can be handled on the profiler's end, because it has to know the context (was there nothing else in the stack? if so, idle)
+
+For this bug I'll remove that stuff and just stick to devtools frames here.
+Comment on attachment 8613333
+1167976-categories.patch
+
+Review of attachment 8613333:
+-----------------------------------------------------------------
+
+I feel like the existing metaCategory machinery should work for this. Chrome JS frames that start with gre/modules/devtools or whatever should get a metaCategory of DEVTOOLS.
+
+::: browser/devtools/performance/modules/logic/frame-utils.js
+@@ -247,5 @@
+>    this.optimizations = frame[OPTIMIZATIONS_SLOT];
+>    this.line = frame[LINE_SLOT];
+>    this.column = undefined;
+> -  this.category = category;
+> -  this.metaCategory = category || CATEGORY_OTHER;
+
+You may be misunderstanding why these are separate.
+
+The metaCategory currently is only displayed for leaf nodes in the call tree (i.e., the FrameNode tree constructed by tree-model.js). The InflatedFrame, on the other hand, is an internal thing to the profile.
+
+So for instance, if I have 2 stacks:
+
+foo -> bar
+foo
+
+The 2 foos will be the *same* InflatedFrame (because they have the same data) but have *different* FrameNodes (because they are in different positions in the tree).
+
+So while an InflatedFrame's .category never changes, whether or not its .metaCategory should be used as its .category depends on where its FrameNode is in that tree.
+
+I think what you're doing here, by combining the two into a single .category property, means every platform frame will be considered a metacategory and displayed as such. Whereas before, only leaf FrameNodes took their metaCategory values.
+
+Now, .metaCategory doesn't need to be cached on the InflatedFrame at all, but I chose to for speed.
+
+@@ +440,5 @@
+> +
+> +  // If no category defined yet, check to see if its a Chrome JS category
+> +  if (!frame.category) {
+> +    if (/resource:\/\/gre\/modules\/devtools/.test(frame.location) ||
+> +        /resource:\/\/\/modules\/devtools/.test(frame.location)) {
+
+No regexps. Change these to do the horrible char-by-char check.
+
+@@ +450,5 @@
+> +}
+> +
+> +function isIdleFrame (frame) {
+> +  return frame.location == "Startup::XRE_InitChildProcess" ||
+> +         frame.location == "Startup::XRE_Main"; // Remove "Startup::XRE_Main" once non-e10s is gone
+
+Nit: === here for the string comparison.
+
+::: browser/devtools/performance/modules/logic/tree-model.js
+@@ +226,5 @@
+> +        // (since we do not want to consider XRE_InitChildProcess frames as idle
+> +        // when they are the root node in pretty much every sample), consider this an idle
+> +        // frame by creating a new InflatedFrame for this frame location, and cache as "idle".
+> +        if (isIdleFrame(inflatedFrame) && isLeaf) {
+> +          if (!inflatedFrameCache["idle"]) {
+
+Don't cache the idle frame in the inflatedFrameCache, especially not with a string key. That's used an array currently with only int32 indices, and accessing a property with a string will mess up the optimizations the engine does.
+
+I'm not understanding why the idle case needs a new InflatedFrame. Can't this be handled by the existing metaCategory machinery?
+Created attachment 8613846
+1167976-categories.patch
+
+Without idle stuff
+ https://treeherder.mozilla.org/#/jobs?repo=try&revision=9724195ff32e
+Comment on attachment 8613846
+1167976-categories.patch
+
+Review of attachment 8613846:
+-----------------------------------------------------------------
+
+No idle?
+
+::: browser/devtools/performance/modules/global.js
+@@ +86,5 @@
+>    "2048": CATEGORIES[6],  // js::ProfileEntry::Category::STORAGE
+>    "4096": CATEGORIES[7],  // js::ProfileEntry::Category::EVENTS
+> +
+> +  // non-bitmasks for specially-assigned categories
+> +  "9000": CATEGORIES[8],
+
+Next one is over nine thousaaand..
+
+::: browser/devtools/performance/modules/logic/tree-model.js
+@@ -471,5 @@
+> -      this.category = CATEGORY_OTHER;
+> -    }
+> -
+> -    // Since only C++ stack frames have associated category information,
+> -    // default to an "unknown" category otherwise.
+
+Nice. The more stuff we get out of this file the better.
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #6)
+> We have a bug for identifying idle nodes, (bug 1152839), but not sure if
+> that can be handled on the profiler's end, because it has to know the
+> context (was there nothing else in the stack? if so, idle)
+> 
+> For this bug I'll remove that stuff and just stick to devtools frames here.
+
+Oh, ok. I didn't think about the 'nothing on the stack' bit. If that's the case, then yes, this should be handled on the frontend.
+Thinking about it more, idle is a hard case. Even if nothing on the stack, it could just be uninstrumented code (ex: some web audio demos that chug hard would look like it has a lot of idle time, but actually its just uninstrumented c++ pseudostacks)
+Turning on stackwalking would somewhat alleviate the problem. We can get real C++ frames, not just pseudostacks, in which case it'd be easier to decide whether or not we consider a sample "idle".
+Created attachment 8614128
+1167976-categories.patch
+
+Added the function we talked about last night -- in tests that use isContent, just added helpers there (don't want to make a frame util export for that because it has side effects of modifying the frame, which can be misleading)
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5a344ca2948b
+Comment on attachment 8614128
+1167976-categories.patch
+
+Review of attachment 8614128:
+-----------------------------------------------------------------
+
+LGTM. Thanks!
+
+::: browser/devtools/performance/modules/logic/frame-utils.js
+@@ +312,5 @@
+>      // where they _are_ spending time. For non-platform hackers, the
+>      // non-leaf platform frames don't give any meaningful context, and so we
+>      // can safely filter them out.
+>      options.isMetaCategoryOut = true;
+> +
+
+Nit: extra new line not needed.
+
+::: browser/devtools/performance/test/unit/test_tree-model-08.js
+@@ +89,5 @@
+> +      let field = fields[j];
+> +      let value = field === "categoryData.abbrev" ? info.categoryData.abbrev : info[field];
+> +      equal(value, expect[j], `${field} for frame #${i} is correct: ${expect[j]}`);
+> +    }
+> +  }
+
+Nice rewrite of the test.
+https://hg.mozilla.org/integration/fx-team/rev/04a3d9130aa0
+https://hg.mozilla.org/mozilla-central/rev/04a3d9130aa0
+
+
+Add additional special cases for categories in the tree view
+
+
+
+Bug 1167976 - Mark platform JS code with category where appropriate. In this case, just "tools" category as devtools JS code. r=vp,shu 

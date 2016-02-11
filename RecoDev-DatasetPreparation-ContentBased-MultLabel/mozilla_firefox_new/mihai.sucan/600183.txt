@@ -1,0 +1,259 @@
+In the Web Console httpObserver we always use the gBrowser object from the currentContext() (which gives use the most recent / the active browser window). This means it's almost guaranteed that the code fails to work when the user loads more tabs in more than one window.
+
+We need to investigate when exactly the httpObserver code fails and how badly it does. If important, we need to fix the bug. It should be easy to do this.
+
+In the Web Console httpObserver we always use the gBrowser object from the currentContext() (which gives use the most recent / the active browser window). This means it's almost guaranteed that the code fails to work when the user loads more tabs in more than one window.
+
+We need to investigate when exactly the httpObserver code fails and how badly it does. If important, we need to fix the bug. It should be easy to do this.
+Created attachment 480992
+proposed fix and test code
+
+Proposed fix and test code.
+
+This patch changes the network logging code such that the currentContext() is no longer used. It determines the correct browser element. The initial code also mistakenly used gBrowser (instance of tabbrowser) instead of browser.
+
+The reason why such code existed was to correctly find the charset ... to convert the request and response bodies to utf8. However, there were still errors. Response bodies on baidu.com, for example, looked garbled inside the Network panel. This patch also fixes that issue.
+Comment on attachment 480992
+proposed fix and test code
+
+
+>diff --git a/toolkit/components/console/hudservice/tests/browser/test-bug-600183-charset.html^headers^ b/toolkit/components/console/hudservice/tests/browser/test-bug-600183-charset.html^headers^
+>new file mode 100644
+>--- /dev/null
+>+++ b/toolkit/components/console/hudservice/tests/browser/test-bug-600183-charset.html^headers^
+>@@ -0,0 +1,1 @@
+>+Content-Type: text/html; charset=gb2312
+
+Why is this in a separate file, named this way?
+
+
+Looks nice and surgical!
+(In reply to comment #2)
+> Comment on attachment 480992 [details]
+> proposed fix and test code
+> 
+> 
+> >diff --git a/toolkit/components/console/hudservice/tests/browser/test-bug-600183-charset.html^headers^ b/toolkit/components/console/hudservice/tests/browser/test-bug-600183-charset.html^headers^
+> >new file mode 100644
+> >--- /dev/null
+> >+++ b/toolkit/components/console/hudservice/tests/browser/test-bug-600183-charset.html^headers^
+> >@@ -0,0 +1,1 @@
+> >+Content-Type: text/html; charset=gb2312
+> 
+> Why is this in a separate file, named this way?
+
+This is the way we change change HTTP headers for any web page inside Mochitests.
+
+See:
+https://developer.mozilla.org/en/Mochitest#How_do_I_change_the_HTTP_headers_or_status_sent_with_a_file_used_in_a_Mochitest.3f
+
+> Looks nice and surgical!
+
+Thanks for the feedback+!
+Comment on attachment 480992
+proposed fix and test code
+
+Asking for review from Shawn Wilsher.
+Requesting blocking for this bug... put into English, if someone opens another tab while receiving network data in the first tab, the results logged in the console of that first tab will use things like character set from the *new* tab.
+I've actually hit this many times and keep forgetting to file a bug on this.  This makes the network logging bits of the console rather useless, so we should absolutely block on it.
+Comment on attachment 480992
+proposed fix and test code
+
+>+++ b/toolkit/components/console/hudservice/HUDService.jsm
+>   convertToUnicode: function NH_convertToUnicode(aText, aCharset)
+>   {
+>+    if (!aCharset) {
+>+      return aText;
+>+    }
+>+
+>     let conv = Cc["@mozilla.org/intl/scriptableunicodeconverter"].
+>                createInstance(Ci.nsIScriptableUnicodeConverter);
+>+    conv.charset = aCharset;
+>+
+>+    try {
+>+      return conv.ConvertToUnicode(aText);
+>+    }
+>+    catch (ex) {
+>+      Cu.reportError("NH_convertToUnicode(aText, '" +
+>+        aCharset + "') exception: " + ex);
+>+      return aText;
+>+    }
+Please add a comment about why you need this change.  I suspect it's because web pages aren't good about using text that is encoded as it says it is, but maybe it's something else.
+
+>+                let gBrowser = msgObject.messageNode.ownerDocument.
+>+                  defaultView.gBrowser;
+so, this is weird style-wise.  We'd generally do something like this:
+let gBrowser = msgObject.messageNode.ownerDocument.
+               defaultView.gBrowser;
+or this:
+let gBrowser = msgObject.messageNode.ownerDocument
+                        .defaultView.gBrowser;
+or, if it fits, this:
+let gBrowser =
+  msgObject.messageNode.ownerDocument.defaultView.gBrowser;
+
+I prefer the second or third ones, but I don't really care which of those three you pick.
+
+>+                let browser = gBrowser.getBrowserForDocument(HUD.
+>+                  contentDocument);
+likewise here (probably want to go with something like the third option)
+
+>+                let sentBody = NetworkHelper.
+>+                  readPostTextFromRequest(aChannel, browser);
+and here (third option again probably)
+
+(I'll note that it's really unfortunate that we are indented so far here too.  It might be a good idea to refactor this stuff so we can get some more line length back too)
+
+>+++ b/toolkit/components/console/hudservice/tests/browser/browser_webconsole_bug_600183_charset.js
+>+function performTest()
+>+{
+>+  ok(lastFinishedRequest, "charset test page was loaded and logged");
+>+
+>+  let body = lastFinishedRequest.response.body;
+>+  ok(body, "we have the response body");
+>+
+>+  let chars = "\u7684\u95ee\u5019!"; // çé®å!
+>+  isnot(body.indexOf("<p>" + chars + "</p>"), -1,
+>+    "found the chinese simplified string");
+>+
+>+  finishTest();
+This should really be done with http://mxr.mozilla.org/mozilla-central/source/testing/mochitest/browser-test.js#349.  The benefit is that it will also run when the test fails so it's less likely to cause other tests to fail because its state was left around.
+
+>+}
+>+
+>+function finishTest()
+>+{
+>+  lastFinishedRequest = null;
+>+  HUDService.saveRequestAndResponseBodies = false;
+>+  HUDService.lastFinishedRequestCallback = null;
+>+  HUDService.deactivateHUDForContext(gBrowser.selectedTab);
+>+
+>+  executeSoon(function() {
+>+    gBrowser.removeCurrentTab();
+>+    finish();
+>+  });
+And then I think you can get rid of the executeSoon for removing tabs, but you'll need to call finish outside of this method.
+
+r=sdwilsh with comments addressed
+(In reply to comment #7)
+> Comment on attachment 480992 [details]
+> proposed fix and test code
+> 
+> >+++ b/toolkit/components/console/hudservice/HUDService.jsm
+> >   convertToUnicode: function NH_convertToUnicode(aText, aCharset)
+> >   {
+> >+    if (!aCharset) {
+> >+      return aText;
+> >+    }
+> >+
+> >     let conv = Cc["@mozilla.org/intl/scriptableunicodeconverter"].
+> >                createInstance(Ci.nsIScriptableUnicodeConverter);
+> >+    conv.charset = aCharset;
+> >+
+> >+    try {
+> >+      return conv.ConvertToUnicode(aText);
+> >+    }
+> >+    catch (ex) {
+> >+      Cu.reportError("NH_convertToUnicode(aText, '" +
+> >+        aCharset + "') exception: " + ex);
+> >+      return aText;
+> >+    }
+> Please add a comment about why you need this change.  I suspect it's because
+> web pages aren't good about using text that is encoded as it says it is, but
+> maybe it's something else.
+
+That is correct. Having played with this code I found it throws exceptions if the web page has corrupt text encoding.
+
+> >+                let gBrowser = msgObject.messageNode.ownerDocument.
+> >+                  defaultView.gBrowser;
+> so, this is weird style-wise.  We'd generally do something like this:
+> let gBrowser = msgObject.messageNode.ownerDocument.
+>                defaultView.gBrowser;
+
+Sure, no problem. I'll fix the code styling.
+
+> (I'll note that it's really unfortunate that we are indented so far here too. 
+> It might be a good idea to refactor this stuff so we can get some more line
+> length back too)
+
+Yeah, I know, but I didn't want to make this patch bug and hard to review just to refactor the deepness - and because we are quite late in the Firefox 4 dev process.
+
+> >+++ b/toolkit/components/console/hudservice/tests/browser/browser_webconsole_bug_600183_charset.js
+> >+function performTest()
+> >+{
+> >+  ok(lastFinishedRequest, "charset test page was loaded and logged");
+> >+
+> >+  let body = lastFinishedRequest.response.body;
+> >+  ok(body, "we have the response body");
+> >+
+> >+  let chars = "\u7684\u95ee\u5019!"; // çé®å!
+> >+  isnot(body.indexOf("<p>" + chars + "</p>"), -1,
+> >+    "found the chinese simplified string");
+> >+
+> >+  finishTest();
+> This should really be done with
+> http://mxr.mozilla.org/mozilla-central/source/testing/mochitest/browser-test.js#349.
+>  The benefit is that it will also run when the test fails so it's less likely
+> to cause other tests to fail because its state was left around.
+> 
+> >+}
+> >+
+> >+function finishTest()
+> >+{
+> >+  lastFinishedRequest = null;
+> >+  HUDService.saveRequestAndResponseBodies = false;
+> >+  HUDService.lastFinishedRequestCallback = null;
+> >+  HUDService.deactivateHUDForContext(gBrowser.selectedTab);
+> >+
+> >+  executeSoon(function() {
+> >+    gBrowser.removeCurrentTab();
+> >+    finish();
+> >+  });
+> And then I think you can get rid of the executeSoon for removing tabs, but
+> you'll need to call finish outside of this method.
+
+Indeed. Both issues will be solved once I rebase the patch on top of the latest mozilla-central code. There's already stuff that does this.
+
+> r=sdwilsh with comments addressed
+
+Thanks for the review+!
+Created attachment 484794
+rebased patch
+
+Rebased the patch and addressed the review comments. Thanks Shawn!
+if this patch applies, I think we should put the checkin-needed keyword here and get it landed.
+with this applied, I'm getting the following errors:
+
+INFO TEST-START | Shutdown
+Browser Chrome Test Summary
+	Passed: 419
+	Failed: 2
+	Todo: 0
+
+*** End BrowserChrome Test Results ***
+INFO | automation.py | Application ran for: 0:00:48.307913
+INFO | automation.py | Reading PID log: /var/folders/Bv/BvxnJzazGzeR6Yy4QRUEFU+++TI/-Tmp-/tmpa0gSfipidlog
+WARNING | automationutils.processLeakLog() | refcount logging is off, so leaks can't be detected!
+
+INFO | runtests.py | Running tests: end.
+mochitest-browser-chrome failed:
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/toolkit/components/console/hudservice/tests/browser/browser_webconsole_netlogging.js | Request body was logged - Got undefined, expected Hello world!
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/toolkit/components/console/hudservice/tests/browser/browser_webconsole_netlogging.js | Test timed out
+make: *** [mochitest-browser-chrome] Error 1
+Created attachment 491844
+patch for checkin
+Created attachment 491908
+[checked-in] rebased patch
+
+Rebased the patch. Doing this also fixed the test failures.
+Comment on attachment 491908
+[checked-in] rebased patch
+
+http://hg.mozilla.org/mozilla-central/rev/f373642ac372
+
+
+Web Console: currentContext is always used in network logging code
+
+
+
+Bug 600183 - Web Console: currentContext is always used in network logging code; f=ddahl r=sdwilsh a=blocking2.0 

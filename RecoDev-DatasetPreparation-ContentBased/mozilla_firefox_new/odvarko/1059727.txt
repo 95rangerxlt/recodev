@@ -1,0 +1,353 @@
+This report is fork from Bug 1036949 (New API: MarkupView customization)
+
+The purpose of this report is to modify toolbox API, so extensions can access panel instances extend them and provide new features.
+
+Two goals here:
+
+1) Get reference to a toolbox panel instance as soon as it's created. This allows registering event listeners (before any events are fired) and also set necessary properties on the panel itself.
+
+2) Get panel frame element as soon as it's created. This allows to set proper attributes on it before it's loaded.
+
+---
+
+It's currently impossible to get instance of an existing panel (and panel-frame) at the right time. Panel instance is created inside Tool.build method and the reference is not returned from it. Return value is a promise that is resolved asynchronously. Registering listeners after the promise is resolved is too late since some events are already fired.
+
+A solution is to return panel instance directly from the build method, fire an event that allows extension to access the panel and continue with panel build process by calling panel.open() method explicitly. 
+
+There should be following events in order to allow hooking panel creation process.
+
+* "<panelId>-init" - after panel iframe is created
+* "<panelId>-build" - after panel iframe is loaded and panel instance created
+* "<panelId>-ready" - after panel's (async) initialization sequence is finished.
+
+
+Here is a code snippet that demonstrates when these events are fired (toolbox.js):
+
+Toolbox.loadTool = function(id) {
+
+...
+
+let definition = gDevTools.getToolDefinition(id);
+
+iframe = this.doc.createElement("iframe");
+// ...set iframe attributes
+
+// Fire an event saying that the <iframe> element is created
+gDevTools.emit(id + "-init", this, iframe);
+
+// onLoad is called when the iframe content is loaded.
+let onLoad = () => {
+
+  // Call panel-definition's build method. It should return instance of the panel.
+  let panel = definition.build(iframe.contentWindow, this);
+
+  // Store reference to the panel, so it's accessible any time later
+  // (e.g. for bootstrapped extension installed in the middle of Fx session)
+  iframe.contentWindow.panel = panel;
+
+  // Fire an event saying the panel is instanciated.
+  // Extensions can register listeners now.
+  this.emit(id + "-build", panel);
+
+  // Call 'open' on the panel.
+  let built = panel.open();
+  promise.resolve(built).then((panel) => {
+    ...
+    // Fire when panel is ready (an existing event)
+    this.emit(id + "-ready", panel);
+    ...
+  });
+);
+
+iframe.setAttribute("src", definition.url);
+
+
+
+
+Honza
+
+This report is fork from Bug 1036949 (New API: MarkupView customization)
+
+The purpose of this report is to modify toolbox API, so extensions can access panel instances extend them and provide new features.
+
+Two goals here:
+
+1) Get reference to a toolbox panel instance as soon as it's created. This allows registering event listeners (before any events are fired) and also set necessary properties on the panel itself.
+
+2) Get panel frame element as soon as it's created. This allows to set proper attributes on it before it's loaded.
+
+---
+
+It's currently impossible to get instance of an existing panel (and panel-frame) at the right time. Panel instance is created inside Tool.build method and the reference is not returned from it. Return value is a promise that is resolved asynchronously. Registering listeners after the promise is resolved is too late since some events are already fired.
+
+A solution is to return panel instance directly from the build method, fire an event that allows extension to access the panel and continue with panel build process by calling panel.open() method explicitly. 
+
+There should be following events in order to allow hooking panel creation process.
+
+* "<panelId>-init" - after panel iframe is created
+* "<panelId>-build" - after panel iframe is loaded and panel instance created
+* "<panelId>-ready" - after panel's (async) initialization sequence is finished.
+
+
+Here is a code snippet that demonstrates when these events are fired (toolbox.js):
+
+Toolbox.loadTool = function(id) {
+
+...
+
+let definition = gDevTools.getToolDefinition(id);
+
+iframe = this.doc.createElement("iframe");
+// ...set iframe attributes
+
+// Fire an event saying that the <iframe> element is created
+gDevTools.emit(id + "-init", this, iframe);
+
+// onLoad is called when the iframe content is loaded.
+let onLoad = () => {
+
+  // Call panel-definition's build method. It should return instance of the panel.
+  let panel = definition.build(iframe.contentWindow, this);
+
+  // Store reference to the panel, so it's accessible any time later
+  // (e.g. for bootstrapped extension installed in the middle of Fx session)
+  iframe.contentWindow.panel = panel;
+
+  // Fire an event saying the panel is instanciated.
+  // Extensions can register listeners now.
+  this.emit(id + "-build", panel);
+
+  // Call 'open' on the panel.
+  let built = panel.open();
+  promise.resolve(built).then((panel) => {
+    ...
+    // Fire when panel is ready (an existing event)
+    this.emit(id + "-ready", panel);
+    ...
+  });
+);
+
+iframe.setAttribute("src", definition.url);
+
+
+
+
+Honza
+Tracking issue on Firebug side:
+https://github.com/firebug/firebug.next/issues/67
+
+Honza
+Created attachment 8480553
+bug1059727-1.patch
+
+The attached patch implements suggested events, updates existing panel registration and tests.
+
+@Joe: who do you think could do the review?
+
+@Irakli: This is also slightly related (but not in a collision) with Bug 980410 - Toolbox panel API
+
+Here is a commit with related changes in Add-on SDK (based on bug/low-level-devpanel branch)
+https://github.com/janodvarko/addon-sdk/commit/fc403e0425222bfb786a139e96d1ca172df982b3
+
+
+Thoughts?
+
+Honza
+I suggest pinging Brian for review.
+Comment on attachment 8480553
+bug1059727-1.patch
+
+Review of attachment 8480553:
+-----------------------------------------------------------------
+
+We need to think about backwards compatibility for existing extensions.  Could we make build() optionally return a promise as it currently does, in which case loadTool would just skip calling open() or firing (id + "build") events?  Or do you have another idea of how to support backwards - compat?
+Created attachment 8482302
+bug1059727-2.patch
+
+(In reply to Brian Grinstead [:bgrins] from comment #4)
+> We need to think about backwards compatibility for existing extensions. 
+> Could we make build() optionally return a promise as it currently does, in
+> which case loadTool would just skip calling open() or firing (id + "build")
+> events?  Or do you have another idea of how to support backwards - compat?
+Yep, I was also thinking about skipping open, see the patch (back comp supported).
+
+Honza
+@Irakli: I think we could yet append something like:
+
+if (typeof definition.init == "function")
+  definition.init(iframe, this);
+
+.. at the place where the "*-init" events are fired. This could help to avoid the hack in the SDK, where the panel's iframe is recreated and improve performance a bit since the panel wouldn't have to wait to load two iframes. See also the first version of the patch. I removed it from the second version since it needs more testing and should be done (if we want to) in separate bug.
+
+Honza
+Comment on attachment 8482302
+bug1059727-2.patch
+
+Review of attachment 8482302:
+-----------------------------------------------------------------
+
+::: browser/devtools/framework/test/browser_devtools_api.js
+@@ -21,5 @@
+>      visibilityswitch: "devtools.test-tool.enabled",
+>      url: "about:blank",
+>      label: "someLabel",
+>      build: function(iframeWindow, toolbox) {
+> -      let panel = new DevToolPanel(iframeWindow, toolbox);
+
+Please add an extra tool definition in this test that does the old-style return panel.open() to ensure we don't break that in the future.  In addition, can you make this test check the "-init", "-build", "-ready" events are firing appropriately?
+
+::: browser/devtools/framework/toolbox.js
+@@ +878,5 @@
+> +    this.emit(id + "-init", iframe);
+> +    gDevTools.emit(id + "-init", this, iframe);
+> +
+> +    // If no parent yet, append the frame into default location.
+> +    if (!iframe.parentNode) {
+
+What is the exact purpose of passing the iframe into the -init event?  You mention:
+
+2) Get panel frame element as soon as it's created. This allows to set proper attributes on it before it's loaded.
+
+But in this condition it looks like you are also wanting the ability to append the iframe to a custom parent node.  I guess there isn't much harm in adding that, but I'm curious when it is useful.
+
+If this is necessary, we should have a quick test case in browser_devtools_api that makes sure it doesn't break.
+
+@@ +895,2 @@
+>        let built = definition.build(iframe.contentWindow, this);
+> +      if (!isPromise(built)) {
+
+I think this check could be replaced with `!(built instanceof Promise)`
+
+@@ +896,5 @@
+> +      if (!isPromise(built)) {
+> +        let panel = built;
+> +        iframe.panel = panel;
+> +
+> +        this.emit(id + "-build", panel);
+
+Shouldn't this.emit and gDevTools.emit send the same arguments?  In this case is the iframe necessary for the gDevTools -build event to include?
+Created attachment 8484946
+bug1059727-3.patch
+
+Thanks for the review Brian!
+
+> Please add an extra tool definition in this test that does the old-style return
+> panel.open() to ensure we don't break that in the future.  In addition, can you
+> make this test check the "-init", "-build", "-ready" events are firing appropriately?
+Yep, done 
+
+> But in this condition it looks like you are also wanting the ability to append
+> the iframe to a custom parent node.
+Yes, precisely! The ability to put the iframe in a custom XUL structure allows
+extensions to provide new layout of the panel in which the iframe is located.
+
+> I think this check could be replaced with `!(built instanceof Promise)`
+Done
+
+> Shouldn't this.emit and gDevTools.emit send the same arguments? 
+Nice catch! Fixed 
+
+> In this case is the iframe necessary for the gDevTools -build event to include?
+Agree, I removed the iframe argument.
+
+I also reverted the order of emitted events. First gDevTools and then the toolbox.
+This allows to catch the *-init event through the gDevTools global and before
+the init is fired on the toolbox i.e. get reference to the toolbox in time.
+(see the test)
+
+Honza
+Comment on attachment 8484946
+bug1059727-3.patch
+
+Review of attachment 8484946:
+-----------------------------------------------------------------
+
+This looks fine, just a few nits and a test change
+
+::: browser/devtools/framework/test/browser_devtools_api.js
+@@ +153,2 @@
+>  
+> +  gDevTools.unregisterTool(toolId2);
+
+Need to make sure to unregister toolId1 as well
+
+::: browser/devtools/framework/toolbox.js
+@@ +887,5 @@
+>      let onLoad = () => {
+>        // Prevent flicker while loading by waiting to make visible until now.
+>        iframe.style.visibility = "visible";
+>  
+> +      // The build method should return panel instance, so events can
+
+'return a panel instance'
+
+@@ +888,5 @@
+>        // Prevent flicker while loading by waiting to make visible until now.
+>        iframe.style.visibility = "visible";
+>  
+> +      // The build method should return panel instance, so events can
+> +      // be fired with the panel as an argument. However, in order too keep
+
+'in order to keep'
+
+@@ +904,5 @@
+> +        // initialization sequence.
+> +        if (typeof panel.open == "function") {
+> +          built = panel.open();
+> +        }
+> +        else {
+
+else on same line as }
+Created attachment 8485664
+bug1059727-4.patch
+
+Updated patch attached.
+
+Honza
+(In reply to Jan Honza Odvarko [:Honza] from comment #10)
+> Created attachment 8485664
+> bug1059727-4.patch
+> 
+> Updated patch attached.
+> 
+> Honza
+
+Do we need to wait for feedback Irakli (in needinfo?) before landing this?
+(In reply to Brian Grinstead [:bgrins] from comment #11)
+> (In reply to Jan Honza Odvarko [:Honza] from comment #10)
+> Do we need to wait for feedback Irakli (in needinfo?) before landing this?
+No, I removed the specific part in comment #6
+(the part related to the feedback)
+
+Honza
+Probably shouldn't have removed the flag - see comment #6
+Comment on attachment 8485664
+bug1059727-4.patch
+
+Review of attachment 8485664:
+-----------------------------------------------------------------
+
+Looks good - pushed to try: https://tbpl.mozilla.org/?tree=Try&rev=3d615256fa18
+We should update the documentation as this lands at https://developer.mozilla.org/en-US/docs/Tools/DevToolsAPI.
+https://hg.mozilla.org/integration/fx-team/rev/0871676b8d90
+I do believe this is another take on what I've reported earlier in Bug 1049188, that being said API proposed in that bug would have being more convenient from the SDK perspective. I don't see any problem with exposing more initialization state events as long as API is backwards compatible & from what I can tell that is the case.
+(In reply to Irakli Gozalishvili [:irakli] [:gozala] [@gozala] from comment #17)
+> I do believe this is another take on what I've reported earlier in Bug
+> 1049188,
+But the bug #1049188 doesn't solve the problem that the original panel's iframe
+is cloned and recreated, correct?
+
+> I don't see any problem with exposing
+> more initialization state events as long as API is backwards compatible &
+> from what I can tell that is the case.
+Great!
+
+Honza
+https://hg.mozilla.org/mozilla-central/rev/0871676b8d90
+
+
+New API: Toolbox panel initialization events
+
+dev-doc-needed
+
+Bug 1059727 - Add API to fire a new Toolbox panel initialization events. r=bgrins 

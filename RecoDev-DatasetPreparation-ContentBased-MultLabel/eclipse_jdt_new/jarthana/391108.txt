@@ -1,0 +1,286 @@
+BETA_JAVA8:
+
+The following program compiles alright with ECJ while it should not.
+
+// -------------
+public class X {
+	@Marker public void foo() {
+	}
+}
+
+@java.lang.annotation.Target (java.lang.annotation.ElementType.TYPE_USE)
+@interface Marker {
+}
+
+BETA_JAVA8:
+
+The following program compiles alright with ECJ while it should not.
+
+// -------------
+public class X {
+	@Marker public void foo() {
+	}
+}
+
+@java.lang.annotation.Target (java.lang.annotation.ElementType.TYPE_USE)
+@interface Marker {
+}
+I found this during the code review for bug 390891. Please see that
+there is already a IProblem constant IllegalUsageOfTypeAnnotations
+and a message 
+
+641 = Type annotation is illegal for a method that returns void
+
+The problem constant should be renamed IllegalTypeAnnotationsOnVoidMethod.
+Likewise the message should be changed to
+
+641 = Type annotations are illegal here as this method returns void
+The problem lies in SourceTypeBinding.resolveTypesFor(MethodBinding). We invoke method.getAnnotationTagBits() even before the return type is resolved and set for the method binding. But resolving the annotations itself requires a complete method binding.
+
+We either have to push the code that invokes method.getAnnotationTagBits() down or move the code that reports the error from Annotation#resolveType() to SourceTypeBinding. Basically, it's a question of how early/late do we want to resolve annotations for a method. Of course, we can't resolve either of them completely without the other. I am working on a patch.
+Stephan understands the nuances here better.
+Jay, please take a look at org.eclipse.jdt.internal.compiler.ast.TypeReference.baseTypeReference(int, int, Annotation[][])
+
+It would be a very straightforward fix to reject annotations on void types
+there.
+(In reply to comment #4)
+> Jay, please take a look at
+> org.eclipse.jdt.internal.compiler.ast.TypeReference.baseTypeReference(int,
+> int, Annotation[][])
+> 
+> It would be a very straightforward fix to reject annotations on void types
+> there.
+
+Spoke too soon - At the place we are talking about, SE8 annotations show up
+as SE5 annotations and the discrimination can happen only later. And SE5 
+annotations *are* legal there - So please ignore this suggestion and we need 
+to start the investigation with a clean slate.
+There is some code in org.eclipse.jdt.internal.compiler.ast.Annotation.resolveType(BlockScope)
+(search for illegalUsageOfTypeAnnotations) that is not working for some
+reason.
+(In reply to comment #6)
+> There is some code in
+> org.eclipse.jdt.internal.compiler.ast.Annotation.resolveType(BlockScope)
+> (search for illegalUsageOfTypeAnnotations) that is not working for some
+> reason.
+
+Either it never worked or the timing of the request for resolving annotation has been altered. This is the code I was referring to in comment #2 by "or move the code that reports the error"
+(In reply to comment #7)
+
+> Either it never worked or the timing of the request for resolving annotation
+> has been altered. This is the code I was referring to in comment #2 by "or
+> move the code that reports the error"
+
+I see. I could confirm that the original patch did not have any tests
+eliciting this message.
+In SourceTypeBinding:1591, the return type is resolved.
+If the resolved return type is void and method declaration
+has any type use annotations, we should report an error.
+
+Jay, please investigate this approach.
+(In reply to comment #9)
+> In SourceTypeBinding:1591, the return type is resolved.
+> If the resolved return type is void and method declaration
+> has any type use annotations, we should report an error.
+
+Indeed, this would work and my initial investigation (mentioned in comment #2) early on showed this. But I was more keen on just keeping all the annotation related validations to Annotation. I will explore both options and see which one turns out simpler.
+(In reply to comment #2)
+> The problem lies in SourceTypeBinding.resolveTypesFor(MethodBinding). We
+> invoke method.getAnnotationTagBits() even before the return type is resolved
+> and set for the method binding. But resolving the annotations itself
+> requires a complete method binding.
+> 
+> We either have to push the code that invokes method.getAnnotationTagBits()
+> down or move the code that reports the error from Annotation#resolveType()
+> to SourceTypeBinding. Basically, it's a question of how early/late do we
+> want to resolve annotations for a method. Of course, we can't resolve either
+> of them completely without the other. I am working on a patch.
+
+Not sure if this is still relevant: For annotation based null analysis I made some changes to when annotations on arguments are resolved, but no change regarding method annotations.
+The only assumption that should be maintained here is: method annotations have been resolved before the call to createArgumentBindings(method).
+Created attachment 222315
+Proposed fix
+
+Patch under consideration. All Java 8 tests pass. Currently running all tests.
+Created attachment 222375
+Alternate fix
+
+Jay, please take a look:
+
+   - Eliminates comments in Annotation.java
+   - Handles complaining on annotations on void [] array methods.
+   - Refactors common code.
+   - Eliminates changes to irrelevant parts
+   - Sets the state foundReturnTypeProblem properly for all cases.
+
+Java8 tests pass.
+Please review and release after testing if you agree. Could you add a test
+for void [] case ?
+
+@Marker void [] foo() {
+} 
+
+and
+
+@Marker void foo() [] {
+}
+(In reply to comment #13)
+> Created attachment 222375 [details]
+> Alternate fix
+> 
+> Jay, please take a look:
+> 
+>    - Eliminates comments in Annotation.java
+>    - Handles complaining on annotations on void [] array methods.
+>    - Refactors common code.
+>    - Eliminates changes to irrelevant parts
+>    - Sets the state foundReturnTypeProblem properly for all cases.
+> 
+> Java8 tests pass.
+
+Couple of questions:
+1. void[] being an illegal return type, we already know the method has problems with the return type and needs to be fixed. At this point, why should we bother about the validating the annotations? It's extra work since we are not sure if the code was intended to have void as return type.
+
+2. The method itself is alright with the return type. What relevance does the foundReturnTypeProblem have with annotations?
+(In reply to comment #15)
+
+> Couple of questions:
+> 1. void[] being an illegal return type, we already know the method has
+> problems with the return type and needs to be fixed. At this point, why
+> should we bother about the validating the annotations? It's extra work since
+> we are not sure if the code was intended to have void as return type.
+
+But it is not a secondary error. If the dimensions are removed in response to
+the first error regarding void [], but the annotations are left in, we would
+complain again. As these are unrelated it makes sense to complain together.
+
+On the same note, we should not complain about annotations on dimensions on
+a void array. e.g:
+
+void foo() @Blah [] {
+}
+
+We don't complain on Blah missing and that is the right behavior. 
+
+> 2. The method itself is alright with the return type. What relevance does
+> the foundReturnTypeProblem have with annotations?
+
+Annotations modify the return type. If the modified return type has a problem
+then the method has a return type problem.
+(In reply to comment #16)
+> But it is not a secondary error. If the dimensions are removed in response to
+> the first error regarding void [], but the annotations are left in, we would
+> complain again. As these are unrelated it makes sense to complain together.
+
+But wouldn't that mean we are assuming that the user intended to use void as return type? Since the annotation validation comes at a cost, albeit small, I think we should avoid guessing and complain only when it's necessary.
+
+> Annotations modify the return type. If the modified return type has a problem
+> then the method has a return type problem.
+
+Shouldn't we leave that to the annotation processors? Note that we don't do it in other cases where we report an error on annotation on methods (let's say the annotation doesn't have the correct target). We don't do that in case of arguments with annotations with problems either.
+(In reply to comment #17)
+> (In reply to comment #16)
+> > But it is not a secondary error. If the dimensions are removed in response to
+> > the first error regarding void [], but the annotations are left in, we would
+> > complain again. As these are unrelated it makes sense to complain together.
+> 
+> But wouldn't that mean we are assuming that the user intended to use void as
+> return type? Since the annotation validation comes at a cost, albeit small,
+> I think we should avoid guessing and complain only when it's necessary.
+
+You are arguing my exact point actually, though you are thinking otherwise :)
+
+In what I am suggesting we do, we are not "assuming" or "guessing" anything.
+We are reporting against what we *see*. On the other hand, that the user didn't
+intend to use void as the return type constitutes "assuming" and "guessing" :)
+
+> Shouldn't we leave that to the annotation processors? 
+
+With predefined (meta) annotations such as Target, the compiler *is* 
+the annotation processor. An auxiliary annotation processor would not even 
+look at Target meta annotation.
+
+> Note that we don't do
+> it in other cases where we report an error on annotation on methods (let's
+> say the annotation doesn't have the correct target). 
+
+In these cases the annotation is not annotating the return type.
+
+>We don't do that in
+> case of arguments with annotations with problems either.
+
+OK, I am fine if you want to revert that piece of code. In that case
+please make rejectTypeAnnotatedVoidMethod a void method.
+(In reply to comment #18)
+> In what I am suggesting we do, we are not "assuming" or "guessing" anything.
+> We are reporting against what we *see*. On the other hand, that the user
+> didn't
+> intend to use void as the return type constitutes "assuming" and "guessing"
+> :)
+
+I think we shouldn't read too much into the relevance between void and void[]. We should simply *see* the void[] as an invalid return type. Just as in this case:
+    public X(@Marker void v){}
+where we don't report error on the annotation.
+
+When we report an error against void[] foo(), the programmer can either remove the '[]' or he can write something like int[], which will make the annotations valid. While we can argue that "void" being the most probable intent, I prefer not reporting an error on the merit that we do less.
+ 
+> In these cases the annotation is not annotating the return type.
+
+I meant the code like this:
+   @Marker int foo() {}
+   @java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE)
+   @interface Marker {}
+(In reply to comment #19)
+> (In reply to comment #18)
+> > In what I am suggesting we do, we are not "assuming" or "guessing" anything.
+> > We are reporting against what we *see*. On the other hand, that the user
+> > didn't
+> > intend to use void as the return type constitutes "assuming" and "guessing"
+> > :)
+> 
+> I think we shouldn't read too much into the relevance between void and
+> void[]. We should simply *see* the void[] as an invalid return type. Just as
+> in this case:
+>     public X(@Marker void v){}
+> where we don't report error on the annotation.
+> 
+> When we report an error against void[] foo(), the programmer can either
+> remove the '[]' or he can write something like int[], which will make the
+> annotations valid. While we can argue that "void" being the most probable
+> intent, I prefer not reporting an error on the merit that we do less.
+>  
+> > In these cases the annotation is not annotating the return type.
+> 
+> I meant the code like this:
+>    @Marker int foo() {}
+>    @java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE)
+>    @interface Marker {}
+
+OK, Jay.
+Created attachment 222386
+Updated patch
+
+(In reply to comment #15)
+> > Jay, please take a look:
+> > 
+> >    - Eliminates comments in Annotation.java
+> >    - Eliminates changes to irrelevant parts
+
+I have retained these two changes from the previous patch and the new method rejectTypeAnnotatedVoidMethod(). For the record, the code in SourceTypeBinding for handling void[] is obsolete and no longer used. I will be removing that code in a separate commit.
+
+Srikanth, are you fine with this patch?
+Patch looks good. Please release. TIA,
+Released the latest patch here:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=b0d0325dfb965a2c15932e4737e1e47a197d7d43
+
+
+[1.8][compiler] Compiler allows type annotations on void methods.
+
+
+
+Removing unused code - Refer to bug 391108, comment 21 
+
+Removing unused code - Refer to bug 391108, comment 21 
+
+Fix for bug 391108: [1.8][compiler] Compiler allows type annotations on void methods. 

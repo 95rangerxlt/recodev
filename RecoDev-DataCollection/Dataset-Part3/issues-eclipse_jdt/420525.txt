@@ -1,0 +1,137 @@
+I suspect this problem is related to type inference which is currently being worked on by the JDT team. Please see the attached .java file for the entire source.
+
+Specifically, the following compiles from the command line, but "Integer::sum" is flagged as an error, whose description is "The type Integer does not define sum(Object, Object) that is applicable here".
+
+code: 
+
+		CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[]{})).thenApplyAsync( (Void v) -> {
+			Integer finalResult = futures.stream().map( (CompletableFuture<Integer> f) -> {
+				try {
+					return f.get();
+				} catch (InterruptedException | ExecutionException e) {
+					return 0;
+				}
+			}).reduce(0, Integer::sum);
+
+(This is not my code. I am exploring the code from this blog post: http://blog.maxant.co.uk/pebble/2013/10/13/1381695720000.html. The git repository for this code is: https://github.com/maxant/share.git.  See the source in "blog20131013_asyncJava8TrySuccessFailure/src/maxant/ch/async/blackboxtests/TestThreeCompletableFutureJava8.java".)
+
+
+-- Configuration Details --
+Product: Spring Tool Suite 3.4.0.201310051614-RELEASE (org.springsource.sts.ide)
+Installed Features:
+ org.eclipse.jdt 3.9.1.v20130911-1000
+ 
+$ java -version
+java version "1.8.0-ea"
+Java(TM) SE Runtime Environment (build 1.8.0-ea-b112)
+Java HotSpot(TM) 64-Bit Server VM (build 25.0-b54, mixed mode)
+
+I suspect this problem is related to type inference which is currently being worked on by the JDT team. Please see the attached .java file for the entire source.
+
+Specifically, the following compiles from the command line, but "Integer::sum" is flagged as an error, whose description is "The type Integer does not define sum(Object, Object) that is applicable here".
+
+code: 
+
+		CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[]{})).thenApplyAsync( (Void v) -> {
+			Integer finalResult = futures.stream().map( (CompletableFuture<Integer> f) -> {
+				try {
+					return f.get();
+				} catch (InterruptedException | ExecutionException e) {
+					return 0;
+				}
+			}).reduce(0, Integer::sum);
+
+(This is not my code. I am exploring the code from this blog post: http://blog.maxant.co.uk/pebble/2013/10/13/1381695720000.html. The git repository for this code is: https://github.com/maxant/share.git.  See the source in "blog20131013_asyncJava8TrySuccessFailure/src/maxant/ch/async/blackboxtests/TestThreeCompletableFutureJava8.java".)
+
+
+-- Configuration Details --
+Product: Spring Tool Suite 3.4.0.201310051614-RELEASE (org.springsource.sts.ide)
+Installed Features:
+ org.eclipse.jdt 3.9.1.v20130911-1000
+ 
+$ java -version
+java version "1.8.0-ea"
+Java(TM) SE Runtime Environment (build 1.8.0-ea-b112)
+Java HotSpot(TM) 64-Bit Server VM (build 25.0-b54, mixed mode)
+Created attachment 236964
+source code referred to in bug report
+Thanks, this will be looked at as part of the hooking up the new type inference engine.
+Very likely same issue as https://bugs.eclipse.org/bugs/show_bug.cgi?id=423504
+I'll start with some simpler examples in bug 423504 and then come back here.
+
+(In reply to Paul Furbacher from comment #0)
+> (This is not my code. I am exploring the code from this blog post:
+> http://blog.maxant.co.uk/pebble/2013/10/13/1381695720000.html. The git
+> repository for this code is: https://github.com/maxant/share.git.  See the
+> source in
+> "blog20131013_asyncJava8TrySuccessFailure/src/maxant/ch/async/blackboxtests/
+> TestThreeCompletableFutureJava8.java".)
+
+Please give my regards to Ant K. :)
+Earlier today I got 3 bogus errors on this example. After fixing bug 423504 I'm down to 1 error. Currently says:
+
+The method thenApplyAsync(Function<? super Void,? extends U>) in the type CompletableFuture<Void> is not applicable for the arguments (Function<Void,? extends U>)
+
+Investigating.
+More work on this issue showed problems in repeated resolve attempts when bouncing up and down, problems in detecting when inference is finished, and in finalizing the inferred result back into all relevant AST nodes.
+
+I have a patch in my workspace that touches the following pieces:
+- ASTNode.resolvePolyExpressionArguments()
+- remove the tiny interface PolyExpression and implementations of its methods
+- new LambdaExpression.internalResolveTentatively() based on copy()
+- InferenceContext18, ConstraintExpressionFormula
+
+The idea is to pull into one locations what currently is spread over two disparate locations:
+
+1 in ASTNode.resolvePolyExpressionArguments() we update argument expressions
+  after inference has determined target type for those
+
+2 in InferenceContext18.rebindInnerPolies() we push down inference results
+  into poly expressions for which a nested inference was triggered directly
+  from this inference.
+
+It seems that (1) is not a very good strategy. I'm working on registering all relevant expressions with the InferenceContext18 so that after each round of inference all affected expressions can be updated immediately, with no need to trigger another round of method lookup (as resolvePolyExpressionArguments() did).
+
+Unfortunately, this is not in a sharable state right now. I hope to finish and clean this tomorrow evening. I expect also positive impact on bug 424071.
+The new code that is pushed via bug 423504 is causing an NPE for the following case:
+
+interface I<T> {
+    T bold(T t);
+}
+
+class Main {  
+    public String foo(String x) { return "<b>" + x + "</b>"; }
+    String bar() {
+        I<? extends String> i = this::foo;
+        return i.bold("1");
+    }  
+}
+
+The problem is in ParameterizedTypeBinding#getSingleAbstractMethod()
+
+On first glance, looks like we always create an array of length 2+ but end up leaving one null since (in this case) typeParameters[i].firstBound is null.
+
+Stephan, please let me know if you would like a separate bug for this.
+Thanks, I'm seeing the same (or similar) problem while working on bug 424167.
+
+We have an ill-formed WildcardBinding "? super null" which introduces the null into resolving. This in turn is caused by working from a not-finished state of the inference context. Before closing the other bug I will come back here and check these examples, too.
+On top of the patch for bug 424167 the NPE reported in comment 7 has been fixed via https://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=a6d23e686845a8f3a37751a7b350298fb34c87e5
+
+This still leaves the main issue from comment 0 unresolved, though. See disabled GenericsRegressionTest_1_8._testBug420525().
+LambdaExpression.resultExpressions() was looking in the wrong place, as I didn't realize that the field .resultExpressions is only populated in the original, not a lambda *copy*. As a result we never included return expressions of block lambdas into the inference <blush/>.
+
+The fix will reveal one problem that was previously masked by this omission, I've filed bug 426984 to track that.
+
+Since I'm not sure, why LE.returnsExpression(..) is implemented the way it is, I'm leaving that as it is and only in LE.getResolvedCopyForInferenceTargeting(..) I move the collected expression over to the copy.
+
+Fix released via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=54bf5326ab985536456783d83e145375b5dc7f04
+(In reply to Stephan Herrmann from comment #10)
+
+> Since I'm not sure, why LE.returnsExpression(..) is implemented the way it
+> is, I'm leaving that as it is and only in
+> LE.getResolvedCopyForInferenceTargeting(..) I move the collected expression
+> over to the copy.
+
+Purely for part F, result expressions are meaningful only for explicitly
+typed lambdas: To do the S is more specific analysis. So it made sense to
+tie this with "shape analysis complete" and store it in just the original.

@@ -1,0 +1,155 @@
+Every once in a while (but non-consistently), Firefox gets into a state in which it writes the following error message to the console every 15 seconds until restarted:
+
+Error: this.pageURI has no properties
+Source File: file:///home/myk/Applications/firefox/components/nsMicrosummaryService.js
+Line: 906
+
+It may stop updating some or all microsummaries when this happens.  The line in question (and the line after it, which is where I think the problem really is) is:
+
+  update: function MS_update() {
+    LOG("microsummary.update called for page:\n  " + this.pageURI.spec +
+        "\nwith generator:\n  " + this.generator.uri.spec);
+
+Since it happens every 15 seconds, it's almost certainly triggered by _updateMicrosummaries, which runs on a timer at that interval.  _updateMicrosummaries calls refreshMicrosummary for each microsummary that needs to be updated, and that method calls _getPageForBookmark to get the pageURI, which it then passes to the Microsummary constructor while instantiating the microsummary.
+
+The constructor assigns it to the Microsummary.pageURI instance property.  refreshMicrosummary then calls _update, which accesses the Microsummary.pageURI property, triggering the bug.
+
+Possible causes of the bug:
+
+1. _updateMicrosummaries might be passing refreshMicrosummary a bogus bookmarkID.
+
+2. _getPageForBookmark might return a bogus pageURI to refreshMicrosummary.
+
+3. the Microsummary object might not properly receive or store the pageURI.
+
+Of these possibilities, #3 seems pretty unlikely, since the Microsummary object handles the pageURI very simply.  Its constructor sets that property upon instantiation, and the property's setter merely assigns it to a private property; it doesn't process it in any way.
+
+Possibility #1 seems the most likely, since _updateMicrosummaries always resets the update interval for bookmarks to 30 minutes before calling refreshMicrosummary.  If the bookmarkID was valid, that interval updating would probably work, and after the exception, _updateMicrosummaries wouldn't call refreshMicrosummary for that microsummary for another half hour.
+
+But why would _updateMicrosummaries have a bogus bookmarkID?  It's unclear, and it's also not clear how to find it out, although I'm going to add a bunch of debugging statements to my local build and see if I can catch the problem in the act.
+
+But in any case, we should probably make _updateMicrosummaries trap exceptions thrown by refreshMicrosummary so a single bogus microsummary bookmark doesn't prevent all microsummary bookmarks after the bogus one from refreshing.
+
+Every once in a while (but non-consistently), Firefox gets into a state in which it writes the following error message to the console every 15 seconds until restarted:
+
+Error: this.pageURI has no properties
+Source File: file:///home/myk/Applications/firefox/components/nsMicrosummaryService.js
+Line: 906
+
+It may stop updating some or all microsummaries when this happens.  The line in question (and the line after it, which is where I think the problem really is) is:
+
+  update: function MS_update() {
+    LOG("microsummary.update called for page:\n  " + this.pageURI.spec +
+        "\nwith generator:\n  " + this.generator.uri.spec);
+
+Since it happens every 15 seconds, it's almost certainly triggered by _updateMicrosummaries, which runs on a timer at that interval.  _updateMicrosummaries calls refreshMicrosummary for each microsummary that needs to be updated, and that method calls _getPageForBookmark to get the pageURI, which it then passes to the Microsummary constructor while instantiating the microsummary.
+
+The constructor assigns it to the Microsummary.pageURI instance property.  refreshMicrosummary then calls _update, which accesses the Microsummary.pageURI property, triggering the bug.
+
+Possible causes of the bug:
+
+1. _updateMicrosummaries might be passing refreshMicrosummary a bogus bookmarkID.
+
+2. _getPageForBookmark might return a bogus pageURI to refreshMicrosummary.
+
+3. the Microsummary object might not properly receive or store the pageURI.
+
+Of these possibilities, #3 seems pretty unlikely, since the Microsummary object handles the pageURI very simply.  Its constructor sets that property upon instantiation, and the property's setter merely assigns it to a private property; it doesn't process it in any way.
+
+Possibility #1 seems the most likely, since _updateMicrosummaries always resets the update interval for bookmarks to 30 minutes before calling refreshMicrosummary.  If the bookmarkID was valid, that interval updating would probably work, and after the exception, _updateMicrosummaries wouldn't call refreshMicrosummary for that microsummary for another half hour.
+
+But why would _updateMicrosummaries have a bogus bookmarkID?  It's unclear, and it's also not clear how to find it out, although I'm going to add a bunch of debugging statements to my local build and see if I can catch the problem in the act.
+
+But in any case, we should probably make _updateMicrosummaries trap exceptions thrown by refreshMicrosummary so a single bogus microsummary bookmark doesn't prevent all microsummary bookmarks after the bogus one from refreshing.
+I'm now running a copy of branch Firefox that logs lots of info to the console.  Hopefully the next time this happens the log will reveal the problem.  I suspect that perhaps the microsummary service's reference to the bookmark datasource is going away for some reason.
+Finally some progress.  I've been able to reproduce the problem by deleting a bookmark with a microsummary.  I'm not sure whether this happens every time you delete a bookmark with a microsummary, but I can reproduce it for a specific bookmark with a specific microsummary.
+
+I suspect that the bookmarks service isn't deleting every arc related to the RDF resource for the bookmark when I delete the bookmark.  In particular, I bet it isn't deleting the arc that identifies the bookmark as RDF:type MicsumBookmark.  
+
+Thus, when the microsummary service queries the bookmarks data source for a list of bookmarks whose RDF:type is MicsumBookmark, the deleted bookmark is one of the elements of the list.  But since the URL of the bookmark has been deleted from the data source, we can't set pageURI to it, so when we try to load it we fail because pageURI isn't defined.
+
+So we probably need to modify the code in nsBookmarksService.cpp for deleting a bookmark to make sure a "bookmark resource -> RDF:type -> MicsumBookmark" arc is properly deleted.
+
+Hmm, upon further investigation, it looks like this is going to cause microsummary updating to break until restart whenever a user deletes a microsummary bookmark.  We should fix this for Firefox 2.
+Created attachment 234464
+patch v1: the lowest-risk fix
+
+Here's the low risk fix.  It doesn't actually fix the bug, but it appropriately handles the consequences of the bug, so those consequences no longer hork microsummary updating.
+
+We should take this fix regardless of whether we take the higher risk fix I'll attach shortly.
+Created attachment 234498
+a medium-risk partial fix
+
+This patch incorporates the fix in patch v1 and also an additional fix to delete the microsummary properties when a bookmark gets deleted.  It still doesn't resolve the problem, since it doesn't delete the RDF type property, which is what is actually causing the bug, but it deletes properties we should be deleting.
+Created attachment 234535
+a medium risk complete fix
+
+Time spent digging through the bookmarks code reveals that removing the RDF type of a bookmark when deleting or cutting it is fraught with complication.
+
+In fact, it seems as if the system was designed to leave resources and their RDF type arcs around for bookmarks that get deleted, since the undo/redo code doesn't preserve those arcs itself but needs them to maintain consistency across changes.
+
+So rather than wade into the hornets nest, here's a simpler solution.  We leave the RDF type be and merely make sure a resource representing a microsummary bookmark is a real bookmark via nsIBookmarksService::IsBookmarkedResource before we try updating it.
+
+Deleting or cutting a bookmark makes IsBookmarkedResource return false for that bookmark (at least until you undo the deletion or paste the cut bookmark).  As far as I can tell, it otherwise will return true, so using that method is an accurate way to determine whether a resource represents an actual bookmark.
+
+There are two potential sources of risk in this patch:
+
+1. IsBookmarkedResource might behave differently from how I expect, sometimes returning false for real bookmarks.  I've read its code, and it looks like it just checks that the bookmark is part of the containment hierarchy headed by the bookmarks root.  All real bookmarks should be in that root somewhere, so I don't think this is a problem, but noting it.
+
+2. The changes to bookmarks.js and nsBookmarkTransactionManager.js might not take into account some necessary change.  This is a greater concern, especially after it turns out that adding a property to the list means adding "\n" to a string somewhere else in the code.  What else like that is there?
+
+Strictly speaking, we don't need the bookmarks.js and nsBookmarkTransactionManager.js changes, so if we wanted to absolutely minimize risk, we could leave those out.  But those changes look like the right thing to do, and they may well fix other as-yet-unidentified bugs, so it makes sense to consider them (perhaps as a separate bug fix).
+Comment on attachment 234535
+a medium risk complete fix
+
+I'm assuming that the arcs left behind are gone after restart, based on your description of this bug last week.
+
+Also, should the reportError call be a call to LOG() instead?  If some/many of these errors are expected, it seems like something we'd want authors/hackers to selectively enable.
+
+r=me with those answered
+(In reply to comment #7)
+> (From update of attachment 234535 [edit])
+> I'm assuming that the arcs left behind are gone after restart, based on your
+> description of this bug last week.
+
+Yes, that's right.  The arcs don't get serialized to bookmarks.html (the bookmarks service walks the bookmarks hierarchy to serialize the datastore to the file, and deleted bookmarks are removed from that hierarchy), so they are gone after a restart.
+
+There may be some edge cases where that doesn't happen, causing perplexing bugs about bookmarks that don't quite go away, but that's not microsummary-specific; it'll happen with any deleted bookmark, since arcs remain for all of them.
+
+A more comprehensive fix for this bug that took care of any such edge cases would be to make sure we delete all arcs.  But that would require significant changes to the bookmarks transaction manager code, which is quite complicated and somewhat crufty, so doing that work seems too high risk for the reward unless we find important bugs that necessitate it.
+
+
+> Also, should the reportError call be a call to LOG() instead?  If some/many
+> of these errors are expected, it seems like something we'd want 
+> authors/hackers to selectively enable.
+
+That'd be true if we hadn't found the cause of these errors, but now that we've found it (and handle it appropriately), deleted bookmarks no longer trigger the call, so any future errors will be unexpected, and it'll be useful to display them on the error console so that bug reporters can cite them when filing bugs.
+
+Comment on attachment 234535
+a medium risk complete fix
+
+Notes for drivers considering this approval request:
+
+Per this patch:
+
+1. the microsummary service, after retrieving a list of microsummary bookmarks to update, now verifies that each bookmark on the list is a real bookmark before trying to update it, so it doesn't spark an exception trying to update deleted or cut bookmarks (which unfortunately stay around in the datastore until restart);
+
+2. the microsummary service, when trying to update a microsummary bookmark, now traps and reports exceptions, so an update that fails doesn't prevent the service from updating the rest of the bookmarks;
+
+3. the bookmarks transaction manager now saves microsummary properties when users delete or cut bookmarks and restores those properties when users undo deletions or paste those bookmarks.
+
+The first two changes are low-risk.  The second is medium-risk, since the bookmarks transaction manager code is complicated and crufty, and I'm no expert in it.  In my tests, deleting/undoing/redoing and cutting/pasting regular bookmarks, folders, microsummary bookmarks, and live bookmarks all work fine with this patch; but perhaps there are some situations I haven't accounted for.
+
+The patch has been on the trunk since Thursday, August 24, but baking it on the trunk won't help much, since it's specific to the old RDF backend, and the trunk uses the new Places backend.
+Comment on attachment 234535
+a medium risk complete fix
+
+Vlad, can you take a look at this and poke myk to ask him what specifically he's worried about (see previous comment) and help us get a sense of risk, here?
+Comment on attachment 234535
+a medium risk complete fix
+
+Ugh, I hate that bookmarks code.  This looks OK; the transaction manager changes look correct, as far as I can remember that code.  And yes, I think that myk's understanding of IsBookmarkedResource is correct.
+Comment on attachment 234535
+a medium risk complete fix
+
+a=schrep for drivers - per triage meeting this a.m. just waiting on sr from Vlad which is now done.

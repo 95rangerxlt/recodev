@@ -1,0 +1,151 @@
+Bug 1161072 is starting to clean stuff up in Inspector on the actor side.
+Before that we were basically keeping everything alive!
+But these patches aren't enough to ensure that the inspector/walker actors aren't leaked.
+There is also the MutationObserver registered on the actor, whereas we are trying to clean it up on the front!!
+
+With bug 1161072 and this patch, I finally see the Inspector/Walker actors beeing garbage collected!
+
+Bug 1161072 is starting to clean stuff up in Inspector on the actor side.
+Before that we were basically keeping everything alive!
+But these patches aren't enough to ensure that the inspector/walker actors aren't leaked.
+There is also the MutationObserver registered on the actor, whereas we are trying to clean it up on the front!!
+
+With bug 1161072 and this patch, I finally see the Inspector/Walker actors beeing garbage collected!
+Created attachment 8637977
+patch v1
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=37adbd5e8ab4
+This one may have to wait for bug 1161072 before landing as it turns try to a christmas tree!
+Let's see if that pass with bug 116072:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=66f73a3314b2
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=d3a8b5f954c9
+Really... I'm fixing a leak and in return, try is reporting me leaks!!
+Created attachment 8643595
+patch v2
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=488c9e7ca16c
+
+Ok so these leaks were due to some exception in destroy() because of some dead wrapper exception.
+I tweaked the cleanup code to avoid them.
+I'm not very happy with this patch, I wish we could move that MutationObserver code into NodeActor,
+and especially handle the cleanup of it in NodeActor.destroy.
+But as we don't cleanup NodeActors correctly yet, we can't do that.
+Last time I tried to address that in bug 1145049 (ensure that we don't leak node actors and call their destroy method)
+try was a rainbow. But I want to followup on this and hopefully make this MutationObserver thing better.
+(In reply to Alexandre Poirot [:ochameau] from comment #5)
+> I'm not very happy with this patch, I wish we could move that
+> MutationObserver code into NodeActor,
+> and especially handle the cleanup of it in NodeActor.destroy.
+
+I don't understand why the mutation observer would be attached to the NodeActor.  Would you even move getMutations / onMutations / queueMutation onto the Node?  The mutation handling needs to have context that only the Walker has (it's _refMap), so it doesn't make sense to me.
+I guess when you say "move that MutationObserver code into NodeActor", you mean just the disconnect() part.  In that case I agree it'd be ideal since we wouldn't need to deal with onFrameUnload and keeping a list of observers on the walker because the Node should be properly cleaned up when it becomes released.
+Comment on attachment 8643595
+patch v2
+
+Review of attachment 8643595:
+-----------------------------------------------------------------
+
+Sorry, but can you break this into two patches?  One that does all of the other non-mutation related cleanup and one that just does mutation observer stuff. That'd make it easier to review.
+
+Also, why is it that we can't just disconnect() the observer when the node actor is released?
+Yes. `mutationObservers` array is very redundant with _refMap.
+Could we just add a line to unmanage before `this._refMap.delete(actor.rawNode);`?
+
+if (actor.observer) {
+  actor.observer.disconnect();
+  actor.observer = null;
+}
+(In reply to Brian Grinstead [:bgrins] from comment #8)
+> Comment on attachment 8643595
+>
+> Also, why is it that we can't just disconnect() the observer when the node
+> actor is released?
+
+As I said, last time I looked, NodeActors weren't cleaned up correctly.
+We release them during frame unload, but not when a device gets unplugged (disconnect story).
+But thanks to the last walker patch in bug 1161072, it may not be the case anymore.
+
+I'll verify that. I didn't wanted to look at that as it was introducing many test failures,
+but as I fixed many of those now... may be we can finally tweak stuff without burning the tree!
+I was finaly able to verify that (I had so many issues in getting able to build b2g again :x).
+So NodeActors appear to be correctly destroyed now!
+We should be able to clean things up in NodeActor destroy then.
+Created attachment 8658708
+patch v3
+
+So, here is something better.
+
+I moved MutationObserver creation to NodeActor
+as it is much more related to the node than the walker.
+Then, we can cleanup the mutation observer from NodeActor.destroy
+(which is now correctly called).
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=3dd4b2c6f6aa
+Comment on attachment 8658708
+patch v3
+
+Review of attachment 8658708:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/inspector.js
+@@ +321,5 @@
+> +      characterData: true,
+> +      childList: true,
+> +      subtree: true
+> +    });
+> +    observer.document = node;
+
+Why is observer.document being set here?
+(In reply to Brian Grinstead [:bgrins] from comment #14)
+> Comment on attachment 8658708
+> patch v3
+> 
+> Review of attachment 8658708:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/devtools/server/actors/inspector.js
+> @@ +321,5 @@
+> > +      characterData: true,
+> > +      childList: true,
+> > +      subtree: true
+> > +    });
+> > +    observer.document = node;
+> 
+> Why is observer.document being set here?
+
+Oh I used that in my previous patch to be able to filter the mutation observers.
+This is no longer needed.
+Created attachment 8658760
+patch v4
+Comment on attachment 8658760
+patch v4
+
+Review of attachment 8658760:
+-----------------------------------------------------------------
+
+This makes sense.  Please update the commit message to explain that it's disconnecting the MutationObserver when the NodeActor is destroyed
+Created attachment 8659170
+patch v5
+
+I had to add a isDeadWrapper check due to some exception in one test:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=4020013d0786
+
+This is surprising as it means one node is destroyed/unmanaged after its document has been destroyed.
+Comment on attachment 8659170
+patch v5
+
+Review of attachment 8659170:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/inspector.js
+@@ +227,5 @@
+> +  destroy: function () {
+> +    protocol.Actor.prototype.destroy.call(this);
+> +
+> +    if (this.mutationObserver) {
+> +      if (!Cu.isDeadWrapper(this.mutationObserver)) {
+
+Carrying over r+ with just this additional check for test fix.
+https://hg.mozilla.org/integration/fx-team/rev/36abb9d306015a9b67235d72b3d68b38a898b916
+Bug 1186937 - Disconnect MutationObserver instances on Node actor destruction. r=bgrins
+https://hg.mozilla.org/mozilla-central/rev/36abb9d30601

@@ -1,0 +1,366 @@
+swapFrameLoader
+
+swapFrameLoader
+Oops - premature submission :)
+
+browser/base/content/test/browser_bug477014.js uses swapFrameLoader and it fails with ERROR_NOT_IMPLEMENTED.  I've not dug any further.
+*** Bug 993431 has been marked as a duplicate of this bug. ***
+information loss.
+
+"swapFrameLoaders (and thus replaceTabWithWindow) not implemented for e10s"
+Created attachment 8466832
+frameloader-swap wip
+
+This is what I have so far. However, it crashes in graphics code:
+
+#6  0x00007fbd7ebd890c in mozilla::layers::RefLayer::ConnectReferentLayer (this=0x7fbd52db6000, 
+    aLayer=0x7fbd52c6cc00) at /home/billm/moz/in1/gfx/layers/Layers.h:2186
+#7  0x00007fbd7ebd701d in mozilla::layers::WalkTheTree<(mozilla::layers::Op)0> (
+    aLayer=0x7fbd52db6000, aReady=@0x7fbd5a36ca1a: true, aTargetConfig=...)
+    at /home/billm/moz/in1/gfx/layers/composite/AsyncCompositionManager.cpp:84
+#8  0x00007fbd7ebd7051 in mozilla::layers::WalkTheTree<(mozilla::layers::Op)0> (
+    aLayer=0x7fbd59b70400, aReady=@0x7fbd5a36ca1a: true, aTargetConfig=...)
+    at /home/billm/moz/in1/gfx/layers/composite/AsyncCompositionManager.cpp:94
+#9  0x00007fbd7ebbf373 in mozilla::layers::AsyncCompositionManager::ResolveRefLayers (
+    this=0x7fbd5a36c9b0)
+    at /home/billm/moz/in1/gfx/layers/composite/AsyncCompositionManager.cpp:108
+#10 0x00007fbd7ec09a04 in mozilla::layers::AutoResolveRefLayers::AutoResolveRefLayers (
+    this=0x7fbd5d2f93d0, aManager=0x7fbd5a36c9b0)
+    at ../../dist/include/mozilla/layers/AsyncCompositionManager.h:215
+#11 0x00007fbd7ebf3b12 in mozilla::layers::CompositorParent::ShadowLayersUpdated (this=
+    0x7fbd59ef3000, aLayerTree=0x7fbd5a1cce00, aTransactionId=@0x7fbd5d2f9690: 25, 
+    aTargetConfig=..., aIsFirstPaint=false, aScheduleComposite=true, aPaintSequenceNumber=0, 
+    aIsRepeatTransaction=false) at /home/billm/moz/in1/gfx/layers/ipc/CompositorParent.cpp:807
+#12 0x00007fbd7ebfddc4 in mozilla::layers::LayerTransactionParent::RecvUpdate (
+    this=0x7fbd5a1cce00, cset=..., aTransactionId=@0x7fbd5d2f9690: 25, targetConfig=..., 
+    isFirstPaint=@0x7fbd5d2f9620: false, scheduleComposite=@0x7fbd5d2f9621: true, 
+    paintSequenceNumber=@0x7fbd5d2f9624: 0, isRepeatTransaction=@0x7fbd5d2f9622: false, 
+    reply=0x7fbd5d2f9660) at /home/billm/moz/in1/gfx/layers/ipc/LayerTransactionParent.cpp:545
+
+I guess the problem is that we're trying to move a remote browser from one PCompositor to another and so the layer tree will be totally messed up.
+
+I looked at how this works in non-e10s code, and it looks like the BeginSwapDocshells code somehow causes the entire content layer tree to be torn down, presumably to be reconstructed later. That makes sense.
+
+However, I think that the child process owns the content layer tree in e10s. Maybe the frontend needs to ask the child to tear down the layer tree for the tab before it does the swap? Once the layers have been deleted, it can do the swap. Then it would have to ask for new layers in the new compositor.
+
+David, would you mind taking this over? It seems similar to the tab switching bug. Matt, can you offer any advice about how to proceed?
+I'll take a look.  Its good timing -- I'm freeing up anyway.
+Thanks, changing assignee. Also, the steps to get the crash are pretty simple. Just make two e10s windows and drag a tab from one to the other. Let me know if you have trouble reproducing.
+
+
+
+Moving to M3 milestone. These bugs affect e10s dogfooding but Brad and Gavin did not think they were M2 blockers.
+
+Created attachment 8492550
+WIP: Very messy swapFrameLoaders/swapWebBrowsers impl
+
+...because I promised billm.  The gist is that nsFrameLoaders::swapFrameLoaders should work on remote content - it tries to swap the frameloaders for chrome in the main process (nsFrameLoader::SwapWithOtherFrameLoader) and then swap the nsWebBrowsers (nsWebBrowser::SwapWithOtherBrowser) in the content proc.
+Hey Bill, did you want to chime in with any comments on this?  Brad has suggested maybe submitting a patch that does the partial work that's been implemented, which I'm fine with.  I'll push ahead with that plan unless you have an opinion.
+Sorry, I haven't had a chance to look at this yet. Feel free to submit a patch if you're ready.
+
+Created attachment 8498294
+WIP: Much improved tab dragging behavior
+
+Bill: NI'ed you so that you would read this (or TL;DR).  No questions... just the hand-off.
+
+In broad strokes, here’s what happens in the patch:
+
+        1. Main Proc sends a Pause message to content proc.
+        2. Content proc pauses documentViewer and *synchronously* sends pause to the Compositor back on the main proc.
+        3. The Compositor pauses and then replies to the content proc.
+        4. The content proc sends a MozPausedTabRendering event to the tabbrowser.
+        5. Now that rendering is paused, the tabbrowser safely runs a promise that calls nsFrameLoader::swapFrameLoaders.
+        6. swapFrameLoaders performs the main-process-non-compositor swap behavior
+        7. swapFrameLoaders asynchronously tells the content proc to swap TabChild/nsDisplayViewer/etc stuff.
+        8. The content proc performs its swap operations.
+        9. The tabbrowser sends Resume to the content proc (which will bounce it to the Compositor like with Pause).  There is no need for an event for Resume.
+        10. The tabbrowser continues running continuations made with Promise.then(), with the knowledge that the swap is complete.
+
+The behavior of swapFrameLoaders is not too dissimilar to the non-e10s version in the main proc.  Mostly, its different because of stuff that is no longer relevant.  The content-side ‘RecvSwapWebBrowsers’ is new but not too confusing (it is a bit delicate tho).  
+
+There is one obvious main issue — when you swap tabs, the new tab shows no content (I believe the color is called “about:blank”).  Note that the document is still there — you can mouse over things and see the cursor change, and you can navigate (invisible) links - and it updates tab chrome (with the current URL as a title).  I’ve also seen proper composition events happen — they just don’t appear.  And there is also no context menu.  And it will still crash if the tabs involved has plugins.  On the plus side, dragging a tab out into a new window works as well as dragging to an existing window (which is to say, you end up looking at about:blank in a new window).  
+
+The Promises are verbose and existing code has to be refitted to use them.  There are a number of tests that I didn’t bother to repair to use this style (the fix is easy but tedious — I’ve done it for all of the “important”, ie “non-test”, functions).  The Promises could be replaced by their mirror image, ‘continuations’… its just a style choice but, judging from code, the Promise pattern seems to be preferred.
+
+I thought about trying something a little more wicked like synchronously pausing to get rid of the Promises and just make swapFrameLoaders a slow (<1sec), synchronous function.  We don’t care that it takes a moment to pause both processes so this would be ok if it was possible.  Since IPDL doesn’t allow sync chrome -> content, this isn’t obvious but there is a possibility that is a take on a theory that :BenWa had in mind for MozAfterRemotePaint… since the front-end and the compositor are in different threads on the same process, the front-end could probably wait for a semaphore from the compositor saying it paused (instead of bouncing the messages).  I don’t recall why this was eventually dropped for MozAfterRemotePaint but there was a reason.
+
+I haven’t tried this on Windows.  If its too misbehaved there, let me know and I’ll take a look but it shouldn’t be very different than the mac behavior.
+
+The patch includes a fix for bugs in the nsSearchService that, now that some of this swap behavior is asynchronous, was causing problems at launch time for me.  (It also gets rid of some launch-time error spew, which is nice.)
+
+A lot of this stuff is pretty intertwined.  If you've got questions, I may have already investigated them so feel free to ask but, apparently, I don't have *all* of the answers.  Thanks for the assist!
+Created attachment 8500172
+WIP: Much improved tab dragging behavior
+
+De-bitrotting the patch and added a minor (and wasteful) hack to nsPIDOMWindow::PauseTabRendering that restores non-e10s swap behavior.
+Thanks David.
+I think Bill's original patch should *almost* work as long as the two windows are within the same child process (which is always true for now afaik).
+
+Each child process only has a single PCompositor (CompositorChild -> CrossProcessCompositorParent) connection, so all the ipdl objects should be fine when swapped to a different window.
+
+The crash Bill was hitting was because we're moving layers to be under a different layer manager, and that asserts. 
+
+It seems like we could 'reparent' all the layers, tell them about the different Compositor instance, recreate any compositor specific object (like textures) and have it all work. That would let this work without requiring a repaint, and be pretty awesome. I'm a little worried about that since we have to propagate the changed layermanager/compositor message through the entire tree (layers/compositables/texturehosts/texturesources) and make sure all the different implementations handle it correctly. Lot of potential for bugs in code that I bet we don't test all that thoroughly.
+
+The safer alternative is to update the RenderFrameParent with a new mLayersId, and then send a message to the child process notifying it of the new id and telling it to invalidate and repaint. The new layers id will stop the compositor from picking up the existing layer tree, and we'll draw nothing (just like tab switching) until the child process sends the new layer tree.
+Created attachment 8500807
+WIP: Layers prototype
+
+The second options I suggested turned out to be really difficult, so I had a go at the first instead.
+
+This builds on top of bills original patch and let us transplant the remote layer tree into the new window.
+
+Seems to 'work' from a layer perspective, renders the content in the new window just fine. Lots of weirdness, most of which I think is to do with content/e10s code, not layers.
+david, is matt's wip sufficient to move forward on this, or do we still have open questions?
+Looks good!  This patch resolves the missing rendering and most of the remaining issues are things I've already fixed so this should be pretty quick.
+Created attachment 8502123
+WIP: Layers Prototype
+
+Bugfix to allow tab swap to close old tab.
+Created attachment 8503370
+SwapFrameLoaders - content
+Created attachment 8503372
+SwapFrameLoaders - gfx
+Comment on attachment 8503372
+SwapFrameLoaders - gfx
+
+Review of attachment 8503372:
+-----------------------------------------------------------------
+
+I think nical will be a much better reviewer for this!
+Comment on attachment 8503372
+SwapFrameLoaders - gfx
+
+Review of attachment 8503372:
+-----------------------------------------------------------------
+
+Looks good overall, just want to clarify the removed assertions.
+
+::: gfx/layers/Layers.h
+@@ +2229,5 @@
+>    void ConnectReferentLayer(Layer* aLayer)
+>    {
+>      MOZ_ASSERT(!mFirstChild && !mLastChild);
+>      MOZ_ASSERT(!aLayer->GetParent());
+> +    if (aLayer->Manager() != Manager()) {
+
+When can this happen? This early returns without connecting the layer so I assume that this is an invalid case. Is it really better to silently return rather than assert? If so, please add a comment explaining what's happening in this case.
+
+::: gfx/layers/composite/CanvasLayerComposite.cpp
+@@ +60,5 @@
+>  CanvasLayerComposite::GetLayer()
+>  {
+>    return this;
+>  }
+> +  
+
+nit:trailing spaces here and in other places in the patch
+Comment on attachment 8503370
+SwapFrameLoaders - content
+
+>+nsFrameLoader::SwapWithOtherRemoteLoader(nsFrameLoader* aOther,
+>+                                         nsRefPtr<nsFrameLoader>& aFirstToSwap,
+>+                                         nsRefPtr<nsFrameLoader>& aSecondToSwap)
+>+{
+>+  Element* ourContent = mOwnerContent;
+>+  Element* otherContent = aOther->mOwnerContent;
+>+
+>+  if (!ourContent || !otherContent) {
+>+    // Can't handle this
+>+    return NS_ERROR_NOT_IMPLEMENTED;
+>+  }
+>+
+>+  // Make sure there are no same-origin issues
+>+  bool equal;
+>+  nsresult rv =
+>+    ourContent->NodePrincipal()->Equals(otherContent->NodePrincipal(), &equal);
+>+  if (NS_FAILED(rv) || !equal) {
+>+    // Security problems loom.  Just bail on it all
+>+    return NS_ERROR_DOM_SECURITY_ERR;
+>+  }
+>+
+>+  // Make sure to swap docshells between the two frames.
+>+  nsIDocument* ourDoc = ourContent->GetCurrentDoc();
+>+  nsIDocument* otherDoc = otherContent->GetCurrentDoc();
+>+  if (!ourDoc || !otherDoc) {
+>+    // Again, how odd, given that we had docshells
+Looks like you moved some code after writing the comments, since the docshell check certainly happens after docshell check
+
+>+
+>+  nsCOMPtr<EventTarget> ourContentTarget = do_QueryInterface(ourContent);
+>+  nsCOMPtr<EventTarget> otherContentTarget = do_QueryInterface(otherContent);
+You don't need this QI, nor those variables. Element is an EventTarget.
+Also, you don't seem to actually use ourContentTarget nor otherContentTarget.
+
+
+I don't understand the change to FirePageShowEvent. In SwapWithOtherRemoteLoader you don't ever call it.
+Should we actually call it and dispatch the events to relevant xul:browser elements perhaps?
+
+What happens if one frameloader is for remote browser and the other isn't?
+In addition to the issues in these reviews, I'm looking at some Linux test failures:
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=bf12e07d34f4
+Created attachment 8505053
+WIP: SwapFrameLoaders - content
+
+Implements changes from smaug's review.  This patch is temporary while I deal with Linux tests.
+Created attachment 8505056
+WIP: SwapFrameLoaders - gfx
+
+Implementing Nicolas' recommendations.  This one is also a WIP while I repair Linux tests.
+Created attachment 8505960
+SwapFrameLoaders - content
+
+Trying again with suggested repairs.
+Created attachment 8505961
+SwapFrameLoaders - gfx
+
+Ditto.
+For posterity:
+
+I've enabled one of the six tests that is disabled on e10s.  The other five still have issues.  They are:
+
+browser_bug477014.js
+	is waiting for pageshow, which is sent by the nsDocument (via EventDispatcher::DispatchDOMEvent) in the content proc.  For whatever reason, this event does not reach the browser.  The event is listened for, but never received, on gBrowser.  markh's mochitest harness did this formerly, now it should be the stuff in bug 1066433, but, while I see the event being sent (in the content process), it never makes it to the test.
+
+browser_bug491431.js
+	works + enabled
+
+browser_bug495058.js
+	Tests swapping 3 about pages.  Swapping works.  Test passes if all pages are made about:blank.
+	Complains if all pages are about:home.  It believes the active tab is about:blank (this one is weird)
+	For other about pages, SessionRestore attempts to alter browser remoteness but tabState is incomplete (missing index).
+
+browser_bug537013.js
+	seems to be ok with the swap but complains that the find bar doesnt retain stuff
+
+browser_tabMatchesInAwesomebar_perwindowpb.js
+	Fails early waiting for uri-visit-saved message to come from history - it never comes.  Never gets to the swap.
+
+browser_tab_dragdrop.js
+	Fails.  Who knows why.
+TBPL: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=ab45b655ca74
+(In reply to David Parks [:handyman] from comment #34)
+> 	is waiting for pageshow, which is sent by the nsDocument (via
+> EventDispatcher::DispatchDOMEvent) in the content proc.  For whatever
+Well, you're changing code which is executed in the parent document. Of course that can't work. Events don't propagate
+cross-process.
+Comment on attachment 8505960
+SwapFrameLoaders - content
+
+>+  // Switch the owner content before we start calling AddTreeItemToTreeOwner.
+This comment makes no sense, since we're not calling AddTreeItemToTreeOwner anywhere
+(because that is about non-e10s-setup)
+
+So why we don't fire pagehide/show event on chrome event handlers
+(well, xul:browser) like we do for non-e10s case?
+I think we should to behave more consistently with non-e10s.
+Sure, event.target is different, but still.
+But that can happen in a follow patch or bug, once someone figures out for what all the
+chrome code uses pagehide/show.
+Created attachment 8507232
+SwapFrameLoaders - content (r+'ed by smaug)
+
+Trivial removal of extraneous comment (thanks smaug).
+
+> So why we don't fire pagehide/show event on chrome event handlers
+> (well, xul:browser) like we do for non-e10s case?
+> I think we should to behave more consistently with non-e10s.
+> Sure, event.target is different, but still.
+> But that can happen in a follow patch or bug, once someone figures out for
+> what all the chrome code uses pagehide/show.
+
+I'm not sure why the events are sent in general -- as best I can tell, they are sent *for* the mochitests.  In this case, the event target and dom differences mean that the mochitests don't get the event anyway.  So the tests still fail (timeout waiting for events).  I'm certainly not sure that we should not be sending the events to xul:browser - but it had no discernible effect that I could see.
+
+We have a framework in place to make sure that the relevant events originating in the content proc make it to the mochitest - that's what bug 1066433 was about.  But it may have issues (bug 1084637).
+A note:
+
+I spent a little more time with the hg history, trying to figure out the nature of the pageshow/pagehide behavior in the non-e10s version.  The only work since the hg repo began seems to be recent work related to guaranteeing behavior for tests (bug 1058164).  That bug included test browser_bug1058164.js which I had missed.  The behavior in the test seems to match the behavior in browser_bug477014.js above -- the pageshow events are seemingly sent and not received -- firing pageshow/hide in SwapOtherRemoteLoader, as done in non-e10s's SwapWithOtherLoader, doesn't rectify this.
+*** Bug 1075941 has been marked as a duplicate of this bug. ***
+https://treeherder.mozilla.org/ui/#/jobs?repo=fx-team&revision=832c3790b6ef
+Hi,
+
+seems this patch didn't apply cleanly:
+
+patching file gfx/layers/Layers.h
+Hunk #1 FAILED at 2224
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/Layers.h.rej
+patching file gfx/layers/composite/CanvasLayerComposite.cpp
+Hunk #1 FAILED at 56
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/CanvasLayerComposite.cpp.rej
+patching file gfx/layers/composite/CanvasLayerComposite.h
+Hunk #1 FAILED at 43
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/CanvasLayerComposite.h.rej
+patching file gfx/layers/composite/ColorLayerComposite.h
+Hunk #1 FAILED at 36
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/ColorLayerComposite.h.rej
+patching file gfx/layers/composite/ContainerLayerComposite.h
+Hunk #1 FAILED at 56
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/ContainerLayerComposite.h.rej
+patching file gfx/layers/composite/ImageLayerComposite.h
+Hunk #1 FAILED at 8
+Hunk #2 FAILED at 39
+2 out of 2 hunks FAILED -- saving rejects to file gfx/layers/composite/ImageLayerComposite.h.rej
+patching file gfx/layers/composite/LayerManagerComposite.cpp
+Hunk #1 FAILED at 1077
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/LayerManagerComposite.cpp.rej
+patching file gfx/layers/composite/LayerManagerComposite.h
+Hunk #1 FAILED at 346
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/LayerManagerComposite.h.rej
+patching file gfx/layers/composite/PaintedLayerComposite.cpp
+Hunk #1 FAILED at 79
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/PaintedLayerComposite.cpp.rej
+patching file gfx/layers/composite/PaintedLayerComposite.h
+Hunk #1 FAILED at 47
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/PaintedLayerComposite.h.rej
+patching file gfx/layers/composite/TextureHost.cpp
+Hunk #1 FAILED at 366
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/TextureHost.cpp.rej
+patching file gfx/layers/composite/TiledContentHost.h
+Hunk #1 FAILED at 209
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/composite/TiledContentHost.h.rej
+patching file gfx/layers/ipc/CompositorParent.cpp
+Hunk #1 FAILED at 1033
+Hunk #2 FAILED at 1173
+2 out of 2 hunks FAILED -- saving rejects to file gfx/layers/ipc/CompositorParent.cpp.rej
+patching file gfx/layers/ipc/CompositorParent.h
+Hunk #1 FAILED at 103
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/ipc/CompositorParent.h.rej
+patching file gfx/layers/ipc/PCompositor.ipdl
+Hunk #1 FAILED at 67
+1 out of 1 hunks FAILED -- saving rejects to file gfx/layers/ipc/PCompositor.ipdl.rej
+patching file layout/ipc/RenderFrameParent.cpp
+Hunk #1 FAILED at 67
+Hunk #2 FAILED at 396
+2 out of 2 hunks FAILED -- saving rejects to file layout/ipc/RenderFrameParent.cpp.rej
+patch failed, unable to continue (try -v)
+patch failed, rejects left in working dir
+
+
+and also for the 2nd patch:
+
+applying layers1.patch
+patching file browser/base/content/test/general/browser.ini
+Hunk #1 FAILED at 174
+1 out of 1 hunks FAILED -- saving rejects to file browser/base/content/test/general/browser.ini.rej
+patching file content/base/src/nsFrameLoader.cpp
+Hunk #1 FAILED at 63
+Hunk #2 FAILED at 935
+2 out of 2 hunks FAILED -- saving rejects to file content/base/src/nsFrameLoader.cpp.rej
+patching file content/base/src/nsFrameLoader.h
+Hunk #1 FAILED at 125
+1 out of 1 hunks FAILED -- saving rejects to file content/base/src/nsFrameLoader.h.rej
+patching file toolkit/content/widgets/browser.xml
+Hunk #1 FAILED at 1117
+1 out of 1 hunks FAILED -- saving rejects to file toolkit/content/widgets/browser.xml.rej
+patch failed, unable to continue (try -v)
+patch failed, rejects left in working dir
+errors during apply, please fix and refresh layers1.patch
+
+could you take a look and maybe rebase against a current tree, thanks!
+(In reply to Brad Lassey [:blassey] (use needinfo?) from comment #41)
+> https://treeherder.mozilla.org/ui/#/jobs?repo=fx-team&revision=832c3790b6ef
+
+Oops! Someone left the checkin-needed flag on the bug. :)
+https://hg.mozilla.org/mozilla-central/rev/6dd3690b879c
+https://hg.mozilla.org/mozilla-central/rev/832c3790b6ef
+

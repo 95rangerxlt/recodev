@@ -1,0 +1,270 @@
+User Agent: Mozilla/5.0 (X11; Linux x86_64; rv:24.0) Gecko/20130705 Firefox/24.0 Iceweasel/24.0a2 (Nightly/Aurora)
+Build ID: 20130705004019
+
+Steps to reproduce:
+
+ * Added "startpage.com" to Firefox
+ * Click the Home button in Firefox
+ * Try to search for anything
+
+
+Actual results:
+
+Home page showed up and I couldn't search for anything, error console displayed:
+[13:32:57.544] Error: Home page does not support POST search engines. @ chrome://browser/content/tabbrowser.xml:420
+
+
+Expected results:
+
+The home page should allow searches via startpage.com, completly failing when one (not even the selected search engine) uses POST is not a viable option.
+
+User Agent: Mozilla/5.0 (X11; Linux x86_64; rv:24.0) Gecko/20130705 Firefox/24.0 Iceweasel/24.0a2 (Nightly/Aurora)
+Build ID: 20130705004019
+
+Steps to reproduce:
+
+ * Added "startpage.com" to Firefox
+ * Click the Home button in Firefox
+ * Try to search for anything
+
+
+Actual results:
+
+Home page showed up and I couldn't search for anything, error console displayed:
+[13:32:57.544] Error: Home page does not support POST search engines. @ chrome://browser/content/tabbrowser.xml:420
+
+
+Expected results:
+
+The home page should allow searches via startpage.com, completly failing when one (not even the selected search engine) uses POST is not a viable option.
+There is a similar bug, see bug 862401 but it's fixed in FF24.
+
+Is your Aurora version up-to-date?
+I just tested with "25.0a1 (2013-07-07)"; as soon as I select a search engine which uses POST for receiving the query the homepage will no longer function.
+This is indeed a bug, we bail out setting the search engine in about:home when we encounter a POST engine.
+
+Gavin: since we now have an originalDefaultEngine getter again, can we use it when we encounter a POST engine in the browser.js code?
+Mike: Please don't consider dooing that, that would be completely non-intuitive behavior to endusers; the sensible fix would be to just fix your code for POST. Out of curiosity, what's the issue with POST at all?
+We could in theory have the home page support POST search engines by introducing a way to give it the postData (via AboutHomeUtils) and having it use a form to submit it, I think, but that sounds complicated. Maybe we'd need a chrome-side observer for such searches that added the relevant post data automatically. In any case this sounds too complicated for landing on beta, so we probably should default to one of the default engines in this case in the near term.
+
+Mike, can you take this?
+Created attachment 777814
+WIP: support POST searches in about:home
+
+As promised, a fully functional 'prototype'. If we decide to go this route (yay!) then I'd file the patch in two parts: one for the nsSearchService changes and another for the about:home changes.
+
+As a WIP, you can find all you need in this patch.
+Comment on attachment 777814
+WIP: support POST searches in about:home
+
+>diff --git a/browser/base/content/abouthome/aboutHome.js b/browser/base/content/abouthome/aboutHome.js
+
+>+let _originalFormContent;
+>+let _currentFormContent;
+
+Can you get rid of these and just always create a new form on search, separate from the form with the search input? Then always preventDefault() the search form submission and either set location.href (GET) or call form.submit() on the new form (POST).
+
+>+        if (value == SEARCH_TOKEN) {
+>+          value = searchTerms;
+>+        }
+
+Rather than having to manually manipulate the postData and URL to replace the SEARCH_TOKEN, it seems like it would be simpler to have the page talk to chrome through events so that it can effectively call getSubmission both times (send a message with the search term, receive a message with URL+postData).
+
+>diff --git a/netwerk/base/public/nsIBrowserSearchService.idl b/netwerk/base/public/nsIBrowserSearchService.idl
+
+I think you should limit the changes here to getSubmission, by adding the postDataString attribute that is unconditionally added to POST submissions (i.e. avoid changing getSubmission's signature). It might actually also be better to expose it as a jsval, with it returning an array-of-arrays representing name/value pairs - I don't think we need to care too much about C++ users of this attribute.
+Created attachment 778369
+Patch 1: add postDataString property to nsISearchSubmission
+
+I did go for the String representation of the postData, because I think it provides a cleaner implementation, provides compat with C code and parsing a post data string is not much additional work for consumers. If we were to provide the post data as a jsvar, consumers would need to use a loop to iterate the post vars regardless.
+
+For supporting post data in about:home, this choice doesn't introduce a significant amount of processing boilerplate code imho... see patch 2.
+Created attachment 778372
+Patch 2: support POST searches in about:home
+
+Should I add the 'searchEnginePostData' attribute conditionally in browser.js, or is ok to keep it like this? I opted for unconditionally, because I need to somehow check for post data in aboutHome.js anyway...
+Comment on attachment 778369
+Patch 1: add postDataString property to nsISearchSubmission
+
+>diff --git a/netwerk/base/public/nsIBrowserSearchService.idl b/netwerk/base/public/nsIBrowserSearchService.idl
+
+>   /**
+>+   * The POST data associated with a search submission as a String. May be null.
+>+   */
+>+  readonly attribute AString postDataString;
+
+Perhaps worth mentioning "a application/x-www-form-urlencoded string"
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>   getSubmission: function SRCH_EURL_getSubmission(aSearchTerms, aEngine, aPurpose) {
+>-    var url = ParamSubstitution(this.template, aSearchTerms, aEngine);
+>+    let url = ParamSubstitution(this.template, aSearchTerms, aEngine);
+
+gratuitous changes! If you're going to drive-by these things, please put it in a separate changeset. But I don't think it's worth it in this case.
+
+>+      postDataString = dataString;
+>       // POST method requests must wrap the encoded text in a MIME
+>       // stream and supply that as POSTDATA.
+
+Worth adjusting this comment, something like:
+
+// For POST requests, specify the data as a MIME stream as well as a string
+
+>+function Submission(aURI, aPostData, aPostDataString) {
+
+could use a default argument value (aPostDataString=null) (same for aPostData)
+Created attachment 778567
+Patch 1.2: add postDataString property to nsISearchSubmission
+
+Addressed review comments. Carrying over r=gavin.
+Comment on attachment 778372
+Patch 2: support POST searches in about:home
+
+Review of attachment 778372:
+-----------------------------------------------------------------
+
+a test would be appreciated, you can use an sjs file to send your post request to.
+
+::: browser/base/content/browser.js
+@@ +2309,5 @@
+>      function updateSearchEngine() {
+>        let engine = AboutHomeUtils.defaultSearchEngine;
+>        docElt.setAttribute("searchEngineName", engine.name);
+>        docElt.setAttribute("searchEngineURL", engine.searchURL);
+> +      docElt.setAttribute("searchEnginePostData", engine.postData);
+
+please do this before searchEngineURL, IIRC the mutation observers in the page and the tests consider searchEngineURL as the last set attribute, that means once it mutates the initialization is complete.
+Maybe could even be worth to add a comment here.
+
+::: browser/modules/AboutHomeUtils.jsm
+@@ +28,5 @@
+>    
+>      return Object.freeze({
+>        name: defaultEngine.name,
+> +      searchURL: submission.uri.spec,
+> +      postData: submission.postDataString || ""
+
+postDataString is defined as an AString, why should the service return null instead of an empty string? Is there a use case for an empty string?
+(In reply to Marco Bonardo [:mak] from comment #12)
+> postDataString is defined as an AString, why should the service return null
+> instead of an empty string? Is there a use case for an empty string?
+
+I think null makes more sense, to signify "no postData" (and is consistent with the equivalent "postData" attribute).
+Comment on attachment 778372
+Patch 2: support POST searches in about:home
+
+>diff --git a/browser/base/content/abouthome/aboutHome.js b/browser/base/content/abouthome/aboutHome.js
+
+>+    const SEARCH_TOKEN = "_searchTerms_";
+
+>+      // Set the URL to submit the form to.
+>+      form.setAttribute("action", searchURL);
+
+You need to replace SEARCH_TOKEN in this value even if this is a POST submission, to match nsSearchService behavior. Please do file a followup for not duplicating this logic, though (i.e. having getSubmission called for all searches via events to/from chrome).
+Comment on attachment 778372
+Patch 2: support POST searches in about:home
+
+I agree we need a test, too.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #15)
+> Comment on attachment 778372
+> Patch 2: support POST searches in about:home
+> 
+> I agree we need a test, too.
+
+I agree as well! I'm glad we found this approach feasible though and that no different short-term solution is required. I will post a new patch in the beginning of next week (Monday) or so with a test. Thanks guys!
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #13)
+> I think null makes more sense, to signify "no postData" (and is consistent
+> with the equivalent "postData" attribute).
+
+So, what's confusing now is AboutHomeUtils.defaultSearchEngine.postData returning an empty string instead of null...
+Sure, I think we can get rid of that behavior (though the attribute setting code might need to guard against it).
+Created attachment 780700
+Patch 2.2: support POST searches in about:home
+Created attachment 780701
+Patch 3.1: add unit test for POST search engines in about:home
+Comment on attachment 780701
+Patch 3.1: add unit test for POST search engines in about:home
+
+awesome!
+Comment on attachment 780700
+Patch 2.2: support POST searches in about:home
+
+>diff --git a/browser/modules/AboutHomeUtils.jsm b/browser/modules/AboutHomeUtils.jsm
+
+>   get defaultSearchEngine() {
+
+>+      postData: submission.postDataString || ""
+
+We should probably call this property "postDataString" rather than postData, and as Marco says the fallback to "" should probably happen in the searchEnginePostData-setting code in browser.js.
+Created attachment 780714
+Patch 2.3: support POST searches in about:home
+
+nits addressed, carrying over r=gavin.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/0b3f53c36016
+https://hg.mozilla.org/integration/mozilla-inbound/rev/3448b7a9d7a5
+https://hg.mozilla.org/integration/mozilla-inbound/rev/658e5f8a8daf
+Backed out for failures in browser_contextSearchTabPosition.js:
+https://tbpl.mozilla.org/php/getParsedLog.php?id=25719787&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=25720022&tree=Mozilla-Inbound
+
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/eadbd2a913cb
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/5f4b123fbc99
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/b4c4450fd7bf
+Created attachment 781264
+additional test fix
+
+The browser_contextSearchTabPosition.js failure was caused by browser_aboutHome failing to properly restore the search engine after it finished. It failed to do that because the test that runs just before the newly-added one changes the engine to Yahoo, and only restored the real original default in a cleanup function. So the newly added test stored Yahoo as the engine to restore, and then registered its own cleanup function that ran after the previous tests, undoing its restoration. The fix is to have that test not rely on cleanup functions to restore its state (but I left the cleanup function in case the test fails for some reason).
+Re-pushed with the test fix:
+https://hg.mozilla.org/integration/fx-team/rev/9111e4106137
+https://hg.mozilla.org/integration/fx-team/rev/48772f78d696
+https://hg.mozilla.org/integration/fx-team/rev/0cf201bba70d
+Created attachment 781275
+rollup patch for branch
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): bug 738818
+User impact if declined: about:home broken when certain search plugins are selected
+Testing completed (on m-c, etc.): automated test
+Risk to taking this patch (and alternatives if risky): risk is pretty isolated to the case that's already broken.
+String or IDL/UUID changes made by this patch: IDL change for nsISearchSubmission. It's possible this interface is used by compiled code, though I don't know of any such cases.
+Created attachment 781294
+no IDL change rollup patch for Aurora
+
+As discussed on IRC, it's possible to avoid the IID bump by adding the attribute to the end rather than the middle. This means that binary callers can't reliably detect whether they can call postDataString, but that's a fine limitation to avoid the compatibility impact of the IID change, and will only last for two cycles.
+
+Same request as comment 28, minus the IDL change part.
+Created attachment 781297
+no IDL change rollup patch for Beta
+
+[Approval Request Comment]
+(Just required some trivial merges to browser.js and the test)
+
+Same request as comment 28, minus the IDL change part.
+Talked to Gavin in IRC, without the IDL change we can take this low risk fix on our next Beta, just waiting for it to cleanly land to trunk.
+Created attachment 781368
+no IDL change rollup patch for Beta
+
+I had to make some test tweaks for beta, due to bug 860119 not landing there.
+Adjusting the test for beta revealed that the test could be simplified on trunk as well, so I pushed a followup to do that:
+
+ https://hg.mozilla.org/integration/fx-team/rev/156f5120a9f0
+
+It's not necessary to wait on promiseBrowserAttributes from within the test, because the test runner does that for us.
+https://hg.mozilla.org/mozilla-central/rev/9111e4106137
+https://hg.mozilla.org/mozilla-central/rev/48772f78d696
+https://hg.mozilla.org/mozilla-central/rev/0cf201bba70d
+https://hg.mozilla.org/mozilla-central/rev/156f5120a9f0
+Oh my, and here I was, thinking I was going to start my day debugging this... thanks Gavin!
+Comment on attachment 781294
+no IDL change rollup patch for Aurora
+
+Thanks for the no IDL patches so we can take this on branches.
+https://hg.mozilla.org/releases/mozilla-beta/rev/25ac5bb0b22b
+https://hg.mozilla.org/releases/mozilla-aurora/rev/2c84d35d5703
+Verified as fixed on Firefox 24 beta 7 (build ID: 20130829135643), on Windows 7 64bit, Ubuntu 13.04 32bit and Mac OS X 10.8, following the STR from comment 0.
+Works on Firefox 25 alpha 2, thank you!
+Mozilla/5.0 (Windows NT 6.1; WOW64; rv:25.0) Gecko/20100101 Firefox/25.0
+Mozilla/5.0 (X11; Linux i686; rv:25.0) Gecko/20100101 Firefox/25.0 
+Mozilla/5.0 (Macintosh; Intel Mac OS X 10.7; rv:25.0) Gecko/20100101 Firefox/25.0
+Verified fixed with latest Aurora (20130909004001).

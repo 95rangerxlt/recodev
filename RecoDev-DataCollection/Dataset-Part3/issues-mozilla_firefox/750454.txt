@@ -1,0 +1,894 @@
+Short story: We should nuke the gShutdown mechanism entirely. FUEL adds a bunch of closures to the gShutdown array, and those closures keep their respective FUEL objects alive until shutdown. For things like pref observers this should be unnecessary (since they request to be used as weak observers). Other things (Window, BrowserTab) should figure out some other way to clean up in a more timely fashion.
+
+Longer story: One of my favorite addons does this: 
+
+  for(var window_index in Application.windows){
+    if(Application.windows.hasOwnProperty(window_index)){
+      var window = Application.windows[window_index];
+      for(var tab_index in window.tabs){
+        if(window.tabs.hasOwnProperty(tab_index)){
+          var tab = window.tabs[tab_index]
+  ...
+
+I tend to keep a lot of tabs open (though not loaded) and every time this function runs I have 2N+1 calls to Application.windows (where N is number of windows). Then for every window I have 2M+1 calls to Window.tabs (where M is the number of tabs). Every Window object created adds an item to the gShutdown array, as does every BrowserTab object.
+
+This quickly gets out of control if you have a large number of tabs. On a very short browsing session this array contained > 600k entries.
+
+And then those closures just... sit there... forever... until shutdown. DOM windows cannot be cleaned up, so they hang around, get included in the CC graph, etc.
+
+And then it gets even worse. At shutdown, we run this code:
+
+  while (gShutdown.length) {
+    gShutdown.shift()();
+
+This pulls one item out of the array and then memmove's everything else, for every iteration (quadratic in number of elements according to bz). This is causing me to experience 10+ minute shutdown times, and I have a very zippy machine.
+
+We _really_ need to fix this. Any addon using FUEL to access windows or tabs are going to hit this, as are preference observers, extension inspectors, etc.
+
+Short story: We should nuke the gShutdown mechanism entirely. FUEL adds a bunch of closures to the gShutdown array, and those closures keep their respective FUEL objects alive until shutdown. For things like pref observers this should be unnecessary (since they request to be used as weak observers). Other things (Window, BrowserTab) should figure out some other way to clean up in a more timely fashion.
+
+Longer story: One of my favorite addons does this: 
+
+  for(var window_index in Application.windows){
+    if(Application.windows.hasOwnProperty(window_index)){
+      var window = Application.windows[window_index];
+      for(var tab_index in window.tabs){
+        if(window.tabs.hasOwnProperty(tab_index)){
+          var tab = window.tabs[tab_index]
+  ...
+
+I tend to keep a lot of tabs open (though not loaded) and every time this function runs I have 2N+1 calls to Application.windows (where N is number of windows). Then for every window I have 2M+1 calls to Window.tabs (where M is the number of tabs). Every Window object created adds an item to the gShutdown array, as does every BrowserTab object.
+
+This quickly gets out of control if you have a large number of tabs. On a very short browsing session this array contained > 600k entries.
+
+And then those closures just... sit there... forever... until shutdown. DOM windows cannot be cleaned up, so they hang around, get included in the CC graph, etc.
+
+And then it gets even worse. At shutdown, we run this code:
+
+  while (gShutdown.length) {
+    gShutdown.shift()();
+
+This pulls one item out of the array and then memmove's everything else, for every iteration (quadratic in number of elements according to bz). This is causing me to experience 10+ minute shutdown times, and I have a very zippy machine.
+
+We _really_ need to fix this. Any addon using FUEL to access windows or tabs are going to hit this, as are preference observers, extension inspectors, etc.
+Do we know how many add-ons use FUEL?
+> DOM windows cannot be cleaned up, so they hang around, get included in the CC graph, etc.
+
+Ben tells me on IRC that he hasn't actually observed this; it's a hypothesis based on the other things which are happening.
+(In reply to Dão Gottwald [:dao] from comment #1)
+> Do we know how many add-ons use FUEL?
+
+Many add-ons use FUEL, possibly hundreds:
+https://mxr.mozilla.org/addons/search?string=fuel
+
+What exactly does an add-on need to do to trigger this bug?
+(In reply to Justin Lebar [:jlebar] from comment #2)
+> Ben tells me on IRC that he hasn't actually observed this; it's a hypothesis
+> based on the other things which are happening.
+
+Well, unclear about *content* windows. We definitely leak the chrome windows.
+(In reply to Jorge Villalobos [:jorgev] from comment #3)
+> (In reply to Dão Gottwald [:dao] from comment #1)
+> > Do we know how many add-ons use FUEL?
+> 
+> Many add-ons use FUEL, possibly hundreds:
+> https://mxr.mozilla.org/addons/search?string=fuel
+
+That's not going to be comprehensive. The "Application" object is fuel, for instance...
+(In reply to Jorge Villalobos [:jorgev] from comment #3)
+> What exactly does an add-on need to do to trigger this bug?
+
+Use "Application.windows" or "Application.windows.tabs", basically.
+> What exactly does an add-on need to do to trigger this bug?
+
+Iterate over Application.windows and then the .tabs for each window in the "obvious" way (the one that involves doing the get on every loop of the iteration).
+
+Assuming the common case of 1 window with M tabs, any add-on that does that will end up with 2*M*(M+1)*(number of times it tried to walk the tabs) entries in gShutdown.
+
+For Ben's case, M is about 100, as I understand, so to hit 600k entries would require about 30 walks over the tabs.  If the addon just walks over the tabs periodically, that's easy to hit.
+
+To put that 600k number in perspective, I wrote a small C++ program that tests how long it takes to just do the memmoving involved in the shutdown observer.  It took 3 seconds for 100k entries.  I stopped it at about 8 minutes for 1000k entries.  Note that the expected time for 1000k entries based on the 100k time was about 5 minutes, so clearly 1000k entries doesn't fit in cache as well, and there is a jump in the time needed at some point depending on cache size.
+
+In either case, the smallest time one would expect for 600k entries based on the 100k entry time is about a minute and a half, which is already completely unacceptable for shutdown....
+You know, we should just get rid of this gShutdown business entirely and without regard for leaking (assuming we pass our tests).
+
+At best, gShutdown makes us not "leak" at shutdown.  But we leaked *right up until shutdown* regardless!  So it's buying us exactly zero.
+Yes, 100% agreed.
+Let's see how orange it turns the tree.  :)  https://tbpl.mozilla.org/?tree=Try&rev=df130256b169
+Created attachment 619810
+Patch to fix the array clearing.
+
+Here's a patch to fix the array clearing (moved from bug 750583). Although I'd rather just nuke gShutdown entirely.
+*** Bug 750583 has been marked as a duplicate of this bug. ***
+Try run for df130256b169 is complete.
+Detailed breakdown of the results available here:
+    https://tbpl.mozilla.org/?tree=Try&rev=df130256b169
+Results (out of 222 total builds):
+    success: 181
+    warnings: 41
+Builds (or logs if builds failed) available at:
+http://ftp.mozilla.org/pub/mozilla.org/firefox/try-builds/jlebar@mozilla.com-df130256b169
+I think I can fix everything except the Extension{,s} objects via judicious use of weak references.
+
+But it's not clear to me how to fix the Extensions.  The Extension objects are kept alive by JS code implementing an event listener pattern, so weakmaps don't fit.
+
+I think we could solve the problem if we never created more than one Extension object for a given add-on, but then add-ons could trample on each other by modifying that object.  We could freeze the object, but that would change the API.
+
+I thought about a solution where we do:
+
+  add-on (non-FUEL object) ---> ExtensionProxy singleton <--- Extension objects
+
+That is, one add-on object keeps this one ExtensionProxy alive (via a WeakMap keyed on the add-on), and the extension objects are implemented by forwarding their requests to the ExtensionProxy.  But this doesn't work either, because each Extension object needs to be able to fire events triggered by the add-on, so we need to have path from the add-on to the Extension objects.
+
+So...I'm not sure what to do here.
+Are the Extension objects used in practice?
+
+Quite honestly, I think that at first glance the "never create more than one Extension object for a given add-on" approach seems safest.
+
+Though if add-ons add event listeners to the Extension objects, that would just mean those listeners leak...
+I filed bug 750953 on the crazy behavior that is killing the readability extension. Basically once you get a FUEL Window object the system is doomed, if it runs long enough.
+> Quite honestly, I think that at first glance the "never create more than one Extension 
+> object for a given add-on" approach seems safest.
+
+You don't think it's a problem that the changes one add-on might make to an Extension object would be visible to other add-ons?  Or do you think we should freeze the objects?
+
+I'm now less confident that weak references are going to solve even most of these leaks.  There are a lot of event listeners...
+
+Alternatively, I think an enumerable list of weak refs might work.  I'm kind of surprised we don't already have one, actually...
+> You don't think it's a problem that the changes one add-on might make to an Extension
+> object would be visible to other add-ons?
+
+I think it's a smaller problem than the other things we're looking at here, and I'm willing to bet add-ons make such changes very rarely if ever.
+
+And yes, we really need to solve the event listener issues.  I think that the only sane way to do that is to just minimize the number of objects we create, hence my support for singleton objects.
+(In reply to Justin Lebar [:jlebar] from comment #17)
+> You don't think it's a problem that the changes one add-on might make to an
+> Extension object would be visible to other add-ons?  Or do you think we
+> should freeze the objects?
+
+What changes do you envision add-ons making to these objects? All of its useful properties are read-only, so I think it's quite unlikely that add-ons are changing these objects at all to begin with. Even if they are, it's even more unlikely that another add-on would break because of it (unless you're doing something dumb like replacing _item, but I really don't see any reasonable reason why anyone would do that).
+> What changes do you envision add-ons making to these objects?
+
+I didn't have a specific case in mind.  I agree that modifying the objects doesn't make much sense; I just hoping we wouldn't have to change any semantics.  But it looks like that's not doable, at least, not easily.
+Created attachment 621060
+WIP v1
+
+Gets rid of gShutdown.  This passes the tests locally, without leaking.  But I know that at least the Extensions code and part of the Bookmarks code is untested.
+
+So I need to investigate testing, and also clean up the patch some.
+Created attachment 621163
+WIP v2
+
+Cleaned up mostly; still needs a bunch of additional tests before I'm confident that it works properly.
+
+A notable change: Preference registered a weakref listener on the pref branch, so the intent was apparently for the listener to die when the Preference object died.  That is, you'd have to keep the Preference object alive in order for the listener objects you registered using it to do anything.
+
+However, gShutdown foiled that plan -- it kept a strong reference to every Preference object.  So you could register a listener on a Preference object, drop all your refs to it, and still have that listener fire.
+
+I decided to keep the current semantics by making listeners registered via a Preference object stay alive forever, because that matches our semantics around bookmarks, and I think it's sane.
+Created attachment 621760
+WIP v3
+
+Re-enabled a preferences test, made it work.
+I think this should fix bug 533290.  That seems to have been caused by weakref weirdness, which I'm removing here.
+(In reply to Justin Lebar from comment #24)
+> I think this should fix bug 533290.  That seems to have been caused by
+> weakref weirdness, which I'm removing here.
+
+I don't see you removing weakrefs, c.f. this patch excerpt:
+>+        QueryInterface: XPCOMUtils.generateQI([Ci.nsIObserver,
+>+                                               Ci.nsISupportsWeakReference])
+>+      };
+>+      this._observersDict[aBranch] = observer;
+>+      this._prefs.addObserver(aBranch, observer, /* ownsWeak = */ true);
+Well, see the first line here:
+
+>+      this._observersDict[aBranch] = observer;
+>+      this._prefs.addObserver(aBranch, observer, /* ownsWeak = */ true);
+
+We're now holding a strong ref to the observer.  The prefbranch also holds a weakref to it, it's true, but the object is now explicitly held alive until the PreferenceObserver goes away, and the PreferenceObserver lives until shutdown.
+I can't figure out how to test this extension code without shoving hooks pretty deep into AddonManager.jsm.  I'm not sure that we want to do that.
+
+If we're afraid of changing this untested code, we could leave it as-is.  We might need to leave gShutdown, in this case -- the extension objects are held alive by strong listeners from AddonManager.jsm, and I'm not sure if we'll leak if we leave those listeners until shutdown.
+
+An add-on shouldn't create bazillions of Extension objects unless they call Application.getExtensions() in a loop.  It returns via a callback, so I presume extensions won't call this too many times.
+
+So the options I have are: Leave the grossness alone because we think it's likely to work properly, test our new code by injecting fake extensions into the add-on manager, or look closely at the code and let our users do the testing for us.
+
+Thoughts?
+Why do you need to shove hooks into the addon manager to test this?
+I don't fully understand the scope of the objects defined in these files, but it seems that I can't do |new Extensions| from a browser chrome test -- that seems pretty reasonable.
+
+So to get a handle on a non-empty Extensions object, AddonManager.getAddonsByTypes needs to return a non-empty list.  It's currently empty when I run the browser-chrome tests.
+
+Then, once I get an Extension object, I want to trigger a relevant onenable (or whatever) event.  The object listening to that event is the singleton ExtensionObserver, which does AddonManager.addAddonListener(this).  Again, I don't understand how things are scoped here, but it seems that I can't get a handle on gExtensionObserver from the test (and this is again reasonable; we don't want an extension messing with this global).  So even if I wanted to, I can't call gExtensionObserver.onEnabling() myself -- I'd need to trigger that via the addon manager.
+Couldn't your test just install an addon and enable it? toolkit/mozapps/extensions/test/xpcshell/test_fuel.js does something similar, but it could also be done from a browser chrome test. Or maybe tweaking that test would be sufficient.
+There was some chatter on IRC:
+
+bz: pdf.js uses FUEL?
+bdahl: pdf.js uses fuel
+gavin: yes
+gavin: so does testpilot
+
+:(
+> bz: pdf.js uses FUEL?
+> bdahl: pdf.js uses fuel
+> gavin: yes
+> gavin: so does testpilot
+
+Oh, so the two add-ons we ship by default to users?  Sigh.
+(And yes, I know Test Pilot is not shipped on normal releases and pdf.js isn't enabled yet.  Still...)
+I "requested a pull" to fix pdf.js at https://github.com/mozilla/pdf.js/pull/1683 .
+I'm really under the gun here at the b2g work week.  Doing my best, but I may not be able to get back to this until next week.
+(Comment 35 was really me; I signed in with browser-id on my phone and didn't realize it was going to post as a new user.)
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #30)
+> Couldn't your test just install an addon and enable it?
+> toolkit/mozapps/extensions/test/xpcshell/test_fuel.js does something
+> similar, but it could also be done from a browser chrome test. Or maybe
+> tweaking that test would be sufficient.
+
+Indeed, it was sufficient.  I didn't even realize that test existed.  Thanks!
+Created attachment 623777
+Patch v1
+Can you split this up into pieces? The bookmarks observer changes are more complicated and don't necessary to fix the primary issue (lots of Tab/Window objects being accumulated in gShutdown).
+To be clear, the bookmarks and pref observer changes are necessary to fix the primary issue of memory leaks.  For example, accessing Preferences.all leaks an object for every pref.  (Plus listeners for each object, etc.)  Depending on how one uses this API, that could be quite bad.
+
+I'll split this up however you want, but can you be specific about how you want it split?  Do you want the window leak fixes split out from the non-window leak fixes?  Do you want one patch per object I changed?
+Splitting it into three parts would probably be good. In order of importance:
+1) Window/Tab changes
+2) Prefs changes
+3) Bookmarks/Extensions
+Created attachment 623893
+FUEL - Part 1, Use weak refs in Application.
+Created attachment 623894
+FUEL - Part 2, Fix browser leaks.
+Created attachment 623895
+FUEL - Part 3, Fix preferences leaks.
+Created attachment 623896
+FUEL - Part 4, Fix bookmarks leaks.
+Created attachment 623897
+FUEL - Part 5, Fix extensions.
+Created attachment 623898
+FUEL - Part 6, Remove gShutdown.
+Created attachment 623899
+FUEL - Part 7, Test fixes
+Any chance we're going to get this done by uplift (6/4)?
+Or, Gavin, if you don't think you'll have time, perhaps you can suggest another reviewer?
+I can do this, though I'm not going to flip all requests cause would just be useless spam.
+Comment on attachment 623893
+FUEL - Part 1, Use weak refs in Application.
+
+Review of attachment 623893:
+-----------------------------------------------------------------
+
+basically positive, though I think there's potential space for further simplification in the "unload" case.
+
+::: toolkit/components/exthelper/extApplication.js
+@@ +550,2 @@
+>      // references to various services, and to remove itself as
+>      // observer of any other notifications.
+
+This comment doesn't apply anymore, according to what you do here and what you are doing in the "remove gShutdown" patch.
+In the end the shutdown observer will only be used to notify the "unload" event and cleanup a couple singletons, so the comments should be updated.
+
+I we'd not need to nullify those singletons, you may even also just completely get rid of this code and just add "unload": "xpcom-shutdown" to rmap in the events getter, so that it's observed only when the implementer requires to observe it, as all the other events.
+So, do we really need to nullify gExtensionObserver and gPreferenceObserver there? Do they keep anything alive more than usual in case we don't (not sure that really matters cause we are so late there, plus when we'll exit(0) that code won't be called at all).
+
+@@ +550,4 @@
+>      // references to various services, and to remove itself as
+>      // observer of any other notifications.
+>      this._obs = Cc["@mozilla.org/observer-service;1"].
+>                  getService(Ci.nsIObserverService);
+
+OT: Do we already have a bug to use Services.jsm in this old code?
+
+@@ +550,5 @@
+>      // references to various services, and to remove itself as
+>      // observer of any other notifications.
+>      this._obs = Cc["@mozilla.org/observer-service;1"].
+>                  getService(Ci.nsIObserverService);
+> +    this._obs.addObserver(this, "xpcom-shutdown", /* ownsWeak = */ true);
+
+nit: I don't think commenting on each weak ref is really useful, all observer-like interfaces have the same behavior of false=strong, true=weak.  If it's unclear, we should evaluate adding addWeakObserver :)  Though, if you think it clarifies things, fine!
+Comment on attachment 623894
+FUEL - Part 2, Fix browser leaks.
+
+Review of attachment 623894:
+-----------------------------------------------------------------
+
+::: browser/fuel/src/fuelApplication.js
+@@ +116,1 @@
+>  function Window(aWindow) {
+
+I think (actually just tried in Scratchpad) you can use the map inside the constructor itself and keep using new Window(), since this constructor is not exposed there's less risk of misuse.
+
+  if (map.has(aWindow)) {
+    return map.get(aWindow);
+  }
+  // init stuff
+  map.set(aWindow, this);
+
+The same for GetBrowserTab... alternatively, if you did this to be clearer about the fact this may be a new or existing instance, you may name it getOrCreateWindow().
+
+Also, we don't use to uppercase functions in js, unless they are constructors.
+
+@@ +138,5 @@
+>     */
+>    _watch : function win_watch(aType) {
+>      var self = this;
+>      this._tabbrowser.tabContainer.addEventListener(aType,
+> +      function(e){ self._event(e); },
+
+why doesn't this object implement nsIDOMEventListener and provide handleEvent instead of its own custom implementation?
+
+@@ +177,5 @@
+> +    fuelBrowserTabMap.set(aBrowser, fuelBrowserTab);
+> +  }
+> +  else {
+> +    // A tab may change windows, so make sure our tab cached tab has the right
+> +    // window.
+
+"A tab may move to another window, so make sure the cached window is the current ones."
+
+@@ +195,5 @@
+>  }
+>  
+>  BrowserTab.prototype = {
+> +  get _tabbrowser() {
+> +    return this._window._tabbrowser;
+
+accessing "private" property of Window :( Though I see this was there already
+Comment on attachment 623895
+FUEL - Part 3, Fix preferences leaks.
+
+Review of attachment 623895:
+-----------------------------------------------------------------
+
+::: toolkit/components/exthelper/extApplication.js
+@@ +165,5 @@
+> +
+> +function PreferenceObserver() {
+> +  this._observersDict = {};
+> +  this._prefs = Components.classes["@mozilla.org/preferences-service;1"]
+> +                          .getService(Ci.nsIPrefService);
+
+may be a lazyServiceGetter... though, looks unused?
+
+@@ +168,5 @@
+> +  this._prefs = Components.classes["@mozilla.org/preferences-service;1"]
+> +                          .getService(Ci.nsIPrefService);
+> +}
+> +
+> +PreferenceObserver.prototype = {
+
+is there a specific reasons this is an instanceable object than just a plain let gPreferenceObserver = Object.freeze({...}); ?
+
+@@ +170,5 @@
+> +}
+> +
+> +PreferenceObserver.prototype = {
+> +  // aPrefs is the nsIPrefBranch onto which we'll install our listener.
+> +  addListener: function(aPrefs, aDomain, aEvent, aListener) {
+
+please, proper javadoc and name the methods
+
+@@ +180,5 @@
+> +
+> +    if (!observer) {
+> +      observer = {
+> +        events: new Events(),
+> +        observe: function(aSubject, aTopic, aData) {
+
+please name the method
+
+@@ +191,5 @@
+> +      observer.prefBranch.addObserver(aDomain, observer, /* ownsWeak = */ true);
+> +
+> +      if (!this._observersDict[root]) {
+> +        this._observersDict[root] = {};
+> +      }
+
+we just made this at the beginning of the method...
+
+@@ +192,5 @@
+> +
+> +      if (!this._observersDict[root]) {
+> +        this._observersDict[root] = {};
+> +      }
+> +      this._observersDict[root][aDomain] = observer;
+
+please add a comment clarifying the ownership here, cause it's really easy to miss the fact the dict is keeping the observer alive, rather than the pref branch.
+
+@@ +205,5 @@
+> +      return;
+> +    }
+> +    var observer = this._observersDict[root][aDomain];
+> +
+> +    observer.events.removeListener(aEvent, aListener);
+
+nit: move newline one line above
+
+@@ +213,5 @@
+> +      // aPrefs is the same object as observer.prefBranch, so we have to call
+> +      // removeObserver on observer.prefBranch.
+> +      observer.prefBranch.removeObserver(aDomain, observer);
+> +      delete this._observersDict[root][aDomain];
+> +      if (this._observersDict[root] === {}) {
+
+are you sure this works? doesn't look like it would
+I think you should rather check Object.keys(this._observersDict).length === 0
+
+@@ +236,1 @@
+>    this._prefs.QueryInterface(Ci.nsIPrefBranch);
+
+hm, getBranch already returns nsIPrefBranch, the getService above could just do getService(Ci.nsIPrefBranch). Not sure what's the point of this QI then.
+
+@@ +236,3 @@
+>    this._prefs.QueryInterface(Ci.nsIPrefBranch);
+>  
+> +  let self = this;
+
+since you only use self._prefs, would be cleaner to have let prefs = this._prefs; and use that.
+
+@@ +236,5 @@
+>    this._prefs.QueryInterface(Ci.nsIPrefBranch);
+>  
+> +  let self = this;
+> +  this._events = {
+> +    addListener: function(aEvent, aListener) {
+
+space after "function" for anonymous functions, but probably better naming these
+Comment on attachment 623896
+FUEL - Part 4, Fix bookmarks leaks.
+
+Review of attachment 623896:
+-----------------------------------------------------------------
+
+I admit I had to close more than 1 eye on this part, this bookmarks abstraction is terrible... but not your fault and not related to this bug so... whatever :(
+
+::: browser/fuel/src/fuelApplication.js
+@@ +346,5 @@
+> +function BookmarksObserver() {
+> +  this._eventsDict = {};
+> +  this._folderEventsDict = {};
+> +  this._rootEvents = new Events();
+> +  Utilities.bookmarks.addObserver(this, /* ownsWeak = */ true);
+
+We should stop using Utilities for places services and actually use defineLazyModuleGetter and use PlacesUtils
+
+@@ +347,5 @@
+> +  this._eventsDict = {};
+> +  this._folderEventsDict = {};
+> +  this._rootEvents = new Events();
+> +  Utilities.bookmarks.addObserver(this, /* ownsWeak = */ true);
+> +}
+
+same question as before, couldn't this just be a gBookmarksObserver and effectively add the observer first time an addxxx method is invoked?
+
+@@ +352,5 @@
+> +
+> +BookmarksObserver.prototype = {
+> +  onBeginUpdateBatch : function() {},
+> +  onEndUpdateBatch : function() {},
+> +  onBeforeItemRemoved : function(aId) {},
+
+please don't define unused args (not going to repeat)
+
+@@ +354,5 @@
+> +  onBeginUpdateBatch : function() {},
+> +  onEndUpdateBatch : function() {},
+> +  onBeforeItemRemoved : function(aId) {},
+> +
+> +  onItemAdded : function(aId, aFolder, aIndex, aItemType, aURI) {
+
+please name actually used methods
+nit: s/aId/aItemId/, s/aFolder/aParentId/ everywhere
+
+@@ +373,5 @@
+> +    this._dispatchToEvents("change", aProperty, this._eventsDict[aId]);
+> +  },
+> +
+> +  onItemMoved: function(aId, aOldParent, aOldIndex, aNewParent, aNewIndex) {
+> +    this._dispatchToEvents("move", aId, this._eventsDict[aId]);
+
+I wonder what's the usefulness of knowing something moved without knowing from where and to where... probably we should rather notify "remove" and "add" instead of "move", at least you can do something with it.  btw, I actually hope nobody uses this crappy fuel listener...
+
+@@ +457,1 @@
+>  function Bookmark(aId, aParent, aType) {
+
+Sorry, I don't understand why new Bookmark() would be bad in this case, is it not the same?
+
+@@ +464,1 @@
+>    var self = this;
+
+better to have let id = this._id; and use id...
+nit: s/aId/aItemId/, s/aParent/aParentId/, s/aType/aItemType/
+
+@@ +543,5 @@
+> +  onItemAdded : function(aId, aFolder, aIndex, aItemType, aURI) {},
+> +  onBeforeItemRemoved : function(aId) {},
+> +  onItemVisited: function(aId, aVisitID, aTime) {},
+> +  onItemRemoved : function(aId, aFolder, aIndex) {},
+> +  onItemChanged : function(aId, aProperty, aIsAnnotationProperty, aValue) {},
+
+remove unused args
+
+@@ +573,1 @@
+>  function BookmarkFolder(aId, aParent) {
+
+don't get the difference again, sorry
+
+@@ +721,5 @@
+> +  onEndUpdateBatch : function bmf_oeub() {},
+> +  onItemAdded : function bmf_oia(aId, aFolder, aIndex, aItemType, aURI) {},
+> +  onBeforeItemRemoved : function bmf_oir(aId) {},
+> +  onItemRemoved : function bmf_oir(aId, aFolder, aIndex) {},
+> +  onItemChanged : function bmf_oic(aId, aProperty, aIsAnnotationProperty, aValue) {},
+
+pls remove all naming and args
+
+@@ +744,3 @@
+>    get menu() {
+>      if (!this._menu)
+> +      this._menu = GetBookmarkFolder(Utilities.bookmarks.bookmarksMenuFolder, null);
+
+Sigh, all of these should use PlacesUtils.bookmarksMenuFolderId, PlacesUtils.toolbarFolderId and so on, to avoid crossing xpcom :(
+Comment on attachment 623897
+FUEL - Part 5, Fix extensions.
+
+Review of attachment 623897:
+-----------------------------------------------------------------
+
+mostly same comments apply but globally looks fine
+
+::: toolkit/components/exthelper/extApplication.js
+@@ +454,5 @@
+> +  this._eventsDict = {};
+> +
+> +  AddonManager.addAddonListener(this);
+> +  AddonManager.addInstallListener(this);
+> +}
+
+not going to repeat the same question again :)
+
+@@ +518,5 @@
+> +
+> +  var self = this;
+> +  this._events = {
+> +    addListener: function(aEvent, aListener) {
+> +      gExtensionObserver.addListener(self.id, aEvent, aListener);
+
+let id = this.id and use id.
+Comment on attachment 623898
+FUEL - Part 6, Remove gShutdown.
+
+basically what I said in https://bugzilla.mozilla.org/show_bug.cgi?id=750454#c52
+Comment on attachment 623899
+FUEL - Part 7, Test fixes
+
+Review of attachment 623899:
+-----------------------------------------------------------------
+
+::: browser/fuel/test/browser_Bookmarks.js
+@@ +204,5 @@
+> +  testFolderC.remove();
+> +  is(gLastRootAction, "remove");
+> +
+> +  testFolderD.description = "Foo";
+> +  is(gLastRootAction, "bookmarkProperties/description");
+
+my god, I never figured we expose description through fuel.
+Thanks for the review!  Some questions and comments:
+
+> nit: I don't think commenting on each weak ref is really useful, all observer-like interfaces have 
+> the same behavior of false=strong, true=weak.  If it's unclear, we should evaluate adding 
+>  addWeakObserver :)  Though, if you think it clarifies things, fine!
+
+I have a personal vendetta against public APIs which take opaque arguments (particularly booleans), so if it's OK with you, I'd very much like to keep these /* ownsWeak = */ comments in there.
+
+http://jlebar.com/2011/12/16/Boolean_parameters_to_API_functions_considered_harmful..html
+
+I'm also really curious why we name these methods.  If we compare
+
+  doFoo: function() {...}
+
+to
+
+  doFoo: function FOP_doFoo() { ... }
+
+the latter adds verbiage with nearly zero benefit.  (The only case where it matters is when doFoo wants to reference itself and can't do this.doFoo for whatever reason, right?)
+
+> (From comment 52)
+> I [rather?] we'd not need to nullify those singletons
+
+I believe I tested and we need to set the singletons to null, otherwise we leak and the testsuite turns orange.  I'll test again.  Note that the observer singletons necessarily keep a lot of objects alive.
+
+> (From comment 52)
+> OT: Do we already have a bug to use Services.jsm in this old code?
+
+I guess this is a rhetorical question?  I don't think anybody has looked carefully at this code for some time, so it seems unlikely that such a bug exists.
+
+> (From comment 53)
+> I think (actually just tried in Scratchpad) you can use the map inside the constructor itself and keep using new Window(), since this 
+> constructor is not exposed there's less risk of misuse.
+
+Huh, that's a cool trick.  But I'm afraid this still creates a new Window object, which is immediately garbage.  Creating a bit more garbage for Windows would probably be fine, but it likely wouldn't be fine for e.g. tabs (you could have hundreds of tabs and access them in a loop).  So my preference would be to use the straightforward get-or-create functions, unless we know that this is identical.
+
+> (From comment 53)
+>> +    // A tab may change windows, so make sure our tab cached tab has the right
+>> +    // window.
+>
+> "A tab may move to another window, so make sure the cached window is the current ones."
+
+How would you feel about: "A tab may move to another window, so make sure that our cached tab's _window property is up to date."?
+
+>> +  onBeforeItemRemoved : function(aId) {},
+>
+> please don't define unused args (not going to repeat)
+
+How strongly do you feel about this?
+
+If I came in and decided to add an implementation to onBeforeItemRemoved, and it didn't have the aId param, I'd be pretty confused.  I think having the unused args here is good documentation.
+
+If you really don't want to have the args, I'd be OK with
+
+   onBeforeItemRemoved : function(/* args omitted */) {}
+
+But I don't think that's an improvement, personally.
+(In reply to Justin Lebar [:jlebar] from comment #59)
+> I have a personal vendetta against public APIs which take opaque arguments
+> (particularly booleans), so if it's OK with you, I'd very much like to keep
+> these /* ownsWeak = */ comments in there.
+
+sure, I feel the same vs blind booleans args/
+
+> I'm also really curious why we name these methods.  If we compare
+
+I think the main reason was for exception stacks showing anonymous functions, not sure if something changed in that regards lately.
+
+> > (From comment 52)
+> > I [rather?] we'd not need to nullify those singletons
+> 
+> I believe I tested and we need to set the singletons to null, otherwise we
+> leak and the testsuite turns orange.  I'll test again.  Note that the
+> observer singletons necessarily keep a lot of objects alive.
+
+ok, thanks for checking, it's unfortunate we can't simplify code due to those :(
+
+> > (From comment 52)
+> > OT: Do we already have a bug to use Services.jsm in this old code?
+> 
+> I guess this is a rhetorical question?  I don't think anybody has looked
+
+sort of a rant mostly, yeah, this code is unmaintained mostly, that makes me think we should start saying users it's deprecated, and remove it soon or later, would it even be in 1 or 2 years...
+
+> Huh, that's a cool trick.  But I'm afraid this still creates a new Window
+> object, which is immediately garbage.  Creating a bit more garbage for
+> Windows would probably be fine, but it likely wouldn't be fine for e.g. tabs
+> (you could have hundreds of tabs and access them in a loop).  So my
+> preference would be to use the straightforward get-or-create functions,
+> unless we know that this is identical.
+
+I don't have data to tell you that off-hand, for windows the overhead is likely unimportant, so maybe you could keep new for Window and use getOrCreate for tabs, adding a comment about why we don't use the same trick? (overhead)
+
+> How would you feel about: "A tab may move to another window, so make sure
+> that our cached tab's _window property is up to date."?
+
+Fine, regardless I'm not english mother tongue, just the original phrase was sounding unclear.
+
+> >> +  onBeforeItemRemoved : function(aId) {},
+> >
+> > please don't define unused args (not going to repeat)
+> 
+> How strongly do you feel about this?
+
+I think there may be a tiny overhead for defining single args (missing data though), but my actual motivation is mostly readability and code coherence, we usually do that around the codebase, afaict.  This is not blocking a positive review, btw.
+ah, fwiw, the args to mostly of those observer methods are wrong, or better, they are already missing many.
+> alternatively, if you did this to be clearer about the fact this may be a new or existing instance, you may name it
+> getOrCreateWindow().
+
+I think whether we're "getting" or "creating" a Window object here is an implementation detail, so I've left this as getWindow/getBrowserTab.
+
+> please, proper javadoc and name the methods
+
+None of the methods in either fuelApplication.js or extApplication.js has a javadoc.
+
+I know two wrongs don't make a right, but could you please clarify exactly which methods you want me to document with javadocs?
+
+> space after "function" for anonymous functions, but probably better naming these
+
+By my count, the no-space variant appears twice as often in our tree than the space variant.
+
+  $ find . -name '*.js' | xargs grep 'function(' | wc -l
+  23655
+  $ find . -name '*.js' | xargs grep 'function (' | wc -l
+  10250
+
+Moreover, "function (" does not match how we write named functions (it's "function foo()", not "function foo ()").
+
+Are you sure that "function (" is the right style to enforce?
+
+> (From comment 55)
+> We should stop using Utilities for places services and actually use defineLazyModuleGetter and use PlacesUtils
+
+Are you gating the review on this, or is this something you think we can file a follow-up bug on?  (To be clear, I do not volunteer to write this follow-up patch.)
+
+> nit: s/aId/aItemId/, s/aParent/aParentId/, s/aType/aItemType/
+
+This touches a lot of code that I didn't touch here.  I think it's a good change, but I think it should be a separate bug.
+
+> (From comment 55)
+>> +  onEndUpdateBatch : function bmf_oeub() {},
+>> +  onItemAdded : function bmf_oia(aId, aFolder, aIndex, aItemType, aURI) {},
+>> +  onBeforeItemRemoved : function bmf_oir(aId) {},
+>> +  onItemRemoved : function bmf_oir(aId, aFolder, aIndex) {},
+>> +  onItemChanged : function bmf_oic(aId, aProperty, aIsAnnotationProperty, aValue) {},
+> pls remove all naming and args
+
+I don't get why these shouldn't have names while the other anonymous functions should, but I'm happy to remove their names if you want me to!  :)
+
+> couldn't this just be a gBookmarksObserver and effectively add the observer first time an addxxx method is invoked?
+
+I thought this was a good suggestion, and I tried it.
+
+Unfortunately it's complicated to make this work.  extApplication.js is not included until the end of fuelApplication.js.  That means that gBookmarksObserver cannot call, for example, |new Events()| inside its object definition.  Getting around this requires adding a lot of lazy initialization, and I don't think it's worthwhile.
+
+Are you OK leaving things the way they are?
+
+
+As promised, I went through and investigated which of the global singletons must be cleared at shutdown so as to avoid "leaks" and corresponding orange.
+
+ - BookmarksObsever   <-- must be cleared
+ - ExtensionObserver  <-- does not need to be cleared
+ - PreferenceObserver <-- must be cleared
+
+If you want, I can nuke the |gExtensionObserver = null| call.
+(In reply to Marco Bonardo [:mak] from comment #61)
+> ah, fwiw, the args to mostly of those observer methods are wrong, or better,
+> they are already missing many.
+
+Well, that's quite bad.  :)
+
+> I don't get why these shouldn't have names while the other anonymous functions should, but I'm happy 
+> to remove their names if you want me to!  :)
+
+I guess you want the names for stack traces, but you don't care about getting stack traces on these functions?  I thought stack traces now said "[anonymous function at foo.js:42]", but if not, I'm totally in favor of naming all functions we care about.
+(In reply to Justin Lebar [:jlebar] from comment #62)
+> I know two wrongs don't make a right, but could you please clarify exactly
+> which methods you want me to document with javadocs?
+
+Only the ones where you are actually adding a comment before them. I don't want you to fix all the code, just the new one.
+
+> Are you sure that "function (" is the right style to enforce?
+
+yes, at least in browser
+
+> > We should stop using Utilities for places services and actually use defineLazyModuleGetter and use PlacesUtils
+> 
+> Are you gating the review on this, or is this something you think we can
+> file a follow-up bug on?  (To be clear, I do not volunteer to write this
+> follow-up patch.)
+
+Not gating, though I think it would make the patch simpler in certain places, and would improve performances and memory. If you don't think you have the time for that, nvm.
+
+> > couldn't this just be a gBookmarksObserver and effectively add the observer first time an addxxx method is invoked?
+> 
+> I thought this was a good suggestion, and I tried it.
+> 
+> Getting around this requires adding a lot of lazy
+> initialization, and I don't think it's worthwhile.
+> 
+> Are you OK leaving things the way they are?
+
+ok, we should evaluate it in a follow-up, there is so much that can be improved in this code :/ (though, it may not be worth it, we should take a decision regarding deprecation).
+
+> If you want, I can nuke the |gExtensionObserver = null| call.
+
+my point was to remove the shutdown path, if regardless we can't do that, there's poor benefit.
+
+(In reply to Justin Lebar [:jlebar] from comment #63)
+> (In reply to Marco Bonardo [:mak] from comment #61)
+> > ah, fwiw, the args to mostly of those observer methods are wrong, or better,
+> > they are already missing many.
+> 
+> Well, that's quite bad.  :)
+
+The fact is that when someone changes listener APIs it's hard he will go through each single listener in the codebase (may be tens or hundreds) to add new args, so defining all args often doesn't improve anything regarding the need to go looking at the idl/docs.
+
+> I guess you want the names for stack traces, but you don't care about
+> getting stack traces on these functions?
+
+they are empty, so would be crazy to get a stack from there :)
+>> Are you sure that "function (" is the right style to enforce?
+> yes, at least in browser
+
+I'm going to fix this, but please note that "function(" appears twice as often in browser/ than "function (".
+
+I make a big deal of this because style nits waste everyone's time.  We minimize this wasted time by acknowledging that our codebase conforms to certain conventions, whether we like them or not, and that it's easier to write code which matches existing conventions than it is to guess what a reviewer thinks is the right style.
+
+Literally every reviewer who's ever looked at a patch of mine has a different personal style guide.  I have to keep notes in order to keep things straight.
+Created attachment 630049
+Part 1a, review comments (comment 52).
+Created attachment 630050
+Part 2a, review comment (comment 53): Use handleEvent instead of rolling it ourselves.
+Created attachment 630051
+Part 3a, review comments from comment 54.
+Created attachment 630052
+Part 4a, review comments (comment 55)
+Created attachment 630053
+Part 5a, review comments (comment 56).
+Created attachment 630054
+Part 8: Reformat FUEL code.
+
+I reformatted everything so there would be a consistent style.
+Created attachment 630055
+Part 9: Add javadoc to PreferenceObserver.{add,remove}EventListener.
+If you feel that this patch queue has gotten a bit out of hand, the github UI might make things more manageable.  https://github.com/jlebar/mozilla-central/compare/c2139e29efc1e1ff665867e75add7433cc913edd...jlebar:FUEL-750454
+Comment on attachment 630050
+Part 2a, review comment (comment 53): Use handleEvent instead of rolling it ourselves.
+
+Review of attachment 630050:
+-----------------------------------------------------------------
+
+::: browser/fuel/src/fuelApplication.js
+@@ +78,5 @@
+>    }
+>    return fuelWindow;
+>  }
+>  
+> +// Don't call new Winodw() directly; use getWindow instead.
+
+typo: Winodw
+if you wish I may take a quick look to the coalesced patch, otherwise I think we're basically done.
+Created attachment 630274
+Roll-up patch
+Comment on attachment 630274
+Roll-up patch
+
+Review of attachment 630274:
+-----------------------------------------------------------------
+
+just a couple nits, thanks for touching this old unmaintained code.
+
+::: browser/fuel/src/fuelApplication.js
+@@ +263,4 @@
+>      return Utilities.annotations.itemHasAnnotation(this._id, aName);
+>    },
+>  
+> +  get: function(aName) {
+
+other methods have been names in this prototype
+
+@@ +268,5 @@
+>        return Utilities.annotations.getItemAnnotation(this._id, aName);
+>      return null;
+>    },
+>  
+> +  set: function(aName, aValue, aExpiration) {
+
+ditto
+One last try push, for good measure.  https://tbpl.mozilla.org/?tree=Try&rev=ac72aecb0cf0
+FWIW, I agree that "function()" vs. "function ()" is not a distinction worth worrying about. I don't think it would have held up review either way, though :)
+https://hg.mozilla.org/integration/mozilla-inbound/rev/95862b813922
+https://hg.mozilla.org/integration/mozilla-inbound/rev/0a53a1ca7be0
+https://hg.mozilla.org/integration/mozilla-inbound/rev/67a7fc208b7a
+https://hg.mozilla.org/integration/mozilla-inbound/rev/40ac7ca4fff0
+https://hg.mozilla.org/integration/mozilla-inbound/rev/7bf98e5b9577
+https://hg.mozilla.org/integration/mozilla-inbound/rev/4722c9be6492
+https://hg.mozilla.org/integration/mozilla-inbound/rev/b2bf1ae073d2
+https://hg.mozilla.org/integration/mozilla-inbound/rev/9055dbb09137
+
+\o/
+Do we have any telemetry stuff in place that might indicate how much this helps?
+We measure RSS, but that needle is unlikely to move in aggregate.
+
+If we could make a list of the relevant extensions, we could look at how RSS changes for people who have at least one FUEL-using extension installed.
+https://hg.mozilla.org/mozilla-central/rev/95862b813922
+https://hg.mozilla.org/mozilla-central/rev/0a53a1ca7be0
+https://hg.mozilla.org/mozilla-central/rev/67a7fc208b7a
+https://hg.mozilla.org/mozilla-central/rev/40ac7ca4fff0
+https://hg.mozilla.org/mozilla-central/rev/7bf98e5b9577
+https://hg.mozilla.org/mozilla-central/rev/4722c9be6492
+https://hg.mozilla.org/mozilla-central/rev/b2bf1ae073d2
+https://hg.mozilla.org/mozilla-central/rev/9055dbb09137
+*** Bug 717724 has been marked as a duplicate of this bug. ***

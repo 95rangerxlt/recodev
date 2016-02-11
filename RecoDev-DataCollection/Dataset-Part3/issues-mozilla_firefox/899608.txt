@@ -1,0 +1,180 @@
+From IRC:
+
+[2013-07-30 18:03:40] <Gijs> mconley: http://hg.mozilla.org/projects/ux/file/1db33326529f/browser/components/customizableui/src/CustomizableUI.jsm#l2103
+[2013-07-30 18:04:16] <Gijs> mconley: so, nodes should be made a getter, or possibly just removed
+[2013-07-30 18:04:27] <mconley> yeah - is that ever used?
+[2013-07-30 18:04:33] <mconley> at the very least, it should be lazy
+[2013-07-30 18:04:37] <Gijs> mconley: forWindow should, umm, check the wrapper cache before going a-wandering around the DOM
+[2013-07-30 18:04:45] <Gijs> (not after, which is kinda silly)
+[2013-07-30 18:05:00] <mconley> I believe
+[2013-07-30 18:05:34] <Gijs> and really, we could easily have a placement info getter on the group wrapper
+[2013-07-30 18:05:49] <Gijs> which will eliminate DOM lookups entirely in the case where the widget is in the panel
+[2013-07-30 18:06:04] <Gijs> (right now, you have to call forWindow)
+[2013-07-30 18:06:24] <mconley> that'd be awesome
+[2013-07-30 18:06:43] <Gijs> (we could do this by getting the area's type from the placement's area id info)
+[2013-07-30 18:06:51] <mconley> yep
+
+
+Generally, IMO the wrappers should avoid doing actual DOM poking until you ask them for a DOM node (and cache the results, of course).
+
+(some of this slowness seems to be causing the bookmark UI's updates on startup to take about 0.5ms on each tpaint window open)
+
+From IRC:
+
+[2013-07-30 18:03:40] <Gijs> mconley: http://hg.mozilla.org/projects/ux/file/1db33326529f/browser/components/customizableui/src/CustomizableUI.jsm#l2103
+[2013-07-30 18:04:16] <Gijs> mconley: so, nodes should be made a getter, or possibly just removed
+[2013-07-30 18:04:27] <mconley> yeah - is that ever used?
+[2013-07-30 18:04:33] <mconley> at the very least, it should be lazy
+[2013-07-30 18:04:37] <Gijs> mconley: forWindow should, umm, check the wrapper cache before going a-wandering around the DOM
+[2013-07-30 18:04:45] <Gijs> (not after, which is kinda silly)
+[2013-07-30 18:05:00] <mconley> I believe
+[2013-07-30 18:05:34] <Gijs> and really, we could easily have a placement info getter on the group wrapper
+[2013-07-30 18:05:49] <Gijs> which will eliminate DOM lookups entirely in the case where the widget is in the panel
+[2013-07-30 18:06:04] <Gijs> (right now, you have to call forWindow)
+[2013-07-30 18:06:24] <mconley> that'd be awesome
+[2013-07-30 18:06:43] <Gijs> (we could do this by getting the area's type from the placement's area id info)
+[2013-07-30 18:06:51] <mconley> yep
+
+
+Generally, IMO the wrappers should avoid doing actual DOM poking until you ask them for a DOM node (and cache the results, of course).
+
+(some of this slowness seems to be causing the bookmark UI's updates on startup to take about 0.5ms on each tpaint window open)
+Gonna take a crack at this.
+Created attachment 784407
+Remove XULWidgetGroupWrapper cruft and move areaType into group wrappers - Patch v1
+
+This just removes the seemingly unnecessary nodes search that the XUL group wrapper does. I've also moved areaType into the group wrapper, and modified our calls to it.
+
+Checking the gWrapperCache before the instance is searched for didn't work because the wrapper is keyed by the DOM node instance, since the wrapper is unique from window to window. Or did you have some other optimization in mind?
+Comment on attachment 784407
+Remove XULWidgetGroupWrapper cruft and move areaType into group wrappers - Patch v1
+
+Review of attachment 784407:
+-----------------------------------------------------------------
+
+This looks good. However, I see a lot of this:
+
+CUI.getWidget(x).forWindow(y).node
+
+I wonder if we should just provide a single API for that that we can optimize further.
+
+Secondly, and possibly more importantly, I suspect the wrapper cache is leaking; we'll be keeping a reference to the node as the key (but that's a weak map, so if it's the only one, it'll go away) - but we also keep a reference to the node in the closure that is in an object which is the value of this key in the weakmap. I'm fairly sure that's not going to get collected.
+
+Instead, why don't we implement this cache as a map from windows to a map from IDs to nodes? We should be careful to clear entries from that in an onWidgetInstanceDestroyed listener, but we could even add instances in an onWidgetInstanceCreated listener, guaranteeing that getting the node is just going to involve looking through those two maps, which would presumably be cheap. Does that sound right?
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ -2155,5 @@
+>    });
+>  
+> -  this.__defineGetter__("areaType", function() {
+> -    return aNode.getAttribute("customizableui-areatype") || "";
+> -  });
+
+Did you check we don't depend on this anywhere else?
+(In reply to :Gijs Kruitbosch from comment #3)
+> Comment on attachment 784407
+> Patch v1
+> 
+> Review of attachment 784407:
+> -----------------------------------------------------------------
+> 
+> This looks good. However, I see a lot of this:
+> 
+> CUI.getWidget(x).forWindow(y).node
+> 
+> I wonder if we should just provide a single API for that that we can
+> optimize further.
+> 
+> Secondly, and possibly more importantly, I suspect the wrapper cache is
+> leaking; we'll be keeping a reference to the node as the key (but that's a
+> weak map, so if it's the only one, it'll go away) - but we also keep a
+> reference to the node in the closure that is in an object which is the value
+> of this key in the weakmap. I'm fairly sure that's not going to get
+> collected.
+> 
+
+Ah, well spotted. Yes, I think you're right.
+
+> Instead, why don't we implement this cache as a map from windows to a map
+> from IDs to nodes? We should be careful to clear entries from that in an
+> onWidgetInstanceDestroyed listener, but we could even add instances in an
+> onWidgetInstanceCreated listener, guaranteeing that getting the node is just
+> going to involve looking through those two maps, which would presumably be
+> cheap. Does that sound right?
+
+Sounds OK to me. Should that also be part of this bug, or a follow-up?
+
+> 
+> ::: browser/components/customizableui/src/CustomizableUI.jsm
+> @@ -2155,5 @@
+> >    });
+> >  
+> > -  this.__defineGetter__("areaType", function() {
+> > -    return aNode.getAttribute("customizableui-areatype") || "";
+> > -  });
+> 
+> Did you check we don't depend on this anywhere else?
+
+Yep, grepped around and didn't see other instances.
+(In reply to Mike Conley (:mconley) from comment #4)
+> Sounds OK to me. Should that also be part of this bug, or a follow-up?
+
+I think you can land the patch as is (we're already leaking, after all) and if you like, followup in this bug, as it's still the same problem.
+
+(PS: what did you think of the widget-node-in-window API suggestion?)
+(In reply to :Gijs Kruitbosch from comment #5)
+> (In reply to Mike Conley (:mconley) from comment #4)
+> > Sounds OK to me. Should that also be part of this bug, or a follow-up?
+> 
+> I think you can land the patch as is (we're already leaking, after all) and
+> if you like, followup in this bug, as it's still the same problem.
+> 
+> (PS: what did you think of the widget-node-in-window API suggestion?)
+
+That sounds good to me - but maybe double-check with Blair?
+
+attachment 784407 landed in UX as https://hg.mozilla.org/projects/ux/rev/15121432e1b6
+Created attachment 786256
+refactor our wrapper cache into two separate non-leaky caches
+
+Matt or Mike, can you sanity-check this? (also, this is sort of a ping for bug 901827, because this is another way to solve that issue, I believe)
+Comment on attachment 786256
+refactor our wrapper cache into two separate non-leaky caches
+
+Review of attachment 786256:
+-----------------------------------------------------------------
+
+The idea is more or less sound - just a few notes.
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +580,5 @@
+>        if (area.get("type") == CustomizableUI.TYPE_TOOLBAR) {
+>          areaNode.setAttribute("currentset", areaNode.currentSet);
+>        }
+> +
+> +      let windowCache = gSingleWrapperCache.get(areaNode.ownerDocument.defaultView);
+
+We should have "window" already which we can use instead.
+
+@@ +582,5 @@
+>        }
+> +
+> +      let windowCache = gSingleWrapperCache.get(areaNode.ownerDocument.defaultView);
+> +      if (windowCache) {
+> +        windowCache.delete(aWidgetId);
+
+I think we might need to do all of this for destroyWidget too. destroyWidget should probably also wipe out the widget group.
+Created attachment 786296
+refactor our wrapper cache into two separate non-leaky caches
+
+Like this?
+Comment on attachment 786296
+refactor our wrapper cache into two separate non-leaky caches
+
+Review of attachment 786296:
+-----------------------------------------------------------------
+
+This looks good to me - let's see what it gets us. Thanks Gijs!
+https://hg.mozilla.org/projects/ux/rev/872549727aeb
+https://hg.mozilla.org/mozilla-central/rev/15121432e1b6
+https://hg.mozilla.org/mozilla-central/rev/872549727aeb

@@ -1,0 +1,476 @@
+Currently we can end up in a state were we do expensive page-loading before the browser window is shown on screen. Telemetry shows that this can cause people to suffer ridiculously long startups. 
+
+Note that MozAfterPaint listener should be removed after use to not slow things down.
+
+Currently we can end up in a state were we do expensive page-loading before the browser window is shown on screen. Telemetry shows that this can cause people to suffer ridiculously long startups. 
+
+Note that MozAfterPaint listener should be removed after use to not slow things down.
+Updating the summary to reflect current findings.
+
+I cannot reproduce a situation in which pages start loading due to session restore before the window is visible.
+
+However, looking at the code, it certainly is possible for non-critical code to execute prior to the first paint event. That doesn't mean that it *is* happening before the painting, since the receiving of the event obviously happens *after* the painting is completed. However, it's certainly possible if painting is slow - in which case the non-critical code would just compound the problem.
+
+One way to guarantee that *some* browser startup code that is not critical to initial window visibility does not execute too early is to call delayedStartup() after receiving the first paint event.
+
+Forcing delayedStartup to wait until the first paint event doesn't address the root cause of slow painting, but does guarantee that we won't delay a visible window even further.
+Created attachment 586348
+wip
+
+wait until first paint to kick off delayedStartup.
+Bug 651884 could also be involved.
+Comment on attachment 586348
+wip
+
+>-  gDelayedStartupTimeoutId = setTimeout(delayedStartup, 0, isLoadingBlank, mustLoadSidebar);
+>+  window.addEventListener("MozAfterPaint", function() {
+>+    window.removeEventListener("MozAfterPaint", arguments.callee, false);
+>+    // Leaving the setTimeout in place so that it can still be canceled if
+>+    // necessary.
+>+    gDelayedStartupTimeoutId =
+>+      setTimeout(delayedStartup, 0, isLoadingBlank, mustLoadSidebar);
+
+This doesn't seem to make much sense. The code wanting to cancel delayedStartup should remove the MozAfterPaint listener.
+Comment on attachment 586348
+wip
+
+This is fine for what it does, assuming Dao's nit is fixed, but I don't think we should land it until we have evidence that the problem it's supposed to solve is one that can occur in practice.
+Created attachment 592654
+Telemetry pings with sessionRestore < firstPaint
+
+A few of the Telemetry pings from the METRICS-245* data show sessionRestore occurring before firstPaint
+
+* https://metrics.mozilla.com/projects/browse/METRICS-245
+(In reply to Dão Gottwald [:dao] from comment #4)
+> This doesn't seem to make much sense. The code wanting to cancel
+> delayedStartup should remove the MozAfterPaint listener.
+
+Should I remove the timeout for delayedStartup altogether?
+(In reply to Dietrich Ayala (:dietrich) from comment #7)
+> (In reply to Dão Gottwald [:dao] from comment #4)
+> > This doesn't seem to make much sense. The code wanting to cancel
+> > delayedStartup should remove the MozAfterPaint listener.
+> 
+> Should I remove the timeout for delayedStartup altogether?
+
+yes
+
+By the way, do we know /why/ calling delayedStartup before the first paint "can cause people to suffer ridiculously long startups"? What exactly is going on here?
+(In reply to Dão Gottwald [:dao] from comment #8)
+> (In reply to Dietrich Ayala (:dietrich) from comment #7)
+> > (In reply to Dão Gottwald [:dao] from comment #4)
+> > > This doesn't seem to make much sense. The code wanting to cancel
+> > > delayedStartup should remove the MozAfterPaint listener.
+> > 
+> > Should I remove the timeout for delayedStartup altogether?
+> 
+> yes
+> 
+> By the way, do we know /why/ calling delayedStartup before the first paint
+> "can cause people to suffer ridiculously long startups"? What exactly is
+> going on here?
+
+Painting is not deterministic. Currently we do not have any code that ensures that the browser is painted before proceeding.
+Right, but why can proceeding before the browser is painted massively delay things? Is something in delayedStartup overly expensive, and wouldn't this be problematic even if we managed to paint once?
+(In reply to Dão Gottwald [:dao] from comment #10)
+> Right, but why can proceeding before the browser is painted massively delay
+> things? Is something in delayedStartup overly expensive, and wouldn't this
+> be problematic even if we managed to paint once?
+
+it triggers pageloading.
+Ok, so we're talking about page loads blocking the UI, which is bad either way but perceived worse if the window is invisible.
+Created attachment 593399
+v1
+Comment on attachment 593399
+v1
+
+Can you add a comment in BrowserStartup() about why we're using firstPaint?
+Created attachment 594417
+for check-in
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f66ffefbb697
+Backed out, looks like the change in the timeout causes browser_aboutHome.js test to leak some properties and makes a panorama random failure permanent
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/browser_aboutHome.js | leaked window property: TelemetryTimestamps
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/browser_aboutHome.js | leaked window property: AddonManagerPrivate
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/browser_aboutHome.js | leaked window property: __SSi
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/tabview/test/browser_tabview_bug628061.js | There are two groups - Got 1, expected 2
+(In reply to Marco Bonardo [:mak] from comment #17)
+> Backed out, looks like the change in the timeout causes browser_aboutHome.js
+> test to leak some properties and makes a panorama random failure permanent
+> 
+> TEST-UNEXPECTED-FAIL |
+> chrome://mochitests/content/browser/browser/base/content/test/
+> browser_aboutHome.js | leaked window property: TelemetryTimestamps
+> TEST-UNEXPECTED-FAIL |
+> chrome://mochitests/content/browser/browser/base/content/test/
+> browser_aboutHome.js | leaked window property: AddonManagerPrivate
+> TEST-UNEXPECTED-FAIL |
+> chrome://mochitests/content/browser/browser/base/content/test/
+> browser_aboutHome.js | leaked window property: __SSi
+
+I know what's going on here, filed bug 724286. I should have a patch shortly.
+
+> TEST-UNEXPECTED-FAIL |
+> chrome://mochitests/content/browser/browser/components/tabview/test/
+> browser_tabview_bug628061.js | There are two groups - Got 1, expected 2
+I think jimm had to set it up this way because we're seeing browser startup with just glass, sometimes behind other windows, then the browser paints, which delays the UI from painting now.  Sometimes it does that and loads one tab, then decides to reload session over top of it.  So you get like 3 awkward paints instead of just waiting till session restore is ready. Which is what it was trying to prevent a bad UX.
+(In reply to Dennis "Dale" Y. [:cuz84d] from comment #19)
+
+I'm not sure what this comment has to do with this bug.
+Current I believe we wait till sessionrestore is ready before first Paint.  So if you remove that and Paint asap, as the telemetry and bug description says, then you might see a really awkward set to paint scenarios when you start up, which is what I saw.
+We don't explicitly wait for anything before painting, and session restore doesn't impact painting directly (before session restore is initialized we just follow the normal 1-tab startup). It sounds like maybe you're seeing bug 716334.
+https://hg.mozilla.org/integration/fx-team/rev/b3a4b572a634
+https://hg.mozilla.org/mozilla-central/rev/b3a4b572a634
+Backed out because of talos regressions:
+
+https://hg.mozilla.org/mozilla-central/rev/92d3c66fe897
+(In reply to Tim Taubert [:ttaubert] from comment #25)
+> Backed out because of talos regressions:
+> 
+> https://hg.mozilla.org/mozilla-central/rev/92d3c66fe897
+
+Seems like this regression was a feature, means we start session-restore before the paint has happened even on our infrastructure.
+http://graphs-new.mozilla.org/graph.html#tests=[[104,94,15],[104,94,12],[104,94,1],[104,94,14]]&sel=none&displayrange=7&datatype=running
+
+There were lots of MozAfterPaint regressions which I'd say are invalid because the new MozAfterPaint handler that calls delayedStartup (introduced by this patch) blocks subsequent event handlers.
+
+The talos tests should be changed to measure at the capturing phase so that our bubble handler can then invoke the delayed startup afterwards. We backed out to push it again together with those test fixes.
+(In reply to Taras Glek (:taras) from comment #26)
+> Seems like this regression was a feature, means we start session-restore
+> before the paint has happened even on our infrastructure.
+
+Isn't it generally a bad idea to change the meaning of a measurement? We could of course add another test to continue testing both code paths.
+(In reply to Taras Glek (:taras) from comment #26)
+> (In reply to Tim Taubert [:ttaubert] from comment #25)
+> > Backed out because of talos regressions:
+> > 
+> > https://hg.mozilla.org/mozilla-central/rev/92d3c66fe897
+> 
+> Seems like this regression was a feature, means we start session-restore
+> before the paint has happened even on our infrastructure.
+
+Except that this didn't slow things down but avoided getting in their way on our infrastructure? It's not clear to me how this regression can be regarded a feature.
+My understanding of this patch, it's purpose, and the effect it has:
+
+Currently, the time it takes for the first window to become visible is indeterminate. The first painting could be blocked by content loading (via home page navigation) or in extreme circumstances (as detected via telemetry) where delayedStartup runs before the window is visible, pushing painting back ever further.
+
+The goal of the patch on this bug is to ensure that the browser window is visible at the earliest possible moment after the user launches the app, so that it's clear that the app is doing *something*.
+
+The intended effect of the patch is that delayedStartup is guaranteed to never run before the first paint event, ensuring some visible thing on screen before non-critical window-loading code gets executed.
+
+The problem:
+
+The way this patch is implemented means that delayedStartup will run *near immediately* after the first paint event, causing it to interfere with content loading (which causes these test regressions). In the status quo, delayedStartup can run at an indeterminate point after BrowserStartup finishes.
+
+One way forward:
+
+We could call delayedStartup with setTimeout(0), after receiving the first paint event. This would ensure that it doesn't run before the first paint, but then adds it to the *end* of the event queue like we currently do, theoretically not causing it to run so early that it slows down initial content paint. This is the best-of-both-worlds approach: solves the extreme case, while allowing basically the same behavior as the status quo for the normal case (and for these tests).
+
+Note: Since the patch only changes delayedStartup, it doesn't address the problem where content loading from non-session-restore tabs (ie, default settings, or user-specified homepage or homepages) causes delayed first paint of the browser window. I'm not sure that it can happen or not, need to confirm.
+Talked with Taras, and some telemetry data that might help clarify this is:
+
+* timestamp of first browser window paint event
+* timestamp of first content paint event
+It would also be useful to know how common the problem this approach was originally meant to solve is (i.e. what percentage of telemetry reports show firstPaint after delayedStartup).
+Vladan could probably provide that. We need to fix it regardless of what % of users hit it though.
+(In reply to Dão Gottwald [:dao] from comment #29)
+> Except that this didn't slow things down but avoided getting in their way on
+> our infrastructure?
+
+My take is that the tests are trying to measure the first paint by inserting a MozAfterPaint trigger, which now happens to be _another_ one of that kind, and the handlers of those events of the same kind are actually run serially. That means that delayedStatup as the first such handler being added is run first and when it's done, the next such handler is called, which is the one the test adds.
+
+One way we could solve this is to try to make sure that the test handler is being added as the first MozAfterPaint handler instead of as the last. Another one is probably the setTimeout(0) call to delayedStartup as proposed in comment #30.
+(In reply to Robert Kaiser (:kairo@mozilla.com) from comment #34)
+> My take is that the tests are trying to measure the first paint by inserting
+> a MozAfterPaint trigger, which now happens to be _another_ one of that kind,
+> and the handlers of those events of the same kind are actually run serially.
+> That means that delayedStatup as the first such handler being added is run
+> first and when it's done, the next such handler is called, which is the one
+> the test adds.
+
+Yes, that's what I tried to say in comment #27. I filed bug 725748 to 'correct' the talos tests. setTimeout(0) would totally work as well.
+Note that all the changes here may also affect any Ts_shutdown measure, especially the setTimeout(0) suggestion, and those tests are already noisy enough (bug 696053). May be worth to include this issue in the discussion.
+Changing the test doesn't alter the fact that with this patch applied delayedStartup can run earlier in the startup sequence than without the patch.
+
+That said, I'm not sure what the side-effects might be to running delayedStartup earlier. Doing so may not be disastrous, but we don't need to do that experiment now - let's just address the delayedStartup-before-firstPaint bug here.
+
+The setTimeout(0)-after-first-paint approach should result in a startup sequence similar to the status quo for these tests. I'll make this patch and run it through try to see what happens.
+
+(In reply to Marco Bonardo [:mak] from comment #36)
+> Note that all the changes here may also affect any Ts_shutdown measure,
+> especially the setTimeout(0) suggestion, and those tests are already noisy
+> enough (bug 696053). May be worth to include this issue in the discussion.
+
+The setTimeout(0) approach described above is basically what we do now, so shouldn't move any needles. The only scenario in which it differs from what we do now is in situations where painting is so slow that delayedStartup executes before first paint event.
+Created attachment 596799
+wait for paint + setTimeout(0)
+Comment on attachment 596799
+wait for paint + setTimeout(0)
+
+>+  // Listen for the first paint event for this window, and only do non-critical
+>+  // work then, so that things like session restore don't block the window from
+>+  // being visible.
+>+  gFirstPaintListener = function(e) {
+>+    if (e.target == window) {
+>+      window.removeEventListener("MozAfterPaint", gFirstPaintListener, false);
+>+      gFirstPaintListener = null;
+>+      setTimeout(delayedStartup, 0, isLoadingBlank, mustLoadSidebar);
+
+You need to set gDelayedStartupTimeoutId here and keep handling it below.
+
+Please add a comment as to why the timeout is needed on top of the afterpaint listener.
+Autoland Patchset:
+	Patches: 596799
+	Branch: mozilla-central => try
+	Destination: http://hg.mozilla.org/try/pushloghtml?changeset=2cf642632258
+Try run started, revision 2cf642632258. To cancel or monitor the job, see: https://tbpl.mozilla.org/?tree=Try&rev=2cf642632258
+Dao: I didn't ask for review precisely because the patch wasn't ready, so there's no need to r- it yet!
+Try run for 2cf642632258 is complete.
+Detailed breakdown of the results available here:
+    https://tbpl.mozilla.org/?tree=Try&rev=2cf642632258
+Results (out of 33 total builds):
+    success: 33
+Builds (or logs if builds failed) available at:
+http://ftp.mozilla.org/pub/mozilla.org/firefox/try-builds/autolanduser@mozilla.com-2cf642632258
+(In reply to Dietrich Ayala (:dietrich) from comment #31)
+> Talked with Taras, and some telemetry data that might help clarify this is:
+> 
+> * timestamp of first browser window paint event
+> * timestamp of first content paint event
+
+We don't have "content paint events", we paint windows, whatever might be in them. What is it that we specifically want to track? We should probably discuss this in a new bug.
+(In reply to Timothy Nikkel (:tn) from comment #43)
+> (In reply to Dietrich Ayala (:dietrich) from comment #31)
+> > Talked with Taras, and some telemetry data that might help clarify this is:
+> > 
+> > * timestamp of first browser window paint event
+> > * timestamp of first content paint event
+> 
+> We don't have "content paint events", we paint windows, whatever might be in
+> them. What is it that we specifically want to track? We should probably
+> discuss this in a new bug.
+
+The second one was supposed to be "first navigation event". IOW, the first point at which we tell a <browser> to load a URI.
+
+Sure, we'll probably do the telemetry work somewhere else, but it's telemetry to specifically address the lack of information in this bug.
+So, I autolanded the patch but either it didn't run the paint tests, or I couldn't find them in the results. Will ping the releng folks to see what's going on.
+(In reply to Gavin Sharp (use gavin@gavinsharp.com for email) from comment #32)
+> It would also be useful to know how common the problem this approach was
+> originally meant to solve is (i.e. what percentage of telemetry reports show
+> firstPaint after delayedStartup).
+
+The Metrics guys reported a figure of roughly 4%:
+https://metrics.mozilla.com/projects/browse/METRICS-430
+Autoland Patchset:
+	Patches: 596799
+	Branch: mozilla-central => try
+	Destination: http://hg.mozilla.org/try/pushloghtml?changeset=1b6a792cee8b
+Try run started, revision 1b6a792cee8b. To cancel or monitor the job, see: https://tbpl.mozilla.org/?tree=Try&rev=1b6a792cee8b
+Try run for 1b6a792cee8b is complete.
+Detailed breakdown of the results available here:
+    https://tbpl.mozilla.org/?tree=Try&rev=1b6a792cee8b
+Results (out of 5 total builds):
+    success: 5
+Builds (or logs if builds failed) available at:
+http://ftp.mozilla.org/pub/mozilla.org/firefox/try-builds/autolanduser@mozilla.com-1b6a792cee8b
+need to do "-t chrome" to get paint tests, not "-t paint", duh!
+Autoland Patchset:
+	Patches: 596799
+	Branch: mozilla-central => try
+	Destination: http://hg.mozilla.org/try/pushloghtml?changeset=f50a6a9bf7d2
+Try run started, revision f50a6a9bf7d2. To cancel or monitor the job, see: https://tbpl.mozilla.org/?tree=Try&rev=f50a6a9bf7d2
+Try run for f50a6a9bf7d2 is complete.
+Detailed breakdown of the results available here:
+    https://tbpl.mozilla.org/?tree=Try&rev=f50a6a9bf7d2
+Results (out of 9 total builds):
+    success: 9
+Builds (or logs if builds failed) available at:
+http://ftp.mozilla.org/pub/mozilla.org/firefox/try-builds/autolanduser@mozilla.com-f50a6a9bf7d2
+Turns out the name change got it's name changed.
+
+s/chrome/chrome.2,chrome_mac.2/
+Autoland Patchset:
+	Patches: 596799
+	Branch: mozilla-central => try
+	Destination: http://hg.mozilla.org/try/pushloghtml?changeset=60344d608f80
+Try run started, revision 60344d608f80. To cancel or monitor the job, see: https://tbpl.mozilla.org/?tree=Try&rev=60344d608f80
+Try run for 60344d608f80 is complete.
+Detailed breakdown of the results available here:
+    https://tbpl.mozilla.org/?tree=Try&rev=60344d608f80
+Results (out of 16 total builds):
+    success: 16
+Builds (or logs if builds failed) available at:
+http://ftp.mozilla.org/pub/mozilla.org/firefox/try-builds/autolanduser@mozilla.com-60344d608f80
+Are we still planning to land this patch?
+I was not able to get definitive results, and am not working on this atm.
+Created attachment 660819
+hacky patch using mozRequestAnimationFrame()
+I did some measurements on my machine and the median .firstPaint times are as follows:
+
+[w/o the patch]  1187.5ms
+[with the patch] 1034.5ms
+
+That means we'd save 150ms of firstPaint lag by delaying the delayedStartup code by >=32ms.
+(In reply to Tim Taubert [:ttaubert] from comment #58)
+> I did some measurements on my machine and the median .firstPaint times are
+> as follows:
+> 
+> [w/o the patch]  1187.5ms
+> [with the patch] 1034.5ms
+> 
+> That means we'd save 150ms of firstPaint lag by delaying the delayedStartup
+> code by >=32ms.
+
+Sounds very promising, why not nominate the patch for review?
+Taras, can you please explain again why we need two mozRequestAnimationFrame() calls here? I forgot the details and know nothing about the implementation. I'd like to write a little comment for that code part.
+(In reply to Tim Taubert [:ttaubert] from comment #60)
+> Taras, can you please explain again why we need two
+> mozRequestAnimationFrame() calls here? I forgot the details and know nothing
+> about the implementation.
+
+Probably because the first mozRequestAnimationFrame callback would block the first paint. Anything needed to draw the UI correctly is done in gBrowserInit.onLoad rather than _delayedStartup. In fact, since we don't care about painting in _delayedStartup, setTimeout would probably make more sense instead of the inner mozRequestAnimationFrame.
+(In reply to Dão Gottwald [:dao] from comment #61)
+> (In reply to Tim Taubert [:ttaubert] from comment #60)
+> > Taras, can you please explain again why we need two
+> > mozRequestAnimationFrame() calls here? I forgot the details and know nothing
+> > about the implementation.
+> 
+> Probably because the first mozRequestAnimationFrame callback would block the
+> first paint. Anything needed to draw the UI correctly is done in
+> gBrowserInit.onLoad rather than _delayedStartup. In fact, since we don't
+> care about painting in _delayedStartup, setTimeout would probably make more
+> sense instead of the inner mozRequestAnimationFrame.
+
+Sure if someone from GFX can confirm that scheduling a setTimeout from a requestanimationframe is guaranteed to be called after the current frame is painted onscreen.
+So, why would we use mozRequestAnimationFrame at all (Tim's approach), which puts us right before the paint, rather than the MozAfterPaint event (Dietrich's approach)?
+Created attachment 668807
+patch
+Comment on attachment 668807
+patch
+
+Is waiting for the window's first paint event after onload sufficient? AFAIK we repaint the main window multiple times (which is a separate problem that we should investigate), so this might actually make us do this work earlier than we do now, which is not what we want.
+
+We can't really just go on intuition here - we need to analyze the effects of a change like this on the startup ordering, ideally with a detailed startup timeline in multiple different scenarios (different platforms/performance characteristics).
+Note: It's for this kind of issue that I have opened bug 692420. Now that promises have landed on m-c, it should be quite easy to reactivate that bug.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #65)
+> Comment on attachment 668807
+> patch
+> 
+> Is waiting for the window's first paint event after onload sufficient? AFAIK
+> we repaint the main window multiple times (which is a separate problem that
+> we should investigate),
+
+It's the first paint we care about, because that's the first response the user gets when starting up Firefox. Any additional paints between the onload handler and delayedStartup would be redundant, as the onload handler sets up everything needed for the desired rendering, so I don't see why we'd want to wait for a second or third paint rendering the same thing.
+
+> so this might actually make us do this work earlier
+> than we do now, which is not what we want.
+
+Why would we not want that? This code is critical for Firefox being usable and needs to run as soon as possible without blocking the first paint.
+(In reply to Dão Gottwald [:dao] from comment #67)
+> It's the first paint we care about, because that's the first response the
+> user gets when starting up Firefox.
+
+You're assuming that the first MozAfterPaint event firing implies that we've drawn something useful enough to be recognized as Firefox. If the first paint is us painting e.g. a blank window, we don't want to run all of delayedStartup before continuing to draw the rest of the UI. I see 5 MozAfterPaint events fired after onload but before the end of delayedStartup in my local build on Mac. How do you know that after the first one is the best time to do all of the delayedStartup work?
+It's not a blank window at that point, so I don't see how it would be painted as such. (I can imagine a blank window being rendered some time before the load event, thought that would be a bug, such as bug 716334.)
+(In reply to Dão Gottwald [:dao] from comment #63)
+> So, why would we use mozRequestAnimationFrame at all (Tim's approach), which
+> puts us right before the paint, rather than the MozAfterPaint event
+> (Dietrich's approach)?
+
+We started out with MozAfterPaint, but use of it is discouraged as it adds overhead. requestAnimationFrame frame designed as a successor API afaik.
+requestAnimationFrame replaced MozBeforePaint. It's not clear to me how exactly it's supposed to replace MozAfterPaint. What kind of and how much overhead does the latter add?
+(In reply to Dão Gottwald [:dao] from comment #71)
+> requestAnimationFrame replaced MozBeforePaint. It's not clear to me how
+> exactly it's supposed to replace MozAfterPaint. What kind of and how much
+> overhead does the latter add?
+
+Taras?
+(In reply to Dão Gottwald [:dao] from comment #72)
+> (In reply to Dão Gottwald [:dao] from comment #71)
+> > requestAnimationFrame replaced MozBeforePaint. It's not clear to me how
+> > exactly it's supposed to replace MozAfterPaint. What kind of and how much
+> > overhead does the latter add?
+
+It's best to check with roc, I went to check the code and didn't see anything obviously bad caused by mozafterpaint.
+Currently MozAfterPaint fires when we've finished drawing the window contents to the layer tree, but before we composite that to the window. But let's fix that.
+(In reply to Robert O'Callahan (:roc) (Mozilla Corporation) from comment #74)
+> Currently MozAfterPaint fires when we've finished drawing the window
+> contents to the layer tree, but before we composite that to the window. But
+> let's fix that.
+
+Actually, let's not, since MozAfterPaint was designed to tell us about which areas of the window have been redrawn, so it needs to fire after they've been drawn and before new dirty areas are accumulated.
+
+What you really want here is something to tell you when the window has been composited, and we have no event for that. Plus we're driving towards having that happen off the main thread, which makes this tricky.
+(In reply to Robert O'Callahan (:roc) (Mozilla Corporation) from comment #75)
+> (In reply to Robert O'Callahan (:roc) (Mozilla Corporation) from comment #74)
+> > Currently MozAfterPaint fires when we've finished drawing the window
+> > contents to the layer tree, but before we composite that to the window. But
+> > let's fix that.
+> 
+> Actually, let's not, since MozAfterPaint was designed to tell us about which
+> areas of the window have been redrawn, so it needs to fire after they've
+> been drawn and before new dirty areas are accumulated.
+
+That's not really what most MozAfterPaint consumers I've seen want. What also seems worrisome to me here is that talos makes extensive use of MozAfterPaint, apparently missing an important last step.
+
+> What you really want here is something to tell you when the window has been
+> composited, and we have no event for that. Plus we're driving towards having
+> that happen off the main thread, which makes this tricky.
+
+When composition happens off the main thread, a MozAfterPaint listener won't block it and we won't care about it as far as this bug is concerned, right?
+(In reply to Dão Gottwald [:dao] from comment #76)
+> (In reply to Robert O'Callahan (:roc) (Mozilla Corporation) from comment #75)
+> > (In reply to Robert O'Callahan (:roc) (Mozilla Corporation) from comment #74)
+> > > Currently MozAfterPaint fires when we've finished drawing the window
+> > > contents to the layer tree, but before we composite that to the window. But
+> > > let's fix that.
+> > 
+> > Actually, let's not, since MozAfterPaint was designed to tell us about which
+> > areas of the window have been redrawn, so it needs to fire after they've
+> > been drawn and before new dirty areas are accumulated.
+> 
+> That's not really what most MozAfterPaint consumers I've seen want. What
+> also seems worrisome to me here is that talos makes extensive use of
+> MozAfterPaint, apparently missing an important last step.
+
+OK.
+
+> > What you really want here is something to tell you when the window has been
+> > composited, and we have no event for that. Plus we're driving towards having
+> > that happen off the main thread, which makes this tricky.
+> 
+> When composition happens off the main thread, a MozAfterPaint listener won't
+> block it and we won't care about it as far as this bug is concerned, right?
+
+You probably still want to delay your delayedStartup work until after the compositor thread has composited the window, since the two threads can still contend for resources.
+
+I *suppose* we could make MozAfterPaint fire after the composite, carrying a list of the rectangles we repainted in the paint phase before the composite, even if new stuff has been invalidated between the paint and the composite. Maybe we should do that.
+(In reply to Robert O'Callahan (:roc) (Mozilla Corporation) from comment #77)
+> I *suppose* we could make MozAfterPaint fire after the composite, carrying a
+> list of the rectangles we repainted in the paint phase before the composite,
+> even if new stuff has been invalidated between the paint and the composite.
+> Maybe we should do that.
+
+filed bug 800859
+Created attachment 674203
+patch, updated to tip
+
+This should be ready to go now that bug 800859 is fixed.
+Comment on attachment 674203
+patch, updated to tip
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+>   _delayedStartup: function(isLoadingBlank, mustLoadSidebar) {
+
+>+    window.removeEventListener("MozAfterPaint", this._boundDelayedStartup);
+>+    this._boundDelayedStartup = null;
+
+>     // Now either cancel delayedStartup, or clean up the services initialized from
+>     // it.
+>+    if (this._boundDelayedStartup) {
+>+      window.removeEventListener("MozAfterPaint", this._boundDelayedStartup);
+
+It bothers me a bit that these aren't consistent (you only clear out this._boundDelayedStartup in the first case). I guess it doesn't matter in practice since in the latter case the window is being unloaded anyhow, but I wouldn't mind if you add a _cancelDelayedStartup helper that does both. Aesthetic nit, feel free to disregard.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/49062c468f03
+https://hg.mozilla.org/mozilla-central/rev/49062c468f03

@@ -1,0 +1,171 @@
+This bug is for the MsgRouteError crash; bug 1203602 will be reduced in scope to the remaining data loss bugs, because it already has comments which go into detail about them.
+
++++ This bug was initially created as a clone of Bug #1203602 +++
+
+Part of the cause of bug 1202887 is that closing a tab while a persistence operation is in progress will immediately destroy the PBrowser actor and all its descendents, including any PWebBrowserPersistDocument actors, thus leaving a partially completed save.
+
+This is almost certainly not what the user expects, and also doesn't match the non-e10s behavior where holding a reference to the document is enough to keep it alive.
+
+But it's worse than that: a parent->child message can be sent on the PWebBrowserPersistDocument concurrently with the child->parent PBrowser::__delete__, which results in one of these:
+
+###!!! [Child][DispatchAsyncMessage] Error: (msgtype=0xE60003,name=???) Route error: message sent to unknown actor ID
+
+Which crashes the content process.  (For reference, 0xE60003 is PWebBrowserPersistDocument::SetPersistFlags.)  There are probably already some of these on crash-stats, but I don't know if there's enough info in the dump to distinguish them from other child-side MsgRouteError crashes.
+
+So this needs a way of keeping the TabChild alive until persistence is finished.
+
+This bug is for the MsgRouteError crash; bug 1203602 will be reduced in scope to the remaining data loss bugs, because it already has comments which go into detail about them.
+
++++ This bug was initially created as a clone of Bug #1203602 +++
+
+Part of the cause of bug 1202887 is that closing a tab while a persistence operation is in progress will immediately destroy the PBrowser actor and all its descendents, including any PWebBrowserPersistDocument actors, thus leaving a partially completed save.
+
+This is almost certainly not what the user expects, and also doesn't match the non-e10s behavior where holding a reference to the document is enough to keep it alive.
+
+But it's worse than that: a parent->child message can be sent on the PWebBrowserPersistDocument concurrently with the child->parent PBrowser::__delete__, which results in one of these:
+
+###!!! [Child][DispatchAsyncMessage] Error: (msgtype=0xE60003,name=???) Route error: message sent to unknown actor ID
+
+Which crashes the content process.  (For reference, 0xE60003 is PWebBrowserPersistDocument::SetPersistFlags.)  There are probably already some of these on crash-stats, but I don't know if there's enough info in the dump to distinguish them from other child-side MsgRouteError crashes.
+
+So this needs a way of keeping the TabChild alive until persistence is finished.
+I have work in progress that reparents the actors to PContent, and I've found an excitingly new failure mode: WebBrowserPersistLocalDocument::ReadResources can report an error through its return value *and* through the EndVisit callback, which turns into a double-Send__delete__ when it's remote.  This is simple enough to fix (but I think the only reason I found it is because a frame with no loader now causes the outer DOM traversal to fail, which is arguably a regression itself; sigh).
+
+Also, I observe that the content process will cheerfully shut down while the save is happening, which results in a bunch of "Channel closing: too late to send/recv," and a failed save, but that doesn't cause a crash so it doesn't need to be fixed in this bug.
+Created attachment 8660964
+Work In Progress
+
+There's one part of this that I'm not quite sure what to do with: Now that we're starting the protocol from a PContent, getting the top-level document of a particular PBrowser is kind of awkward.  I can pass the actor, which means another parameter that's not used for child->parent construction, and then the GetDocument method is protected so I have to get around that somehow (or change it).  This all seems less than ideal, but I don't know if there's an alternative that doesn't have other problems.
+I can't think of any other way than interrogating the PBrowser for its document, I'm afraid. :/
+Comment on attachment 8660964
+Work In Progress
+
+Review of attachment 8660964:
+-----------------------------------------------------------------
+
+Out of curiosity, will this account for the case where a save operation has begun, but the last tab for a particular content process has closed (which should cause the content process to shut down) - or are we somehow keeping the content process alive until the save is completed?
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #3)
+> I can't think of any other way than interrogating the PBrowser for its
+> document, I'm afraid. :/
+
+Which means I need to know if there's a reason to keep TabChild::GetDocument protected.
+
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #4)
+> Out of curiosity, will this account for the case where a save operation has
+> begun, but the last tab for a particular content process has closed (which
+> should cause the content process to shut down) - or are we somehow keeping
+> the content process alive until the save is completed?
+
+No, in that case IPC messages get dropped and the save fails; see comment #1.  That can be handled in bug 1203602; for this bug I'm just trying not to crash.
+Comment on attachment 8660964
+Work In Progress
+
+It looks like there's no reason for TabChildBase::GetDocument to be protected — it's just a convenience for calling WebNavigation(), which is public, and QI'ing it.
+Created attachment 8663889
+Step 1: Fix the double-__delete__.
+Created attachment 8663890
+Step 2: reparent the actor to PContent.
+Created attachment 8663891
+Step 3: add a regression test.
+
+This took me far too much time and frustration to write, but letting test coverage slide is how we got into this mess in the first place.
+Comment on attachment 8663891
+Step 3: add a regression test.
+
+Review of attachment 8663891:
+-----------------------------------------------------------------
+
+Most of these comments are optional. I would like to make sure the test fails on try though.
+
+::: embedding/test/browser_bug1204626.js
+@@ +8,5 @@
+> +  let delayStr = delay === null ? "no delay" : "delay = " + delay + "ms";
+> +  let browser = gBrowser.addTab(contentBase + "bug1204626_doc0.html")
+> +                        .linkedBrowser;
+> +  let mm = browser.messageManager;
+> +  mm.addMessageListener("wbp-test:loaded", onBrowserLoaded);
+
+See BrowserTestUtils.openNewForegroundTab for a nicer way to do this.
+
+@@ +66,5 @@
+> +    }
+> +    if (delay === null) {
+> +      doSave();
+> +    } else {
+> +      setTimeout(doSave, delay);
+
+I'm really surprised this doesn't trigger our flaky timeout validation.
+
+Can you make sure this test fails reasonably often on try without your fixes? It seems possible that the delays you've chosen won't be valid for our test machines.
+
+@@ +68,5 @@
+> +      doSave();
+> +    } else {
+> +      setTimeout(doSave, delay);
+> +    }
+> +    mm.sendAsyncMessage("wbp-test:close");
+
+You could use loadFrameScript with a data: URL here. Might be easier.
+
+@@ +79,5 @@
+> +  // 10ms provokes the double-__delete__, but not 0ms.
+> +  // And a few others, just in case.
+> +  const testRuns = [null, 0, 10, 0, 10, 20, 50, 100];
+> +  let i = 0;
+> +  (function next_text() {
+
+It might be easier to do this as a loop, with each iteration calling add_task. I think you should be able to do that even with arguments.
+(In reply to Bill McCloskey (:billm) from comment #10)
+> Most of these comments are optional. I would like to make sure the test
+> fails on try though.
+
+I tested that (with the various combinations of the two fixes-or-not), but I didn't retry to get info on how reliably it would fail.
+
+> > +      setTimeout(doSave, delay);
+> 
+> I'm really surprised this doesn't trigger our flaky timeout validation.
+
+According to the code, // Right now, we only enable these checks for mochitest-plain.
+
+I wonder if multiple setTimeout(_, 0)s would do the same thing.  I don't know if that's less sketchy or more.
+
+> Can you make sure this test fails reasonably often on try without your
+> fixes? It seems possible that the delays you've chosen won't be valid for
+> our test machines.
+
+This is why I threw in a bunch of longer timeouts, and tested that it would catch both bugs on try… but this might call for some retrying.
+
+> @@ +68,5 @@
+> > +      doSave();
+> > +    } else {
+> > +      setTimeout(doSave, delay);
+> > +    }
+> > +    mm.sendAsyncMessage("wbp-test:close");
+> 
+> You could use loadFrameScript with a data: URL here. Might be easier.
+
+I had that in one of this test's many other versions, but I already had a frame script to get the 'load' event… but BrowserTestUtils already does that.  (It looks like I could have saved some time and frustration writing this if I'd known about BrowserTestUtils; such is hindsight.)
+
+> > +  const testRuns = [null, 0, 10, 0, 10, 20, 50, 100];
+> > +  let i = 0;
+> > +  (function next_text() {
+
+next_test with an 's' would be what I meant; oops.
+
+> It might be easier to do this as a loop, with each iteration calling
+> add_task. I think you should be able to do that even with arguments.
+
+I'd rather leave it as-is — making the control flow less explicit may not be a good idea given what this test is testing, and it's been argued that I've already spent too much time on this test case as it is.
+Created attachment 8667422
+Step 3: add a regression test. [v2]
+
+I've used openNewForegroundTab and gotten rid of the frame script, but I'm leaving the rest of it as-is for now.  (Including the possibly flaky timeouts — which aren't as bad as most, because they can't cause the test to spuriously fail, only to spuriously pass in case of a hypothetical future regression.)  Carrying over r+ and currently waiting for try runs.
+Failed 5/5 times on each platform, with the actor reparenting but missing the double-__delete__ patch (which is the one that needs the 10ms timeout): https://treeherder.mozilla.org/#/jobs?repo=try&revision=2867f743b728 (except Windows, where the test jobs are still waiting in the queue after nearly 5 hours).
+…and *this* is a try run with all the patches, restricted to only embedding and jsdownloads tests, which looks a little weird because I was figuring out how to use |mach try| and got it wrong the first time: https://treeherder.mozilla.org/#/jobs?repo=try&revision=dbddab73b7d9 (the B2G orange is because none of these tests run there, so the test runner objects to having 0 tests to run; the try syntax can't easily avoid that, I don't think).
+Great, thanks!
+https://hg.mozilla.org/integration/fx-team/rev/d7e153cbad98
+https://hg.mozilla.org/integration/fx-team/rev/edd4498f7f83
+https://hg.mozilla.org/integration/fx-team/rev/ef6f7c6a5a79
+https://hg.mozilla.org/mozilla-central/rev/d7e153cbad98
+https://hg.mozilla.org/mozilla-central/rev/edd4498f7f83
+https://hg.mozilla.org/mozilla-central/rev/ef6f7c6a5a79

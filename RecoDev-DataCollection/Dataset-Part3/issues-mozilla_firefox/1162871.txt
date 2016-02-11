@@ -1,0 +1,186 @@
+SessionStore.duplicateTab() is a sync API that returns the duplicated tab. The nice thing however is that it doesn't make any promises about when the tab itself starts loading or starts being restored. Most of the existing tests use promiseTabRestored() already to wait until that has finished so we shouldn't break too much here and can introduce async flushing.
+
+SessionStore.duplicateTab() is a sync API that returns the duplicated tab. The nice thing however is that it doesn't make any promises about when the tab itself starts loading or starts being restored. Most of the existing tests use promiseTabRestored() already to wait until that has finished so we shouldn't break too much here and can introduce async flushing.
+*** Bug 939764 has been marked as a duplicate of this bug. ***
+Created attachment 8603248
+0001-Bug-1162871-Introduce-the-TabStateFlusher-for-async-.patch
+
+This introduces the TabStateFlusher that keeps track of async flushes. Using this we can in a follow-up convert tests to:
+
+yield TabStateFlusher.flush(browser);
+
+That should work in most of the places. I need to think what to do about TabState.flushAsync() that is used to simulate some race conditions in browser_broadcast.js. We should keep this functionality but also get rid of the SyncHandler. That's a follow-up though.
+Created attachment 8603249
+0002-Bug-1162871-Use-async-flushing-for-duplicateTab.patch
+
+This makes SessionStore.duplicateTab() use the new flusher.
+Created attachment 8603250
+0003-Bug-1162871-Fix-sessionstore-tests-that-don-t-wait-f.patch
+
+With those few fixes sessionstore tests succeed locally, e10s & non-e10s.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=9db2f68e482f
+Guess we also need a few tests to ensure flushing works as expected.
+Created attachment 8603322
+0004-Bug-1162871-Test-that-duplicateTab-does-wait-for-the.patch
+
+Test that covers duplicateTab().
+Created attachment 8603336
+0001-Bug-1162871-Introduce-the-TabStateFlusher-for-async-.patch, v2
+
+Small fix to let it use Promise.jsm.
+Created attachment 8603337
+0002-Bug-1162871-Use-async-flushing-for-duplicateTab.patch, v2
+
+Fixes a small issue, discovered when writing tests.
+Created attachment 8603339
+0004-Bug-1162871-Test-that-duplicateTab-does-wait-for-the.patch, v2
+
+The tests weren't quite checking the right things.
+Created attachment 8603342
+0005-Bug-1162871-Test-TabStateFlusher.flush-behavior-incl.patch
+
+Tests for only flushing itself.
+Created attachment 8603353
+0002-Bug-1162871-Use-async-flushing-for-duplicateTab.patch, v3
+
+Should've run tests locally before attaching :/
+Created attachment 8603356
+0003-Bug-1162871-Fix-sessionstore-tests-that-don-t-wait-f.patch, v2
+
+Needed to fix some more tests.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=0352a59c9d2e
+(Try looks great.)
+(In reply to Tim Taubert [:ttaubert] from comment #2)
+> I need to think what to do about
+> TabState.flushAsync() that is used to simulate some race conditions in
+> browser_broadcast.js. We should keep this functionality but also get rid of
+> the SyncHandler. That's a follow-up though.
+
+Oh wow. I just remembered that flushAsync() only exists to test a few edge cases that only exist because we have sync flushes. My day just got brighter.
+Comment on attachment 8603336
+0001-Bug-1162871-Introduce-the-TabStateFlusher-for-async-.patch, v2
+
+Review of attachment 8603336:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +659,5 @@
+>     *
+>     * @param options (object)
+>     *        {id: 123} to override the update ID used to accumulate data to send.
+>     *        {sync: true} to send data to the parent process synchronously.
+> +   *        {flushID: 123} to specify that this is a flush
+
+Can you document isFinal while you're here?
+Comment on attachment 8603353
+0002-Bug-1162871-Use-async-flushing-for-duplicateTab.patch, v3
+
+Review of attachment 8603353:
+-----------------------------------------------------------------
+
+I'd like to wait and see what you think about the comment below.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +1836,4 @@
+>  
+> +      // Update state with flushed data.
+> +      let options = {includePrivateData: true};
+> +      TabState.copyFromCache({linkedBrowser: browser}, tabState, options);
+
+It occurs to me that copyFromCache doesn't deal with the case where browser.__SS_data is present. Based on [1] (which is used by TabState.clone), it seems like that could be a problem. This might also be an issue for bug 1109875 too.
+
+Even if this isn't a bug, I think it might be nice to have a single API call in TabState that returns a promise that will be resolved with the tabState. Having to use copyFromCache seems like an implementation detail that shouldn't be exposed to SessionStore.jsm.
+
+It would also be nice to fold this new API in with the bug 1109875 stuff too. Perhaps the big branch in the SessionStore:update handler that deals with _closedTabs could instead be moved to onTabClose and written to use TabStateFlusher and a promise.
+
+Not all of this needs to happen right away. I'm just trying to think of what the desired end-state could be.
+
+[1] http://mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/TabState.jsm#223
+Comment on attachment 8603339
+0004-Bug-1162871-Test-that-duplicateTab-does-wait-for-the.patch, v2
+
+Review of attachment 8603339:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/head.js
+@@ +34,5 @@
+>  Cu.import("resource:///modules/sessionstore/TabState.jsm", tmp);
+> +Cu.import("resource:///modules/sessionstore/TabStateFlusher.jsm", tmp);
+> +let {
+> +  Promise, Task, SessionStore, SessionSaver, SessionFile, TabState,
+> +  TabStateFlusher
+
+Might be nicer if each one is on a separate line.
+Comment on attachment 8603342
+0005-Bug-1162871-Test-TabStateFlusher.flush-behavior-incl.patch
+
+Review of attachment 8603342:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_async_flushes.js
+@@ +74,5 @@
+> +  yield Promise.all([promise1, promise2]);
+> +
+> +  // The pending update should be lost.
+> +  ({entries} = JSON.parse(ss.getTabState(tab)));
+> +  is(entries.length, 1, "still only one history entry");
+
+This test seems kinda flaky. Isn't it possible that the update message will, by chance, be sent before the content process gets the crash message (due to the one second timer expiring)?
+(In reply to Bill McCloskey (:billm) from comment #20)
+> ::: browser/components/sessionstore/test/browser_async_flushes.js
+> @@ +74,5 @@
+> > +  yield Promise.all([promise1, promise2]);
+> > +
+> > +  // The pending update should be lost.
+> > +  ({entries} = JSON.parse(ss.getTabState(tab)));
+> > +  is(entries.length, 1, "still only one history entry");
+> 
+> This test seems kinda flaky. Isn't it possible that the update message will,
+> by chance, be sent before the content process gets the crash message (due to
+> the one second timer expiring)?
+
+Line 48 flushes just before clicking the link. Before the second is over we crashed the browser already so this shouldn't be a problem. We have other tests doing the same, they basically rely on the assumption that sending a few messages causing small actions shouldn't take a second - so far that's been true. It's really hard to test messaging without it.
+(In reply to Bill McCloskey (:billm) from comment #18)
+> It occurs to me that copyFromCache doesn't deal with the case where
+> browser.__SS_data is present. Based on [1] (which is used by
+> TabState.clone), it seems like that could be a problem. This might also be
+> an issue for bug 1109875 too.
+
+Yeah, that's true it doesn't deal with it. But TabStateCache is basically a clone of __SS_data except a few things. I think we should just get rid of that and remove any chance of overriding data here. I couldn't get it to fail with multiple situations in tests so I think it's safe, it's still very confusing. Filed bug 1166757.
+(In reply to Bill McCloskey (:billm) from comment #18)
+> Even if this isn't a bug, I think it might be nice to have a single API call
+> in TabState that returns a promise that will be resolved with the tabState.
+> Having to use copyFromCache seems like an implementation detail that
+> shouldn't be exposed to SessionStore.jsm.
+> 
+> It would also be nice to fold this new API in with the bug 1109875 stuff
+> too. Perhaps the big branch in the SessionStore:update handler that deals
+> with _closedTabs could instead be moved to onTabClose and written to use
+> TabStateFlusher and a promise.
+
+Bug 1109875 does really only want cached data and I think it's fine to know about that. We can't flush at this point anymore and the <xul:tab> is gone too. Other points in the browser might want to collect data without flushing, some wants to - like duplicateTab(). I think we should combine those use cases as they turn up.
+(In reply to Tim Taubert [:ttaubert] from comment #21)
+> Line 48 flushes just before clicking the link. Before the second is over we
+> crashed the browser already so this shouldn't be a problem. We have other
+> tests doing the same, they basically rely on the assumption that sending a
+> few messages causing small actions shouldn't take a second - so far that's
+> been true. It's really hard to test messaging without it.
+
+OK, I see what you mean. Seems fine.
+Comment on attachment 8603353
+0002-Bug-1162871-Use-async-flushing-for-duplicateTab.patch, v3
+
+Review of attachment 8603353:
+-----------------------------------------------------------------
+
+OK, let's do this then.
+https://hg.mozilla.org/integration/fx-team/rev/14932987629f
+https://hg.mozilla.org/integration/fx-team/rev/9cf3c9833dd5
+https://hg.mozilla.org/integration/fx-team/rev/92cd66241010
+https://hg.mozilla.org/integration/fx-team/rev/030dbb9b3b9a
+https://hg.mozilla.org/integration/fx-team/rev/d76a27bfd070
+https://hg.mozilla.org/mozilla-central/rev/14932987629f
+https://hg.mozilla.org/mozilla-central/rev/9cf3c9833dd5
+https://hg.mozilla.org/mozilla-central/rev/92cd66241010
+https://hg.mozilla.org/mozilla-central/rev/030dbb9b3b9a
+https://hg.mozilla.org/mozilla-central/rev/d76a27bfd070

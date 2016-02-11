@@ -1,0 +1,127 @@
+With the most recent Java 8 support, Eclipse reports the error as given in the snippet:
+
+new TreeSet<>((String qn1, String qn2) -> {
+   boolean b = true;
+   System.out.println(b); // ok
+   if(b) { } // Eclipse says: b cannot be resolved or is not a field
+   return qn1.compareTo(qn2);
+});
+
+With the most recent Java 8 support, Eclipse reports the error as given in the snippet:
+
+new TreeSet<>((String qn1, String qn2) -> {
+   boolean b = true;
+   System.out.println(b); // ok
+   if(b) { } // Eclipse says: b cannot be resolved or is not a field
+   return qn1.compareTo(qn2);
+});
+Strange indeed.
+
+If I plug in explicit type argument in place of the diamond problem vanishes.
+Stephan, the lambda's eventual resolution seems to be happening one too
+many times: 
+
+First time from: 
+
+LambdaExpression(FunctionalExpression).checkAgainstFinalTargetType(TypeBinding) line: 176	
+InferenceContext18.acceptPendingPolyArguments(BoundSet, TypeBinding[], boolean) line: 1200	
+InferenceContext18.rebindInnerPolies(BoundSet, TypeBinding[]) line: 1149	
+InferenceContext18.rebindInnerPolies(MethodBinding, InvocationSite) line: 1134	
+InferenceContext18.inferInvocationType(Invocation, TypeBinding[], ParameterizedGenericMethodBinding) line: 543	
+MethodScope(Scope).inferInvocationType(InvocationSite, MethodBinding, TypeBinding[]) line: 5049	
+MethodScope(Scope).getStaticFactory(ReferenceBinding, ReferenceBinding, TypeBinding[], Invocation) line: 4962	
+AllocationExpression.inferElidedTypes(ReferenceBinding, ReferenceBinding, TypeBinding[], BlockScope) line: 572	
+AllocationExpression.resolvePart2(AllocationExpression$ResolutionState) line: 492	
+AllocationExpression.resolveType(BlockScope) line: 482	
+AllocationExpression(Expression).resolve(BlockScope) line: 1018	
+MethodDeclaration(AbstractMethodDeclaration).resolveStatements() line: 621	
+MethodDeclaration.resolveStatements() line: 303	
+MethodDeclaration(AbstractMethodDeclaration).resolve(ClassScope) line: 532	
+
+
+and subsequently from:
+
+LambdaExpression(FunctionalExpression).checkAgainstFinalTargetType(TypeBinding) line: 176	
+ASTNode.resolvePolyExpressionArguments(Invocation, MethodBinding, TypeBinding[]) line: 730	
+MethodScope(Scope).inferInvocationType(InvocationSite, MethodBinding, TypeBinding[]) line: 5052	
+MethodScope(Scope).getConstructor0(ReferenceBinding, TypeBinding[], InvocationSite) line: 2451	
+MethodScope(Scope).getConstructor(ReferenceBinding, TypeBinding[], InvocationSite) line: 2390	
+AllocationExpression(Statement).findConstructorBinding(BlockScope, Invocation, ReferenceBinding, TypeBinding[]) line: 340	
+AllocationExpression.resolvePart2(AllocationExpression$ResolutionState) line: 506	
+AllocationExpression.resolveType(BlockScope) line: 482	
+AllocationExpression(Expression).resolve(BlockScope) line: 1018	
+MethodDeclaration(AbstractMethodDeclaration).resolveStatements() line: 621	
+MethodDeclaration.resolveStatements() line: 303	
+MethodDeclaration(AbstractMethodDeclaration).resolve(ClassScope) line: 532	
+
+
+I though we had a very similar issue recently. Perhaps that fix was
+MessageSend specific ? If so we need to make sure other invocation forms
+are similarly handled. Thanks for taking a look.
+This looks very similar to https://bugs.eclipse.org/bugs/show_bug.cgi?id=424710#c1
+We should also include a test for ECC and QAE. Thanks.
+(In reply to Srikanth Sankaran from comment #3)
+> This looks very similar to
+> https://bugs.eclipse.org/bugs/show_bug.cgi?id=424710#c1
+> We should also include a test for ECC and QAE. Thanks.
+
+If I add 
+
+    if (this.resolvedType != null)
+        return this.resolvedType
+
+the problem vanishes. 
+
+In ASTNode.resolvePolyExpressionArguments
+
+	if (argument.isPolyExpression()) {
+					// poly expressions in an invocation context may need to be resolved now:
+					if (infCtx != null && infCtx.stepCompleted == InferenceContext18.BINDINGS_UPDATED)
+						updatedArgumentType = argument.resolvedType; // in this case argument was already resolved via InferenceContext18.acceptPendingPolyArguments()
+					else
+						updatedArgumentType = argument.checkAgainstFinalTargetType(parameterType);
+
+infCtx comes out as null.
+
+We should also take out all the unresolve() calls as soon as reasonably
+possible. 
+
+Recently, I implemented support for method/constructor references targetting
+varargs method by transforming the method reference into a synthesized
+implicit lambda. I needed bits and pieces of virgin AST for this and this
+was achieved by: 
+
+final Parser parser = new Parser(this.enclosingScope.problemReporter(), false);
+		final char[] source = this.compilationResult.getCompilationUnit().getContents();
+		ReferenceExpression copy =  (ReferenceExpression) parser.parseExpression(source, this.sourceStart, this.sourceEnd - this.sourceStart + 1, 
+										this.enclosingScope.referenceCompilationUnit(), false /* record line separators */);
+		
+This should work for any expression actually.
+(In reply to Srikanth Sankaran from comment #4)
+> We should also take out all the unresolve() calls as soon as reasonably
+> possible. 
+
+Yes, please :) I copied your hint over to bug 426996
+(In reply to Srikanth Sankaran from comment #4)
+> infCtx comes out as null.
+
+Yep, that's the culprit. We registered an inference context but against a _slightly_ different method: the synthetic static factory for the diamond invocation. Later when we use the real constructor we fail to retrieve this inference context.
+
+I invented a little new subclass of MethodBinding: SyntheticFactoryMethodBinding, which remembers the original constructor it represents.
+
+Now, when we register an inference context for a given PGMB, where the underlying original is a SyntheticFactoryMethodBinding, we can register the inference context also for the real constructor updated with matching type arguments.
+
+Effect: we correctly find the inference context, see it has state BINDINGS_UPDATED, and quit from resolvePolyExpressionArguments() thus avoiding duplicate work.
+
+Released via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=c0648c986bd8f9b4b5c031105639a6f9119992bf
+The code does not compile and throws up a error 
+"Eclipse says: b cannot be resolved or is not a field" as specified in Comment 0
+with older builds.
+
+Compiles without any issues with 
+Eclipse + Java 8 RC1 Eclipse Kepler 4.3.2(RC4) Build id: M20140212-0800 +  
+Eclipse Java Development Tools Patch for Java 8 Support (BETA)	
+1.0.0.v20140220-2054.
+Verified as working for Eclipse + Java 8 RC1 Eclipse Kepler 4.3.2(RC4) Build id: M20140212-0800 +  
+Eclipse Java Development Tools Patch for Java 8 Support (BETA)	
+1.0.0.v20140220-2054.

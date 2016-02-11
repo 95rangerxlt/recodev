@@ -1,0 +1,187 @@
+Created attachment 233952
+Test case to reproduce the issue
+
+Stack Trace:
+
+java.lang.ClassCastException: org.eclipse.jdt.internal.compiler.ast.Annotation$TypeUseBinding cannot be cast to org.eclipse.jdt.internal.compiler.lookup.FieldBinding
+	at org.eclipse.jdt.internal.compiler.ast.ASTNode.resolveAnnotations(ASTNode.java:713)
+	at org.eclipse.jdt.internal.compiler.lookup.FieldBinding.getAnnotationTagBits(FieldBinding.java:281)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.resolveTypeFor(SourceTypeBinding.java:1474)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.fields(SourceTypeBinding.java:775)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.faultInTypesForFieldsAndMethods(SourceTypeBinding.java:753)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.faultInTypesForFieldsAndMethods(SourceTypeBinding.java:757)
+	at org.eclipse.jdt.internal.compiler.lookup.CompilationUnitScope.faultInTypes(CompilationUnitScope.java:424)
+	at org.eclipse.jdt.core.dom.CompilationUnitResolver.resolve(CompilationUnitResolver.java:1200)
+	at org.eclipse.jdt.core.dom.CompilationUnitResolver.resolve(CompilationUnitResolver.java:692)
+	at org.eclipse.jdt.core.dom.ASTParser.internalCreateAST(ASTParser.java:1186)
+	at org.eclipse.jdt.core.dom.ASTParser.createAST(ASTParser.java:812)
+	at org.eclipse.jdt.internal.ui.javaeditor.ASTProvider$1.run(ASTProvider.java:544)
+	at org.eclipse.core.runtime.SafeRunner.run(SafeRunner.java:42)
+	at org.eclipse.jdt.internal.ui.javaeditor.ASTProvider.createAST(ASTProvider.java:537)
+	at org.eclipse.jdt.internal.ui.javaeditor.ASTProvider.getAST(ASTProvider.java:480)
+	at org.eclipse.jdt.ui.SharedASTProvider.getAST(SharedASTProvider.java:128)
+	at org.eclipse.jdt.internal.ui.viewsupport.SelectionListenerWithASTManager$PartListenerGroup.calculateASTandInform(SelectionListenerWithASTManager.java:170)
+	at org.eclipse.jdt.internal.ui.viewsupport.SelectionListenerWithASTManager$PartListenerGroup$3.run(SelectionListenerWithASTManager.java:155)
+	at org.eclipse.core.internal.jobs.Worker.run(Worker.java:53)
+
+Created attachment 233952
+Test case to reproduce the issue
+
+Stack Trace:
+
+java.lang.ClassCastException: org.eclipse.jdt.internal.compiler.ast.Annotation$TypeUseBinding cannot be cast to org.eclipse.jdt.internal.compiler.lookup.FieldBinding
+	at org.eclipse.jdt.internal.compiler.ast.ASTNode.resolveAnnotations(ASTNode.java:713)
+	at org.eclipse.jdt.internal.compiler.lookup.FieldBinding.getAnnotationTagBits(FieldBinding.java:281)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.resolveTypeFor(SourceTypeBinding.java:1474)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.fields(SourceTypeBinding.java:775)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.faultInTypesForFieldsAndMethods(SourceTypeBinding.java:753)
+	at org.eclipse.jdt.internal.compiler.lookup.SourceTypeBinding.faultInTypesForFieldsAndMethods(SourceTypeBinding.java:757)
+	at org.eclipse.jdt.internal.compiler.lookup.CompilationUnitScope.faultInTypes(CompilationUnitScope.java:424)
+	at org.eclipse.jdt.core.dom.CompilationUnitResolver.resolve(CompilationUnitResolver.java:1200)
+	at org.eclipse.jdt.core.dom.CompilationUnitResolver.resolve(CompilationUnitResolver.java:692)
+	at org.eclipse.jdt.core.dom.ASTParser.internalCreateAST(ASTParser.java:1186)
+	at org.eclipse.jdt.core.dom.ASTParser.createAST(ASTParser.java:812)
+	at org.eclipse.jdt.internal.ui.javaeditor.ASTProvider$1.run(ASTProvider.java:544)
+	at org.eclipse.core.runtime.SafeRunner.run(SafeRunner.java:42)
+	at org.eclipse.jdt.internal.ui.javaeditor.ASTProvider.createAST(ASTProvider.java:537)
+	at org.eclipse.jdt.internal.ui.javaeditor.ASTProvider.getAST(ASTProvider.java:480)
+	at org.eclipse.jdt.ui.SharedASTProvider.getAST(SharedASTProvider.java:128)
+	at org.eclipse.jdt.internal.ui.viewsupport.SelectionListenerWithASTManager$PartListenerGroup.calculateASTandInform(SelectionListenerWithASTManager.java:170)
+	at org.eclipse.jdt.internal.ui.viewsupport.SelectionListenerWithASTManager$PartListenerGroup$3.run(SelectionListenerWithASTManager.java:155)
+	at org.eclipse.core.internal.jobs.Worker.run(Worker.java:53)
+Looking at the AST after parsing reveals a bit of what's going on here:
+
+import java.lang.annotation.*;
+@Target(ElementType.TYPE_USE) @interface NonNull {
+  class value {
+    value() {
+      super();
+    }
+  }
+  public class X extends @NonNull() Object {
+    public static @NonNull() int i = 0;
+    public X() {
+      super();
+    }
+    <clinit>() {
+    }
+  }
+}
+
+This happens partly due to the syntax error at int[].class, but it's strange why we 
+end up with duplicate @NonNull()?
+
+Actually, that directly leads to the root cause: the AST is not well-formed,
+two type references (the type's superclass and the field's type) share the same
+instance of NormalAnnotation!!
+
+From here it's easy to see that the recipient of the annotation is a field
+and is not a field at the same time, depending on how you look at the AST.
+
+My guess: during error recovery someone is not properly consuming the type
+annotation from its stack.
+
+I vaguely remember we already had a similar situation.
+Created attachment 233998
+sketch of a possible fix
+
+No, not the parser's stack is corrupt, but the reference to the annotation
+is replicated via
+- RecoveredType#pendingAnnotations
+- SingleTypeReference#annotations
+
+At the point we regularly consume the annotation into the superclass reference
+we forgot that we previously stashed it into the RecoveredType.
+
+Resetting that stash at the real consumption resolves the immediate problem,
+but raises these questions:
+- should this fix apply to other currentElements besides RecoveredType?
+- do more locations in the parser exist that need a similar fix?
+
+Looking for Recovered*#pendingAnnotations gives 5 matches.
+
+Just within Parser I see 8 locations decrementing #typeAnnotationPtr, which all
+are candidates for creating illegal sharing.
+This looks similar:
+
+Given a CU with syntax errors and this method:
+
+public Object[] @NonNull [] foo() {
+  return null;
+}
+
+The MarkerAnnotation "@NonNull" will end up both 
+- as a declaration annotation in MethodDeclaration#annotations
+- as a type annotation of the method's return type 
+  (ArrayTypeReference#annotationsOnDimensions)
+
+In my workspace I added inside ASTNode#resolveAnnotations()
+(FYI, these lines are needed for bug 392384):
+
+	final Binding annotationRecipient = annotation.recipient;
+	if (annotationRecipient != null && recipient != null) {
+		switch (recipient.kind()) {
+// ...
+// this section is new:
+		case Binding.TYPE_USE :
+			TypeUseBinding typeUse = (TypeUseBinding) recipient;
+			typeUse.tagBits = ((TypeUseBinding) annotationRecipient).tagBits;
+//
+
+With the above input I get CCE because the receiver of a TYPE_USE annotation is not
+a TypeUseBinding but a MethodBinding.
+
+This illegal sharing of AST nodes only happens during syntax recovery.
+Manoj, would you like to take this up?
+(In reply to Stephan Herrmann from comment #3)
+> // ...
+> // this section is new:
+> 		case Binding.TYPE_USE :
+> 			TypeUseBinding typeUse = (TypeUseBinding) recipient;
+> 			typeUse.tagBits = ((TypeUseBinding) annotationRecipient).tagBits;
+> //
+
+This addition was released via commit 427a01e331e57852efc472cca3a8360bd121fda9
+but reverted in commit 8a1621e802c664e59aba36b8a87f59ae57902e37.
+
+This means that the mentioned strategy for triggering CCE no longer works,
+but I still believe that syntax recovery creates malformed structures.
+*** Bug 417662 has been marked as a duplicate of this bug. ***
+I released a temporary fix here: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=70293ebfba1aa3d3dce9544e23e757d77487db91
+
+Will leave this open for continued analysis and eventual
+proper resolution.
+BTW, did you see my sketch in comment 2?
+I'm afraid malformed AST will hit us in more situations than just this CCE...
+(In reply to Stephan Herrmann from comment #8)
+> BTW, did you see my sketch in comment 2?
+> I'm afraid malformed AST will hit us in more situations than just this CCE...
+
+Agreed, that is why this is still left open. ATM, I don't have the time for
+due diligence on this task - hence the first aid.
+Cumulative fix for bug 414038 and bug 420320 delivered via: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=1821b3dbff03a19f0410029f03844aad56801cc1.
+
+Fix was to simply make sure type annotations are mixed up with the
+recovery machinery.
+
+If type annotation recovery is necessary, it will have to dealt with
+as a separate problem. I don't think it is as important as SE5 annotations
+discovery.
+(In reply to Srikanth Sankaran from comment #10)
+
+> Fix was to simply make sure type annotations are mixed up with the
+                                               are NOT mixed up with the
+(In reply to Srikanth Sankaran from comment #10)
+> If type annotation recovery is necessary, it will have to dealt with
+> as a separate problem. [...]
+
+I've filed bug 422784 with a reference to the tentative fix in comment 2.
+
+
+[1.8][compiler] CCE in resolveAnnotations
+
+
+
+[1.8] Cumulative fix for 414038 + 420320 
+
+Temporary fix for Bug 414038 - [1.8][compiler]CCE in resolveAnnotations 

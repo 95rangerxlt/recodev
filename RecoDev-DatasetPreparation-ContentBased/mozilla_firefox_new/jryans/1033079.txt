@@ -1,0 +1,556 @@
+The debugger server currently is only aware of a single listening socket at a time.
+
+With the addition of WiFi debugging, a user may wish to set the DevTools to be available by either USB or WiFi, and so this requires two listening sockets active at the same time.
+
+The debugger server currently is only aware of a single listening socket at a time.
+
+With the addition of WiFi debugging, a user may wish to set the DevTools to be available by either USB or WiFi, and so this requires two listening sockets active at the same time.
+Created attachment 8449811
+Part 1: Server style cleanup
+Created attachment 8449812
+Part 2: Support multiple listening sockets
+
+The functions performed by today's listener API have be moved to new names:
+
+* openListener -> openOneListener
+* closeListener -> closeAllListeners
+
+And there are now new functions with the names:
+
+* openListener
+* closeListener
+
+that allow for management of multiple open listeners.
+
+Also, I removed the |_socketConnections| state variable...  It seemed to want to track all connections on a socket, but it was only ever incremented a single when the listener is first opened.  Additionally, |closeListener(force == true)| seemed unnecessary since the left side of the OR is always true.
+
+Assuming this looks good, I'll also need to update the mentioned Gaia test, and then clean this up in a separate patch.
+Try: https://tbpl.mozilla.org/?tree=Try&rev=232dfb1e2117
+Created attachment 8450471
+Part 2: Support multiple listening sockets (v2)
+
+Forgot to revert a test debugging change.
+Created attachment 8450723
+Part 2: Support multiple listening sockets (v3)
+
+Added an extra API |getListenerPort| which cleans up some tests here.
+
+I am pretty sure that's the last update for now, sorry for spam.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=81181ca26799
+Created attachment 8451845
+Part 2: Support multiple listening sockets (v4)
+
+I've improved the API a bit, so that |openListener| now gives a new Listener object which is easier to work.
+
+This will also be helpful in later bugs, as I'll likely be splitting up a few more server functions per listener, such as triggering display of the connection prompt.
+
+I won't make any other changes until I receive review feedback. :)
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=8592ef38b157
+Comment on attachment 8451845
+Part 2: Support multiple listening sockets (v4)
+
+Review of attachment 8451845:
+-----------------------------------------------------------------
+
+I have a few comments around API issues, but my main question is why would users (developers) need to debug a device or process from 2 completely different connection methods. Is there a real use case that you have come across?
+
+I can understand how it would seem logical to generalize the server's support for multiple protocol connections to cover multiple protocol transports, but the existing constraint provides some security benefits that I'd be leery to lose without tangible benefits.
+
+::: toolkit/devtools/server/main.js
+@@ +445,3 @@
+>    /**
+>     * Listens on the given port or socket file for remote debugger connections.
+> +   * If there is already at least one open listener, no changes are made.
+
+How is this useful if there is a TCP listener open and the request was made for a UNIX domain socket listener, for example? Or for a different port? I expect that consumers would find this behavior surprising, since we don't even return the listener for manual inspection.
+
+I realize that this just follows the existing behavior, but it seems to me that in a DebuggerServer where there can be multiple listeners open simultaneously that behavior is no longer useful.
+
+@@ +489,5 @@
+> +
+> +    // When the listener closes, remove it from the server
+> +    listener.once("close", () => {
+> +      this._listeners = this._listeners.filter(someListener => {
+> +        return someListener !== listener;
+
+Relying on the "close" event to clean up the array implicitly requires an event library that dispatches the event synchronously. I am mentioning this because we have talked about using async events in the past. You should at least add a comment that mentions this requirement here or in the Listener constructor.
+
+I assume that you chose this option to avoid having the Listener know too much about DebuggerServer, which is a worthwhile goal. It looks like onSocketAccepted however does need access to its internals, so I'm not sure going in this roundabout way for the _listeners array is worth it.
+
+@@ -494,5 @@
+>      }
+>  
+> -    // Only close the listener when the last connection is closed, or if the
+> -    // force flag is passed.
+> -    if (--this._socketConnections == 0 || force) {
+
+This part was for compatibility with marionette, which used to be surprised when the devtools would close the connection underneath it. You seem to have run it through try, so it must be fine.
+
+@@ +892,5 @@
+> +   */
+> +  close: function() {
+> +    this._socket.close();
+> +    this.emit("close");
+> +    this._server = null;
+
+I would swap the order of these two statements, because I can imagine listeners of the close event expecting to find a null socket property (especially in tests).
+(In reply to Panos Astithas [:past] from comment #7)
+> Comment on attachment 8451845
+> Part 2: Support multiple listening sockets (v4)
+> 
+> Review of attachment 8451845:
+> -----------------------------------------------------------------
+> 
+> I have a few comments around API issues, but my main question is why would
+> users (developers) need to debug a device or process from 2 completely
+> different connection methods. Is there a real use case that you have come
+> across?
+
+Yes, the real use case is in support of WiFi debugging on Firefox OS.  Separate options are exposed to independently control whether debugging is available via USB (listening on the UNIX domain socket) or WiFi (listening on a TCP socket for non-local interfaces).  If both options are enabled, it seemed like the best fit would be to have a listener active for each case.
+
+As I mentioned above, I'll likely move the security prompt pieces onto the Listener instances eventually.  The reasoning for this is the API consumer that opened the listeners may wish to show different prompts for USB vs. WiFi connections, such as the connecting client's IP, host name, or other more sophisticated info from the authentication process we'll have via WiFi.  So, breaking this out into multiple Listener instances will support this need too.
+
+> I can understand how it would seem logical to generalize the server's
+> support for multiple protocol connections to cover multiple protocol
+> transports, but the existing constraint provides some security benefits that
+> I'd be leery to lose without tangible benefits.
+
+I am not sure exactly what you mean here...  Maybe you mean that reasoning about the security model and its various prefs is more complex when there multiple listeners, each with their own needs and expectations?  If so, you're definitely right.  The WiFi debugging project is revisiting many of these past decisions, I think, since it carries a very different threat model (especially in shared hotspot environment with unknown users listening).  So, we should certainly be thinking carefully about the security risks.
+
+We may also need to shift away from some of the "one answer fits every use case" prefs we're using today (force-local, etc.), since different transport layers can have different answers for each.
+
+At a higher level, the WiFi debugging features will definitely remain preffed off until we are confident that we have the right level of security in place.
+
+> ::: toolkit/devtools/server/main.js
+> @@ +445,3 @@
+> >    /**
+> >     * Listens on the given port or socket file for remote debugger connections.
+> > +   * If there is already at least one open listener, no changes are made.
+> 
+> How is this useful if there is a TCP listener open and the request was made
+> for a UNIX domain socket listener, for example? Or for a different port? I
+> expect that consumers would find this behavior surprising, since we don't
+> even return the listener for manual inspection.
+> 
+> I realize that this just follows the existing behavior, but it seems to me
+> that in a DebuggerServer where there can be multiple listeners open
+> simultaneously that behavior is no longer useful.
+
+Yes, I kept this in just to preserve the existing API of the old |openListener| making no further changes if one listener is already active.
+
+But, you're probably right, it's clearer to remove it.  I'll audit the existing callers, have them do their own check on the number of listeners if they actually do want to only have only one live.
+
+> @@ +489,5 @@
+> > +
+> > +    // When the listener closes, remove it from the server
+> > +    listener.once("close", () => {
+> > +      this._listeners = this._listeners.filter(someListener => {
+> > +        return someListener !== listener;
+> 
+> Relying on the "close" event to clean up the array implicitly requires an
+> event library that dispatches the event synchronously. I am mentioning this
+> because we have talked about using async events in the past. You should at
+> least add a comment that mentions this requirement here or in the Listener
+> constructor.
+> 
+> I assume that you chose this option to avoid having the Listener know too
+> much about DebuggerServer, which is a worthwhile goal. It looks like
+> onSocketAccepted however does need access to its internals, so I'm not sure
+> going in this roundabout way for the _listeners array is worth it.
+
+Ah, fair enough, I'll drop the event pattern then.
+
+> @@ -494,5 @@
+> >      }
+> >  
+> > -    // Only close the listener when the last connection is closed, or if the
+> > -    // force flag is passed.
+> > -    if (--this._socketConnections == 0 || force) {
+> 
+> This part was for compatibility with marionette, which used to be surprised
+> when the devtools would close the connection underneath it. You seem to have
+> run it through try, so it must be fine.
+
+Ah, I see.  I guess Marionette used to use our server at some point then?  At this point, it looks like they are only using the DevTools transport layer, so that must be why it no longer matters.
+Created attachment 8452586
+Part 2: Support multiple listening sockets (v5)
+
+* Replaced all callers of |openOneListener| with |openListener| and guards where needed
+* |Listener|s now tell |DebuggerServer| directly to remove them on close, so no more event complexity
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=c13d5d08e721
+Created attachment 8452692
+Part 2: Support multiple listening sockets (v6)
+
+Fix test failure.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=9f95d6145e44
+Comment on attachment 8452692
+Part 2: Support multiple listening sockets (v6)
+
+Review of attachment 8452692:
+-----------------------------------------------------------------
+
+My main concern is from the UI/UX standpoint of having separate options to toggle remote debugging via each transport. It seems to me that enabling debugging should be a single option with the type of the transport as another option dependent on that. In other words I can't think of a scenario where a user would want to be simultaneously debugging through 2 different transports. What I think is more likely to happen is that the user will turn on both kinds of debugging even though she will be using only one, just in case the need ever arises, and then forget about it.
+
+However I feel that this should be an explicit design decision and not one that is dictated by a certain code structure, so I'm fine with landing this. I'd suggest to loop in Mark, Paul or others from our security team in this design, but I bet you've already done that.
+
+::: toolkit/devtools/server/main.js
+@@ +436,5 @@
+> +    return this._listeners.length;
+> +  },
+> +
+> +  // TODO: Remove after cleaning up Gaia test:
+> +  // https://github.com/mozilla-b2g/gaia/blob/1ba15ce1ae7254badd25fd276556c1b4f36c0a45/tests/integration/devtools/server_test.js#L31
+
+Add the number of the followup bug in the comment please.
+
+@@ +451,5 @@
+> +   * @return Listener
+> +   *         A Listener instance that is already opened is returned.  This
+> +   *         single listener can be closed at any later time by calling |close|
+> +   *         on the Listener.  If a Listener could not be opened, an error is
+> +   *         thrown.
+
+It should also be mentioned that undefined will be returned in case remote debugging is disabled.
+
+@@ +472,5 @@
+> +   */
+> +  _removeListener: function(listener) {
+> +    this._listeners = this._listeners.filter(someListener => {
+> +      return someListener !== listener;
+> +    });
+
+You could also use this shorter form, if you care about that sort of thing:
+
+this._listeners = this._listeners.filter(l => l !== listener);
+
+@@ +823,5 @@
+> + * Creates a new socket listener for remote connections to a given
+> + * DebuggerServer.  This helps contain and organize the parts of the server that
+> + * may differ or are particular to one given listener mechanism vs. another.
+> + */
+> +function Listener(server) {
+
+Listener seems too generic for this, how about SocketListener or DebuggerServerListener (maybe even ConnectionListener)?
+
+@@ +864,5 @@
+> +  },
+> +
+> +  /**
+> +   * Closes the Listener.  The server listens for the |close| event and will
+> +   * remove the Listener from its state.
+
+Now that there is no "close" event this comment needs updating.
+(In reply to Panos Astithas [:past] from comment #11)
+> My main concern is from the UI/UX standpoint of having separate options to
+> toggle remote debugging via each transport. It seems to me that enabling
+> debugging should be a single option with the type of the transport as
+> another option dependent on that. In other words I can't think of a scenario
+> where a user would want to be simultaneously debugging through 2 different
+> transports. 
+
+Well, I don't expect someone to debug through 2 transports *simultaneously*.  But, if the developer generally finds both USB and WiFi debugging methods acceptable, I think it is a UX improvement to have separate checkboxes where they are both enabled at the same time.
+
+In this scenario, I would expect most people to use WiFi debugging, but if they need ADB access for some reason, then they can switch to USB usage of the DevTools as well without needing to revisit their device settings.
+
+Further, if developers feel they must constantly toggle debugging on and off for security reasons, then we should strive to make it secure enough so that is no longer a concern for most.
+
+I believe the design of WiFi debugging will be sufficiently secure that leaving it on would not cause a problem if a developer wishes to do so.  I've taken this moment to finally update design document to match what's being built.  It's now hosted on the wiki[1].
+
+So, if we are to allow them to both be enabled, then that's why we need the separate listeners here.
+
+> What I think is more likely to happen is that the user will turn
+> on both kinds of debugging even though she will be using only one, just in
+> case the need ever arises, and then forget about it.
+
+It may be likely, but my desire is for it not to be a security concern if it is forgotten.  Also, we plan to show a persistent status bar icon when the device is listening for debugging connections (bug 998328), so this lessens the chance to forget.
+
+> However I feel that this should be an explicit design decision and not one
+> that is dictated by a certain code structure, so I'm fine with landing this.
+> I'd suggest to loop in Mark, Paul or others from our security team in this
+> design, but I bet you've already done that.
+
+I've certainly been in contact with them about WiFi debugging generally, but this particular choice was made mostly by myself and Jan.
+
+So, let's ask them here explicitly:
+
+Paul, Mark: Do you think it's a good and safe UX choice to allow users to enable both *USB* debugging and *WiFi* debugging at the same time on a device?  WiFi debugging will use an encrypted, authenticated connection, with a user prompt at connection time.  I've explained my reasoning for the answer to be "Yes" in the rest of this comment, so I'll stop there. :)
+
+[1]: https://wiki.mozilla.org/DevTools/WiFi_Debugging/Design
+Another wrinkle that led to the current choice of independent options on Firefox OS is that the USB DevTools option is bundled in a menu with ADB as well.  So, what Jan and I thought would be most clear was:
+
+Debugging via USB (menu)
+
+( ) Disabled
+( ) ADB only
+( ) ADB and DevTools
+
+DevTools via WiFi ( ) (check box)
+
+since WiFi DevTools are unrelated to the others.
+(In reply to J. Ryan Stinnett [:jryans] from comment #12)
+> (In reply to Panos Astithas [:past] from comment #11)
+> So, let's ask them here explicitly:
+> 
+> Paul, Mark: Do you think it's a good and safe UX choice to allow users to
+> enable both *USB* debugging and *WiFi* debugging at the same time on a
+> device?  WiFi debugging will use an encrypted, authenticated connection,
+> with a user prompt at connection time.  I've explained my reasoning for the
+> answer to be "Yes" in the rest of this comment, so I'll stop there. :)
+> 
+> [1]: https://wiki.mozilla.org/DevTools/WiFi_Debugging/Design
+
+I don't see a problem with allowing both enabled at the same time - I can see the use case where you are debugging over wifi and then want to connect usb to read logcat etc as being very common.
+
+I would like us to apply security requirements consistently though, which might be a seperate discussion. Currently we have a number of security controls on adb-based remote debugging that are implemented by enabling/disabling adb - I thinking that we should do the same when it comes to opening up ports for listening/responding to multicast pings.  
+
+- We currently disable adb whenever the phone is locked on production devices. Can we do the same wireless debugging (i.e close the port/don't respond to pings when the phone is locked)
+- We currently disable remote debugging after a period of no connections (12 hours I believe). I'd recommend we do the same for wireless connections
+
+I know this is pain point for some developers (jryans pointed me to bug 1032128), so maybe we want UI to be able to disable these controls, but I feel like whatever we do, we should be consistent across both.
+(In reply to J. Ryan Stinnett [:jryans] from comment #13)
+> Another wrinkle that led to the current choice of independent options on
+> Firefox OS is that the USB DevTools option is bundled in a menu with ADB as
+> well.  So, what Jan and I thought would be most clear was:
+> 
+> Debugging via USB (menu)
+> 
+> ( ) Disabled
+> ( ) ADB only
+> ( ) ADB and DevTools
+> 
+> DevTools via WiFi ( ) (check box)
+> 
+> since WiFi DevTools are unrelated to the others.
+
+I'm probably bikeshedding here, but part of the reason we merged this initially was to have ONE switch for turning debugging off or on.
+
+Can we use a UI similar to the Wifi hotspot UI
+
+Remote Debugging (on/off toggle)
+Debugging Options ...
+
+Where the "Debugging Options..." opens a options dialog which has:
+
+adb ( )
+Devtools via adb ( ) - greyed out if adb is disabled
+Devtoosl via wifi ( )
+
+The main reason why I prefer this is that we could disable remote debugging without messing with the developers debugging preferences. Also, when we display the persistent notification in the address bar, tapping on the notification takes you to one place where you can turn off remote debugging. Rather than having to work out which one is on, and which one you need to turn off.
+(In reply to Paul Theriault [:pauljt] from comment #15)
+> (In reply to J. Ryan Stinnett [:jryans] from comment #13)
+> > Another wrinkle that led to the current choice of independent options on
+> > Firefox OS is that the USB DevTools option is bundled in a menu with ADB as
+> > well.  So, what Jan and I thought would be most clear was:
+> > 
+> > Debugging via USB (menu)
+> > 
+> > ( ) Disabled
+> > ( ) ADB only
+> > ( ) ADB and DevTools
+> > 
+> > DevTools via WiFi ( ) (check box)
+> > 
+> > since WiFi DevTools are unrelated to the others.
+> 
+> I'm probably bikeshedding here, but part of the reason we merged this
+> initially was to have ONE switch for turning debugging off or on.
+> 
+> Can we use a UI similar to the Wifi hotspot UI
+> 
+> Remote Debugging (on/off toggle)
+> Debugging Options ...
+> 
+> Where the "Debugging Options..." opens a options dialog which has:
+> 
+> adb ( )
+> Devtools via adb ( ) - greyed out if adb is disabled
+> Devtoosl via wifi ( )
+> 
+> The main reason why I prefer this is that we could disable remote debugging
+> without messing with the developers debugging preferences. Also, when we
+> display the persistent notification in the address bar, tapping on the
+> notification takes you to one place where you can turn off remote debugging.
+> Rather than having to work out which one is on, and which one you need to
+> turn off.
+
+PS this Debugging Options could be place to put a checkbox to disable the timeout e.g:
+
+Debugging options:
+ adb (x)
+ Devtools via adb (x)
+ Devtoosl via wifi (x)
+Security options:
+ Disable debugging after 12 hours of inactivity (x)
+ Prevent debugging when device is locked (x)
+(In reply to Paul Theriault [:pauljt] from comment #14)
+> I don't see a problem with allowing both enabled at the same time - I can
+> see the use case where you are debugging over wifi and then want to connect
+> usb to read logcat etc as being very common.
+
+That's a good point, I hadn't thought of that.
+
+(In reply to J. Ryan Stinnett [:jryans] from comment #12)
+> Also, we plan to show a persistent status bar icon when the
+> device is listening for debugging connections (bug 998328), so this lessens
+> the chance to forget.
+
+Ohh, I very much like that!
+Paul, these are great suggestions for improving the FxOS settings. :) I've filed bug 1037129 to discuss those in more detail.
+
+Also, for aiming towards consistent policies for disabling different debug transports, I've filed bug 1037138 for this.
+
+For this bug, I'll move forward with landing.
+Created attachment 8454023
+Part 2: Support multiple listening sockets (v7, past: r+)
+
+(In reply to Panos Astithas [:past] from comment #11)
+> Comment on attachment 8452692
+> Part 2: Support multiple listening sockets (v6)
+> ::: toolkit/devtools/server/main.js
+> @@ +436,5 @@
+> > +    return this._listeners.length;
+> > +  },
+> > +
+> > +  // TODO: Remove after cleaning up Gaia test:
+> > +  // https://github.com/mozilla-b2g/gaia/blob/1ba15ce1ae7254badd25fd276556c1b4f36c0a45/tests/integration/devtools/server_test.js#L31
+> 
+> Add the number of the followup bug in the comment please.
+
+I'll use this bug, so I've marked it leave-open and added this bug number in the comment.
+
+> @@ +451,5 @@
+> > +   * @return Listener
+> > +   *         A Listener instance that is already opened is returned.  This
+> > +   *         single listener can be closed at any later time by calling |close|
+> > +   *         on the Listener.  If a Listener could not be opened, an error is
+> > +   *         thrown.
+> 
+> It should also be mentioned that undefined will be returned in case remote
+> debugging is disabled.
+
+Added to comment.
+
+> @@ +472,5 @@
+> > +   */
+> > +  _removeListener: function(listener) {
+> > +    this._listeners = this._listeners.filter(someListener => {
+> > +      return someListener !== listener;
+> > +    });
+> 
+> You could also use this shorter form, if you care about that sort of thing:
+> 
+> this._listeners = this._listeners.filter(l => l !== listener);
+
+Okay, updated!
+
+> @@ +823,5 @@
+> > + * Creates a new socket listener for remote connections to a given
+> > + * DebuggerServer.  This helps contain and organize the parts of the server that
+> > + * may differ or are particular to one given listener mechanism vs. another.
+> > + */
+> > +function Listener(server) {
+> 
+> Listener seems too generic for this, how about SocketListener or
+> DebuggerServerListener (maybe even ConnectionListener)?
+
+Changed to SocketListener.
+
+> @@ +864,5 @@
+> > +  },
+> > +
+> > +  /**
+> > +   * Closes the Listener.  The server listens for the |close| event and will
+> > +   * remove the Listener from its state.
+> 
+> Now that there is no "close" event this comment needs updating.
+
+Updated.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=e63230d5a99e
+(In reply to J. Ryan Stinnett [:jryans] from comment #12)
+> Paul, Mark: Do you think it's a good and safe UX choice...
+
+Yeah, I think this is acceptable.
+
+(In reply to Paul Theriault [:pauljt] from comment #14)
+> I would like us to apply security requirements consistently though, which
+> might be a seperate discussion. Currently we have a number of security
+> controls on adb-based remote debugging that are implemented by
+> enabling/disabling adb - I thinking that we should do the same when it comes
+> to opening up ports for listening/responding to multicast pings.  
+> 
+> - We currently disable adb whenever the phone is locked on production
+> devices. Can we do the same wireless debugging (i.e close the port/don't
+> respond to pings when the phone is locked)
+> - We currently disable remote debugging after a period of no connections (12
+> hours I believe). I'd recommend we do the same for wireless connections
+> 
+> I know this is pain point for some developers (jryans pointed me to bug
+> 1032128), so maybe we want UI to be able to disable these controls, but I
+> feel like whatever we do, we should be consistent across both.
+
+I think this is important too; if people use one, they'll build expectations of how they see the other working.
+(In reply to Mark Goodwin [:mgoodwin] from comment #20)
+> (In reply to J. Ryan Stinnett [:jryans] from comment #12)
+> > Paul, Mark: Do you think it's a good and safe UX choice...
+> 
+> Yeah, I think this is acceptable.
+
+Great!  We seem to all be agreed then. :)
+
+> (In reply to Paul Theriault [:pauljt] from comment #14)
+> > I would like us to apply security requirements consistently though, which
+> > might be a seperate discussion. Currently we have a number of security
+> > controls on adb-based remote debugging that are implemented by
+> > enabling/disabling adb - I thinking that we should do the same when it comes
+> > to opening up ports for listening/responding to multicast pings.  
+> > 
+> > - We currently disable adb whenever the phone is locked on production
+> > devices. Can we do the same wireless debugging (i.e close the port/don't
+> > respond to pings when the phone is locked)
+> > - We currently disable remote debugging after a period of no connections (12
+> > hours I believe). I'd recommend we do the same for wireless connections
+> > 
+> > I know this is pain point for some developers (jryans pointed me to bug
+> > 1032128), so maybe we want UI to be able to disable these controls, but I
+> > feel like whatever we do, we should be consistent across both.
+> 
+> I think this is important too; if people use one, they'll build expectations
+> of how they see the other working.
+
+Yes, and I think adding UI controls for these like Paul suggested not only helps by letting them be controlled, but it also makes the behavior more discoverable, since I imagine developers don't know why the disabling happens currently.
+https://hg.mozilla.org/integration/fx-team/rev/862e74c77107
+https://hg.mozilla.org/integration/fx-team/rev/9c484bb185fd
+https://hg.mozilla.org/mozilla-central/rev/862e74c77107
+https://hg.mozilla.org/mozilla-central/rev/9c484bb185fd
+Created attachment 8455491
+Change Gaia test to use new API
+
+Jan, can you review this change to the DebuggerServer test in Gaia?
+Comment on attachment 8455491
+Change Gaia test to use new API
+
+Try is green and the change makes sense. r+ with one question.
+Created attachment 8456382
+Part 3: Remove DS._listener after Gaia update
+
+Panos, just removing the TODO now that Gaia is fixed.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=4f74d57c065e
+https://hg.mozilla.org/integration/fx-team/rev/d56e8ef026a0
+https://hg.mozilla.org/mozilla-central/rev/d56e8ef026a0
+
+
+Server support for multiple open listeners
+
+
+
+Bug 1033079 - Part 1: Server style cleanup. r=past 
+
+Bug 1033079 - Part 2: Support multiple listening sockets. r=past 
+
+Bug 1033079 - Part 3: Remove DS._listener after Gaia update. r=past 

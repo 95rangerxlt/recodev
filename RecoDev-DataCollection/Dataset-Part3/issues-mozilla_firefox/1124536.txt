@@ -1,0 +1,148 @@
+Created attachment 8552845
+Debugger_PageMod_loadSourceError.png
+
+When an add-on developer can use the PageMod addon-sdk module to create content scripts attached to browser tabs using a javascript code string instead of a resource url:
+
+     var pagemod = require('sdk/page-mod');
+
+     pagemod.PageMod({
+       include: "*",
+       contentScript: 'console.error("CONTENT SCRIPT EXECUTED");'
+     });
+
+its source code will be evaluated in its sandbox using "javascript:SOURCECODE" as its related url:
+
+- https://github.com/mozilla/addon-sdk/blob/be781bfd724969d6d5c9e66fb22336fabd4fe019/lib/sdk/content/sandbox.js#L347)
+
+The Debugger lists correctly this kind of javascript sources associated to the tab, but it's unable to show its sourcecode because the Debugger frontend receive a loadSourceError from the DebuggerServer ScriptActor (screenshot attached).
+
+Created attachment 8552845
+Debugger_PageMod_loadSourceError.png
+
+When an add-on developer can use the PageMod addon-sdk module to create content scripts attached to browser tabs using a javascript code string instead of a resource url:
+
+     var pagemod = require('sdk/page-mod');
+
+     pagemod.PageMod({
+       include: "*",
+       contentScript: 'console.error("CONTENT SCRIPT EXECUTED");'
+     });
+
+its source code will be evaluated in its sandbox using "javascript:SOURCECODE" as its related url:
+
+- https://github.com/mozilla/addon-sdk/blob/be781bfd724969d6d5c9e66fb22336fabd4fe019/lib/sdk/content/sandbox.js#L347)
+
+The Debugger lists correctly this kind of javascript sources associated to the tab, but it's unable to show its sourcecode because the Debugger frontend receive a loadSourceError from the DebuggerServer ScriptActor (screenshot attached).
+Created attachment 8552853
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+This is the smallest change that I've currently found to work correctly (the Debugger is able to show the sourcecode and breakpoint works as well).
+
+Tracking the problem down on the DebuggerServer SourceActor, it seems that this type of script sources are not detected by the "SourceActor.prototype._getSourceText" method as javascript code because the source actor doesn't include javascript in its "this._contentType" property.
+Created attachment 8553706
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+I tweaked the above patch a bit, it's better to set the SourceActor's _contentType attribute in the constructor instead of changing it in a getter method.
+
+my doubt is: do we have to fix it in the SourceActor or in the actor which creates SourceActor instances?
+It's a little strange where we do it (I once tried to move it into the `SourceActor` constructor, but it caused problems and I can't remember why), but here's where you should probably do the check: https://github.com/mozilla/gecko-dev/blob/master/toolkit/devtools/server/actors/script.js#L5340
+
+`if(fileExtension === 'js' || url.indexOf('javascript:') === 0) {}`
+
+Hm, the url parsing might throw there actually since it can't parse that? Not sure. If that's the case, do the check within the `catch` statement.
+
+Eventually we could probably move this in the SourceActor, but you're probably interested in getting this fixed quickly.
+Created attachment 8554530
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+Moved the fix into the threadActor, inside the catch block because the URL decoding throws on "javascript:SOURCECODE" urls.
+
+It is possible that the same catch block is catching silently more urls, so I put a console.warn in an else block to prevent silent exception catching (but I'm not sure this is the right way or enough to produce warning log messages from debugger actors)   
+
+Now I'm studing the test cases related to the SourceActor to prepare a corresponding test case.
+(and because, if we decide to move this into the SourceActor in a follow up, I need a better understanding of the test cases to preserve the feature correctly during the move)
+Created attachment 8554947
+Bug1124536_DebuggerPageMod_fix_loadSourceError_testcase.patch
+
+This patch adds a new "browser_dbg_sources-pagemod.js" test case in the mochitest-devtools test suite.
+by the way, this small change makes possible to use breakpoints on bookmarklets ;-)
+Sorry, was at a conference last week so reviewing now!
+Comment on attachment 8554530
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+Review of attachment 8554530:
+-----------------------------------------------------------------
+
+Thanks! Sorry I didn't get around to this until now. Also in the future feel free to include the test case in the same patch.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +5392,5 @@
+>          // Not a valid URI.
+> +
+> +        // bug 1124536: fix getSourceText on scripts associated "javascript:SOURCE" urls
+> +        // (e.g. 'evaluate(sandbox, sourcecode, "javascript:"+sourcecode)' )
+> +        if (url.indexOf('javascript:') === 0) {
+
+nit: can you change this to double-quotes? we use those for all strings
+Comment on attachment 8554947
+Bug1124536_DebuggerPageMod_fix_loadSourceError_testcase.patch
+
+Review of attachment 8554947:
+-----------------------------------------------------------------
+
+Cool, thanks for the extensive test case. This looks good. Can you push to try with both these patches?
+Created attachment 8560909
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+I've just rebased the patch, fixed the nit and merged the testcase patch.
+
+Try pushed: https://treeherder.mozilla.org/#/jobs?repo=try&revision=bb2c5d8c3125
+https://hg.mozilla.org/integration/fx-team/rev/acc254692008
+Backed out in https://hg.mozilla.org/integration/fx-team/rev/1821e8426f63 for xpcshell bustage:
+
+https://treeherder.mozilla.org/logviewer.html#?job_id=1970090&repo=fx-team
+I have a hard time reading if this is the patch's fault or not. Some of these errors look similar to something Eddy landed recently and had to back out.
+
+However, looking at the patch again, you probably want to remove the `console.warn`. I'm not sure if the console is available inside web workers. Either way, seeing as the errors are "console is not defined", that may fix the problem.
+
+It's not really a warning anyway. If the content type isn't detected, we get the content type from the HTTP header later when we fetch the source. We just don't do that for normal JS sources because we don't have to re-fetch them.
+Created attachment 8563168
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+Sorry for that, I've removed the `console.warn` and pushed to try (`-u all` to ensure it doesn't fail in any testsuite):
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=d7c473cd41a7
+Created attachment 8564185
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+The last try build fails on M-e10s, I've tried to run the testcase locally and it seems that, with e10s enabled, the pagemods are not injected at all.
+
+As commented before, this patch fixes the loadSourceError on pagemod defined from a string of javascript code, but it fixes loadSourceError on bookmarklets as well:
+
+so I've rewrote the test case to inject a bookmarklet instead of a pagemod, because injecting a bookmarklet works correctly on both e10s and non-e10s mochitests.
+
+The try is currently closed, I'm waiting until it will be re-opened to lauch a new try build and attach it to this issue.
+pushed to try:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=553936e7eb10
+The above try seems okay (there are a couple of failures, but unrelated to the fix and test case added by this patch).
+
+I prefer this solution because it removes the addon-sdk pagemod module dependency and it works correctly on e10s right now 
+
+(there are probably some issues between the pagemod module and e10s, but it's a different issue which it's probably better to be debugged separately, fixed inside the addon-sdk sources and tested using the addon-sdk test suite)
+
+How it looks to you?
+Comment on attachment 8564185
+Bug1124536_DebuggerPageMod_fix_loadSourceError.patch
+
+Review of attachment 8564185:
+-----------------------------------------------------------------
+
+Looks good!
+(In reply to Luca Greco from comment #17)
+
+> How it looks to you?
+
+Thanks for rewriting this, I like this version better. It's more standalone.
+https://hg.mozilla.org/integration/fx-team/rev/7b5751bf50e9
+https://hg.mozilla.org/mozilla-central/rev/7b5751bf50e9

@@ -1,0 +1,809 @@
+it relies on /browser code such as the microsummary service (or will soon enough).
+
+it relies on /browser code such as the microsummary service (or will soon enough).
+Created attachment 261211
+wip patch
+
+saving my work. this moves the import/export code to /browser and makes it a component. it's not working yet.
+Created attachment 261265
+wip -N
+Created attachment 261348
+wip v2
+
+- better interface/class names, more general for future import/export
+- imports at startup, exports/archives at shutdown
+
+still todo:
+- after landing 349523, remove the old code from toolkit
+- test the migrators on different platforms/browser
+- add a way of detecting if initial bookmarks.html import has been done
+Created attachment 261700
+wip v3
+
+- backs up pre-places bookmarks.html to bookmarks.preplaces.html, and uses it's absence as a flag to do initial import
+- removes import/backup code from the bookmarks service
+
+still todo:
+- get annos working
+- get html escaping working
+Created attachment 261729
+wip v4
+
+adds import/export of anno properties, favicons, HTML escaping
+Comment on attachment 261729
+wip v4
+
+mano, can you do another pass on this? it now covers everything that the toolkit version covered.
+
+some notes about some of the changes:
+
+- the profile manager sends profile-change-teardown, but not final-ui-startup, causing nsBrowserGlue::_onProfileShutdown to be called before the app really comes up, so i added flags there for determining proper startupness.
+
+- nsIAnnotationService.idl was including nsString.h, causing it to not be include-able with frozen-string-api consumers, so i made the call that required it private, as the only usage was internal anyway.
+Comment on attachment 261729
+wip v4
+
+>Index: browser/components/nsBrowserGlue.js
+>===================================================================
+ 
+> // Constructor
+> 
+> function BrowserGlue() {
+>   this._init();
+>+  this._profileStarted = false;
+
+What's this for? How would we get to _onProfileShutdown without having this set?
+
+>+  /**
+>+   * Initialize Places
+>+   * - imports bookmarks.html if bookmarks datastore is empty
+>+   */
+>+  _initPlaces: function bg__initPlaces() {
+>+#ifdef MOZ_PLACES_BOOKMARKS
+>+    var dirService = Components.classes["@mozilla.org/file/directory_service;1"]
+>+                               .getService(Components.interfaces.nsIProperties);
+>+    var profDir = dirService.get("ProfD", Components.interfaces.nsIFile);
+>+    var bookmarksFile = profDir.clone(); // bookmarks.html
+>+    var bookmarksBackup = profDir.clone(); // bookmarks.preplaces.html
+>+    bookmarksBackup.append("bookmarks.preplaces.html");
+>+    if (!bookmarksBackup.exists()) {
+>+      // If bookmarks.preplaces.html doesn't exist, this is the first time
+>+      // places bookmarks is being run.
+>+      var ioService = 
+>+        Components.classes["@mozilla.org/network/io-service;1"]
+>+                  .getService(Components.interfaces.nsIIOService);
+>+      bookmarksFile.append("bookmarks.html");
+
+If we happen to keep importBookmarks* take nsIURI*, this belongs to the block below:
+
+>+      if (bookmarksFile.exists()) {
+>+        // import bookmarks.html
+>+        var importer = 
+>+          Components.classes["@mozilla.org/browser/places/import-export-service;1"]
+>+                    .getService(Components.interfaces.nsIPlacesImportExportService);
+>+        importer.importHTMLFromURI(ioService.newFileURI(bookmarksFile));
+>+        // save old bookmarks.html file as bookmarks.preplaces.html
+>+        bookmarksFile.copyTo(profDir, "bookmarks.preplaces.html");
+
+First copy the file, then touch it ;)
+
+copyTo can fail in various circumstance, I think we should just silently catch those.
+
+>Index: browser/components/build/Makefile.in
+>===================================================================
+
+>+	content \
+>+	htmlparser \
+
+These should be moved to the browser/components/places makefile.
+
+>Index: browser/components/places/public/nsIPlacesImportExportService.idl
+>===================================================================
+
+>+interface nsIPlacesImportExportService: nsISupports
+>+{
+>+  /**
+>+   * Loads the given bookmarks.html file and merges it with the current
+>+   * bookmarks hierarchy.
+>+   */
+>+  void importHTMLFromURI(in nsIURI aURI);
+>+
+>+
+>+  /**
+>+   * Loads the given bookmarks.html file and puts it in the given folder
+>+   */
+>+  void importHTMLFromURIToFolder(in nsIURI aUrl, in PRInt64 aFolder);
+
+Hrm, considering current callers, maybe we should make those take nsILocalFile?
+
+>Index: browser/components/places/src/nsPlacesImportExportService.cpp
+>===================================================================
+
+Please note any non-trivial changes to the import/export code.
+
+>Index: browser/components/places/tests/unit/test_bookmarks_html.js
+>===================================================================
+Hrm, this doesn't really test rdf->places import, right?
+
+>Index: toolkit/components/places/public/nsIAnnotationService.idl
+>===================================================================
+>@@ -36,23 +36,23 @@
+>  *
+>  * ***** END LICENSE BLOCK ***** */
+> 
+> #include "nsISupports.idl"
+> 
+> %{C++
+> #include "nsTArray.h"
+> #include "nsCOMArray.h"
+>-#include "nsString.h"
+>+//#include "nsString.h"
+> %}
+> 
+> interface nsIURI;
+> interface nsIVariant;
+> 
+>-[ptr] native CStringArray(nsTArray<nsCString>);
+>+//[ptr] native CStringArray(nsTArray<nsCString>);
+> [ptr] native URIArray(nsCOMArray<nsIURI>);
+> 
+> [scriptable, uuid(d41c9510-2377-4728-b275-bdad6a0521f8)]
+> interface nsIAnnotationObserver : nsISupports
+> {
+>     /**
+>      * Called when an annotation value is set. It could be a new annotation,
+>      * or it could be a new value for an existing annotation.
+>@@ -248,17 +248,17 @@ interface nsIAnnotationService : nsISupp
+>      * GetPageAnnotationsTArray instead.
+>      */
+>     void getPageAnnotationNames(in nsIURI aURI, out PRUint32 count,
+>       [retval, array, size_is(count)] out nsIVariant result);
+> 
+>     /**
+>      * TArray version of getPageAnnotationNames for ease of use in C++ code.
+>      */
+>-    [noscript] void GetPageAnnotationNamesTArray(in nsIURI aURI, in CStringArray aResult);
+>+    //[noscript] void GetPageAnnotationNamesTArray(in nsIURI aURI, in CStringArray aResult);
+>
+
+Fine, but please remove them for real, and the other ptr/includes.
+
+>Index: toolkit/components/places/public/nsINavBookmarksService.idl
+>===================================================================
+
+rev the uuid.
+
+>Index: toolkit/components/places/tests/bookmarks/test_bookmarks.js
+>===================================================================
+....
+I suppose these were incidentally included here, I suppose?
+(In reply to comment #7)
+> (From update of attachment 261729 [details])
+> >Index: browser/components/nsBrowserGlue.js
+> >===================================================================
+> 
+> > // Constructor
+> > 
+> > function BrowserGlue() {
+> >   this._init();
+> >+  this._profileStarted = false;
+> 
+> What's this for?
+> How would we get to _onProfileShutdown without having this
+> set?
+
+this is initializing the flag that shows whether or not the profile was actually started up (as opposed to just the profile manager opening/closing).
+
+i don't really understand the question though... the problem here is that when the profile manager closes, _onProfileShutdown is called, even though onProfileStartup never was.
+
+> 
+> >+      if (bookmarksFile.exists()) {
+> >+        // import bookmarks.html
+> >+        var importer = 
+> >+          Components.classes["@mozilla.org/browser/places/import-export-service;1"]
+> >+                    .getService(Components.interfaces.nsIPlacesImportExportService);
+> >+        importer.importHTMLFromURI(ioService.newFileURI(bookmarksFile));
+> >+        // save old bookmarks.html file as bookmarks.preplaces.html
+> >+        bookmarksFile.copyTo(profDir, "bookmarks.preplaces.html");
+> 
+> First copy the file, then touch it ;)
+
+haven't touched it yet... this code imports bookmarks.html, then copies it to bookmarks.preplaces.html.
+
+> 
+> copyTo can fail in various circumstance, I think we should just silently catch
+> those.
+
+ok. i added a dump() so that the error will be available in the logs.
+
+> 
+> >Index: browser/components/build/Makefile.in
+> >===================================================================
+> 
+> >+	content \
+> >+	htmlparser \
+> 
+> These should be moved to the browser/components/places makefile
+
+build fails, can't find the interface header files unless i include these dirs here.
+
+> 
+> >Index: browser/components/places/public/nsIPlacesImportExportService.idl
+> >===================================================================
+> 
+> >+interface nsIPlacesImportExportService: nsISupports
+> >+{
+> >+  /**
+> >+   * Loads the given bookmarks.html file and merges it with the current
+> >+   * bookmarks hierarchy.
+> >+   */
+> >+  void importHTMLFromURI(in nsIURI aURI);
+> >+
+> >+
+> >+  /**
+> >+   * Loads the given bookmarks.html file and puts it in the given folder
+> >+   */
+> >+  void importHTMLFromURIToFolder(in nsIURI aUrl, in PRInt64 aFolder);
+> 
+> Hrm, considering current callers, maybe we should make those take nsILocalFile?
+
+it's more useful to extensions if they take a URI, allowing easy import of remotely backed-up bookmarks files.
+
+> 
+> >Index: browser/components/places/src/nsPlacesImportExportService.cpp
+> >===================================================================
+> 
+> Please note any non-trivial changes to the import/export code.
+> 
+
+there aren't any behavioral changes. i only made the changes necessary to get it to work standalone, and w/ the frozen string api. everything else is like it was in /toolkit.
+
+- 
+> >Index: browser/components/places/tests/unit/test_bookmarks_html.js
+> >===================================================================
+> Hrm, this doesn't really test rdf->places import, right?
+
+no, i'll be adding more comprehensive tests asap, and before this lands (bug 376253)
+
+> 
+> >Index: toolkit/components/places/tests/bookmarks/test_bookmarks.js
+> >===================================================================
+> ....
+> I suppose these were incidentally included here, I suppose?
+> 
+
+ugh, no, i just forgot to follow up on this. looking...
+Created attachment 262850
+fix v5
+
+fixes comments from wip v4, adds better tests.
+Comment on attachment 262850
+fix v5
+
+because.
+Created attachment 262975
+fix v6 - added pref
+
+adds a pref determining if bookmarks.html should be imported or not
+Created attachment 263078
+fix v7
+
+- initialize services in constructor
+- add to packages files
+Comment on attachment 263078
+fix v7
+
+Where are the changes to nsAnnotationService.cpp?
+
+>Index: browser/components/places/src/nsPlacesImportExportService.cpp
+>===================================================================
+>+#define NS_NAVHISTORYSERVICE_CONTRACTID \
+>+  "@mozilla.org/browser/nav-history-service;1"
+>+
+>+#define NS_ANNOTATIONSERVICE_CONTRACTID \
+>+  "@mozilla.org/browser/annotation-service;1"
+>+
+>+#define NS_NAVBOOKMARKSSERVICE_CONTRACTID \
+>+  "@mozilla.org/browser/nav-bookmarks-service;1"
+>+
+>+#define NS_LIVEMARKSERVICE_CONTRACTID \
+>+  "@mozilla.org/browser/livemark-service;2"
+>+
+>+#define NS_FAVICONSERVICE_CONTRACTID \
+>+  "@mozilla.org/browser/favicon-service;1"
+
+or you can include nsToolkitCompsCID.h.
+
+>+  nsCAutoString backupFilenameCString(timeString);
+>+  nsAutoString backupFilenameString = NS_ConvertUTF8toUTF16(backupFilenameCString);
+
+better: nsAutoString backupFilenameString(NS_ConvertUTF8toUTF16((timeString)));
+
+>+
+>+  nsCOMPtr<nsIFile> backupFile;
+>+  if (forceArchive) {
+>+    // if we have a backup from today, nuke it
+>+    nsCOMPtr<nsIFile> currentBackup;
+>+    rv = bookmarksBackupDir->Clone(getter_AddRefs(currentBackup));
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+    rv = currentBackup->Append(backupFilenameString);
+>+    NS_ENSURE_SUCCESS(rv, rv);
+>+    rv = currentBackup->Exists(&exists);
+>+    if (!NS_FAILED(rv) && exists) {
+
+make that (NS_SUCCEEDED(rv) && exists)
+
+>Index: browser/components/places/src/nsPlacesImportExportService.h
+>===================================================================
+
+>+#include "nsIHTMLContentSink.h"
+>+#include "nsIParser.h"
+
+nit: these belong to the implementation file.
+
+>+class nsPlacesImportExportService : public nsIPlacesImportExportService
+>+{
+
+>+    nsresult ImportHTMLFromFileInternal(nsILocalFile* aFile, PRBool aAllowRootChanges,
+>+                                       PRInt64 aFolder, PRBool aIsImportDefaults);
+>+    nsresult WriteContainer(PRInt64 aFolder, const nsCString& aIndent, nsIOutputStream* aOutput);
+>+    nsresult WriteContainerHeader(PRInt64 aFolder, const nsCString& aIndent, nsIOutputStream* aOutput);
+>+    nsresult WriteContainerTitle(PRInt64 aFolder, nsIOutputStream* aOutput);
+>+    nsresult WriteItem(nsINavHistoryResultNode* aItem, const nsCString& aIndent, nsIOutputStream* aOutput);
+>+    nsresult WriteLivemark(PRInt64 aFolderId, const nsCString& aIndent, nsIOutputStream* aOutput);
+>+    nsresult WriteContainerContents(PRInt64 aFolder, const nsCString& aIndent, nsIOutputStream* aOutput);
+>+
+
+Those should take const nsACString&.
+
+>Index: browser/components/places/tests/unit/test_bookmarks_html.js
+>===================================================================
+
+Please file follow up(s) on improving this test.
+
+>Index: browser/locales/en-US/chrome/browser/places/default_places.html
+>===================================================================
+>Index: toolkit/components/places/tests/bookmarks/test_bookmarks.js
+>===================================================================
+
+part of another patch i suppose?
+
+>Index: toolkit/components/places/public/nsIAnnotationService.idl
+>===================================================================
+>RCS file: /cvsroot/mozilla/toolkit/components/places/public/nsIAnnotationService.idl,v
+>retrieving revision 1.12
+>diff -u -8 -p -r1.12 nsIAnnotationService.idl
+>--- toolkit/components/places/public/nsIAnnotationService.idl	22 Apr 2007 22:20:25 -0000	1.12
+>+++ toolkit/components/places/public/nsIAnnotationService.idl	28 Apr 2007 01:03:34 -0000
+>@@ -36,23 +36,21 @@
+>  *
+>  * ***** END LICENSE BLOCK ***** */
+> 
+> #include "nsISupports.idl"
+> 
+> %{C++
+> #include "nsTArray.h"
+> #include "nsCOMArray.h"
+
+It would be nice to move these to the implementation file too.
+(In reply to comment #13)
+
+> >+  nsCAutoString backupFilenameCString(timeString);
+> >+  nsAutoString backupFilenameString = NS_ConvertUTF8toUTF16(backupFilenameCString);
+> 
+> better: nsAutoString backupFilenameString(NS_ConvertUTF8toUTF16((timeString)));
+> 
+
+i couldn't get this to work, the resulting object was not nsAutoString. do i have to dereference the resulting value differently?
+
+> >Index: browser/components/places/tests/unit/test_bookmarks_html.js
+> >===================================================================
+> 
+> Please file follow up(s) on improving this test.
+> 
+
+bug 376253
+
+> >Index: browser/locales/en-US/chrome/browser/places/default_places.html
+> >===================================================================
+> >Index: toolkit/components/places/tests/bookmarks/test_bookmarks.js
+> >===================================================================
+> 
+> part of another patch i suppose?
+
+no, the first hunk changes the start index because we're not importing bookmarks.html on service init, and the second hunk fixes a typo.
+
+> > 
+> > %{C++
+> > #include "nsTArray.h"
+> > #include "nsCOMArray.h"
+> 
+> It would be nice to move these to the implementation file too.
+> 
+
+bug 379205
+Created attachment 263207
+fix v8
+
+fixes issues from comment #13
+Comment on attachment 263207
+fix v8
+
+ack, posted this and forgot to ask for review.
+
+note: there's something wrong in the include order somewhere, causing build failure on windows, trying to track it down now.
+(In reply to comment #16)
+> (From update of attachment 263207 [details])
+> ack, posted this and forgot to ask for review.
+> 
+> note: there's something wrong in the include order somewhere, causing build
+> failure on windows, trying to track it down now.
+> 
+
+MSVCRTD.lib(ti_inst.obj) : error LNK2005: "private: __thiscall type_info::type_i
+nfo(class type_info const &)" (??0type_info@@AAE@ABV0@@Z) already defined in LIB
+CMTD.lib(typinfo.obj)
+MSVCRTD.lib(ti_inst.obj) : error LNK2005: "private: class type_info & __thiscall
+ type_info::operator=(class type_info const &)" (??4type_info@@AAEAAV0@ABV0@@Z)
+already defined in LIBCMTD.lib(typinfo.obj)
+   Creating library fake.lib and object fake.exp
+LINK : warning LNK4098: defaultlib 'MSVCRTD' conflicts with use of other libs; u
+se /NODEFAULTLIB:library
+brwsrcmp.dll : fatal error LNK1169: one or more multiply defined symbols found
+make[1]: *** [brwsrcmp.dll] Error 145
+make[1]: Leaving directory `/cygdrive/c/moz/build-dbg/browser/components/build'
+make: *** [all] Error 2
+Created attachment 263483
+fix v9
+
+
+[09:46am] dietrich: mano: it was  USE_STATIC_LIBS
+[09:46am] dietrich: i rolled back everything, and made/tested each change in isolation
+[09:47am] dietrich: i must've mucked something up when we first tried adding that
+[09:47am] dietrich: i'm still getting a slew of warnings on mac though
+[09:47am] dietrich: oh, mano's not here.
+Comment on attachment 263483
+fix v9
+
+>Index: browser/components/migration/src/nsBrowserProfileMigratorUtils.cpp
+>===================================================================
+>RCS file: /cvsroot/mozilla/browser/components/migration/src/nsBrowserProfileMigratorUtils.cpp,v
+>retrieving revision 1.21
+>diff -u -8 -p -r1.21 nsBrowserProfileMigratorUtils.cpp
+>--- browser/components/migration/src/nsBrowserProfileMigratorUtils.cpp	14 Nov 2006 21:25:56 -0000	1.21
+>+++ browser/components/migration/src/nsBrowserProfileMigratorUtils.cpp	2 May 2007 05:52:14 -0000
+>@@ -36,16 +36,17 @@
+>  *
+>  * ***** END LICENSE BLOCK ***** */
+> 
+> #include "nsBrowserProfileMigratorUtils.h"
+> #ifdef MOZ_PLACES_BOOKMARKS
+> #include "nsINavBookmarksService.h"
+> #include "nsBrowserCompsCID.h"
+> #include "nsToolkitCompsCID.h"
+>+#include "nsIPlacesImportExportService.h"
+> #else
+> #include "nsIBookmarksService.h"
+> #endif
+> #include "nsIFile.h"
+> #include "nsIInputStream.h"
+> #include "nsILineInputStream.h"
+> #include "nsIProperties.h"
+> #include "nsIProfileMigrator.h"
+>@@ -278,32 +279,30 @@ ImportBookmarksHTML(nsIFile* aBookmarksF
+>                                getter_Copies(importedBookmarksTitle));
+> 
+> #ifdef MOZ_PLACES_BOOKMARKS
+>   // Get the bookmarks service
+>   nsCOMPtr<nsINavBookmarksService> bms =
+>     do_GetService(NS_NAVBOOKMARKSSERVICE_CONTRACTID, &rv);
+>   NS_ENSURE_SUCCESS(rv, rv);
+> 
+>-  // Get the file:// uri for the bookmarks file.
+>-  nsCOMPtr<nsIURI> fileURI;
+>-  rv = NS_NewFileURI(getter_AddRefs(fileURI), aBookmarksFile);
+>-  NS_ENSURE_SUCCESS(rv, rv);
+>-
+>   // Create an imported bookmarks folder under the bookmarks menu.
+>   PRInt64 root;
+>   rv = bms->GetBookmarksRoot(&root);
+>   NS_ENSURE_SUCCESS(rv, rv);
+> 
+>   PRInt64 folder;
+>   rv = bms->CreateFolder(root, importedBookmarksTitle, -1, &folder);
+>   NS_ENSURE_SUCCESS(rv, rv);
+> 
+>   // Import the bookmarks into the folder.
+>-  rv = bms->ImportBookmarksHTMLToFolder(fileURI, folder);
+>+  nsCOMPtr<nsILocalFile> localFile(do_QueryInterface(aBookmarksFile));
+
+nit: check rv here, too:
+>+  nsCOMPtr<nsILocalFile> localFile(do_QueryInterface(aBookmarksFile, &rv));
+>+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+>Index: browser/components/places/src/nsPlacesImportExportService.cpp
+>===================================================================
+
+>+nsPlacesImportExportService::nsPlacesImportExportService()
+>+  : mPlacesRoot(0), mBookmarksRoot(0), mToolbarFolder(0)
+>+{
+>+  nsresult rv;
+>+  mHistoryService = do_GetService(NS_NAVHISTORYSERVICE_CONTRACTID, &rv);
+>+  NS_WARN_IF_FALSE(rv, "could not get history service");
+>+  mFaviconService = do_GetService(NS_FAVICONSERVICE_CONTRACTID, &rv);
+>+  NS_WARN_IF_FALSE(rv, "could not get favicon service");
+>+  mAnnotationService = do_GetService(NS_ANNOTATIONSERVICE_CONTRACTID, &rv);
+>+  NS_WARN_IF_FALSE(rv, "could not get annotation service");
+>+  mBookmarksService = do_GetService(NS_NAVBOOKMARKSSERVICE_CONTRACTID, &rv);
+>+  NS_WARN_IF_FALSE(rv, "could not get bookmarks service");
+>+  mLivemarkService = do_GetService(NS_LIVEMARKSERVICE_CONTRACTID, &rv);
+>+  NS_WARN_IF_FALSE(rv, "could not get livemark service");
+
+rv is actually false on success :p I guess you want NS_SUCCEEDED(rv)
+
+>+  rv = mBookmarksService->GetPlacesRoot(&mPlacesRoot);
+>+  rv = mBookmarksService->GetBookmarksRoot(&mBookmarksRoot);
+>+  rv = mBookmarksService->GetToolbarFolder(&mToolbarFolder);
+
+and check rv here too (or not set it all here, it's hardly valuable).
+
+>+  // nsIHTMLContentSink
+>+#ifdef MOZILLA_1_8_BRANCH
+>+  NS_IMETHOD SetTitle(const nsString& aValue) { return NS_OK; }
+>+  NS_IMETHOD OpenHTML(const nsIParserNode& aNode) { return NS_OK; }
+>+  NS_IMETHOD CloseHTML() { return NS_OK; }
+>+  NS_IMETHOD OpenHead(const nsIParserNode& aNode) { return NS_OK; }
+>+  NS_IMETHOD CloseHead() { return NS_OK; }
+>+  NS_IMETHOD OpenBody(const nsIParserNode& aNode) { return NS_OK; }
+>+  NS_IMETHOD CloseBody() { return NS_OK; }
+>+  NS_IMETHOD OpenForm(const nsIParserNode& aNode) { return NS_OK; }
+>+  NS_IMETHOD CloseForm() { return NS_OK; }
+>+  NS_IMETHOD OpenMap(const nsIParserNode& aNode) { return NS_OK; }
+>+  NS_IMETHOD CloseMap() { return NS_OK; }
+>+  NS_IMETHOD OpenFrameset(const nsIParserNode& aNode) { return NS_OK; }
+>+  NS_IMETHOD CloseFrameset() { return NS_OK; }
+>+  NS_IMETHOD AddHeadContent(const nsIParserNode& aNode) { return NS_OK; }
+>+#else
+>+  NS_IMETHOD OpenHead() { return NS_OK; }
+>+#endif
+
+There is no need to keep this file in sync with its branch version ;)
+
+r=mano otherwise.
+fixed nits, checked in:
+
+Checking in browser/app/profile/firefox.js;
+/cvsroot/mozilla/browser/app/profile/firefox.js,v  <--  firefox.js
+new revision: 1.176; previous revision: 1.175
+done
+Checking in browser/components/nsBrowserGlue.js;
+/cvsroot/mozilla/browser/components/nsBrowserGlue.js,v  <--  nsBrowserGlue.js
+new revision: 1.22; previous revision: 1.21
+done
+Checking in browser/components/build/Makefile.in;
+/cvsroot/mozilla/browser/components/build/Makefile.in,v  <--  Makefile.in
+new revision: 1.54; previous revision: 1.53
+done
+Checking in browser/components/build/nsBrowserCompsCID.h;
+/cvsroot/mozilla/browser/components/build/nsBrowserCompsCID.h,v  <--  nsBrowserCompsCID.h
+new revision: 1.21; previous revision: 1.20
+done
+Checking in browser/components/build/nsModule.cpp;
+/cvsroot/mozilla/browser/components/build/nsModule.cpp,v  <--  nsModule.cpp
+new revision: 1.49; previous revision: 1.48
+done
+Checking in browser/components/migration/src/Makefile.in;
+/cvsroot/mozilla/browser/components/migration/src/Makefile.in,v  <--  Makefile.in
+new revision: 1.31; previous revision: 1.30
+done
+Checking in browser/components/migration/src/nsBrowserProfileMigratorUtils.cpp;
+/cvsroot/mozilla/browser/components/migration/src/nsBrowserProfileMigratorUtils.cpp,v  <--  nsBrowserProfileMigratorUtils.cpp
+new revision: 1.22; previous revision: 1.21
+done
+Checking in browser/components/places/Makefile.in;
+/cvsroot/mozilla/browser/components/places/Makefile.in,v  <--  Makefile.in
+new revision: 1.6; previous revision: 1.5
+done
+Checking in browser/components/places/content/places.js;
+/cvsroot/mozilla/browser/components/places/content/places.js,v  <--  places.js
+new revision: 1.83; previous revision: 1.82
+done
+Checking in browser/components/places/public/Makefile.in;
+/cvsroot/mozilla/browser/components/places/public/Makefile.in,v  <--  Makefile.in
+new revision: 1.10; previous revision: 1.9
+done
+RCS file: /cvsroot/mozilla/browser/components/places/public/nsIPlacesImportExportService.idl,v
+done
+Checking in browser/components/places/public/nsIPlacesImportExportService.idl;
+/cvsroot/mozilla/browser/components/places/public/nsIPlacesImportExportService.idl,v  <--  nsIPlacesImportExportService.idl
+initial revision: 1.1
+done
+Checking in browser/components/places/src/Makefile.in;
+/cvsroot/mozilla/browser/components/places/src/Makefile.in,v  <--  Makefile.in
+new revision: 1.22; previous revision: 1.21
+done
+RCS file: /cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.cpp,v
+done
+Checking in browser/components/places/src/nsPlacesImportExportService.cpp;
+/cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.cpp,v  <--  nsPlacesImportExportService.cpp
+initial revision: 1.1
+done
+RCS file: /cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.h,v
+done
+Checking in browser/components/places/src/nsPlacesImportExportService.h;
+/cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.h,v  <--  nsPlacesImportExportService.h
+initial revision: 1.1
+done
+Checking in browser/components/places/tests/Makefile.in;
+/cvsroot/mozilla/browser/components/places/tests/Makefile.in,v  <--  Makefile.in
+new revision: 1.7; previous revision: 1.6
+done
+RCS file: /cvsroot/mozilla/browser/components/places/tests/unit/bookmarks.preplaces.html,v
+done
+Checking in browser/components/places/tests/unit/bookmarks.preplaces.html;
+/cvsroot/mozilla/browser/components/places/tests/unit/bookmarks.preplaces.html,v  <--  bookmarks.preplaces.html
+initial revision: 1.1
+done
+Checking in browser/components/places/tests/unit/head_bookmarks.js;
+/cvsroot/mozilla/browser/components/places/tests/unit/head_bookmarks.js,v  <--  head_bookmarks.js
+new revision: 1.7; previous revision: 1.6
+done
+Checking in browser/components/places/tests/unit/tail_bookmarks.js;
+/cvsroot/mozilla/browser/components/places/tests/unit/tail_bookmarks.js,v  <--  tail_bookmarks.js
+new revision: 1.5; previous revision: 1.4
+done
+RCS file: /cvsroot/mozilla/browser/components/places/tests/unit/test_bookmarks_html.js,v
+done
+Checking in browser/components/places/tests/unit/test_bookmarks_html.js;
+/cvsroot/mozilla/browser/components/places/tests/unit/test_bookmarks_html.js,v  <--  test_bookmarks_html.js
+initial revision: 1.1
+done
+Checking in browser/installer/unix/packages-static;
+/cvsroot/mozilla/browser/installer/unix/packages-static,v  <--  packages-static
+new revision: 1.98; previous revision: 1.97
+done
+Checking in browser/installer/windows/packages-static;
+/cvsroot/mozilla/browser/installer/windows/packages-static,v  <--  packages-static
+new revision: 1.109; previous revision: 1.108
+done
+Removing browser/locales/en-US/chrome/browser/places/default_places.html;
+/cvsroot/mozilla/browser/locales/en-US/chrome/browser/places/default_places.html,v  <--  default_places.html
+new revision: delete; previous revision: 1.8
+done
+Checking in toolkit/components/places/public/nsIAnnotationService.idl;
+/cvsroot/mozilla/toolkit/components/places/public/nsIAnnotationService.idl,v  <--  nsIAnnotationService.idl
+new revision: 1.13; previous revision: 1.12
+done
+Checking in toolkit/components/places/public/nsINavBookmarksService.idl;
+/cvsroot/mozilla/toolkit/components/places/public/nsINavBookmarksService.idl,v  <--  nsINavBookmarksService.idl
+new revision: 1.35; previous revision: 1.34
+done
+Checking in toolkit/components/places/src/Makefile.in;
+/cvsroot/mozilla/toolkit/components/places/src/Makefile.in,v  <--  Makefile.in
+new revision: 1.23; previous revision: 1.22
+done
+Checking in toolkit/components/places/src/nsAnnotationService.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsAnnotationService.cpp,v  <--  nsAnnotationService.cpp
+new revision: 1.20; previous revision: 1.19
+done
+Checking in toolkit/components/places/src/nsAnnotationService.h;
+/cvsroot/mozilla/toolkit/components/places/src/nsAnnotationService.h,v  <--  nsAnnotationService.h
+new revision: 1.10; previous revision: 1.9
+done
+Removing toolkit/components/places/src/nsBookmarksHTML.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsBookmarksHTML.cpp,v  <--  nsBookmarksHTML.cpp
+new revision: delete; previous revision: 1.35
+done
+Checking in toolkit/components/places/src/nsNavBookmarks.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavBookmarks.cpp,v  <--  nsNavBookmarks.cpp
+new revision: 1.83; previous revision: 1.82
+done
+Checking in toolkit/components/places/src/nsNavBookmarks.h;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavBookmarks.h,v  <--  nsNavBookmarks.h
+new revision: 1.38; previous revision: 1.37
+done
+Checking in toolkit/components/places/tests/bookmarks/test_bookmarks.js;
+/cvsroot/mozilla/toolkit/components/places/tests/bookmarks/test_bookmarks.js,v  <--  test_bookmarks.js
+new revision: 1.7; previous revision: 1.6
+done
+and bustage fix:
+
+Checking in browser/locales/jar.mn;
+/cvsroot/mozilla/browser/locales/jar.mn,v  <--  jar.mn
+new revision: 1.65; previous revision: 1.64
+done
+
+needed to remove default_places.html from being packaged.
+fix test bustage: only run the import/export tests when MOZ_PLACES_BOOKMARKS
+
+Checking in Makefile.in;
+/cvsroot/mozilla/browser/components/places/tests/Makefile.in,v  <--  Makefile.in
+new revision: 1.8; previous revision: 1.7
+done
+no more builds burning, no more tests failing, marking fixed.
+regression ?
+see http://forums.mozillazine.org/viewtopic.php?p=2868568#2868568
+(In reply to comment #24)
+> regression ?
+> see http://forums.mozillazine.org/viewtopic.php?p=2868568#2868568
+> 
+
+thanks pal-moz, looking into it.
+With this build, a new profile, also cannot drag & drop a URL onto the Bookmarks Toolbar. 
+
+Mozilla/5.0 (Windows; U; Windows NT 6.0; en-US; rv:1.9a5pre) Gecko/20070503  Gecko/20070309 Firefox/2.0.0.3 Firefox ID:2007050310 [cairo]
+jim, your user-agent implies fx 2.0.0.3, and this change is trunk (like Gecko/20070502 Minefield/3.0a5pre).  can you start a new bug on your fx 2.0.0.3 issue?
+(In reply to comment #27)
+> jim, your user-agent implies fx 2.0.0.3
+
+That actually looks like a spoofed UA, the gecko rv and "[cairo]" marker indicates it's a trunk build.
+Yes, sorry, its spoofed since MSNBC does not recognize Minefield to allow vids to play, they tell me to use 1.5 and above - 
+(In reply to comment #25)
+> (In reply to comment #24)
+> > regression ?
+> > see http://forums.mozillazine.org/viewtopic.php?p=2868568#2868568
+> > 
+> 
+> thanks pal-moz, looking into it.
+> 
+
+with places-bookmarks build, new profile.
+Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9a5pre) Gecko/20070504 Minefield/3.0a5pre ID:2007050404 [cairo]
+
+no problem with drag & drop a URL onto the Bookmarks Toolbar. 
+no problem with default bookmarks.html, but problem with old bookmarks.html (maybe created by before 0502 build).
+no problem with "bookmark this page" (ctrl+D).
+import bookmarks from file is broken.
+if using "bookmark all tabs", all bookmarked-page's title are named "(no title)" in bookmark manager, and empty under "Bookmarks" menu. 
+
+what is "bookmarks.preplaces.html" file ?
+
+should file as separate/new bug ?
+Created attachment 263922
+fixes typo in importFromFile
+Comment on attachment 263922
+fixes typo in importFromFile
+
+r=mano
+Checking in browser/components/places/content/places.js;
+/cvsroot/mozilla/browser/components/places/content/places.js,v  <--  places.js
+new revision: 1.84; previous revision: 1.83
+done
+
+thanks onemen.one
+no problem with importing.
+
+but (with new profile)
+if start Minefield after replace new-created bookmarks.html with old bookmarks.html and delete places.sqlite, all bookmarks empties.
+no prob with 0502 build, prob with 0503 build.
+
+confirmed?
+File a bug please, cc me and Dietich.
+see bug #380317 for a crasher think this change introduced.  the crasher is on shutdown when you don't have any livemarks.
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv
+
+
+bookmarks html import/export needs to move to /browser
+
+
+
+Bug 376008  bookmarks html import/export needs to move to /browser (r=mano) 
+
+fixing bustage from bug 376008 
+
+fix test bustage from bug 376008 
+
+Bug 376008 - typo fix (for onemen.one, r=mano) 

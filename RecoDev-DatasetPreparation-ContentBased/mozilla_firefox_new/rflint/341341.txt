@@ -1,0 +1,236 @@
+Microsummary generators become obsolete as site designs change.  To keep them relevant, we need a way to update them when a new version becomes available.  Ideally this mechanism should be automatic, just as we automatically update search engine plugins when new versions of those plugins become available.
+
+Microsummary generators become obsolete as site designs change.  To keep them relevant, we need a way to update them when a new version becomes available.  Ideally this mechanism should be automatic, just as we automatically update search engine plugins when new versions of those plugins become available.
+mconnor, given that this will have no UI implications if done correctly, is this something that could land in beta 2?
+b1 is not just a UI cutoff, its a major changes cutoff.  Anything with nonzero risk that adds functionality needs to hit b1.
+I'd still like to see this make beta1, since this would be very useful, but I'll rescind my blocking-firefox2 request, since this isn't actually essential to that release.
+Not likely to make Firefox 2 at this point.  Retargeting to Firefox 3.
+Not currently working on this.
+Created attachment 257197
+Patch v1
+
+First pass at a patch.
+This registers an app update timer and downloads and saves fresh XML definitions for generators with remote uri properties once a week. It also moves saveGeneratorXML() out of the microsummary service itself so that it's accessible to MicrosummaryGenerator()s.
+
+To test without having to wait a week, set app.update.timer to 30000 or so, browser.microsummary.generatorUpdateInterval to 60 and browser.microsummary.log to true and you should see the updates dumped to the console every 60 seconds.
+Created attachment 257201
+Patch v2
+
+Adds a pref to disable updates.
+Comment on attachment 257201
+Patch v2
+
+>+    for (var i in generators) {
+>+      var generator = generators[i];
+>+      generator._updateGenerator();
+
+Nit: since generators are cached in a hash indexed by non-consecutive URI-based keys, and "i" is conventionally used to represent indices to consecutively indexed arrays, it'd be clearer to name the key variable "uri".
+
+
+>-    this._saveGeneratorXML(xmlDefinition, file);
+>+    saveGeneratorXML(xmlDefinition, file);
+
+I wonder if this can be made an instance method of MicrosummaryGenerator objects.  Unfortunately, one of the callers of the method doesn't have a real MicrosummaryGenerator object at the time, if I recall correctly.
+
+But perhaps it could be modified to get one; otherwise this could be made a class method.  Either way, we can then drop the word "Generator" from the name of the method, since it would then be redundant with the name of the class, and perhaps add "ToFile" (i.e. call it saveXMLToFile) to clarify where we're saving it to.
+
+
+>+  __uri: function MSD___uri(spec) {
+>+    return this._ios.newURI(spec, null, null);
+
+Nit: __uri should be _uri.
+
+
+>+  _updateGenerator: function MSD__updateGenerator() {
+
+The name of this method shouldn't have a leading underscore, since it can be called by external callers, nor should it have the word "Generator" in it, since that is redundant with the type of object it is a method of.
+
+
+>+    try {
+>+      var genURL = this.uri.path.replace(/^source:/, "");
+>+      var genURI = this.__uri(genURL);
+
+Note: not all local generators have URIs that start "urn:source:".  Extensions can install local generators with arbitrary URIs, f.e. URNs containing UUIDs or even non-URN URIs.  So this code should make sure the generator's URI starts with "urn:source:" before taking the next step.
+
+
+>+      // Only attempt to update if we have a valid remote source
+>+      if (genURI.schemeIs("http") || genURI.schemeIs("https") || 
+>+          genURI.schemeIs("ftp")) {
+>+        LOG("updating generator: " + genURL);
+>+        var resource = new MicrosummaryResource(genURI);
+>+        resource.load(loadCallback, errorCallback);
+
+It seems like we should probably try a HEAD request to see if the generator has been updated since the last time we updated it before we redownload it and replace the existing one, no?
+
+
+>+    catch(ex) {
+>+      Components.utils.reportError(ex);
+>+      resource.destroy();
+>+    }
+
+Note that resource might not be defined at this point, since the exception being caught might have been thrown before "var resource = ...".  So this catch block should check that it has a resource before trying to call its "destroy" method.
+
+Also, although JavaScript's "interesting" local scope means that "resource" is defined everywhere in the function despite being declared within a block halfway down, it might be confusing for folks who look at this later and see the variable being used in the loadCallback and errorCallback closures earlier in the function.
+
+So it should probably get declared at the top of the function (just before "var t = this;"), even though it isn't being defined until the try block.
+
+
+>+  _handleGeneratorLoad: function MSD__handleGeneratorLoad(resource) {
+>+    try {
+
+You don't need the try/catch block in this method because the loadCallback handles trapping exceptions and destroying the resource.
+
+
+>+      // Preserve the generator's ID.
+>+      var generatorID = this.uri.spec;
+>+      resource.content.documentElement.setAttribute("uri", generatorID);
+
+It might make sense to update the ID if the generator's location has changed (i.e. we got redirected to a new location), but that's probably another bug.
+
+
+>+      <preference id="browser.microsummary.updateGenerators"
+>+                  name="browser.microsummary.updateGenerators"
+>+                  type="bool"/>
+
+I wonder if this is something mostly power users will want, and, if so, whether it would make more sense to expose this preference in an extension (f.e. in your Microsummary Manager extension, which could additionally add UI for twiddling this preference to the manager window).
+
+But I'll leave that up to beltzner to decide.  Regardless, the core functionality here is a big win for users of microsummary generators.  Thanks for taking this on!
+Created attachment 276148
+Patch v3
+Comment on attachment 276148
+Patch v3
+
+I know mconnor said that he was cool with this approach, but I don't think Microsummary Generators are prominent nor used enough to really warrant a user-visible preference here. I'd rather that we just use the same pref as add-ons to govern this.
+Comment on attachment 276148
+Patch v3
+
+Per a quick discussion with beltzner over IRC, we'll expose the update pref via about:config only.
+Comment on attachment 276148
+Patch v3
+
+>Index: components/microsummaries/src/nsMicrosummaryService.js
+
+>+    // Setup a cross-session timer to periodically check for generator updates.
+>+    var updateManager = Cc["@mozilla.org/updates/timer-manager;1"].
+>+                        getService(Ci.nsIUpdateTimerManager);
+>+    var interval = getPref("browser.microsummary.generatorUpdateInterval",
+>+                           GENERATOR_INTERVAL);
+>+    var updateCallback = {
+>+      _svc: this,
+>+      notify: function(timer) { this._svc._updateGenerators() }
+>+    };
+>+    updateManager.registerTimer("generator-update-timer", updateCallback,
+>+                                interval);
+
+Nit: it would probably make sense to call this "microsummary-generator-update-timer", given that the update manager service is non-microsummary specific (so other folks might register timers for "generator" objects, and we should distinguish ours from theirs).
+
+
+>+  _updateGenerators: function MSS__updateGenerators() {
+>+    var generators = this._localGenerators;
+>+    var update = getPref("browser.microsummary.updateGenerators", true);
+>+    if (!generators || !update)
+>+      return;
+>+
+>+    for (let uri in generators) {
+>+      try       { generators[uri].update() }
+>+      catch(ex) { LOG(ex) }
+
+Use Cu.reportError instead of LOG when reporting exceptions.
+
+
+>     var file;
+>-    if (generator) {
+>-      // This generator is already installed.  Save it in the existing file
+>-      // (i.e. update the existing generator with the newly downloaded XML).
+>-      file = generator.localURI.QueryInterface(Ci.nsIFileURL).file.clone();
+>+    if (generator)
+>       topic = "microsummary-generator-updated";
+>-    }
+>     else {
+>       // This generator is not already installed.  Save it as a new file.
+>       var generatorName = rootNode.getAttribute("name");
+>       var fileName = sanitizeName(generatorName) + ".xml";
+>       file = this._dirs.get("UsrMicsumGens", Ci.nsIFile);
+>       file.append(fileName);
+>       file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, PERMS_FILE);
+>       generator = new MicrosummaryGenerator(null, this._ios.newFileURI(file));
+>       this._localGenerators[generatorID] = generator;
+>       topic = "microsummary-generator-installed";
+>     }
+
+Now that the first conditional clause no longer defines the file variable, it's not necessary to declare out outside of the conditional, so remove "var file;" from above the conditional and add "var" to the file definition line in the else clause.
+
+Nit: It would probably make sense to move the topic definition in the else clause to the top of the clause, as this would make it clearer what the difference is between the topics for the two clauses.
+
+I also wonder if it would make more sense to do this file initialization work in the new _saveXMLToFile method, although that might require more significant architectural changes than we want to do here, given that we currently pass the file to the constructor.
+
+
+>     // Initialize (or reinitialize) the generator from its XML definition,
+>     // the save the definition to the generator's file.
+>-    generator.initFromXML(xmlDefinition);
+>-    this._saveGeneratorXML(xmlDefinition, file);
+>+    generator.initFromXML(xmlDefinition, true);
+
+In the old version of the code, it was clear from the method names how the generator was first initialized from its definition and then saved to the file.  This change makes the process less clear, since neither "initFromXML" nor its "true" argument implies saving to a file.
+
+Moving the "save to file" functionality into MicrosummaryGenerator::_saveXMLToFile is the right move, but I think it would be clearer if that method were a public one (i.e. saveXMLToFile) that this code called after calling generator.initFromXML.
+
+
+>+  update: function MSD_update() {
+>+  _performUpdate: function MSD__performUpdate(uri) {
+
+The names of these methods were confusing at first, since "update" doesn't actually perform the update.  Perhaps you could add a comment explaining that update uses a HEAD request to check for an update and calls _performUpdate if the response indicates an update is necessary.
+
+
+>+    // Let observers know we've updated this generator
+>+    var obs = Cc["@mozilla.org/observer-service;1"].
+>+    getService(Ci.nsIObserverService);
+>+    obs.notifyObservers(this, "microsummary-generator-updated", null);
+
+Nit: indent getService so it's lined up under Cc.
+
+
+>Index: locales/en-US/chrome/browser/preferences/advanced.dtd
+>Index: components/preferences/advanced.js
+>Index: components/preferences/advanced.xul
+
+I think beltzner's right that it doesn't make sense to expose this pref at this point, so this should be removed, but is there anything you need to change in these files in order to make it possible to overlay this functionality?  We should make sure that's possible to introduce this functionality via your microsummary manager extension.
+
+Otherwise, this looks great!
+Created attachment 276783
+Patch v4
+Comment on attachment 276783
+Patch v4
+
+>Index: components/microsummaries/src/nsMicrosummaryService.js
+
+>+    // We use a HEAD request to check if the generator has been modified since
+>+    // the last time we downloaded it. If it has, we move to _preformUpdate() to
+>+    // actually download and save the new generator.
+
+Nit: preformUpdate -> performUpdate
+
+Looks great, r=myk.  Please fix this last nit on check-in.
+mozilla/browser/app/profile/firefox.js 	1.194 mozilla/browser/components/microsummaries/src/nsMicrosummaryService.js 	1.71
+The places tests are having issues with nsIUpdateTimerManager, so I've backed this out for now.
+Created attachment 277089
+Patch
+
+We need to initialize the update manager and have an XULAppInfo instance in order to use nsIUpdateTimerManager under XPCShell.
+Comment on attachment 277089
+Patch
+
+r=mano with trailing spaces  removed.
+mozilla/browser/components/microsummaries/src/nsMicrosummaryService.js 	1.73
+mozilla/browser/components/places/tests/unit/head_bookmarks.js 	1.10
+
+
+automatically update installed microsummary generators
+
+
+
+Bug 341341 - automatically update installed microsummary generators. r=myk 
+
+Bug 341341 - automatically update installed microsummary generators (places unit test fixes). r=mano 
+
+Bug 341341 - automatically update installed microsummary generators. r=myk 

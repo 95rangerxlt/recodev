@@ -1,0 +1,126 @@
+Created attachment 514629
+A bunch of logging statements in nsSessionStore.js
+
+Someone reported to me that sessions being restored by my Session Manager add-on at start up where ignoring the max_concurrent_tabs preference which confused me since that's all handled internally by Firefox.
+
+I added a ton of logging statements to nsSessionStore.js and tracked the problem down to calling setBrowserState start shortly after start up when the previous browser session had a pinned app tab in it.
+
+What happens is that when the browser is startup up and there were previously pinned tabs, then the restoreWindow is called from onLoad.  This cycles down until it reaches restoreHistory where, because the selected browser is the current browser, restoreTab will be called which will increment _tabsRestoringCount to 1.  The problem here is that __resetTabRestoringStateisn't called for for that tab.
+
+When setBrowserState is called, the _tabsRestoringCount is reset back to 0 by the call to _resetRestoringState.  It is then decremented to -1 by the call to _resetTabRestoringState from within the restoreWindow function (this is the bug).  The _tabsRestoringCount is only decremented once, no matter how many pinned tabs there were.  So at this point _tabsRestoringCount is -1.
+
+What happens next, depends on how many tabs are being restored in the session, how many pinned tabs there were and what the max_concurrent_tabs preference is.  Some things will work correctly, other won't.  For example if max_concurrent_tabs is set to 0, then if there is more than one more tab restoring than there were pinned app tabs, all the tabs load simultaneously.  That's the extreme case.  In most cases, the number of concurrently loading tabs will be off by one, meaning restoreNextTab could be called too many times and/or too often.
+
+The root of the problem though is that _tabsRestoringCount should not be going negative.
+
+It looks like the easiest fix is to check to make sure _tabsRestoringCount is greater than 0 before decrementing it in _resetTabRestoringState.   I'd upload a patch, but my development folder is way out of date, plus I'm not entirely sure how to test this since it requires calling setBrowserState before the app tab has a chance to load.
+
+I'm attaching the log file I created by adding a ton of logging statements to nsSessionStore.js to demonstrate the issue.
+
+Created attachment 514629
+A bunch of logging statements in nsSessionStore.js
+
+Someone reported to me that sessions being restored by my Session Manager add-on at start up where ignoring the max_concurrent_tabs preference which confused me since that's all handled internally by Firefox.
+
+I added a ton of logging statements to nsSessionStore.js and tracked the problem down to calling setBrowserState start shortly after start up when the previous browser session had a pinned app tab in it.
+
+What happens is that when the browser is startup up and there were previously pinned tabs, then the restoreWindow is called from onLoad.  This cycles down until it reaches restoreHistory where, because the selected browser is the current browser, restoreTab will be called which will increment _tabsRestoringCount to 1.  The problem here is that __resetTabRestoringStateisn't called for for that tab.
+
+When setBrowserState is called, the _tabsRestoringCount is reset back to 0 by the call to _resetRestoringState.  It is then decremented to -1 by the call to _resetTabRestoringState from within the restoreWindow function (this is the bug).  The _tabsRestoringCount is only decremented once, no matter how many pinned tabs there were.  So at this point _tabsRestoringCount is -1.
+
+What happens next, depends on how many tabs are being restored in the session, how many pinned tabs there were and what the max_concurrent_tabs preference is.  Some things will work correctly, other won't.  For example if max_concurrent_tabs is set to 0, then if there is more than one more tab restoring than there were pinned app tabs, all the tabs load simultaneously.  That's the extreme case.  In most cases, the number of concurrently loading tabs will be off by one, meaning restoreNextTab could be called too many times and/or too often.
+
+The root of the problem though is that _tabsRestoringCount should not be going negative.
+
+It looks like the easiest fix is to check to make sure _tabsRestoringCount is greater than 0 before decrementing it in _resetTabRestoringState.   I'd upload a patch, but my development folder is way out of date, plus I'm not entirely sure how to test this since it requires calling setBrowserState before the app tab has a chance to load.
+
+I'm attaching the log file I created by adding a ton of logging statements to nsSessionStore.js to demonstrate the issue.
+What does this bug have to do with bug 595601?  That's about tab groups, this is about pinned tabs.  Also the fix for this is one line, it shouldn't depend on any bugs, a patch just needs to be written?
+(In reply to comment #1)
+> What does this bug have to do with bug 595601?  That's about tab groups, this
+> is about pinned tabs.  Also the fix for this is one line, it shouldn't depend
+> on any bugs, a patch just needs to be written?
+
+Yeah, actually bug 595601 depends on this. And although the bug description says something about tab groups the patch is more about session restore and is affected by this bug.
+Created attachment 526641
+patch v1
+
+Hint: mochitests do not pass without the patch for bug 650573.
+Would bug 642624 be related somehow?
+Created attachment 526750
+patch v2
+Comment on attachment 526750
+patch v2
+
+>+function test() {
+>+  waitForExplicitFinish();
+>+
+>+  registerCleanupFunction(function () {
+>+    Services.prefs.clearUserPref("browser.sessionstore.max_concurrent_tabs");
+>+
+>+    TabsProgressListener.uninit();
+>+
+>+    ss.setBrowserState(stateBackup);
+>+  });
+>+
+>+  Services.prefs.setIntPref("browser.sessionstore.max_concurrent_tabs", 2);
+>+
+>+  TabsProgressListener.init();
+>+
+>+  window.addEventListener("SSWindowStateReady", function onReady() {
+>+    window.removeEventListener("SSWindowStateReady", onReady, false);
+>+
+>+    let firstProgress = true;
+>+
+>+    TabsProgressListener.setCallback(function (needsRestore, isRestoring) {
+>+      if (firstProgress) {
+>+        firstProgress = false;
+>+        is(isRestoring, 2, "restoring 2 tabs concurrently");
+>+      } else {
+>+        ok(isRestoring < 3, "restoring max. 2 tabs concurrently");
+>+      }
+>+
+>+      if (0 == needsRestore) {
+>+        TabsProgressListener.unsetCallback();
+>+        waitForFocus(finish);
+>+      }
+>+    });
+>+
+>+    ss.setBrowserState(JSON.stringify(state));
+>+  }, false);
+>+
+>+  ss.setBrowserState(JSON.stringify(state));
+
+This should be using statePinned right? (also, as you mentioned on IRC, statePinned doesn't actually have any pinned tabs but it should).
+
+Otherwise I think this is fine. Run it through try to make sure though.
+Created attachment 526759
+patch v3
+
+(In reply to comment #6)
+> This should be using statePinned right? (also, as you mentioned on IRC,
+> statePinned doesn't actually have any pinned tabs but it should).
+
+Fixed. Made sure that the test fails without the patch applied.
+
+> Otherwise I think this is fine. Run it through try to make sure though.
+
+Pushed to try:
+
+http://tbpl.mozilla.org/?tree=MozillaTry&pusher=tim.taubert@gmx.de&rev=1d95e78a7533
+(In reply to comment #4)
+> Would bug 642624 be related somehow?
+
+I don't think so, but feel free to apply the patches and see if the bug still exists :)
+Comment on attachment 526759
+patch v3
+
+Passed try:
+
+http://tbpl.mozilla.org/?tree=MozillaTry&pusher=tim.taubert@gmx.de&rev=1d95e78a7533
+Created attachment 526845
+patch for checkin (do not push before bug 650573)
+Created attachment 533805
+patch for checkin (push with bug 650573)
+Pushed:
+http://hg.mozilla.org/mozilla-central/rev/55062716b8c5

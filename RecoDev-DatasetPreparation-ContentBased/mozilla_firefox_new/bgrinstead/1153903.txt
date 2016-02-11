@@ -1,0 +1,158 @@
+The quick opening/closing/reloading that happens in the damp talos runs cause a bunch of logspam to show up: https://treeherder.mozilla.org/logviewer.html#?job_id=6428150&repo=try
+
+The quick opening/closing/reloading that happens in the damp talos runs cause a bunch of logspam to show up: https://treeherder.mozilla.org/logviewer.html#?job_id=6428150&repo=try
+I am open to a preference or just a general fix to the devtools :)
+(In reply to Joel Maher (:jmaher) from comment #1)
+> I am open to a preference or just a general fix to the devtools :)
+
+I noticed this when running locally and I think most of these should be fixed in devtools.
+
+There are a few that are reporting errors doing a request due to a closed connection:
+
+* Error: Connection closed, pending request to server1.conn92.child1/customhighlighter38, type hide failed
+* Error: Connection closed, pending request to server1.conn41.child1/domwalker26, type getNodeActorFromObjectActor failed
+* Error: Connection closed, pending request to server1.conn54.child1/domwalker25, type getMutations failed
+
+This rejection was added in Bug 1128027.  For these, we should be able to find the common places this happens and catch the rejection on the frontend so we don't end up logging errors.
+Patrick, Mike, just a heads up that there are lots of 'ERROR - Full message: TypeError: gInspector is null' during talos runs.  I saw some discussion on #devtools about this earlier.
+
+I'll take a look at what's going on
+(In reply to Brian Grinstead [:bgrins] from comment #3)
+> Patrick, Mike, just a heads up that there are lots of 'ERROR - Full message:
+> TypeError: gInspector is null' during talos runs.  I saw some discussion on
+> #devtools about this earlier.
+> 
+> I'll take a look at what's going on
+The gInspector error comes from the init of the animation panel in animation-controller.js.
+The initialize method is async, and it looks like by the time the bunch of actorHasMethod calls resolve, the inspector has been closed already, and so accessing gInspector in startListeners which runs next, fails.
+(In reply to Brian Grinstead [:bgrins] from comment #2)
+> server1.conn54.child1/domwalker25, type getMutations failed
+> 
+> This rejection was added in Bug 1128027.  For these, we should be able to
+> find the common places this happens and catch the rejection on the frontend
+> so we don't end up logging errors.
+
+As it turns out, at the moment the logging actually happens in protocol.js, so it shows up regardless of whether the promise is caught in the front: https://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/protocol.js#20.  We may want to change this, but shouldn't block this bug on it.  It's also happening quite a bit during mochitest-dt runs IIRC
+Created attachment 8592575
+damp-logspam.patch
+
+Patrick, this fixes the logspam, but I'm not sure if it's the approach you want to take for the animation inspector.
+
+Try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=c4a9b95c593d
+Comment on attachment 8592575
+damp-logspam.patch
+
+Review of attachment 8592575:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/inspector.js
+@@ +3067,5 @@
+>     * available mutation records.
+>     */
+>    onMutations: protocol.preEvent("new-mutations", function() {
+>      // Fetch and process the mutations.
+> +    this.getMutations({cleanup: this.autoCleanup}).catch(() => {});
+
+See Comment 5 - this is already logged once when the request is rejected so right now we are actually logging this rejection twice.  Removing it here makes it only happen once
+If you are curious to test it out, you can set up talos locally by following these instructions:
+
+https://wiki.mozilla.org/Buildbot/Talos/Running#Running_locally_-_Source_Code
+Then apply the patch from Bug 1150215
+Then run: talos -n -d --develop --executablePath PATH_TO_FIREFOX --activeTests damp
+Comment on attachment 8592575
+damp-logspam.patch
+
+Review of attachment 8592575:
+-----------------------------------------------------------------
+
+Looks good to me overall. Just some minor comments. No need to ask again for review.
+
+::: browser/devtools/animationinspector/animation-controller.js
+@@ +44,5 @@
+>    // If you want to know when everything's ready, do:
+>    // AnimationsPanel.once(AnimationsPanel.PANEL_INITIALIZED)
+>    yield AnimationsController.initialize();
+> +
+> +  if (!AnimationsController.destroyed) {
+
+I think it'd be a little bit nicer if you moved this into AnimationsPanel.initialize:
+
+if (AnimationsController.destroyed) {
+  console.warn("Could not initialize the animation-panel, controller was destroyed");
+  return;
+}
+
+@@ +56,5 @@
+>   */
+>  let shutdown = Task.async(function*() {
+>    yield AnimationsController.destroy();
+>    // Don't assume that AnimationsPanel is defined here, it's in another file.
+> +  if (typeof AnimationsPanel !== "undefined" && AnimationsPanel.initialized) {
+
+AnimationsPanel.destroy already does this:
+
+    if (!this.initialized) {
+      return;
+    }
+
+So the extra && AnimationsPanel.initialized condition shouldn't be needed.
+
+@@ +114,5 @@
+>                                                           "stopAnimationPlayerUpdates");
+>      this.hasSetPlaybackRate = yield target.actorHasMethod("animationplayer",
+>                                                            "setPlaybackRate");
+>  
+> +    if (!this.destroyed) {
+
+Or maybe just an early return:
+
+if (this.destroyed) {
+  console.warn("Could not fully initialize the AnimationsController");
+  return;
+}
+
+this.animationsFront = ....
+...
+
+::: toolkit/devtools/server/actors/inspector.js
+@@ +3067,5 @@
+>     * available mutation records.
+>     */
+>    onMutations: protocol.preEvent("new-mutations", function() {
+>      // Fetch and process the mutations.
+> +    this.getMutations({cleanup: this.autoCleanup}).catch(() => {});
+
+Right, I agree.
+Why not simplify to this then:
+this.getMutations({cleanup: this.autoCleanup});
+Created attachment 8593073
+damp-logspam.patch
+
+Thanks for the review - updated as suggested.  Pushed to try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=b18a6d6d3f4a
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #9)
+> ::: toolkit/devtools/server/actors/inspector.js
+> @@ +3067,5 @@
+> >     * available mutation records.
+> >     */
+> >    onMutations: protocol.preEvent("new-mutations", function() {
+> >      // Fetch and process the mutations.
+> > +    this.getMutations({cleanup: this.autoCleanup}).catch(() => {});
+> 
+> Right, I agree.
+> Why not simplify to this then:
+> this.getMutations({cleanup: this.autoCleanup});
+
+Hm, seeing some orange without the catch(): https://treeherder.mozilla.org/#/jobs?repo=try&revision=b18a6d6d3f4a.
+Created attachment 8593389
+damp-logspam.patch
+
+Yep, needed the catch() in there: https://treeherder.mozilla.org/#/jobs?repo=try&revision=e79f982ac1ef
+remote:   https://hg.mozilla.org/integration/fx-team/rev/6a11cd24dd6f
+https://hg.mozilla.org/mozilla-central/rev/6a11cd24dd6f
+
+
+Get rid of logspam during DAMP test runs
+
+
+
+Bug 1153903 - Get rid of logspam during devtools talos test runs;r=pbrosset 

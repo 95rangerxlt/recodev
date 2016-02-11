@@ -1,0 +1,275 @@
+User Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:23.0) Gecko/20100101 Firefox/23.0 (Beta/Release)
+Build ID: 20130729175331
+
+Steps to reproduce:
+
+Moved search bar into menu panel (like in Bug 901203).
+
+Use the shortcut to focus the menu bar: Cmd+K (Mac)
+
+
+Actual results:
+
+Nothing.
+
+
+Expected results:
+
+Open menu panel, focus search bar.
+
+User Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:23.0) Gecko/20100101 Firefox/23.0 (Beta/Release)
+Build ID: 20130729175331
+
+Steps to reproduce:
+
+Moved search bar into menu panel (like in Bug 901203).
+
+Use the shortcut to focus the menu bar: Cmd+K (Mac)
+
+
+Actual results:
+
+Nothing.
+
+
+Expected results:
+
+Open menu panel, focus search bar.
+(In reply to Florian Bender from comment #0)
+> Actual results:
+> 
+> Nothing.
+
+This is incorrect. Cmd+K actually moves me to https://www.google.de/?gws_rd=cr (last selected search provider). Sorry about that!
+So does that fix the issue completely, or is there still a valid problem in this bug report?
+Comment 0 still applies. Comment 1 is just an update on "Actual results", i. e. it does not invalidate the bug report.
+This is how this keyboard shortcut has worked for a long time (if the search box is not visible, then it takes the user directly to the search engine webpage).
+
+We *could* change this if the search box is in the menu panel, but I'm pretty confident we would be fine shipping with this bug unaddressed.
+*** Bug 948158 has been marked as a duplicate of this bug. ***
+Created attachment 8345108
+Patch
+
+I don't like how I had to duplicate some of the logic in the webSearch function. Maybe you have a better idea here?
+Created attachment 8345111
+Patch with test
+Comment on attachment 8345111
+Patch with test
+
+Review of attachment 8345111:
+-----------------------------------------------------------------
+
+Somewhat hesitant r+. If you want to do the overflow panel / refactor bits and/or adapt tests, I'd probably like to see the new patch, just for fun :-)
+
+::: browser/base/content/browser.js
+@@ +2931,5 @@
+>  #endif
+> +    let searchBar = this.searchBar;
+> +    let placement = CustomizableUI.getPlacementOfWidget("search-container");
+> +    if (placement && placement.area == CustomizableUI.AREA_PANEL) {
+> +      PanelUI.show({type: "command"}).then(() => {
+
+I think Blair updated PanelUI.show to work without passing an event. If my memory is correct, that would be nicer here.
+
+@@ +2936,5 @@
+> +        // The panel is not constructed until the first time it is shown.
+> +        searchBar = this.searchBar;
+> +        searchBar.select();
+> +        if (document.activeElement != searchBar.textbox.inputField)
+> +          openUILinkIn(Services.search.defaultEngine.searchForm, "current");
+
+Yeah, hmm. Duplication is sad, but I don't really see a clever thing to do here, short of writing a utility function of the form:
+
+let OpenSearchPageIfFieldIsNotActive = (aSearchBar) => { if (!aSearchBar || ...) openUILinkIn(...); }
+
+and using that in both places.
+
+@@ +2945,5 @@
+> +          FullScreen.mouseoverToggle(true);
+> +        searchBar.select();
+> +      }
+> +      if (!searchBar || document.activeElement != searchBar.textbox.inputField)
+> +        openUILinkIn(Services.search.defaultEngine.searchForm, "current");
+
+Note that this still won't work for the overflow panel. Could be a followup, but you could do it here, too.
+
+Come to think of it, it actually probably makes sense to do something like the following:
+
+if (placement) {
+  if (placement.area == CustomizableUI.AREA_PANEL) {
+    PanelUI.show().then(onSearchbarShown);
+    return;
+  }
+  if (placement.area == CustomizableUI.AREA_NAVBAR && searchBar &&
+      searchBar.parentNode.classList.contains("overflowedItem")) {
+    ToggleOverflowPanelOrSomething().then(onSearchbarShown);
+    return;
+  }
+}
+if (searchBar && window.fullScreen) {
+  FullScreen.mouseoverToggle(true);
+}
+onSearchbarShown();
+
+Then in onSearchbarShown, if searchBar is not null, call select(), and if it's null or if the select failed to focus it, call openUILinkIn.
+
+Does that make sense? It's still not the prettiest, but I don't know how to simplify it further.
+
+::: browser/components/customizableui/content/panelUI.js
+@@ +148,5 @@
+>        let keyboardOpened = aEvent && aEvent.sourceEvent &&
+>                             aEvent.sourceEvent.target.localName == "key";
+>        this.panel.setAttribute("noautofocus", !keyboardOpened);
+>        this.panel.openPopup(iconAnchor || anchor, "bottomcenter topright");
+> +  
+
+Nit: trailing whitespace
+
+@@ +157,3 @@
+>      });
+> +
+> +    return deferred.promise;
+
+This makes me happy. I think this means we can transition the head.js tests for this (and/or any tests that call PanelUI.open individually) to use this promise rather than rolling their own. Could you file a followup patch/bug to do that, please?
+
+::: browser/components/customizableui/test/browser_901207_searchbar_in_panel.js
+@@ +18,5 @@
+> +      is(document.activeElement, searchbar.textbox.inputField, "The searchbar should be focused");
+> +
+> +      let hiddenPanelPromise = promisePanelHidden(window);
+> +      EventUtils.synthesizeKey("VK_ESCAPE", {});
+> +      yield hiddenPanelPromise;
+
+Maybe also check what happens if the panel is already open? You added code for that case, probably good to check nobody breaks it.
+Created attachment 8345461
+Patch v1.1
+
+Updated patch with more test cases and handling the overflow panel. The test was failing with the overflow panel, and I believe that it has to do with which event listener runs first (I saw this using the Browser Debugger). The executeSoon fixes this, but it's crappy :(
+Created attachment 8345473
+Patch v1.2
+
+Now with a less-ugly waitForCondition :)
+Comment on attachment 8345473
+Patch v1.2
+
+Review of attachment 8345473:
+-----------------------------------------------------------------
+
+Hrm. This code is strange, though. What's up with checking for the "showing" state?
+
+::: browser/components/customizableui/content/panelUI.js
+@@ +124,5 @@
+> +      deferred.resolve();
+> +      return deferred.promise;
+> +    }
+> +    if (this.panel.state == "showing") {
+> +      return deferred.promise;
+
+This is strange. You're returning a promise but you're never resolving it. How does that work?
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +2846,5 @@
+> +      deferred.resolve();
+> +      return deferred.promise;
+> +    }
+> +    if (this._panel.state == "showing")
+> +      return deferred.promise;
+
+This is strange. You're returning a promise but you're never resolving it. How does that work?
+
+@@ +2851,5 @@
+> +    let doc = this._panel.ownerDocument;
+> +    this._panel.hidden = false;
+> +    let anchor = doc.getAnonymousElementByAttribute(this._chevron, "class", "toolbarbutton-icon");
+> +    this._panel.openPopup(anchor || this._chevron, "bottomcenter topright");
+> +    this._chevron.open = !this._chevron.open;
+
+Shouldn't this just be = true?
+
+::: browser/components/customizableui/test/browser_901207_searchbar_in_panel.js
+@@ +14,5 @@
+> +      let shownPanelPromise = promisePanelShown(window);
+> +      EventUtils.synthesizeKey("k", { ctrlKey: true });
+> +      yield shownPanelPromise;
+> +
+> +      info(document.activeElement.id);
+
+Nit: Please add text before this so it's clear what you're echo'ing.
+
+@@ +38,5 @@
+> +      PanelUI.toggle({type: "command"});
+> +      yield shownPanelPromise;
+> +
+> +      EventUtils.synthesizeKey("k", { ctrlKey: true });
+> +      info(document.activeElement.id);
+
+Ditto
+
+@@ +69,5 @@
+> +      EventUtils.synthesizeKey("k", { ctrlKey: true });
+> +      yield shownPanelPromise;
+> +
+> +      let chevron = document.getElementById("nav-bar-overflow-button");
+> +      yield waitForCondition(function() chevron.open);
+
+Nit: add an info() here too, please
+Created attachment 8345536
+Patch v1.3
+
+I was checking for popupshowing just in case there was some way that this code was getting called twice (once to start showing the popup and then again before the popup was shown, but then the promise will be a different instance). I've removed it now.
+Comment on attachment 8345536
+Patch v1.3
+
+Review of attachment 8345536:
+-----------------------------------------------------------------
+
+r=me, but see below for some nits
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +2849,5 @@
+> +    let doc = this._panel.ownerDocument;
+> +    this._panel.hidden = false;
+> +    let anchor = doc.getAnonymousElementByAttribute(this._chevron, "class", "toolbarbutton-icon");
+> +    this._panel.openPopup(anchor || this._chevron, "bottomcenter topright");
+> +    this._chevron.open = !this._chevron.open;
+
+You missed this nit, I think? Just make this say = true (do we update it elsewhere, e.g. if you hide the panel with escape? I noticed the _onClickChevron method does it, but it'd be good to know we don't leave this in an inconsistent state)
+
+::: browser/components/customizableui/test/browser_901207_searchbar_in_panel.js
+@@ +14,5 @@
+> +      let shownPanelPromise = promisePanelShown(window);
+> +      EventUtils.synthesizeKey("k", { ctrlKey: true });
+> +      yield shownPanelPromise;
+> +
+> +      info("Active element: " + descriptionForElement(document.activeElement));
+
+Nit: just push down all of this line into the function, ie make it logActiveElement() and hardcode the "Active element: " and document.activeElement bits inside the function, as that's all we use it for in this file. Either that or pull it out into head.js. :-)
+https://hg.mozilla.org/integration/fx-team/rev/3332e2f1ede3
+Backed out due to missing Australis in commit message:
+
+https://hg.mozilla.org/integration/fx-team/rev/3f3caad81fec
+
+Re-landed as: https://hg.mozilla.org/integration/fx-team/rev/371cd4b623de
+Backed out again in https://hg.mozilla.org/integration/fx-team/rev/fb07ef018a42 for breaking browser-chrome tests at least twice: 
+https://tbpl.mozilla.org/php/getParsedLog.php?id=31774424&tree=Fx-Team
+https://tbpl.mozilla.org/php/getParsedLog.php?id=31774204&tree=Fx-Team
+
+Both of those were on OSX. The only other bc run that has finished was on Linux opt, and it passed: https://tbpl.mozilla.org/php/getParsedLog.php?id=31775000&tree=Fx-Team
+Relanded using Cmd+K on Mac,
+https://hg.mozilla.org/integration/fx-team/rev/3cafeb339fac
+https://hg.mozilla.org/mozilla-central/rev/3cafeb339fac
+
+
+Cmd/Ctrl+K should open menu panel when search bar was moved there
+
+
+
+Bug 901207 - Cmd/Ctrl+K should open menu panel when search bar was moved there. r=Gijs 
+
+Bug 901207 - [Australis] Cmd/Ctrl+K should open menu panel when search bar was moved there. r=Gijs DONTBUILD 
+
+Backed out changeset 371cd4b623de (bug 901207) for m-bc orange 
+
+Bug 901207 - [Australis] Cmd/Ctrl+K should open menu panel when search bar was moved there. r=Gijs 
+
+[Australis] update browser_901207_searchbar_in_panel.js for bug 951928 

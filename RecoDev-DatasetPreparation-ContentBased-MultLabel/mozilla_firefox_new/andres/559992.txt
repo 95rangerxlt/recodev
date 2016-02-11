@@ -1,0 +1,621 @@
+Navigating back and forth between http://www.squarefree.com/start/ and http://www.google.com/ leads to zoom flicker: each page is temporarily displayed using the other's site-specific-zoom level.
+
+(I'm using Firefox trunk, rev c2e522dc68b4, on Mac 10.5.)
+
+Navigating back and forth between http://www.squarefree.com/start/ and http://www.google.com/ leads to zoom flicker: each page is temporarily displayed using the other's site-specific-zoom level.
+
+(I'm using Firefox trunk, rev c2e522dc68b4, on Mac 10.5.)
+This problem happens on Wiindows7 too.
+Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US; rv:1.9.3a5pre) Gecko/20100414 Minefield/3.7a5pre ID:20100416154511
+Same as/related to bug 559991.
+Marking this blocking, same as bug 559991, but I strongly suspect that one bug will fix both them.
+
+Felipe, can you take a look?
+Yes I can. Taking the bug so I can take a look and see if I can find what's going on.
+Created attachment 467685
+Cache zoom value on session history
+
+Gavin, just requesting feedback here. Is this the approach you had in mind to make the page zoom level info faster and not wait on disk?  I added a field in nsIHistoryEntry to store the page zoom, and if it's known then that value is directly used.
+
+No need for review yet as I've got to figure out how to write a test for this.
+
+(Note: this patch goes on top of patch from bug 559991)
+Comment on attachment 467685
+Cache zoom value on session history
+
+I'm not sure session history is the right place for this - I was actually thinking more of a global in-memory cache of the content prefs data (perhaps even built-in to the content-prefs service...), which I figured would also address bug 559991. feedback- because of that, I guess, but if this ends up being better for reasons I'm not seeing, I'm not entirely opposed to the idea!
+Created attachment 468243
+Add a cache to the content prefs service
+
+Alright, attempting new approach as you suggested. I added a cache into the content-prefs service itself, which the service checks first before executing a query to db.
+Note that we have to cache undefined values as well, otherwise sites that do not have the pref set would take the slow path and the flicker will happen.
+
+This makes the getPref call (with a callback parameter) to be sync when the value is cached, or async when it's going to disk. Is this something ok to do? Seems a bit weird at first glance to not know if a callback will be called async or not, but I guess that's the purpose of this.
+
+Also, just added a very simple cache evicting mechanism (cache up to 100 different sites, clear cache when limit is reached). Not sure what a better mechanism would be, or if there's something that I should do to help determine the ideal value for the cache limit.
+Comment on attachment 468243
+Add a cache to the content prefs service
+
+Something simple like this is probably a good start. Rather than completely clobbering the cache when you hit the cap, you could iterate over it and delete half the entries - I think |for in| iteration will give you the properties in the order they were added, which would be a nice bonus (but even if it doesn't, it's probably better than clearing the cache entirely).
+Created attachment 475778
+contentprefs cache
+
+Ok, patch is up!
+
+I spent some time fighting with two type conversions that happen implictly when inserting values to the database:
+
+One of them was that boolean values are converted to integer 0|1. If we don't perform the same conversion on the cache we'd be returning different type values from what's in the DB.
+
+The other was a bit trickier. It's not possible to store _undefined_ as a content pref (it's converted to null) but it can be *returned* as a value that means that there's no pref set.  That's why there's both the setPref/cachePref functions as we only want to convert undefined -> null during setter time, but we still want to cache undefined as a return value.
+
+
+For testing, I did your "test the opposite" suggestion, and it worked out very well. The logic is a bit convoluted at times, but I think it was possible to test everything from the cache behavior.
+I had to change test_getPrefAsync.js a bit too. It passed without any modifications but it'd be a blatant lie^H^H^H^H^H useless test.
+
+
+I'll hold off asking r? now because I'm seeing some leaks on the contentPrefs tests as is on trunk right now (without my patch), so it's hard to tell if I didn't introduce any new ones. I've sent to tryserver and see how that goes.
+
+(though I'm curious why I see these leaks locally and it's apparently not known.. maybe some odd condition of my non-libxul mozconfig)
+Created attachment 475940
+contentprefs cache v2
+
+So I found the leak problem, turns out it does exist on trunk (see e.g. http://tinderbox.mozilla.org/showlog.cgi?log=Firefox/1284639429.1284640898.11693.gz). I thought these leaks would be reported as orange.
+
+What leaks is the directory-service that is cached on head_contentprefs.js. I don't know why that would leak though (some odd circular reference) or if that represents some deeper problem.
+I added ContentPrefTest.__dirSvc = null to tail_contentPrefs.js and none of the tests leak anymore.
+
+The patch looked good on tryserver.
+
+Gavin: who should I tag for review? you or Myk?
+Comment on attachment 475940
+contentprefs cache v2
+
+>diff --git a/toolkit/components/contentprefs/src/nsContentPrefService.js b/toolkit/components/contentprefs/src/nsContentPrefService.js
+
+>+    _prefCacheGroupsCount: 0,
+
+Seems like we could get rid of this in favor of Object.keys(this._prefCache).length?
+
+>   _selectPref: function ContentPrefService__selectPref(aGroup, aSetting, aCallback) {
+
+>+    let [cached, value] = this._cache.getPref(aSetting, aGroup);
+>+    if (cached) {
+>+      if (aCallback)
+>+        aCallback.onResult(value);
+
+I don't think we want this change in behavior (calling the callback synchronously when the value is cached). Some callers might rely on the callback not being called synchronously - or even if there aren't any such callers, having the API vary this way has the potential to be confusing. So I think you should use something like executeSoon() here:
+
+http://mxr.mozilla.org/mozilla-central/source/testing/mochitest/browser-test.js#327
+
+>+    if (!aCallback)
+>+      this._cache.cachePref(aName, value);
+
+Why don't we do this next to where value is assigned to? I don't think we want to cache a failure to retrieve the pref (it might not make a difference in practice if we can't recover from failures, but it seems more correct).
+
+(these comments apply to both _selectPref methods)
+
+>diff --git a/toolkit/components/contentprefs/tests/unit/tail_contentPrefs.js b/toolkit/components/contentprefs/tests/unit/tail_contentPrefs.js
+
+>+ContentPrefTest.__dirSvc = null;
+
+I wonder whether tail_handlerService.js needs the same fix...
+
+>diff --git a/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js b/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js
+
+>+function run_test() {
+
+>+  testCachedPrefIsSync("test2.example.com", "test-pref2");
+
+I guess this test will need to be removed.
+
+>+function testTypeConversions(uri, prefName) {
+
+>+  do_check_eq(typeof(value), "number");
+>+  do_check_eq(typeof(value), "number");
+
+These can use do_check_true(value === 1/0).
+
+>+function testNonExistingPrefCachesAsUndefined(uri, prefName) {
+
+>+  // Cached pref
+>+  value = cps.getPref(uri, prefName);
+>+  do_check_true(value === undefined);
+>+
+>+  do_check_true(isCached(uri, prefName));
+
+Shouldn't you do the isCached check before the second getPref?
+
+>+function isCached(uri, prefName) {
+
+This will need to be changed per my comment above... I think you can probably use the "change the DB and test that it doesn't affect getPref" trick?
+
+>diff --git a/toolkit/components/contentprefs/tests/unit/test_getPrefAsync.js b/toolkit/components/contentprefs/tests/unit/test_getPrefAsync.js
+
+And I think this change become unnecessary?
+(In reply to comment #11)
+> >   _selectPref: function ContentPrefService__selectPref(aGroup, aSetting, aCallback) {
+> 
+> >+    let [cached, value] = this._cache.getPref(aSetting, aGroup);
+> >+    if (cached) {
+> >+      if (aCallback)
+> >+        aCallback.onResult(value);
+> 
+> I don't think we want this change in behavior (calling the callback
+> synchronously when the value is cached). Some callers might rely on the
+> callback not being called synchronously - or even if there aren't any such
+> callers, having the API vary this way has the potential to be confusing. So I
+> think you should use something like executeSoon() here:
+> 
+> http://mxr.mozilla.org/mozilla-central/source/testing/mochitest/browser-test.js#327
+
+
+Hmm there is a problem: the thing is that the async nature is what causes this bug. If I make this change the cache won't really fix the bug.
+
+I think we have three alternatives:
+ - go with this change
+ - build a cache in the front-end's browser-fullZoom.js instead of the content-prefs svc (so it never queries the content-prefs svc when the value is cached)
+ - cache the value on session history
+
+
+What do you suggest?
+I was suggesting also reverting the fix for bug 541779 (i.e. changing fullzoom to use the synchronous API), once we have the cache.
+Oh right, that's another alternative that I didn't realize. Sounds good. Just one last question before I start with it:
+
+- is it acceptable to call this executeSoon function here in code (not only tests)? I guess my real question is: is this what is called "spinning the event loop"? - I'm not sure.. I just know that Shawn will stab anyone that does that!
+No, spinning the event loop from JS requires using nsIThread::processNextEvent. executeSoon just schedules a task, and is a perfectly reasonable alternative to setTimeout(..., 0);
+Implemented new isCached (I named it hasCachedPref to match other functions, feel free to suggest otherwise) as discussed. I think we need to mark this as b7 blocker to take this change (AIUI uuid changes can't happen after b7, right?)
+
+
+The only thing missing here is the check for the storage service itself for cached data. I'll check with sdwilsh or mak about this, but I believe this could be done in a follow-up. I am imagining that even if the storage svc caches things in-memory to take fast paths, it won't be able to tell if what we need is cached, given the usage of raw SQL statements on this service.
+
+
+Also, I have a question: what's the deal with these IIDs here:
+http://mxr.mozilla.org/mozilla-central/source/toolkit/components/contentprefs/src/nsContentPrefService.js#142
+http://mxr.mozilla.org/mozilla-central/source/toolkit/components/contentprefs/src/nsContentPrefService.manifest#1
+http://mxr.mozilla.org/mozilla-central/source/dom/interfaces/base/nsIContentPrefService.idl#74
+
+The one on the .idl doesn't match the two on the impl and manifest. Which ones should I be changing?
+
+
+(I just sent everything for a full tryserver run).
+
+-------
+Addressing review comments:
+
+
+
+
+(In reply to comment #11)
+> Comment on attachment 475940 [details]
+> contentprefs cache v2
+> 
+> >diff --git a/toolkit/components/contentprefs/src/nsContentPrefService.js b/toolkit/components/contentprefs/src/nsContentPrefService.js
+> 
+> >+    _prefCacheGroupsCount: 0,
+> 
+> Seems like we could get rid of this in favor of
+> Object.keys(this._prefCache).length?
+
+Indeed.
+
+> 
+> >   _selectPref: function ContentPrefService__selectPref(aGroup, aSetting, aCallback) {
+> 
+> >+    let [cached, value] = this._cache.getPref(aSetting, aGroup);
+> >+    if (cached) {
+> >+      if (aCallback)
+> >+        aCallback.onResult(value);
+> 
+> I don't think we want this change in behavior (calling the callback
+> synchronously when the value is cached). Some callers might rely on the
+> callback not being called synchronously - or even if there aren't any such
+> callers, having the API vary this way has the potential to be confusing. So I
+> think you should use something like executeSoon() here:
+> 
+> http://mxr.mozilla.org/mozilla-central/source/testing/mochitest/browser-test.js#327
+
+Changed this as discussed.
+
+> 
+> >+    if (!aCallback)
+> >+      this._cache.cachePref(aName, value);
+> 
+> Why don't we do this next to where value is assigned to? I don't think we want
+> to cache a failure to retrieve the pref (it might not make a difference in
+> practice if we can't recover from failures, but it seems more correct).
+> 
+> (these comments apply to both _selectPref methods)
+
+Yeah, I moved this up next to assignment. Note that we still want to cache the undefined value if the pref is non-existent, as that is the most common case.
+
+> 
+> >diff --git a/toolkit/components/contentprefs/tests/unit/tail_contentPrefs.js b/toolkit/components/contentprefs/tests/unit/tail_contentPrefs.js
+> 
+> >+ContentPrefTest.__dirSvc = null;
+> 
+> I wonder whether tail_handlerService.js needs the same fix...
+
+I ran the uriloader/exthandler xpcshell tests and didn't see any leaks. However those tests fail locally for me, so I don't know how much of the tests were completed.
+
+> 
+> >diff --git a/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js b/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js
+> 
+> >+function run_test() {
+> 
+> >+  testCachedPrefIsSync("test2.example.com", "test-pref2");
+> 
+> I guess this test will need to be removed.
+
+Yes, changed this for a test of the hasCachedPref function.
+
+> 
+> >+function testTypeConversions(uri, prefName) {
+> 
+> >+  do_check_eq(typeof(value), "number");
+> >+  do_check_eq(typeof(value), "number");
+> 
+> These can use do_check_true(value === 1/0).
+
+Ok.
+
+> 
+> >+function testNonExistingPrefCachesAsUndefined(uri, prefName) {
+> 
+> >+  // Cached pref
+> >+  value = cps.getPref(uri, prefName);
+> >+  do_check_true(value === undefined);
+> >+
+> >+  do_check_true(isCached(uri, prefName));
+> 
+> Shouldn't you do the isCached check before the second getPref?
+
+With the current impl it wouldn't make a difference, but for correctness, yes. Changed.
+
+> 
+> >+function isCached(uri, prefName) {
+> 
+> This will need to be changed per my comment above... I think you can probably
+> use the "change the DB and test that it doesn't affect getPref" trick?
+> 
+
+I had done this change, but with the new isCached function I can just use it directly. The "change the DB and test" is done on the tests for that function itself.
+
+> >diff --git a/toolkit/components/contentprefs/tests/unit/test_getPrefAsync.js b/toolkit/components/contentprefs/tests/unit/test_getPrefAsync.js
+> 
+> And I think this change become unnecessary?
+
+It does.
+Created attachment 486778
+contentprefs cache v3
+
+The full patch
+Created attachment 486782
+Interdiff between v2 and v3
+
+And here's an interdiff from the previous patch, if you prefer
+Created attachment 486921
+contentprefs cache v4
+
+Small update to the change in browser-fullZoom.js. The change is:
+
+====================
++    let browser = aBrowser || gBrowser.selectedBrowser;
++
+-    if (Services.contentPrefs.hasCachedPref(aURI, this.name)) {
++    if (Services.contentPrefs.hasCachedPref(aURI, this.name) &&
++        aURI.equals(browser.currentURI)) {
+====================
+
+i.e., checking that the aURI matches the currentURI. This is needed otherwise browser_bug559991.js fails here: http://mxr.mozilla.org/mozilla-central/source/browser/base/content/test/browser_bug559991.js#26
+
+In theory this situation only happens in the test, but I think it's good to make the check in code (as is done in the async path), in case the way FullZoom.OnLocationChange is called is changed.
+I should add that there were no other failures on a tryserver run.
+
+(And ignore the nsWindow.cpp change on that patch, it was part of some debugging I was doing. I already removed it from the patch queue)
+(In reply to comment #16)
+> The one on the .idl doesn't match the two on the impl and manifest. Which ones
+> should I be changing?
+
+Indeed, that's normal. Interface IDs and component IDs are separate (there can be multiple implementations of an interface, and a component can implement multiple interfaces). If you change the interface, you need to change the interface ID (IID). You very rarely (never) need to change a component ID.
+Comment on attachment 486921
+contentprefs cache v4
+
+Apologies for the long delay...
+
+>diff --git a/browser/base/content/browser-fullZoom.js b/browser/base/content/browser-fullZoom.js
+
+>+    if (Services.contentPrefs.hasCachedPref(aURI, this.name) &&
+>+        aURI.equals(browser.currentURI)) {
+
+I don't think you need the aURI.equals check here. It was only added to the async case because the selected tab could have changed before the callback runs.
+
+>+      Services.contentPrefs.getPref(aURI, this.name, function (aResult) {
+>+        // Check that we're still where we expect to be in case this took a while.
+>+        let browser = aBrowser || gBrowser.selectedBrowser;
+
+This doesn't need to redeclare "browser" (it's available via a closure from its definition above). That would actually also be a bugfix - we really want the selected browser from when the method was called, not whichever one is selected when the callback runs.
+
+>diff --git a/dom/interfaces/base/nsIContentPrefService.idl b/dom/interfaces/base/nsIContentPrefService.idl
+
+>+  boolean hasCachedPref(in nsIVariant aGroup, in AString aName);
+
+We'll need to add this to nsIContentPrefService_MOZILLA_2_0 at this point, I think.
+
+>diff --git a/toolkit/components/contentprefs/src/nsContentPrefService.js b/toolkit/components/contentprefs/src/nsContentPrefService.js
+
+Looks like you're missing a change to removeGroupedPrefs, which needs to also clear the cache. The current tests only check the database directly, so they wouldn't catch this problem.
+
+>+  _scheduleCallback: function(func, value) {
+
+>+    tm.mainThread.dispatch({
+>+      run: function() {
+>+        func(value);
+>+      }
+>+    }, Ci.nsIThread.DISPATCH_NORMAL);
+
+I believe this can just be:
+tm.mainThread.dispatch(func.bind(null, value), Ci.nsIThread.DISPATCH_NORMAL);
+since nsIRunnable is marked "function".
+
+(or you could move the .bind() call to the callers and have this only take "func", like executeSoon)
+
+>diff --git a/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js b/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js
+
+>+ * The Initial Developer of the Original Code is Mozilla.
+
+"the Mozilla Foundation", per http://weblogs.mozillazine.org/gerv/archives/2010/02/mpl_initial_developer_for_mozilla_employ.html
+
+>+function testHasCachedPrefFunction(uri, prefName) {
+
+>+  do_check_true(cps.hasCachedPref(uri, prefName));
+
+isCached()?
+
+>+function testCacheEviction(uri, prefName) {
+
+>+  // Change the value directly through the DB ...
+
+This doesn't look necessary, given that you only check isCached() rather than the values themselves.
+
+I didn't check that the tests are exhaustive - I take it you went through and ensured most code paths are covered.
+
+>diff --git a/widget/src/windows/nsWindow.cpp b/widget/src/windows/nsWindow.cpp
+
+This change looks unrelated :)
+(In reply to comment #22)
+> Comment on attachment 486921 [details]
+> contentprefs cache v4
+> 
+> Apologies for the long delay...
+> 
+> >diff --git a/browser/base/content/browser-fullZoom.js b/browser/base/content/browser-fullZoom.js
+> 
+> >+    if (Services.contentPrefs.hasCachedPref(aURI, this.name) &&
+> >+        aURI.equals(browser.currentURI)) {
+> 
+> I don't think you need the aURI.equals check here. It was only added to the
+> async case because the selected tab could have changed before the callback
+> runs.
+
+Yeah I don't think we need it either, as long as all callers do the right thing (not calling that with an unmatched aURI/aBrowser. Take the check off?
+
+> 
+> >+      Services.contentPrefs.getPref(aURI, this.name, function (aResult) {
+> >+        // Check that we're still where we expect to be in case this took a while.
+> >+        let browser = aBrowser || gBrowser.selectedBrowser;
+> 
+> This doesn't need to redeclare "browser" (it's available via a closure from its
+> definition above). That would actually also be a bugfix - we really want the
+> selected browser from when the method was called, not whichever one is selected
+> when the callback runs.
+> 
+
+Retrieving gBrowser.selectedBrowser here (instead of using the one from the closure) has the advantage that if the tab was switched before the callback was called, we avoid setting the zoom for that tab. With the aURI.equals check below it, the bug you mention won't happen.
+
+> >diff --git a/dom/interfaces/base/nsIContentPrefService.idl b/dom/interfaces/base/nsIContentPrefService.idl
+> 
+> >+  boolean hasCachedPref(in nsIVariant aGroup, in AString aName);
+> 
+> We'll need to add this to nsIContentPrefService_MOZILLA_2_0 at this point, I
+> think.
+> 
+
+Ok
+
+> >diff --git a/toolkit/components/contentprefs/src/nsContentPrefService.js b/toolkit/components/contentprefs/src/nsContentPrefService.js
+> 
+> Looks like you're missing a change to removeGroupedPrefs, which needs to also
+> clear the cache. The current tests only check the database directly, so they
+> wouldn't catch this problem.
+
+I guess this function is also missing _notifyPrefRemoved then. Not sure if we should do something about  that? This function takes a fast path to delete all non-global prefs, but then it can't enumerate which ones were deleted.
+For the cache I think we can just invalidate the whole cache, right?
+
+> 
+> >+  _scheduleCallback: function(func, value) {
+> 
+> >+    tm.mainThread.dispatch({
+> >+      run: function() {
+> >+        func(value);
+> >+      }
+> >+    }, Ci.nsIThread.DISPATCH_NORMAL);
+> 
+> I believe this can just be:
+> tm.mainThread.dispatch(func.bind(null, value), Ci.nsIThread.DISPATCH_NORMAL);
+> since nsIRunnable is marked "function".
+> 
+> (or you could move the .bind() call to the callers and have this only take
+> "func", like executeSoon)
+
+Is this .bind() new? didn't know about that. I'll go with the second suggestion for the similarity with executeSoon.
+
+> 
+> >diff --git a/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js b/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js
+> 
+> >+ * The Initial Developer of the Original Code is Mozilla.
+> 
+> "the Mozilla Foundation", per
+> http://weblogs.mozillazine.org/gerv/archives/2010/02/mpl_initial_developer_for_mozilla_employ.html
+
+ok
+
+> 
+> >+function testHasCachedPrefFunction(uri, prefName) {
+> 
+> >+  do_check_true(cps.hasCachedPref(uri, prefName));
+> 
+> isCached()?
+
+I left the explicit function in this test since it's its main purpose
+
+> 
+> >+function testCacheEviction(uri, prefName) {
+> 
+> >+  // Change the value directly through the DB ...
+> 
+> This doesn't look necessary, given that you only check isCached() rather than
+> the values themselves.
+
+Indeed, this was left-over from the previous approach.
+(In reply to comment #23)
+> Take the check off?
+
+Yeah.
+
+> Retrieving gBrowser.selectedBrowser here (instead of using the one from the
+> closure) has the advantage that if the tab was switched before the callback was
+> called, we avoid setting the zoom for that tab. With the aURI.equals check
+> below it, the bug you mention won't happen.
+
+I think we actually want to set the zoom, given that we went through all of the trouble of getting its value? And then we could lose the check... I'm not sure. Either way is OK, I guess.
+
+> For the cache I think we can just invalidate the whole cache, right?
+
+Yep.
+
+> Is this .bind() new?
+
+Yeah, new in 4.0.
+
+> > isCached()?
+> 
+> I left the explicit function in this test since it's its main purpose
+
+I don't understand this - isCached's implementation is exactly the same.
+*** Bug 612173 has been marked as a duplicate of this bug. ***
+Created attachment 497993
+Contentprefs cache - v5
+
+Comments addressed. Also added tests for removeGroupedPrefs and removePrefsByName. With this there's coverage for all public functions that access or modify the cache.
+
+Do I need to add the MOZILLA_2_0 interface here? http://mxr.mozilla.org/mozilla-central/source/toolkit/components/contentprefs/src/nsContentPrefService.manifest#5
+I don't know what that line is about..
+Created attachment 497994
+Interdiff between v4 and v5
+
+And the interdiff
+Hmm I just noticed comment 19 here.. I did that change on purpose.
+I think ideally FullZoom.onLocationChange would take only a browser, from which it could get .currentURI (which AFAICT is guaranteed to be the same as the URI received in onLocationChange, since docshell uses mCurrentURI to notify for onLocationChange). I suppose that might not be something we want to change now for compatibility's sake, but in that vein we can just change the test to avoid intentionally making this bogus call (URI doesn't match browser), since it seems quite unlikely that someone is actually relying on that behavior.
+(In reply to comment #26)
+> Do I need to add the MOZILLA_2_0 interface here?
+> http://mxr.mozilla.org/mozilla-central/source/toolkit/components/contentprefs/src/nsContentPrefService.manifest#5
+> I don't know what that line is about..
+
+Looks like no. That's just a registration for wakeup-message as described in nsIMessageWakeupService.idl, and the messages it handles just uses getPref/setPref which are on nsIContentPrefService (even though I'm not sure it matters at all since it also uses wrappedJSObject...)
+Comment on attachment 497993
+Contentprefs cache - v5
+
+>diff --git a/browser/base/content/browser-fullZoom.js b/browser/base/content/browser-fullZoom.js
+
+>+    let browser = aBrowser || gBrowser.selectedBrowser;
+>+
+>+    if (Services.contentPrefs.hasCachedPref(aURI, this.name)) {
+>+      let zoomValue = Services.contentPrefs.getPref(aURI, this.name);
+>+      this._applyPrefToSetting(zoomValue, aBrowser);
+
+Shouldn't this be just "browser" rather than aBrowser? (_applyPrefToSetting does its own fallback but no need to rely on it)
+
+>diff --git a/dom/interfaces/base/nsIContentPrefService.idl b/dom/interfaces/base/nsIContentPrefService.idl
+
+>-[scriptable, uuid(36715960-de39-457b-9d02-b800d5d3079b)]
+>+[scriptable, uuid(e5215d71-8f6f-446b-8406-6c5ad848bc49)]
+> interface nsIContentPrefService : nsISupports
+
+Can undo this now.
+
+>diff --git a/toolkit/components/contentprefs/src/nsContentPrefService.js b/toolkit/components/contentprefs/src/nsContentPrefService.js
+
+>   removeGroupedPrefs: function ContentPrefService_removeGroupedPrefs() {
+
+>+    this._cache.invalidate();
+
+Probably better to do this at the beginning rather than the end, not that it matters much.
+
+>   _selectPref: function ContentPrefService__selectPref(aGroup, aSetting, aCallback) {
+>-    var value;
+>+
+>+    let [cached, value] = this._cache.getPref(aSetting, aGroup);
+>+    if (cached) {
+>+      if (aCallback) {
+>+        this._scheduleCallback(aCallback.onResult.bind(null, value));
+
+Actually it's probably safer to use _scheduleCallback(function () {aCallback.onResult(value);}) to maintain the same thisObj behavior when invoking the callback.
+
+>diff --git a/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js b/toolkit/components/contentprefs/tests/unit/test_contentPrefsCache.js
+
+>+/* ***** BEGIN LICENSE BLOCK *****
+>+ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+
+You might consider using the simpler "public domain" license for this, per http://www.mozilla.org/MPL/license-policy.html 
+
+It seems like this test adds stuff to the DB but doesn't clean it up afterward. I think you probably should use registerCleanupFunction and make sure to clear the database (using removeGroupedPrefs?) after the test has completed, to avoid potential side effects on other tests.
+
+This also seems like it's missing cache-related tests for the async functionality of getPref.
+Created attachment 498921
+Contentprefs cache - v6
+
+Comments addressed, test for getPref with callback added. I sent this to tryserver and will use this build locally for a few days..
+Created attachment 498922
+Interdiff between v5 and v6
+Comment on attachment 498921
+Contentprefs cache - v6
+
+>diff --git a/dom/interfaces/base/nsIContentPrefService.idl b/dom/interfaces/base/nsIContentPrefService.idl
+
+Technically these changes should get SR - maybe ping vlad to rs it?
+
+>diff --git a/toolkit/components/contentprefs/src/nsContentPrefService.js b/toolkit/components/contentprefs/src/nsContentPrefService.js
+
+>+    cachePref: function(aName, aValue, aGroup) {
+>+      aGroup = aGroup || "__GlobalPrefs__";
+
+Someone could pass in __GlobalPrefs__ as a group name, couldn't they? Perhaps we should keep a separate globalPrefs cache?
+
+>+    getPref: function(aName, aGroup) {
+>+      aGroup = aGroup || "__GlobalPrefs__";
+>+
+>+      if (this._prefCache[aGroup] && this._prefCache[aGroup].hasOwnProperty(aName)) {
+
+Similarly, http://monogatari.doukut.su/2010/12/lightweight-javascript-dictionaries.html reminded me that this will fail for __proto__ (and maybe some other magic property names?). I think that's unlikely to pose a problem in practice (groups are almost always host names, right?), but it seems like something we should be careful about. I filed bug 621204 about adding the Dict.jsm module to toolkit, I think we should get a followup filed to make use of it here.
+Comment on attachment 498921
+Contentprefs cache - v6
+
+Vlad, asking sr or rs for this interface change. It adds the interface nsIContentPrefService_MOZILLA_2_0 with a function to query the newly implemented cache functionality for the contentprefs svc.
+This was added to allow the front-end to query the cache and decide between making a sync or async call to retrieve site-specific zoom values.
+Comment on attachment 498921
+Contentprefs cache - v6
+
+hate _MOZILLA_2_0 so much :(
+http://hg.mozilla.org/mozilla-central/rev/435b65622b7b
+backed out in 4e381da26dc7 due to orange and relanded after test fix.
+
+http://hg.mozilla.org/mozilla-central/rev/9365fe1a3165
+
+
+Zoom flicker with back/forward navigation
+
+regression
+
+Bug 559992. Implement a caching mechanism for the contentprefs service and use it to retrieve page-specific zoom values, avoiding zoom flicker with back/forward navigation. r=gavin sr=vlad a=blocking-betaN 
+
+Bug 559992. Implement a caching mechanism for the contentprefs service and use it to retrieve page-specific zoom values, avoiding zoom flicker with back/forward navigation. r=gavin sr=vlad a=blocking-betaN 

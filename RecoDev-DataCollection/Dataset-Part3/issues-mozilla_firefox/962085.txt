@@ -1,0 +1,80 @@
+* Open inspector
+* Select an element, choose Fonts tab on right
+* Click "See all fonts used in this page"
+* Nothing happens, there is an error:
+
+JavaScript error: chrome://browser/content/devtools/fontinspector/font-inspector.js, line 199: contentDocument is undefined
+
+Relevant lines:
+
+    let node = this.inspector.selection.nodeFront;
+    let contentDocument = node.ownerDocument;
+    let root = contentDocument.documentElement;
+
+* Open inspector
+* Select an element, choose Fonts tab on right
+* Click "See all fonts used in this page"
+* Nothing happens, there is an error:
+
+JavaScript error: chrome://browser/content/devtools/fontinspector/font-inspector.js, line 199: contentDocument is undefined
+
+Relevant lines:
+
+    let node = this.inspector.selection.nodeFront;
+    let contentDocument = node.ownerDocument;
+    let root = contentDocument.documentElement;
+Patrick,
+Could this have something to do with the remote highlighter in Bug 916443?  I see this line changed as part of this
+Yes you're right, it's probably related. In bug 916443 I removed some of the non remote-safe code in our tools. It seems the font-inspector manipulates remote nodes on the client-side, and I changed only half of the code that should have been changed to make it completely remote-safe.
+I didn't test this usecase unfortunately and it seems we have no tests failing for this...
+
+In this function:
+
+>  showAll: function FI_showAll() {
+>    if (!this.isActive() ||
+>        !this.inspector.selection.isConnected() ||
+>        !this.inspector.selection.isElementNode()) {
+>      return;
+>    }
+>    let node = this.inspector.selection.nodeFront;
+>    let contentDocument = node.ownerDocument;
+>    let root = contentDocument.documentElement;
+>    if (contentDocument.body) {
+>      root = contentDocument.body;
+>    }
+>    this.inspector.selection.setNode(root, "fontinspector");
+>  },
+
+We should make the call to the parent document and body node via the walkerActor instead and when it resolves, using selection.setNodeFront instead of setNode.
+
+We should also use this bug to search our code for occurrences of setNode and see if it's possible to migrate them all (note that a LOT of tests use it, so the function should be kept for them).
+You are right, it is used in a ton of tests.  The only other place I found from a search through the code is in the 'inspect' gcli command:
+
+https://mxr.mozilla.org/mozilla-central/source/browser/devtools/inspector/CmdInspect.jsm#36
+I'm fixing the font-inspector bug and adding a test for it.
+However, I think the gcli inspect command will have to be dealt with in a separate bug (and you're right, it's the only remaining occurrence we have in the code apart from tests).
+
+Joe: In the inspect command, I see that the string selector argument gets converted into a DOM node thanks to its type being "node". The conversion is apparently done in gcli.jsm with |nodes = doc.querySelectorAll(arg.text);|
+So this is surely being done on the server, but it seems the resulting node is passed in as is to the client command, and that's why |selection.setNode(args.selector, "gcli")| is then used.
+Is my understanding correct? What is the plan for making this remote-safe?
+Created attachment 8364283
+bug962085-show-all-fonts.patch
+
+This patch changes the |showAll| function in the font-inspector in a way that it selects the body node after having retrieved it from the walker, instead of accessing it directly from the client-side and using setNode().
+
+It also adds a couple of tests to the browser_fontinspector.js test.
+
+Ongoing try build : https://tbpl.mozilla.org/?tree=Try&rev=213f1386433f
+Try green, thanks Paul for the quick review, going to check this in.
+Fixed in fx-team https://hg.mozilla.org/integration/fx-team/rev/72300f62e00c
+https://hg.mozilla.org/mozilla-central/rev/72300f62e00c
+(In reply to Patrick Brosset [:pbrosset] from comment #4)
+> Joe: In the inspect command, I see that the string selector argument gets
+> converted into a DOM node thanks to its type being "node". The conversion is
+> apparently done in gcli.jsm with |nodes = doc.querySelectorAll(arg.text);|
+> So this is surely being done on the server, but it seems the resulting node
+> is passed in as is to the client command, and that's why
+> |selection.setNode(args.selector, "gcli")| is then used.
+> Is my understanding correct? What is the plan for making this remote-safe?
+
+I made (not checked in yet) it so that there is an instance of the command line both in the client and the server, so we can decide where these things should execute. The node type is one of the things I've not updated yet so it could either run on the client using remote functions to find a node, stored using a front, or on the server passing a string representation back to the client.

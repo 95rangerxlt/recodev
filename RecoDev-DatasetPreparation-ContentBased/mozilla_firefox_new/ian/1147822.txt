@@ -1,0 +1,503 @@
+We recently had issues when changing the format of sessionstore.js. These issues would have been less annoying if we had had a version number that would have let Firefox know beforehand that it cannot load a sessionstore.js using a format too recent, and that it should have fallen back to loading a backup.
+
+We recently had issues when changing the format of sessionstore.js. These issues would have been less annoying if we had had a version number that would have let Firefox know beforehand that it cannot load a sessionstore.js using a format too recent, and that it should have fallen back to loading a backup.
+I'm happy to work on this bug. Could you please provide some more information about what you had in mind?
+- Is this a version number for the sessionstore format that is independent from the Firefox version number?
+- So the issue appears by changing the sessionstore format without changing Firefox to handle the new format. I assume that would only arise during development? What about backward-compatibility (is a newer Firefox version able to load old sessionstore files)?
+- How would Firefox know which sessionstore version(s) it can process?
+For the moment, there is no numbering scheme for Session Restore. Most versions of Firefox do not change the format, so we do not want to tie the format version number to the version of Gecko/Firefox. Rather, we will want to change the number manually whenever we change the actual format.
+
+The issue appears when downgrading Firefox, or when a change to Session Restore has been landed then backed out (backing things out is the kind of stuff that happens on a regular basis with Nightly), or possibly in the future when attempting to synchronize distinct versions of Firefox through Firefox Sync.
+
+Newer versions of Firefox are expected to be able to load files from older versions. We may eventually give up on compatibility after several years.
+
+The code of SessionRestore would need to be patched manually whenever it learns/unlearns a format.
+So if I understand correctly, it would require the following changes:
+
+- add a version number when writing the session to sessionstore.js and to upgrade backups
+- add a preference(?) like `session_store_version`
+- when loading sessionstore.js, compare the sessionstore.js version to the `session_store_version` and if `session_store_version` is lower, repeat the process with the upgrade backups
+
+Is that correct? Feel free to assign the bug to me btw.
+1. add a version number when writing the session to sessionstore.js and to upgrade backups
+
+When writing the session, yes. You don't need to change anything to the backups.
+
+2. add a preference(?) like `session_store_version`
+
+Actually, a hardcoded constant in (I believe) SessionStore.jsm
+
+3. when loading sessionstore.js, compare the sessionstore.js version to the `session_store_version` and if `session_store_version` is lower, repeat the process with the upgrade backups
+
+`SessionFile.read` already has a mechanism for trying the next file if a file doesn't parse correctly. We just need to add "I don't understand this version" as an error case and use it.
+Created attachment 8590165
+first-draft.patch
+
+I've created a first draft but there are several things I'm not happy about. First, what I've done:
+
+- SessionStore.jsm got a constant version number
+- SessionStore.jsm got a function `getSessionStoreVersion()` that returns this number
+- SessionStore.jsm function `getCurrentState(...)` returns an additional property `version` with the value of the constant version number
+
+- SessionFile.jsm loads the SessionStore module
+- SessionFile.jsm, after parsing a sessionstore file, checks whether the file is a sessionstore.js file rather than an upgrade backup (is that correct?), and whether the version number is too high. If it is, the file is skipped.
+
+What I'm unhappy about:
+
+- SessionFile.jsm probably shouldn't load the SessionStore module but how else does it find out whether it understands the version of the file?
+- I'm not sure that the check I added in the loop that processes the load order is correct
+- I'm not sure that I handle invalid versions well. Maybe we should remove the file with the invalid version?
+- How can I test this?
+Comment on attachment 8590165
+first-draft.patch
+
+Review of attachment 8590165:
+-----------------------------------------------------------------
+
+Good start. I'll answer the rest of your comments a bit later.
+
+::: browser/components/sessionstore/SessionFile.jsm
+@@ +209,5 @@
+>          let path = this.Paths[key];
+>          let startMs = Date.now();
+>          let source = yield OS.File.read(path, { encoding: "utf-8" });
+>          let parsed = JSON.parse(source);
+> +        let parsedVersion = parseInt(parsed.version, 10);
+
+let version = `parsed.version || 0` should be sufficient.
+
+@@ +211,5 @@
+>          let source = yield OS.File.read(path, { encoding: "utf-8" });
+>          let parsed = JSON.parse(source);
+> +        let parsedVersion = parseInt(parsed.version, 10);
+> +        // Check whether version of the file can be read
+> +        if (key === "clean" && (isNaN(parsedVersion) || parsedVersion > SessionStore.getSessionStoreVersion())) {
+
+I don't understand why you check whether `key` is `"clean"`.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +10,5 @@
+>  const Cc = Components.classes;
+>  const Ci = Components.interfaces;
+>  const Cr = Components.results;
+>  
+> +// Current version of the session store
+
+// Current version of the format used by Session Restore.
+
+@@ +317,5 @@
+>    },
+> +
+> +  getSessionStoreVersion() {
+> +    return SESSION_STORE_VERSION;
+> +  },
+
+get formatVersion() {
+  ...
+}
+
+You'll probably also want
+
+`true` if we are compatible with this format version, `false` otherwise
+isFormatVersionUnderstood(version) {
+  // ...
+}
+(In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment #6)
+> @@ +211,5 @@
+> >          let source = yield OS.File.read(path, { encoding: "utf-8" });
+> >          let parsed = JSON.parse(source);
+> > +        let parsedVersion = parseInt(parsed.version, 10);
+> > +        // Check whether version of the file can be read
+> > +        if (key === "clean" && (isNaN(parsedVersion) || parsedVersion > SessionStore.getSessionStoreVersion())) {
+> 
+> I don't understand why you check whether `key` is `"clean"`.
+> 
+
+You mentioned that we only apply the versioning to the sessionstore.js file and not the upgrade backups. `SessionFileInternal.read` loops over `SessionFileInternal.Paths.loadOrder`, checking files in descending priority. The entry "clean" in the loadOrder refers to "sessionstore.js", hence I check for key "clean".
+(In reply to Fabian Furger from comment #5)
+> I've created a first draft but there are several things I'm not happy about.
+> First, what I've done:
+> 
+> - SessionStore.jsm got a constant version number
+> - SessionStore.jsm got a function `getSessionStoreVersion()` that returns
+> this number
+> - SessionStore.jsm function `getCurrentState(...)` returns an additional
+> property `version` with the value of the constant version number
+
+Sounds good to me (with a few nits expressed above).
+
+> - SessionFile.jsm loads the SessionStore module
+
+I can't think of a better solution, as only SessionStore is expected to know its format.
+
+> - SessionFile.jsm, after parsing a sessionstore file, checks whether the
+> file is a sessionstore.js file rather than an upgrade backup (is that
+> correct?), and whether the version number is too high. If it is, the file is
+> skipped.
+
+Unless I'm missing something, we don't care about it being an upgrade backup.
+
+> What I'm unhappy about:
+> 
+> - SessionFile.jsm probably shouldn't load the SessionStore module but how
+> else does it find out whether it understands the version of the file?
+
+I agree it's not very nice, but I can't think of a better idea at the moment.
+
+> - I'm not sure that the check I added in the loop that processes the load
+> order is correct
+> - I'm not sure that I handle invalid versions well. Maybe we should remove
+> the file with the invalid version?
+
+No, let's not take the initiative to remove files. They will be considered invalid and overwritten anyway.
+
+> - How can I test this?
+Created attachment 8590256
+second-version.patch
+
+Thanks for your feedback. I've included this in an updated patch. I've removed access to the version number since the function to check version compatibility should be sufficient.
+Comment on attachment 8590256
+second-version.patch
+
+Review of attachment 8590256:
+-----------------------------------------------------------------
+
+Looks good to me.
+
+For testing purposes, you'll want to extend one of the Session Restore tests that checks we can fallback to a backup. In sessionstore.js, put a valid JSON file with a very large number as a version, then in previous.js put a valid JSON file with different content and a version of 1, check that it uses the second one. Repeat with a few variations (e.g. when previous.js also has a very large version number, or when it doesn't have a version number at all, etc.)
+
+::: browser/components/sessionstore/SessionFile.jsm
+@@ +212,5 @@
+>          let parsed = JSON.parse(source);
+> +        let parsedVersion = parsed.version || 0;
+> +        // Check whether version of the file can be read
+> +        if (!SessionStore.isFormatVersionCompatible(parsedVersion)) {
+> +          // Skip sessionstore files that we don't understand
+
+I believe that it would be a good idea to print something so that users have at least a small chance of understanding what's going on.
+
+Something along the lines of:
+
+Cu.reportError(`Cannot extract data from Session Restore file ${path}: it uses an invalid format ${parsedVersion}.`);
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +11,5 @@
+>  const Ci = Components.interfaces;
+>  const Cr = Components.results;
+>  
+> +// Current version of the format used by Session Restore.
+> +const SESSION_STORE_VERSION = 1;
+
+Let's call this `FORMAT_VERSION`.
+
+@@ +2216,5 @@
+>        recentCrashes: this._recentCrashes
+>      };
+>  
+>      let state = {
+> +      version: SESSION_STORE_VERSION,
+
+Let's call this field "sessionrestore:version". I suspect that putting "sessionrestore" in the name will eventually prove useful for debugging/forensics purposes.
+(In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment #10)
+> Let's call this field "sessionrestore:version". I suspect that putting
+> "sessionrestore" in the name will eventually prove useful for
+> debugging/forensics purposes.
+
+Why? I think this field being stored in sessionstore.js is a pretty clear indicator it belongs to sessionstore. Starting a new naming convention now doesn't make sense to me.
+Just a hunch that someday, we will have to debug a file in which someone else (some add-on?) will have injected a version number called "version".
+We can't prepare for every thing add-on authors are or might be doing in the future, I wouldn't like to adjust the format we want to have with unnecessary annotations to guard against weird add-ons. We provide no official API anymore to tamper with the session data that's stored to disk so I don't think this will be an issue.
+What's wrong with putting a clearer name?
+Well first, having property names with a colon isn't something we usually do. And second, why would we add a "sessionstore" namespace to a property that exists in the sessionstore data file? To me that is overly cautious and I'd rather limit the possibilities of tampering with our data even further than guarding against hypothetical misuses by add-ons.
+Feel free to replace the colon with anything else. What's important here is to attach not just the format *version*, but also the *format* itself, to avoid accidents, help with debugging, help finding out answering the question "wth is that file I just opened", help with recovery, etc. Just as in just about every single file format on Earth.
+Could call it "format_version" then.
+So `format_version` and `format_name`?
+I don't understand why we would need format_name? What else should a property in sessionstore.js refer to than the version of the file itself? It would be in sync with the FORMAT_VERSION constant in the JSM.
+Let me put it this way: can you find any file format in existence that doesn't offer a header (or some other mechanism) to identify files that belong to this format?
+
+Avi, Doc, Odf, Xml, Bash, Core Dump, Sqlite, Elf, Exe, etc. all have a magic number, shebang or equivalent that specifies the file *format*. This is useful as documentation, for debugging, recovery, building third-party tools, etc. Source code typically doesn't have that, but at least relies on a meaningful extension. Session Restore, on the other hand, has nothing. No meaningful extension, no header. You need expert knowledge to identify a Session Restore file from its contents, and I suspect that there are less than 10 of us who can do that. I want to remedy this with a trivial field.
+
+Any of the following is fine for me:
+- "sessionstore:version": 1
+- format: "sessionstore", version: 1,
+- format: {kind: "sessionstore", version: 1},
+- ...
+Created attachment 8599824
+third-version.patch
+
+Sorry for the delay, I've been busy finishing up my bachelor thesis during the last days and weeks.
+
+As you guys don't seem to really have reached a consensus on the naming, I'm leaving it as is at the moment ("sessionstore-version").
+
+I've tried adding tests as outlined in comment 10 but I'm unable to create `previous.js`:
+
+> 47 INFO TEST-UNEXPECTED-FAIL | browser/components/sessionstore/test/browser_backup_recovery.js | Uncaught exception - at (unknown module):0 - Unix error 2 during operation open on file /tmp/tmpIAcQQm.mozrunner/sessionstore-backups/previous.js (No such file or directory)
+
+This exception is raised when calling
+
+> yield File.writeAtomic(Paths.cleanBackup, BACKUP_SOURCE);
+
+I don't understand why, as the file's directory is created earlier by calling
+
+> yield File.makeDir(Paths.backups);
+
+Any ideas? Also, can you please confirm that I'm operating on the correct 2 files, referenced by `Paths.clean` and `Paths.cleanBackup`. The complete test output is here: http://pastebin.com/d6ukMSAk
+
+PS: Can I have `mach test` run individual tasks (rather than entire test files)?
+> PS: Can I have `mach test` run individual tasks (rather than entire test files)?
+
+I'm afraid not.
+(I'm trying to debug your error right now)
+Comment on attachment 8599824
+third-version.patch
+
+Review of attachment 8599824:
+-----------------------------------------------------------------
+
+I found your issue: `promiseSource` calls `wipe`, which destroys the directory. You need to recreate it *after* calling `promiseSource`.
+
+::: browser/components/sessionstore/test/browser_backup_recovery.js
+@@ +186,5 @@
+> +  yield File.writeAtomic(Paths.cleanBackup, BACKUP_SOURCE);
+> +  info("writing done");
+> +
+> +  // Ensure that we can recover from Paths.recovery
+> +  is((yield SessionFile.read()).source, SOURCE, "Recovered the correct source from the recovery file");
+
+Wait, why should we recover SOURCE and not BACKUP_SOURCE?
+
+@@ +193,5 @@
+> +  yield SessionFile.wipe();
+> +
+> +  // Create Paths.recoveryBackup and invalid Paths.recovery file
+> +  info("Corrupting recovery file, attempting to recover from recovery backup");
+> +  SOURCE = yield promiseSource("Paths.recoveryBackup");
+
+Please use another variable name.
+By the way, I assume that
+{
+  version: ["sessionstore", 1]
+}
+
+will keep everybody happy. Could you make that change, Fabian?
+Created attachment 8604608
+four.patch
+
+Alright, I took your comments into consideration and updated my changes on the flight last weekend. Unfortunately, I lost my notes so I might be missing something...
+
+Thanks David, that did indeed solve my problem. I created 2 separate tests, one that checks the scenario where the recovery file has a valid format version number and one where the recovery file has a high format version number to check the fallback to the backup file.
+
+There is a similar test (`test_recovery`) that checks fallback in case of a corrupt file but I'd say my tests are sufficiently different to keep both.
+
+What about the case where both recovery and recovery backup have a higher format version though? I assume the expected behavior is to start a new, clean session, is that correct? How can I test that?
+
+David, I used your proposed naming but I can't claim I'm happy with it. I'd rather have
+>{
+>  version: {
+>    sessionstore: 1
+>  }
+>}
+so that the version can be accessed like that: `format = foo.version.sessionstore` (rather than something like `format = foo.version[0] === "sessionstore" ? foo.version[1] : -1`. I'd say with your proposal and the array, there's much more room for error. Am I missing something?
+The idea of making it `["sessionstore", 1]` is that:
+- the format name is "sessionstore";
+- the format version is 1.
+
+I kind of like this. However, I realize that `version` is a bad name, so
+ format: ["sessionstore", 1]
+would certainly be better.
+
+How does that sound?
+I understand what you mean, my point I is that I'd prefer to store it as an object rather than an array. The reason being that this allows more secure access.
+Comment on attachment 8604608
+four.patch
+
+Review of attachment 8604608:
+-----------------------------------------------------------------
+
+Looks good to me with trivial nits.
+
+::: browser/components/sessionstore/test/browser_backup_recovery.js
+@@ +73,5 @@
+>    yield promiseBrowserLoaded(tab.linkedBrowser);
+>    TabState.flush(tab.linkedBrowser);
+>    yield SessionSaver.run();
+>  
+> +  // Ensure the exepected files (don't) exist
+
+Nit: "expected"
+
+@@ +168,5 @@
+> +
+> +  // Check there's a format version number
+> +  is(JSON.parse(SOURCE).version[0], "sessionstore", "Found sessionstore format version");
+> +
+> +  // Create Paths.recovery file
+
+Isn't this Paths.source?
+
+@@ +198,5 @@
+> +  let parsedSource = JSON.parse(SOURCE);
+> +  parsedSource.version[1] = Number.MAX_VALUE;
+> +  SOURCE = JSON.stringify(parsedSource);
+> +
+> +  yield File.writeAtomic(Paths.clean, SOURCE);
+
+I'd prefer if you wrote directly `JSON.stringify(parsedSource)` without first doing `SOURCE = JSON.stringify(...)`.
+Created attachment 8611282
+five.patch
+
+> Isn't this Paths.source?
+
+I didn't check that, this is copied from the previous test that someone else wrote. Looking at the code I'd probably prefer "// Create Paths.clean file" or something like that. "Paths.source" implies that the commonly used "Paths" object has a "source" property, which, as far as I can recall, it doesn't.
+Comment on attachment 8611282
+five.patch
+
+Review of attachment 8611282:
+-----------------------------------------------------------------
+
+r=me with trivial changes
+
+(and forget my comment on `Paths.clean`, that was a typo)
+
+::: browser/components/sessionstore/SessionFile.jsm
+@@ +213,5 @@
+> +        let versions = parsed.version;
+> +        let parsedVersion = undefined;
+> +        if (versions[0] == "sessionstore") {
+> +          parsedVersion = versions[1];
+> +        }
+
+Actually, the following might be a little easier to read:
+
+  let [format, version] = parsed.version || ["sessionstore", 0]; // Older versions of the file didn't have a format name/number.
+  if (!SessionStore.isFormatVersionCompatible(version)) {
+    ...
+  }
+
+::: browser/components/sessionstore/test/browser_backup_recovery.js
+@@ +173,5 @@
+> +  yield File.makeDir(Paths.backups);
+> +  yield File.writeAtomic(Paths.clean, SOURCE);
+> +
+> +  info("Attempting to recover from the recovery file");
+> +  // Ensure that we can recover from Paths.recovery
+
+Actually, you wrote to Paths.clean, not Paths.recovery.
+
+@@ +192,5 @@
+> +
+> +  // Create Paths.clean and Paths.cleanBackup files
+> +  yield File.makeDir(Paths.backups);
+> +
+> +  // Change version number so we'll attempt to load the backup
+
+"to something that we don't understand yet"
+Created attachment 8616133
+six.patch
+
+There you go!
+Comment on attachment 8616133
+six.patch
+
+Review of attachment 8616133:
+-----------------------------------------------------------------
+
+Looks good to me, thanks for the patch.
+Remind me: do you have Try access or do you need me to push the patch to Try?
+I had asked for and was given L1 access after finishing the previous bug (session store backup cleanup). 
+
+I've had a look at this page: https://wiki.mozilla.org/ReleaseEngineering/TryServer and tried to access the Try server via SSH but it failed due to permissions. However, I saw no option to add my SSH key to my Try account. How exactly should I submit to Try?
+
+
+Then I'll also need to create a proper patch (rather than just redirecting the `hg diff` output).
+Have you resolved this issue, Fabian?
+
+David, may you help him?
+Sorry about that, I missed the question.
+In the future, Fabian, don't hesitate to mark me as "need info", otherwise I risk missing your message.
+
+Normally, you provided your ssh when you got your L1 access. So you should not need to do anything special for the Try server.
+
+If you have run `./mach mercurial-setup` recently, the only thing you need to do to push to try is
+`hg push-to-try -m "try: ..."`, where the ... are given by http://trychooser.pub.build.mozilla.org/ or equivalent.
+Thanks for the reply. I ran the mercurial-setup before submitting the patch for the previous bug so I tried push-to-try which failed ("hg: unknown command 'push-to-try'"). I re-ran the mercurial-setup which suggested a few changes to my hgrc (which I accepted and applied) but that didn't fix it. Google didn't help me find a way to get the mercurial push-to-try. Is that an alias that I could add manually?
+Have you pulled recently? You may be using an old version of mercurial-setup. Command `hg push-to-try` is provided by extension `push-to-try`, which should be installed by `./mach mercurial-setup`.
+Hm that's strange, I ran `./mach mercurial-setup` two days ago, several times, without being queried to install push-to-try. Now I re-ran the setup and could install push-to-try. After some more configurating, I actually managed to run the push-to-try, I used the arguments that you supplied for my last patch! Thanks for your patience! The results should end up here: https://treeherder.mozilla.org/#/jobs?repo=try&revision=9ab792a7358chttps://treeherder.mozilla.org/#/jobs?repo=try&revision=9ab792a7358c
+
+My current changes are more extensive than they were when I was writing them because I ran `hg pull` in the meantime and several other changes were made to the 3 files that I modified. Is this a problem?
+Well, according to the test results, there seems to be a problem. My guess is that there is a syntax error somewhere in your changes. Could you try and run a test manually, to see if you can pinpoint the error?
+
+./mach mochitest browser/components/sessionstore/test/browser_backup_recovery.js
+Sorry for the delay, I finally got around to investigating the matter. Since submitting my latest patch (the sixth), I added no more changes. The only thing that I did was run `hg pull`.
+
+I did a complete re-build and ran the tests which again failed. It appears that, before an actual test is run, an exception in a promise resolution callback is reported. Then, I get a few TypeError exceptions: "SessionSaver.clearLastSaveTime is not a function" in the SessionSaver and "TabState.flush is not a function" in the actual test (which is thrown a couple of times). The full test output is here: http://pastebin.com/NW6B5u9T
+
+I don't know what that's about, I'm quite sure it's not something I did, back in June.
+With the latest Nightly, the patch doesn't apply.
+Did you run `hg pull --rebase`?
+I tried again removing all local changes, pulling (with rebase), and applying the patch. As you say (and as I noticed earlier), there are conflicts. SessionStore.jsm seems to have changed around my addition of the `isFormatVersionCompatible(version)` function  and the browser_backup_recovery.js seems to have changed as well. There are two chunks in my diff of the test, the first is the addition of several comments to existing code and the second is the addition of two new tests, `test_version` and `test_version_fallback`.
+
+Now, only one test fails (the contents of a backup recovery file don't match the expected contents). I can't see why it doesn't match, the diff shows quite a lot of differences so I assume something significant is done incorrectly. However, I'm now too far away from the code to understand what's wrong so I'll just show you the test output if that's ok: pastebin.com/hd1BFKKN
+I'll try and find some time next week to help you.
+I actually don't encounter any error.
+Created attachment 8670810
+MozReview Request: Bug 1147822 - Add a format to Session Restore files;r?yoric
+
+Bug 1147822 - Add a format to Session Restore files;r?yoric
+Comment on attachment 8670810
+MozReview Request: Bug 1147822 - Add a format to Session Restore files;r?yoric
+
+Bug 1147822 - Add a format to Session Restore files;r?yoric
+https://reviewboard.mozilla.org/r/21459/#review19451
+Comment on attachment 8670810
+MozReview Request: Bug 1147822 - Add a format to Session Restore files;r?yoric
+
+https://reviewboard.mozilla.org/r/21461/#review19453
+Try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=4dae51949b26
+https://hg.mozilla.org/integration/fx-team/rev/c1b4c02d7b38
+https://hg.mozilla.org/mozilla-central/rev/c1b4c02d7b38
+(In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment #0)
+> We recently had issues when changing the format of sessionstore.js. These
+> issues would have been less annoying if we had had a version number that
+> would have let Firefox know beforehand that it cannot load a sessionstore.js
+> using a format too recent, and that it should have fallen back to loading a
+> backup.
+
+I'm guessing the immediate impetus for this was bug 1143720.  It's a good change.
+
+If format changes are extremely rare it perhaps might not matter in the sense that most users will never encounter a situation where their session restore will not be built from the most recent store. But for testers such as myself who bounce around random old versions for testing, the risk is much higher, so I wonder 
+ a) is the user informed when session recover does not use the last session file and informed why?
+ b) alternatively, or in addition, are session format revs documented in a place other than just the source code that could be monitored - for example wiki?
+(In reply to Wayne Mery (:wsmwk, use Needinfo for questions) from comment #52)
+> (In reply to David Rajchenbach-Teller [:Yoric] (use "needinfo") from comment
+> #0)
+> > We recently had issues when changing the format of sessionstore.js. These
+> > issues would have been less annoying if we had had a version number that
+> > would have let Firefox know beforehand that it cannot load a sessionstore.js
+> > using a format too recent, and that it should have fallen back to loading a
+> > backup.
+> 
+> I'm guessing the immediate impetus for this was bug 1143720.  It's a good
+> change.
+> 
+> If format changes are extremely rare it perhaps might not matter in the
+> sense that most users will never encounter a situation where their session
+> restore will not be built from the most recent store. But for testers such
+> as myself who bounce around random old versions for testing, the risk is
+> much higher, so I wonder 
+>  a) is the user informed when session recover does not use the last session
+> file and informed why?
+
+No such information is available, no. How would you suggest we do that?
+
+>  b) alternatively, or in addition, are session format revs documented in a
+> place other than just the source code that could be monitored - for example
+> wiki?
+
+Not yet, but at least, now, we have support for actually documenting stuff.
+
+
+[Session Restore] Add a format version number for sessionstore.js
+
+
+
+Bug 1147822 - Add a format version number for sessionstore.js. r=Yoric 

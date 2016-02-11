@@ -1,0 +1,1093 @@
+Created attachment 742583
+WIP 1
+
+This patch assumes code not yet in evidence, but here's where it stands for now.
+
+Created attachment 742583
+WIP 1
+
+This patch assumes code not yet in evidence, but here's where it stands for now.
+Created attachment 755530
+WIP 2
+Created attachment 755698
+v1
+Comment on attachment 755698
+v1
+
+Review of attachment 755698:
+-----------------------------------------------------------------
+
+Wow, protocol.js is a lot to digest. I'm going to need some time for that.
+
+In the mean time, I have some really trivial comments:
+
+::: toolkit/devtools/server/actors/string.js
+@@ +18,5 @@
+> +
+> +  initialize: function(conn, str) {
+> +    this.str = str;
+> +    this.short = (this.str.length < DebuggerServer.LONG_STRING_LENGTH);
+> +    protocol.Actor.prototype.initialize.call(this, conn);
+
+I have no experience with this, but in C++ the base class initialization happens first. The base class constructor certainly shouldn't be counting on state established by the derived class's constructor. But I really don't know the issues.
+
+@@ +22,5 @@
+> +    protocol.Actor.prototype.initialize.call(this, conn);
+> +  },
+> +
+> +  destroy: function() {
+> +    delete this.str;
+
+'this.str = null' probably uses less memory in SM's implementation. Deleting properties puts the object in "dictionary mode", where it has its own hash table. You probably want to change this almost everywhere it occurs.
+
+@@ +111,5 @@
+> +      let end = start + (Math.min(DebuggerServer.LONG_STRING_READ_LENGTH, this.length - start));
+> +      this.substring(start, end).then((chunk) => {
+> +        chunks.push(chunk);
+> +        if (end === this.length) {
+> +          deferred.resolve(chunks.join(""));
+
+My understanding is that our string implementation represents the result of a concatenation as a 'rope' that just points to the left and right halves; a DAG of ropes gets automatically flattened into a real string at appropriate times. So the chunk array really isn't any better than just appending strings with '+'.
+
+@@ +125,5 @@
+> +    readChunk();
+> +
+> +    this.strPromise = deferred.promise;
+> +    return this.strPromise;
+> +  }
+
+This isn't really important, and I shouldn't have let myself get caught up in it, but couldn't this be, simply:
+
+function() {
+  if (!this.strPromise) {
+    let promiseRest = (thusFar) => {
+      if (thusFar.length === this.length)
+        return resolve(thusFar);
+      else {
+        return this.substring(thusFar.length,
+                              thusFar.length + DebuggerServer.LONG_STRING_READ_LENGTH)
+          .then((next) => promiseRest(thusFar + next));
+      }
+    }
+
+    this.strPromise = promiseRest(this.initial);
+  }
+  return this.strPromise;
+}
+
+::: toolkit/devtools/server/protocol.js
+@@ +122,5 @@
+> +  }
+> +
+> +  let type = object.merge({
+> +    name: name,
+> +    primitive: !(methods.read || methods.write) || undefined,
+
+Why '|| undefined'? Isn't it good enough to just let it be false? (The object stores the property, even if its value is 'undefined'.)
+Given the size of the patch (sorry!) would you prefer refreshed patches with comments addressed, or incremental patches as we go?
+Created attachment 756915
+v1 review fixes
+
+For safe keeping....
+Created attachment 756917
+change how requests are sent
+
+This changes how requests are sent, no longer waiting for previous replies.  Putting here for safe keeping, can either fold into a new version of the patch or save this for a new bug.
+Created attachment 757020
+a few extra fixes
+
+This patch makes sure that form() when called on a front during initialization gets the same args it would get later.
+
+But honestly I think we should just leave initial form reading out of construction, and just always do new Front(client); front.form(form) instead of new Front(client, form).
+(For my sake, it's fine to just mark the prior versions as obsolete.)
+... and just post updated versions of the patch.
+OK, will rollup all the current patches.
+Comment on attachment 756917
+change how requests are sent
+
+Review of attachment 756917:
+-----------------------------------------------------------------
+
+YES. THIS.
+
+:)
+Created attachment 758682
+v2
+Created attachment 759315
+v2.1
+
+Small fix to LongStringFront.string
+Created attachment 759335
+v2.2
+
+Removed debugging dump, sorry for the churn.
+Comment on attachment 759335
+v2.2
+
+Review of attachment 759335:
+-----------------------------------------------------------------
+
+Still reviewing; some interim comments, hopefully not too clueless:
+
+::: toolkit/devtools/server/protocol.js
+@@ +38,5 @@
+> +
+> +let types = Object.create(null);
+> +exports.types = types;
+> +
+> +let registeredTypes = Object.create(null);
+
+These really all ought to be Maps. There's no reason to use Object.create(null) any more, as far as I can tell. That can certainly be a follow-up bug, though.
+
+@@ +111,5 @@
+> + * @param typestring name
+> + *    Name to register
+> + * @param object methods
+> + *    The type's read and write methods.  Either can be blank
+> + *    to use an identity function.
+
+You probably ought to add, "This can have other properties as well, which will be included in the type object," so that the _actor flag is covered.
+
+Also, an explanation of what a "context" is would go a long way. I gather that, on the server side, the context of marshalling is an Actor instance, and on the client side, it's a... what?
+
+@@ +165,5 @@
+> + * Add a dict type to the type system.  This allows you to serialize
+> + * a JS object that contains non-primitive subtypes.
+> + *
+> + * Properties of the value that aren't included in the specializations
+> + * will be serialized as primitive values.
+
+I wonder, have there been bugs caused by forgetting to add a specialization? Should we require all properties to be registered at least as 'primitive', and throw if asked to read/write properties that have no specialization? (We could treat: 'x:null' as shorthand that means x is a primitive, if that helps.) Or would that just be bureaucratic?
+
+I'm just thinking about strings, which will normally marshall fine as a primitive until someone sends a long one...
+
+@@ +212,5 @@
+> + */
+> +types.addActorType = function(name) {
+> +  let type = types.addType(name, {
+> +    _actor: true,
+> +    read: (v, ctx, detail) => {
+
+General design thought, not important to address in this patch: the 'read' and 'write' methods are running different code depending on whether they're client-side or server-side, even though the caller presumably knows where it's being used. If it could be done nicely (because this isn't bad at all as it stands), it might be nice to separate out the server and client paths into their own methods. Doing so might be helpful to people trying to keep track of the server-side vs. client-side x read vs. write combinations.
+
+@@ +219,5 @@
+> +      if (ctx instanceof Actor) {
+> +        return ctx.conn.getActor(v);
+> +      }
+> +
+> +      // Reading a response from the client side, check for an
+
+I think "Reading a response on the client side" would be clearer here. When I heard "from the client side" my first thought was, "Oh, we're on the server."
+
+@@ +353,5 @@
+> + * with a RetVal placeholder where the return value should be
+> + * placed.
+> + */
+> +
+> +function cloneArg(arg) {
+
+For this and cloneRetVal, why not just let the 'clone' method do the whole job?
+
+@@ +563,5 @@
+> +    for (let templateArg of this.args) {
+> +      setPath(packet, templateArg.path, templateArg.write(fnArgs[templateArg.index], ctx));
+> +    }
+> +    return packet;
+> +  },
+
+Is it better to copy the template as we do in processTemplate, and then JSON-clone it again at send time and store the arguments in the clone, or to simply walk the original template at send time and substitute arguments in as we encounter them? I don't really know. I'm just not clear on what the extra copy accomplishes.
+
+I think JSON.stringify can be given a 'replacer' function that would drop Arg or RetVal instances. Perhaps you could clone with such a replacer, and then drop the argument / retval values in.
+
+@@ +664,5 @@
+> +  /**
+> +   * Create a clone of the response template, saving the RetVal
+> +   * instance in the template along with its path.
+> +   */
+> +  processTemplate: function(template, path=[]) {
+
+This looks an awful lot like Request.prototype.processTemplate. If 'clone' did the whole job of returning a clone, and if Arg and RetVal inherited from some common class, processTemplate could be a top-level function, or in some base class of Response and Reply, and test for membership in Arg and RetVal's common base class. The 'name' field of Arg could be a getter that fetches the path's final element.
+
+::: toolkit/devtools/server/tests/unit/test_protocol_simple.js
+@@ +1,5 @@
+> +/* Any copyright is dedicated to the Public Domain.
+> +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> +
+> +/**
+> + * Test simple requests using the protocol helpers.
+
+It's a bit weird to be using the same protocol description to encode and then decode the messages here --- it might be just sending the Arg or RetVal fields over in an array, and it would still pass. :)
+(In reply to Jim Blandy :jimb from comment #15)
+> Comment on attachment 759335
+> v2.2
+> 
+> Review of attachment 759335:
+> -----------------------------------------------------------------
+> 
+> Still reviewing; some interim comments, hopefully not too clueless:
+> 
+> ::: toolkit/devtools/server/protocol.js
+> @@ +38,5 @@
+> > +
+> > +let types = Object.create(null);
+> > +exports.types = types;
+> > +
+> > +let registeredTypes = Object.create(null);
+> 
+> These really all ought to be Maps. There's no reason to use
+> Object.create(null) any more, as far as I can tell. That can certainly be a
+> follow-up bug, though.
+
+Converted to maps in my repo.
+
+> 
+> @@ +111,5 @@
+> > + * @param typestring name
+> > + *    Name to register
+> > + * @param object methods
+> > + *    The type's read and write methods.  Either can be blank
+> > + *    to use an identity function.
+> 
+> You probably ought to add, "This can have other properties as well, which
+> will be included in the type object," so that the _actor flag is covered.
+> 
+> Also, an explanation of what a "context" is would go a long way. I gather
+> that, on the server side, the context of marshalling is an Actor instance,
+> and on the client side, it's a... what?
+
+Updated to:
+
+/**
+ * Add a type to the type system.
+ *
+ * When registering a type, you can provide `read` and `write` methods.
+ *
+ * The `read` method will be passed a JS object value from the JSON
+ * packet and must return a native representation.  The `write` method will
+ * be passed a native representation and should provide a JSONable value.
+ *
+ * These methods will both be passed a context.  The context is the object
+ * performing or servicing the request - on the server side it will be
+ * an Actor, on the client side it will be a Front.
+ *
+ * @param typestring name
+ *    Name to register
+ * @param object typeObject
+ *    An object whose properties will be stored in the type, including
+ *    the `read` and `write` methods.
+ * @param object options
+ *    Can specify `thawed` to prevent the type from being frozen.
+ *
+ * @returns a type object that can be used in protocol definitions.
+ */
+
+in my local copy.
+
+> @@ +165,5 @@
+> > + * Add a dict type to the type system.  This allows you to serialize
+> > + * a JS object that contains non-primitive subtypes.
+> > + *
+> > + * Properties of the value that aren't included in the specializations
+> > + * will be serialized as primitive values.
+> 
+> I wonder, have there been bugs caused by forgetting to add a specialization?
+> Should we require all properties to be registered at least as 'primitive',
+> and throw if asked to read/write properties that have no specialization? (We
+> could treat: 'x:null' as shorthand that means x is a primitive, if that
+> helps.) Or would that just be bureaucratic?
+
+I went back and forth on this, and chose what I did because I was worried about "just bureaucratic".
+
+I don't think that was the right call, I think we should require types.  It makes things more self-documenting too (if we register simple types like "boolean" and "number" rather than using the :null ).
+
+BUT I have a bunch of outstanding r+'ed patches that don't specify the type, so do you mind if I fix in a followup with a big fix for everything rather than bitrotting each patch in the queue?
+
+> 
+> I'm just thinking about strings, which will normally marshall fine as a
+> primitive until someone sends a long one...
+
+BTW, the way this works now, you have to specifically use the "longstring" type if you want a string that might be long.  There's a "string" alias for the primitive type.
+
+I don't think we can give a sane API if every string is in danger of being a longstring.  Individual interfaces should probably think out which things might get longer than our long string threshold, and use "string" if it knows it'll never get that long.  Our "string" type, rather than being a primitive type, could at least assert that limit.
+
+(I think this agrees with what you said earlier about some types like property names just being assumed to never be longstrings).
+
+> @@ +212,5 @@
+> > + */
+> > +types.addActorType = function(name) {
+> > +  let type = types.addType(name, {
+> > +    _actor: true,
+> > +    read: (v, ctx, detail) => {
+> 
+> General design thought, not important to address in this patch: the 'read'
+> and 'write' methods are running different code depending on whether they're
+> client-side or server-side, even though the caller presumably knows where
+> it's being used. If it could be done nicely (because this isn't bad at all
+> as it stands), it might be nice to separate out the server and client paths
+> into their own methods. Doing so might be helpful to people trying to keep
+> track of the server-side vs. client-side x read vs. write combinations.
+
+I started to do this, but because it's late and I'm tired I didn't finish.  Might do this in a followup instead of this bug.  As long as we retain read and write as fallbacks for serverRead/clientWrite/whatever, fixing that won't break existing code.
+
+> @@ +219,5 @@
+> > +      if (ctx instanceof Actor) {
+> > +        return ctx.conn.getActor(v);
+> > +      }
+> > +
+> > +      // Reading a response from the client side, check for an
+> 
+> I think "Reading a response on the client side" would be clearer here. When
+> I heard "from the client side" my first thought was, "Oh, we're on the
+> server."
+
+Fixed.
+
+> For this and cloneRetVal, why not just let the 'clone' method do the whole
+> job?
+
+Got rid of all the cloning entirely.
+
+> @@ +563,5 @@
+> > +    for (let templateArg of this.args) {
+> > +      setPath(packet, templateArg.path, templateArg.write(fnArgs[templateArg.index], ctx));
+> > +    }
+> > +    return packet;
+> > +  },
+> 
+> Is it better to copy the template as we do in processTemplate, and then
+> JSON-clone it again at send time and store the arguments in the clone, or to
+> simply walk the original template at send time and substitute arguments in
+> as we encounter them? I don't really know. I'm just not clear on what the
+> extra copy accomplishes.
+
+I was cloning because I really want to freeze the stuff passed in by the client (so they can safely reuse packet specifications), but I was mutating those Arg/Option objects to store their name/path.
+
+But I just reworked things so that the path/name is passed in to the arg's read/write, and now we can save that extra clone.
+
+> I think JSON.stringify can be given a 'replacer' function that would drop
+> Arg or RetVal instances. Perhaps you could clone with such a replacer, and
+> then drop the argument / retval values in.
+
+Yeah, my packet writes now look like:
+
+    return JSON.parse(JSON.stringify(this.template, (key, value) => {
+      if (value instanceof Arg) {
+        return value.write(fnArgs[value.index], ctx, key);
+      }
+      return value;
+    }));
+
+
+It's way better, thanks.
+
+> 
+> @@ +664,5 @@
+> > +  /**
+> > +   * Create a clone of the response template, saving the RetVal
+> > +   * instance in the template along with its path.
+> > +   */
+> > +  processTemplate: function(template, path=[]) {
+> 
+> This looks an awful lot like Request.prototype.processTemplate. If 'clone'
+> did the whole job of returning a clone, and if Arg and RetVal inherited from
+> some common class, processTemplate could be a top-level function, or in some
+> base class of Response and Reply, and test for membership in Arg and
+> RetVal's common base class. The 'name' field of Arg could be a getter that
+> fetches the path's final element.
+
+I factored out processTemplate, but rather than saving paths in the Arg/Option/RetVal objects I just send in names at packet read/write time.
+
+> ::: toolkit/devtools/server/tests/unit/test_protocol_simple.js
+> @@ +1,5 @@
+> > +/* Any copyright is dedicated to the Public Domain.
+> > +   http://creativecommons.org/publicdomain/zero/1.0/ */
+> > +
+> > +/**
+> > + * Test simple requests using the protocol helpers.
+> 
+> It's a bit weird to be using the same protocol description to encode and
+> then decode the messages here --- it might be just sending the Arg or RetVal
+> fields over in an array, and it would still pass. :)
+
+Huh.  Yeah.  Need to do something about that, not sure what yet.
+Created attachment 760737
+address review comments
+
+I know you said you're OK with new patches that obsolete old ones.  But since you're partway through the review, here's a patch that addresses just review comments.
+
+I will happily qfold on your goahead.
+(In reply to Dave Camp (:dcamp) from comment #16)
+> > Should we require all properties to be registered at least as 'primitive',
+> > and throw if asked to read/write properties that have no specialization? (We
+> > could treat: 'x:null' as shorthand that means x is a primitive, if that
+> > helps.) Or would that just be bureaucratic?
+> 
+> I went back and forth on this, and chose what I did because I was worried
+> about "just bureaucratic".
+> 
+> I don't think that was the right call, I think we should require types.  It
+> makes things more self-documenting too (if we register simple types like
+> "boolean" and "number" rather than using the :null ).
+> 
+> BUT I have a bunch of outstanding r+'ed patches that don't specify the type,
+> so do you mind if I fix in a followup with a big fix for everything rather
+> than bitrotting each patch in the queue?
+
+I wasn't even ready to ask for the change! I could hardly object to a follow-up bug. :)
+
+
+> I don't think we can give a sane API if every string is in danger of being a
+> longstring.
+
+I totally agree. (That's why they're not permitted everywhere in the protocol...)
+
+> > @@ +212,5 @@
+> > > + */
+> > > +types.addActorType = function(name) {
+> > > +  let type = types.addType(name, {
+> > > +    _actor: true,
+> > > +    read: (v, ctx, detail) => {
+> > 
+> > General design thought, not important to address in this patch: the 'read'
+> > and 'write' methods are running different code depending on whether they're
+> > client-side or server-side, even though the caller presumably knows where
+> > it's being used. If it could be done nicely (because this isn't bad at all
+> > as it stands), it might be nice to separate out the server and client paths
+> > into their own methods. Doing so might be helpful to people trying to keep
+> > track of the server-side vs. client-side x read vs. write combinations.
+> 
+> I started to do this, but because it's late and I'm tired I didn't finish. 
+> Might do this in a followup instead of this bug.  As long as we retain read
+> and write as fallbacks for serverRead/clientWrite/whatever, fixing that
+> won't break existing code.
+
+The thing is, there are marshallers like the array and dictionary marshallers that really take advantage of the *lack* of distinction. (In fact, those two don't even care about the read vs. write distinction!) Splitting the two cases might remove (or at least hoist) dispatch code, but if it just adds duplication elsewhere, then that's not much fun either.
+
+> Yeah, my packet writes now look like:
+> 
+>     return JSON.parse(JSON.stringify(this.template, (key, value) => {
+>       if (value instanceof Arg) {
+>         return value.write(fnArgs[value.index], ctx, key);
+>       }
+>       return value;
+>     }));
+> 
+> 
+> It's way better, thanks.
+
+Excellent!
+
+(I suppose this sort of coding-nicety suggestion is not really what's called for given the schedule. I'm sorry about that; it's just habit. I want to review to the point that I can be "the second person who understands the code", so the suggestions just come for free.)
+Comment on attachment 760737
+address review comments
+
+Review of attachment 760737:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/protocol.js
+@@ +435,1 @@
+>      if (typeof(v) === "undefined") {
+
+I think it's safe in modern code to just say 'if (v === undefined)'; undefined is a non-writable, non-configurable property of the global object, so unless you're using it as a local variable name it's not going to be overridden.
+(In reply to Jim Blandy :jimb from comment #18)
+> (In reply to Dave Camp (:dcamp) from comment #16)
+
+> > > @@ +212,5 @@
+> > > > + */
+> > > > +types.addActorType = function(name) {
+> > > > +  let type = types.addType(name, {
+> > > > +    _actor: true,
+> > > > +    read: (v, ctx, detail) => {
+> > > 
+> > > General design thought, not important to address in this patch: the 'read'
+> > > and 'write' methods are running different code depending on whether they're
+> > > client-side or server-side, even though the caller presumably knows where
+> > > it's being used. If it could be done nicely (because this isn't bad at all
+> > > as it stands), it might be nice to separate out the server and client paths
+> > > into their own methods. Doing so might be helpful to people trying to keep
+> > > track of the server-side vs. client-side x read vs. write combinations.
+> > 
+> > I started to do this, but because it's late and I'm tired I didn't finish. 
+> > Might do this in a followup instead of this bug.  As long as we retain read
+> > and write as fallbacks for serverRead/clientWrite/whatever, fixing that
+> > won't break existing code.
+> 
+> The thing is, there are marshallers like the array and dictionary
+> marshallers that really take advantage of the *lack* of distinction. (In
+> fact, those two don't even care about the read vs. write distinction!)
+> Splitting the two cases might remove (or at least hoist) dispatch code, but
+> if it just adds duplication elsewhere, then that's not much fun either.
+
+Yeah, it was that duplication that gave me pause.
+
+> > Yeah, my packet writes now look like:
+> > 
+> >     return JSON.parse(JSON.stringify(this.template, (key, value) => {
+> >       if (value instanceof Arg) {
+> >         return value.write(fnArgs[value.index], ctx, key);
+> >       }
+> >       return value;
+> >     }));
+> > 
+> > 
+> > It's way better, thanks.
+> 
+> Excellent!
+> 
+> (I suppose this sort of coding-nicety suggestion is not really what's called
+> for given the schedule. I'm sorry about that; it's just habit. I want to
+> review to the point that I can be "the second person who understands the
+> code", so the suggestions just come for free.)
+
+I'm in favor of coding-nicety suggestions.
+Comment on attachment 759335
+v2.2
+
+Review of attachment 759335:
+-----------------------------------------------------------------
+
+Some more minor comments-in-progress:
+
+::: toolkit/devtools/server/protocol.js
+@@ +691,5 @@
+> +/**
+> + * A protocol object that can manage the lifetime of other protocol
+> + * objects.
+> + */
+> +let Pool = Class({
+
+It seems like this should just be the definition of ActorPool, and we should extend the real thing; we're using duck typing to make this pass as an actor pool, right? Could you file a follow-up for this?
+
+@@ +754,5 @@
+> +    this.__poolMap.delete(actor.actorID);
+> +  },
+> +
+> +  // true if the given actor ID exists in the pool.
+> +  has: function(actorID) this._poolMap.has(actorID),
+
+If you're trying to keep it lazy, this could be:
+
+this.__poolMap && this._poolMap.has(actorID);
+
+(I think the actor lookup code does call 'has' on a lot of pools that it has no reason to think might contain anything.)
+
+@@ +778,5 @@
+> +    }
+> +    if (!this.__poolMap) {
+> +      return;
+> +    }
+> +    for (actor in this.__poolMap) {
+
+Shouldn't this be 'for(of)'? What does this do?
+
+@@ +826,5 @@
+> +    Pool.prototype.initialize.call(this, conn);
+> +
+> +    // Forward events to the connection.
+> +    if (this._actorSpec && this._actorSpec.events) {
+> +      Object.getOwnPropertyNames(this._actorSpec.events).forEach((name) => {
+
+If .events were a Map, then this could simply be: for (let name of this._actorSpec.events) { ...
+
+@@ +930,5 @@
+> +  }
+> +
+> +  // Find event specifications
+> +  if (actorProto.events) {
+> +    protoSpec.events = {};
+
+This should be a Map; then see comments in Actor.
+(In reply to Dave Camp (:dcamp) from comment #17)
+> I will happily qfold on your goahead.
+
+Sure, at your leisure.
+Created attachment 761229
+v3
+(In reply to Jim Blandy :jimb from comment #21)
+
+> > +let Pool = Class({
+> 
+> It seems like this should just be the definition of ActorPool, and we should
+> extend the real thing; we're using duck typing to make this pass as an actor
+> pool, right? Could you file a follow-up for this?
+
+Filed bug 881927.
+
+> If you're trying to keep it lazy, this could be:
+> 
+> this.__poolMap && this._poolMap.has(actorID);
+
+Done.
+
+> @@ +778,5 @@
+> > +    }
+> > +    if (!this.__poolMap) {
+> > +      return;
+> > +    }
+> > +    for (actor in this.__poolMap) {
+> 
+> Shouldn't this be 'for(of)'? What does this do?
+
+Yes - it calls destroy on child actors.  I added a test that confirms that destroy is called on the child actors, because obviously they weren't.
+ 
+> If .events were a Map, then this could simply be: for (let name of
+> this._actorSpec.events) { ...
+...
+> This should be a Map; then see comments in Actor.
+
+Changed events to maps.
+Comment on attachment 759335
+v2.2
+
+Review of attachment 759335:
+-----------------------------------------------------------------
+
+Just a few final comments on the v2.2; sorry.
+
+::: toolkit/devtools/server/protocol.js
+@@ +719,5 @@
+> +  /**
+> +   * Override this if you want actors returned by this actor
+> +   * to belong to a different actor by default.
+> +   */
+> +  defaultParent: function() { return this; },
+
+It's kind of confusing to have one member named 'parent', meaning the parent of 'this' as an actor/front in its own right, and then another 'defaultParent', meaning the parent to use for the actors/fronts we introduce. 'childPool'? Perhaps 'marshallPool', since it's what you use when marshalling messages to/from this actor/front?
+
+@@ +757,5 @@
+> +  // true if the given actor ID exists in the pool.
+> +  has: function(actorID) this._poolMap.has(actorID),
+> +
+> +  // The actor for a given actor id stored in this pool
+> +  actor: function(actorID) this._poolMap.get(actorID),
+
+If we use 'actor' for querying, then you'd want a __poolMap check here too. But I don't think we do...
+
+@@ +789,5 @@
+> +        actor.destroy = destroy;
+> +      }
+> +    };
+> +    this.conn.removeActorPool(this);
+> +    this._poolMap.clear();
+
+__poolMap is probably what you mean here.
+Created attachment 762206
+v4
+
+New version checks the protocol packets in tests.
+Comment on attachment 761229
+v3
+
+Review of attachment 761229:
+-----------------------------------------------------------------
+
+All right. Some final comments, but this looks great.
+
+::: toolkit/devtools/server/actors/string.js
+@@ +46,5 @@
+> +      start: Arg(0),
+> +      end: Arg(1)
+> +    },
+> +    response: { substring: RetVal() },
+> +    returns: "substring"
+
+What does 'returns' do?
+
+@@ +120,5 @@
+> +// The long string actor needs some custom marshalling, because it is sometimes
+> +// returned as a primitive rather than a complete form.
+> +
+> +let stringActorType = protocol.types.getType("longstractor");
+> +protocol.types.addType("longstring", {
+
+I think this deserves a more thorough comment, perhaps along the lines of:
+
+A value of the "longstring" type always reads as an object that implements the LongStringFront interface, whether the string was transmitted as a long string grip or an ordinary JSON string. The former reads as a real LongStringFront instance, with 'length' and 'initial' properties, and 'string' and 'substring' methods that return promises of text retrieved from the server. The latter reads as a ShortLongString instance, providing the same interface but simply handing out bits of the complete JavaScript string it holds.
+
+@@ +123,5 @@
+> +let stringActorType = protocol.types.getType("longstractor");
+> +protocol.types.addType("longstring", {
+> +  _actor: true,
+> +  write: (value, context, detail) => {
+> +    if (!(context instanceof protocol.Actor)) {
+
+Would it be more direct to say "if (context instanceof protocol.Front)" ? Doesn't that work?
+
+::: toolkit/devtools/server/protocol.js
+@@ +23,5 @@
+> +
+> +/**
+> + * Types: named marshallers/demarshallers.
+> + *
+> + * Types provide 'write' function that takes a js representation and
+
+Missing "a".
+
+@@ +211,5 @@
+> +  })
+> +}
+> +
+> +/**
+> + * Register an actor type with the type system.
+
+This comment ought to talk a little bit about how actors are serialized --- especially that they're just names in requests, but forms in replies. (This is a fine decision, as forms are meant to provide frequently-needed context within the packet, whereas requests just need the name; but it's worth calling out the asymmetry.)
+
+@@ +215,5 @@
+> + * Register an actor type with the type system.
+> + *
+> + * This function can be called before the associated actor has been
+> + * constructed, but the read and write methods won't work until
+> + * the associated addActorImpl or addActorFront methods have been
+
+The 'read' and 'write' functions never use the 'actorClass' property, as far as I can see. It's always the server that decides to create an actor.
+
+@@ +269,5 @@
+> +/**
+> + * Register an actor implementation for a previously-added actor type.
+> + */
+> +types.addActorImpl = function(name, actorClass) {
+> +  registeredTypes.get(name).actorClass = actorClass;
+
+There don't seem to be any tests that use a type's actorClass member. It seems like this is only useful when one wants to construct actors given their type name; I don't really understand when that case arises.
+
+@@ +782,5 @@
+> +      for (let key of this._actorSpec.events.keys()) {
+> +        let name = key;
+> +        this.on(name, (...args) => {
+> +          this._sendEvent.apply(this, [name].concat(args));
+> +        });
+
+You could also say, just after the 'let':
+
+let sendEvent = this._sendEvent.bind(this, name)
+
+and then, in the arrow function:
+
+sendEvent.apply(null, args)
+
+That does the concatenation, effectively, just by pushing the bound args, and then the applied args, on the JS stack.
+
+@@ +809,5 @@
+> +   * @param [optional] string hint
+> +   *   Optional string to customize the form.
+> +   * @returns A jsonable object.
+> +   */
+> +   form: function(hint) {
+
+(Did the indentation change here?)
+
+@@ +837,5 @@
+> + *    The method specification, with the following (optional) properties:
+> + *      request (object): a request template.
+> + *      response (object): a response template.
+> + *      oneway (bool): 'true' if no response should be sent.
+> + *      telemetry (string): Telemetry probe ID for measuring completion time.
+
+They can include 'name' and 'release' here, too, right?
+
+I don't quite understand how 'name' support can work: if it's different from the actual name of the property on the (soon-to-be) prototype object, then the handler function that exports.actorProto generates will try to call a different property of 'this' than the one holding the method(...). That seems really confusing.
+
+@@ +850,5 @@
+> +/**
+> + * Process an actor definition from its prototype and generate
+> + * request handlers.
+> + */
+> +exports.actorProto = function(actorProto) {
+
+Why is actorProto exported?
+
+@@ +853,5 @@
+> + */
+> +exports.actorProto = function(actorProto) {
+> +  if (actorProto._actorSpec) {
+> +    // Already processed this prototype.
+> +    return actorProto;
+
+This isn't an error? frontProto treats it as one.
+
+@@ +891,5 @@
+> +      protoSpec.events.set(name, Request(object.merge({type: name}, eventRequest)));
+> +    }
+> +  }
+> +
+> +  // Generate request handlers for each method definition
+
+These are completely unused on the client side, right? It probably doesn't matter; we've got to load the whole server side on the client side anyway.
+
+@@ +1033,5 @@
+> +    // Pick off event packets
+> +    if (this._clientSpec.events && this._clientSpec.events.has(packet.type)) {
+> +      let event = this._clientSpec.events.get(packet.type);
+> +      let args = event.request.read(packet, this);
+> +      (event.pre || []).forEach((pre) => pre.apply(this, args));
+
+nit: That is sure a weird way to spell 'if (event.pre)'... :)
+
+@@ +1086,5 @@
+> +/**
+> + * Process a front definition from its prototype and generate
+> + * request methods.
+> + */
+> +exports.frontProto = function(proto) {
+
+Why is frontProto exported?
+
+@@ +1127,5 @@
+> +        let histogramId = "DEVTOOLS_DEBUGGER_RDP_"
+> +          + transportType + spec.telemetry + "_MS";
+> +        try {
+> +          histogram = Services.telemetry.getHistogramById(histogramId);
+> +          startTime = +new Date;
+
+nit: Isn't Date.now() the same as +new Date, but without the temporary object allocation?
+
+@@ +1157,5 @@
+> +    // Release methods should call the destroy function on return.
+> +    if (spec.release) {
+> +      let fn = proto[name];
+> +      proto[name] = function(...args) {
+> +        return fn.apply(this, args).then(result => {
+
+Do we support one-way release methods? For one-way methods, fn returns undefined. If we don't support that combination, we should check for that and report an error.
+
+@@ +1172,5 @@
+> +
+> +  let events = proto._actorSpec.events;
+> +  if (events) {
+> +    // This actor has events, scan the prototype for preEvent handlers...
+> +    let preHandlers = new Map();
+
+nit: I love omitting empty paren pairs in 'new' expressions. Do you? :)
+
+@@ +1179,5 @@
+> +      if (!desc.value) {
+> +        continue;
+> +      }
+> +      if (desc.value._preEvent) {
+> +        let preEvent = desc.value._preEvent;
+
+Could we check here that preEvent is actually an event name that appears in events?
+
+@@ +1192,5 @@
+> +
+> +    proto._clientSpec.events = new Map();
+> +
+> +    for (let name of events.keys()) {
+> +      let request = events.get(name);
+
+Isn't this exactly:
+
+for (let [name, request] of events)
+
+?
+
+::: toolkit/devtools/server/tests/unit/test_protocol_children.js
+@@ +21,5 @@
+> +let testTypes = {};
+> +
+> +// Predeclaring the actor type so that it can be used in the
+> +// implementation of the child actor.
+> +types.addActorType("childActor");
+
+Doesn't ActorClass do exactly this before processing the prototype?
+Comment on attachment 761229
+v3
+
+Review of attachment 761229:
+-----------------------------------------------------------------
+
+Some more comments...
+
+::: toolkit/devtools/server/actors/string.js
+@@ +46,5 @@
+> +      start: Arg(0),
+> +      end: Arg(1)
+> +    },
+> +    response: { substring: RetVal() },
+> +    returns: "substring"
+
+What does 'returns' do?
+
+::: toolkit/devtools/server/protocol.js
+@@ +23,5 @@
+> +
+> +/**
+> + * Types: named marshallers/demarshallers.
+> + *
+> + * Types provide 'write' function that takes a js representation and
+
+Missing "a".
+
+@@ +211,5 @@
+> +  })
+> +}
+> +
+> +/**
+> + * Register an actor type with the type system.
+
+This comment ought to talk a little bit about how actors are serialized --- especially that they're just names in requests, but forms in replies. (This is a fine decision, as forms are meant to provide frequently-needed context within the packet, whereas requests just need the name; but it's worth calling out the asymmetry.)
+
+@@ +215,5 @@
+> + * Register an actor type with the type system.
+> + *
+> + * This function can be called before the associated actor has been
+> + * constructed, but the read and write methods won't work until
+> + * the associated addActorImpl or addActorFront methods have been
+
+The 'read' and 'write' functions never use the 'actorClass' property, as far as I can see. It's always the server that decides to create an actor.
+
+@@ +269,5 @@
+> +/**
+> + * Register an actor implementation for a previously-added actor type.
+> + */
+> +types.addActorImpl = function(name, actorClass) {
+> +  registeredTypes.get(name).actorClass = actorClass;
+
+There don't seem to be any tests that use a type's actorClass member. It seems like this is only useful when one wants to construct actors given their type name; I don't really understand when that case arises.
+
+@@ +782,5 @@
+> +      for (let key of this._actorSpec.events.keys()) {
+> +        let name = key;
+> +        this.on(name, (...args) => {
+> +          this._sendEvent.apply(this, [name].concat(args));
+> +        });
+
+You could also say, just after the 'let':
+
+let sendEvent = this._sendEvent.bind(this, name)
+
+and then, in the arrow function:
+
+sendEvent.apply(null, args)
+
+That does the concatenation, effectively, just by pushing the bound args, and then the applied args, on the JS stack.
+
+@@ +809,5 @@
+> +   * @param [optional] string hint
+> +   *   Optional string to customize the form.
+> +   * @returns A jsonable object.
+> +   */
+> +   form: function(hint) {
+
+(Did the indentation change here?)
+
+@@ +837,5 @@
+> + *    The method specification, with the following (optional) properties:
+> + *      request (object): a request template.
+> + *      response (object): a response template.
+> + *      oneway (bool): 'true' if no response should be sent.
+> + *      telemetry (string): Telemetry probe ID for measuring completion time.
+
+They can include 'name' and 'release' here, too, right?
+
+I don't quite understand how 'name' support can work: if it's different from the actual name of the property on the (soon-to-be) prototype object, then the handler function that exports.actorProto generates will try to call a different property of 'this' than the one holding the method(...). That seems really confusing.
+
+@@ +850,5 @@
+> +/**
+> + * Process an actor definition from its prototype and generate
+> + * request handlers.
+> + */
+> +exports.actorProto = function(actorProto) {
+
+Why is actorProto exported?
+
+@@ +853,5 @@
+> + */
+> +exports.actorProto = function(actorProto) {
+> +  if (actorProto._actorSpec) {
+> +    // Already processed this prototype.
+> +    return actorProto;
+
+This isn't an error? frontProto treats it as one.
+
+@@ +891,5 @@
+> +      protoSpec.events.set(name, Request(object.merge({type: name}, eventRequest)));
+> +    }
+> +  }
+> +
+> +  // Generate request handlers for each method definition
+
+These are completely unused on the client side, right? It probably doesn't matter; we've got to load the whole server side on the client side anyway.
+
+@@ +1033,5 @@
+> +    // Pick off event packets
+> +    if (this._clientSpec.events && this._clientSpec.events.has(packet.type)) {
+> +      let event = this._clientSpec.events.get(packet.type);
+> +      let args = event.request.read(packet, this);
+> +      (event.pre || []).forEach((pre) => pre.apply(this, args));
+
+nit: That is sure a weird way to spell 'if (event.pre)'... :)
+
+@@ +1086,5 @@
+> +/**
+> + * Process a front definition from its prototype and generate
+> + * request methods.
+> + */
+> +exports.frontProto = function(proto) {
+
+Why is frontProto exported?
+
+@@ +1127,5 @@
+> +        let histogramId = "DEVTOOLS_DEBUGGER_RDP_"
+> +          + transportType + spec.telemetry + "_MS";
+> +        try {
+> +          histogram = Services.telemetry.getHistogramById(histogramId);
+> +          startTime = +new Date;
+
+nit: Isn't Date.now() the same as +new Date, but without the temporary object allocation?
+
+@@ +1157,5 @@
+> +    // Release methods should call the destroy function on return.
+> +    if (spec.release) {
+> +      let fn = proto[name];
+> +      proto[name] = function(...args) {
+> +        return fn.apply(this, args).then(result => {
+
+Do we support one-way release methods? For one-way methods, fn returns undefined. If we don't support that combination, we should check for that and report an error.
+
+@@ +1172,5 @@
+> +
+> +  let events = proto._actorSpec.events;
+> +  if (events) {
+> +    // This actor has events, scan the prototype for preEvent handlers...
+> +    let preHandlers = new Map();
+
+nit: I love omitting empty paren pairs in 'new' expressions. Do you? :)
+
+@@ +1179,5 @@
+> +      if (!desc.value) {
+> +        continue;
+> +      }
+> +      if (desc.value._preEvent) {
+> +        let preEvent = desc.value._preEvent;
+
+Could we check here that preEvent is actually an event name that appears in events?
+
+@@ +1192,5 @@
+> +
+> +    proto._clientSpec.events = new Map();
+> +
+> +    for (let name of events.keys()) {
+> +      let request = events.get(name);
+
+Isn't this exactly:
+
+for (let [name, request] of events)
+
+?
+
+::: toolkit/devtools/server/tests/unit/test_protocol_children.js
+@@ +21,5 @@
+> +let testTypes = {};
+> +
+> +// Predeclaring the actor type so that it can be used in the
+> +// implementation of the child actor.
+> +types.addActorType("childActor");
+
+Doesn't ActorClass do exactly this before processing the prototype?
+Verified that comment 28 is an exact duplicate of 27. Nothing new: Splinter did not serve me well, and I'd forgotten that I'd checked "Match case", so when I checked it seemed like some comments were missing. Comedic/pathetic.
+Created attachment 763120
+v5
+https://hg.mozilla.org/integration/fx-team/rev/92dcbf76754e
+https://hg.mozilla.org/mozilla-central/rev/92dcbf76754e
+https://hg.mozilla.org/mozilla-central/rev/f9cd65044538

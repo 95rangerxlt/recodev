@@ -1,0 +1,137 @@
+This is because we're calling rAF on the content window. This gets destroy on navigation.
+
+This is because we're calling rAF on the content window. This gets destroy on navigation.
+s/destroy/destroyed/
+Created attachment 8437915
+v1
+Comment on attachment 8437915
+v1
+
+Whoops, found a small bug.
+Created attachment 8437973
+v2
+
+Ok, so this simply moves the rAF call from the content window to the owner tab chrome window. Since the refresh driver synchronizes ticks across chrome/content UI, this should yield the exact same result, but rAF loops don't get lost on navigation (because the requester/requestee stays the same).
+
+I tried making this work by listening to will-navigate/navigate events on the tab actor, but that would suffer from short "dead" zones in which ticks aren't recorded, until rAF is called again on the new content window.
+Comment on attachment 8437973
+v2
+
+Review of attachment 8437973:
+-----------------------------------------------------------------
+
+This looks like a simple enough change.
+I've added a few questions below though.
+You can mark R+ with questions answered cause I'm not actually sure of the implications.
+
+::: toolkit/devtools/server/actors/framerate.js
+@@ -32,5 @@
+>      this._onRefreshDriverTick = this._onRefreshDriverTick.bind(this);
+>    },
+>    destroy: function(conn) {
+>      protocol.Actor.prototype.destroy.call(this, conn);
+> -    this.finalize();
+
+Right, the actor didn't even have a finalize function :|
+
+@@ +74,5 @@
+>  
+>    /**
+> +   * Gets the refresh driver ticks recorded so far.
+> +   */
+> +  getPendingTicks: method(function(beginAt = 0, endAt = Number.MAX_SAFE_INTEGER) {
+
+Is making this a method required to live update the graph on the client-side during a recording?
+
+@@ +173,5 @@
+> +function getChromeWin(innerWin) {
+> +  return innerWin
+> +    .QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIWebNavigation)
+> +    .QueryInterface(Ci.nsIDocShellTreeItem).rootTreeItem
+> +    .QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindow);
+
+Is this going to work in an E10S environment? I'm unsure of what side of the process boundaries the various windows are.
+
+::: toolkit/devtools/server/tests/mochitest/test_framerate_04.html
+@@ +33,5 @@
+> +    front.startRecording().then(() => {
+> +      window.setTimeout(() => {
+> +        front.getPendingTicks().then(firstBatch => {
+> +          target.once("will-navigate", () => {
+> +            window.setTimeout(() => {
+
+Why a setTimeout here? Is this just to give some time to record more ticks on the new page?
+Wouldn't using the "navigate" event be better for this?
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #5)
+> Comment on attachment 8437973
+> v2
+> 
+> Review of attachment 8437973:
+> -----------------------------------------------------------------
+> 
+> This looks like a simple enough change.
+> I've added a few questions below though.
+> You can mark R+ with questions answered cause I'm not actually sure of the
+> implications.
+> 
+> ::: toolkit/devtools/server/actors/framerate.js
+> @@ -32,5 @@
+> >      this._onRefreshDriverTick = this._onRefreshDriverTick.bind(this);
+> >    },
+> >    destroy: function(conn) {
+> >      protocol.Actor.prototype.destroy.call(this, conn);
+> > -    this.finalize();
+> 
+> Right, the actor didn't even have a finalize function :|
+> 
+
+Yeah, copy paste fail from other actors in the original bug 1007200.
+
+> @@ +74,5 @@
+> >  
+> >    /**
+> > +   * Gets the refresh driver ticks recorded so far.
+> > +   */
+> > +  getPendingTicks: method(function(beginAt = 0, endAt = Number.MAX_SAFE_INTEGER) {
+> 
+> Is making this a method required to live update the graph on the client-side
+> during a recording?
+> 
+
+No, this is needed in the test, which goes like so:
+1. Start recording
+2. Wait for ticks to accumulate
+3. Get ticks (batch A)
+4. Reload page
+5. Wait for ticks to accumulate
+6. Get ticks (batch B)
+7. Make sure B ⊂ A
+
+> @@ +173,5 @@
+> > +function getChromeWin(innerWin) {
+> > +  return innerWin
+> > +    .QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIWebNavigation)
+> > +    .QueryInterface(Ci.nsIDocShellTreeItem).rootTreeItem
+> > +    .QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindow);
+> 
+> Is this going to work in an E10S environment? I'm unsure of what side of the
+> process boundaries the various windows are.
+> 
+
+None of our actors (nor devtools) will work in E10S anyway!
+
+> ::: toolkit/devtools/server/tests/mochitest/test_framerate_04.html
+> @@ +33,5 @@
+> > +    front.startRecording().then(() => {
+> > +      window.setTimeout(() => {
+> > +        front.getPendingTicks().then(firstBatch => {
+> > +          target.once("will-navigate", () => {
+> > +            window.setTimeout(() => {
+> 
+> Why a setTimeout here? Is this just to give some time to record more ticks
+> on the new page?
+> Wouldn't using the "navigate" event be better for this?
+
+See my previous comment about how the test works. We're trying to allow ticks to accumulate after reloading. Since "will-navigate" was the turning-point before (it's when the content window gets destroyed, and rAF won't fire anymore), it's a better event to wait for than "navigate". Also, waiting for "navigate" doesn't guarantee that the refresh driver will tick, because often times "navigate" and "will-navigate" are fired synchronously and sequentially.
+https://hg.mozilla.org/integration/fx-team/rev/431dd53007b7
+https://hg.mozilla.org/mozilla-central/rev/431dd53007b7

@@ -1,0 +1,1085 @@
+BETA_JAVA8:
+----------
+
+JSR308 2.1.2 states: Static member accesses are preceded by a type name, but 
+that type name may not be annotated:
+
+@Illegal Outer.StaticNestedClass // illegal!
+@Illegal Outer.staticField // illegal!
+
+While we reject the latter snippet, we silently accept the former.
+
+BETA_JAVA8:
+----------
+
+JSR308 2.1.2 states: Static member accesses are preceded by a type name, but 
+that type name may not be annotated:
+
+@Illegal Outer.StaticNestedClass // illegal!
+@Illegal Outer.staticField // illegal!
+
+While we reject the latter snippet, we silently accept the former.
+Shankha, please follow up. Hint: Find out why is 
+rejectAnnotationsOnStaticMemberQualififer not working ? It is because
+the type annotations are actually attached to the field and not to the
+type of the field. How can this method be modified so that irrespective
+of where the type annotations are attached it would do the right thing ?
+Working on it.
+Hi Srikanth,
+We seem to accept both 
+
+@Illegal Outer.StaticNestedClass // illegal!
+@Illegal Outer.staticField // illegal!
+
+
+-------------- X.java
+class Y {
+	static int i = 10;
+	static class Z {
+		Z() {}
+	}
+}
+
+public class X {
+	public static void main(String[] args) {
+		@Illegal Y.Z z = new Y.Z();
+		@Illegal int i = Y.i;
+		System.out.println(z);
+		System.out.println(i);
+	}
+}
+
+------------- Illegal.java
+
+public @interface Illegal {
+
+}
+
+Thanks
+(In reply to comment #3)
+> Hi Srikanth,
+> We seem to accept both 
+
+In your example, @Illegal is not meta annotated with TYPE_USE. It should
+be.
+
+> 
+> @Illegal Outer.StaticNestedClass // illegal!
+> @Illegal Outer.staticField // illegal!
+
+> 		@Illegal int i = Y.i;
+
+This should be 
+
+    int i = @Illegal Y.i;
+
+to match my second example - we already reject this.
+(In reply to comment #1)
+> Shankha, please follow up. Hint: Find out why is 
+> rejectAnnotationsOnStaticMemberQualififer not working ? 
+
+Also find out why "Y.Z yz = (@Illegal Y.Z)null;" is correctly rejected.
+That gives you one working case and one broken case.
+Hi,
+Following is the update on debugging. 
+
+I had the following unit test case in NegativeTypeAnnotationTest.java:
+
+// [1.8][compiler] Illegal type annotations not rejected (https://bugs.eclipse.org/bugs/show_bug.cgi?id=415308)
+	public void test415308() {
+		this.runNegativeTest(
+				new String[] {
+					"p/X.java",
+					"package p;\n" +
+					"import java.lang.annotation.ElementType;\n" +
+					"import java.lang.annotation.Target;\n" +
+					"\n" +
+					"@Target(ElementType.TYPE_USE)\n" +
+					"@interface Illegal {\n" +
+					"}\n" +
+					"class Y {\n" +
+					"	static class Z {\n" +
+					"		Z() {}\n" +
+					"	}\n" +
+					"}\n" +
+					"\n" +
+					"class X {\n" +
+					"	Y.Z foo() {\n" +
+					"		@Illegal Y.Z z = new Y.Z();\n" +
+					"		return z;\n" +
+					"	}\n" +
+					"	Y.Z foo2() {\n" +
+					"		Y.Z z = (@Illegal Y.Z)null;\n" +
+					"		return z;\n" +
+					"	}\n" +
+					"}\n"
+				},
+		"X");
+	}
+
+We throw up a error for foo2:
+Y.Z z = (@Illegal Y.Z)null;
+
+As pointed out in previous comment the function responsible for reporting the error is:
+protected void rejectAnnotationsOnStaticMemberQualififer(Scope scope, ReferenceBinding currentType, int tokenIndex) {
+		// https://bugs.eclipse.org/bugs/show_bug.cgi?id=385137
+		if (this.annotations != null && currentType.isMemberType() && currentType.isStatic()) {
+			Annotation[] qualifierAnnot = this.annotations[tokenIndex - 1];
+			if (qualifierAnnot != null) {
+				scope.problemReporter().illegalTypeAnnotationsInStaticMemberAccess(qualifierAnnot[0],
+						qualifierAnnot[qualifierAnnot.length - 1]);
+			}
+		}
+	}
+
+The variable this.annotations is set for the case where we report the error. 
+The variable this.annotations is not set for the case where we do not report the error. 
+
+I ran a Search -> Write Access on this.annotations to figure out exactly where 
+the variable gets set. Out of all the possible results thrown up I do not think they are responsible for the field to be initialized. 
+
+At this point I am trying to figure out where does the field gets initialized. 
+
+Thanks
+(In reply to shankha banerjee from comment #6)
+
+> the variable gets set. Out of all the possible results thrown up I do not
+> think they are responsible for the field to be initialized. 
+> 
+> At this point I am trying to figure out where does the field gets
+> initialized. 
+> 
+Please ignore this part of the comment.
+
+Thanks
+Created attachment 235188
+WIP: Patch
+
+I have the basic solution. Will have to write test cases.
+
+The solution is mainly confined to 
+
+org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/Annotation.java
+org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/QualifiedTypeReference.java
+
+Thanks
+The solution looks good except for this test case:
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class YY {
+		class Z {
+			Z() {}
+		}
+	}
+}
+class X {
+	Y.YY.Z foo() {
+		@Illegal Y.YY.Z z = null; // We fail to report the error.
+		return z;
+	}
+	Y.YY.Z bar() {
+		Y.YY.Z z = (@Illegal Y.YY.Z)null;
+		return z;
+	}
+}
+(In reply to shankha banerjee from comment #9)
+> The solution looks good except for this test case:
+> 
+> import java.lang.annotation.ElementType;
+> import java.lang.annotation.Target;
+> 
+> @Target(ElementType.TYPE_USE)
+> @interface Illegal {
+> }
+> class Y {
+> 	static class YY {
+> 		class Z {
+> 			Z() {}
+> 		}
+> 	}
+> }
+> class X {
+> 	Y.YY.Z foo() {
+> 		@Illegal Y.YY.Z z = null; // We fail to report the error.
+> 		return z;
+> 	}
+> 	Y.YY.Z bar() {
+> 		Y.YY.Z z = (@Illegal Y.YY.Z)null;
+> 		return z;
+> 	}
+> }
+
+Please Ignore the comment.
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class YY {
+		class Z {
+			Z() {}
+		}
+	}
+}
+class X {
+	Y.YY.Z bar() {
+		Y.YY.Z z = (@Illegal Y.YY.Z)null;
+		return z;
+	}
+}
+
+The error thrown is:
+1. ERROR in p\X.java (at line 21)\n
+	Y.YY.Z z = (@Illegal Y.YY.Z)null;\n
+	            ^^^^^^^^\n
+Type annotations are not allowed on type names used to access static members
+
+In my opinion the annotation is associated with the type Z which is not static. 
+The error is due to the fact before calling:
+
+
+This is a bug (in the original code without any of my changes).
+
+rejectAnnotationsOnStaticMemberQualififer
+
+one of the parameters currenttype is wrongly assigned to this.resolvedType.
+
+Thanks
+(In reply to shankha banerjee from comment #11)
+
+> The error thrown is:
+> 1. ERROR in p\X.java (at line 21)\n
+> 	Y.YY.Z z = (@Illegal Y.YY.Z)null;\n
+> 	            ^^^^^^^^\n
+> Type annotations are not allowed on type names used to access static members
+> 
+> In my opinion the annotation is associated with the type Z which is not
+> static. 
+
+It is not a matter of opinion Shankha :) The standard says the way yo annotate
+Z is to say Y.YY.@Legal Z. A type annotation is placed immediately before the
+type it annotates.
+Thanks. Just for confirmation. 
+This case is a bug ?
+Y.YY.Z z = (@Illegal Y.YY.Z)null;\n
+	            ^^^^^^^^\n
+Type annotations are not allowed on type names used to access static members
+
+
+As Y is not a static.
+
+Thanks
+(In reply to shankha banerjee from comment #13)
+> Thanks. Just for confirmation. 
+> This case is a bug ?
+> Y.YY.Z z = (@Illegal Y.YY.Z)null;\n
+> 	            ^^^^^^^^\n
+> Type annotations are not allowed on type names used to access static members
+
+Y is a type name that is being used to access a static member YY. So Y cannot
+be annotated.
+Created attachment 235323
+WIP: Patch
+
+This is a complete patch for all the case belonging to local declaration with
+the issues described above. I have run NegativeTypeAnnotationTest.java and it is fine.
+
+If you get a chance please review. 
+
+Will work on classfields and parametrized types.
+
+Thanks
+The code which handles the case is at:
+
+LocalVariableBinding localVariableBinding = (LocalVariableBinding)this.recipient;
+LocalDeclaration localDeclaration = localVariableBinding.declaration;
+if (localDeclaration.type instanceof QualifiedTypeReference) {
+  QualifiedTypeReference typeReference = (QualifiedTypeReference)localDeclaration.type;
+  ReferenceBinding currentType = (ReferenceBinding) localDeclaration.type.resolvedType;
+  while (currentType != null) {
+	typeReference.rejectAnnotationsOnStaticMemberQualififer(scope, currentType, localDeclaration.annotations);
+	currentType = currentType.enclosingType();
+  }
+}
+
+In Annotation.java in Line no : 1121. 
+
+Two test cases have been added as in NegativeTypeannotation.java 
+test415308a and test415308b. 
+
+With respect to test415308b I was the code for all the three functions foo, foo2 and foo3 to be handled by the same code. The function foo is handled by the code above but not the function foo2 and foo3. 
+
+I have copied the test case for your reference.
+
+Y.YY.Z foo() {
+  @Illegal Y.YY.Z z = null;
+	return z;
+}
+Y.YY.Z foo2() {
+  Y.@Illegal YY.Z z = null;
+	return z;
+}
+Y.YY.Z foo3() {
+  Y.YY.@Illegal Z z = null;
+	return z;
+}
+
+Could you please let me know where does the code which handles foo2 and foo3 belongs.
+
+Thanks
+Hi,
+Please ignore comment16. I had few more questions.
+
+Please consider the two test cases:
+
+---------- Test 1 -------------------
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+   public @Illegal Y.Z foo() { return null;}
+} 
+
+
+---------------------------------------
+
+--------- Test 2 ----------------------
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+   @Illegal 
+   Y.Z z;
+} 
+
+----------------------------------------
+---------------------------------------
+
+We should report error for these two cases at places where type use annotations 
+are used on static nested types.
+
+The annotations in these two cases associated with FieldDeclaration and MethodDeclaration. (Please look at resolveType in Annotation.java).
+
+The resolvedType for typeReference (e.g. ((QualifiedTypeReference) (FieldDeclaration.type)).resolveType) has not yet been assigned and is null. 
+
+Thus it doesn't allow us to know if the FieldDeclaration type or the return type of the method is a static nested class. 
+
+The problem could also be handled in "protected TypeBinding getTypeBinding(Scope scope)" 
+in QualifiedTypeReference.java. This issue is annotations are associated with FieldDeclaration and MethodDeclartion  and not its type. 
+
+
+One way of solving the problem would be to copy the annotations from FieldDeclaration and MethodDeclaration to it's type. 
+
+I will check how we handle it for simple datatypes for the above two test cases
+"@Illegal Outer.staticField // illegal!".
+
+Thanks,
+Shankha
+(In reply to shankha banerjee from comment #17)
+
+> I will check how we handle it for simple datatypes for the above two test
+> cases
+> "@Illegal Outer.staticField // illegal!".
+> 
+
+Does not make sense in these two scenarios. 
+
+thanks
+Created attachment 235488
+Patch (1) - WIP
+
+Patch with all the required changes.
+RunAllJava8 tests are clean.
+
+Type Use Annotations on fields are not handled. Test cases are in place.
+Type use Annotations on local variables, array types, parameters have been handled. 
+
+Will wait for https://bugs.eclipse.org/bugs/show_bug.cgi?id=409586 and see if any changes are needed and if type annotation on fields can also be handled. 
+
+Will put up for review after those changes.
+
+If anyone wishes to review, please do so as the patch is clean and doesn't depend on anything else. 
+
+Thanks
+(In reply to shankha banerjee from comment #19)
+
+> Will wait for https://bugs.eclipse.org/bugs/show_bug.cgi?id=409586 and see
+> if any changes are needed and if type annotation on fields can also be
+> handled. 
+
+Shankha, this is released. Take a look at org.eclipse.jdt.internal.compiler.ast.ASTNode.copySE8AnnotationsToType(BlockScope, Binding, AnnotationBinding[])
+I had a look at https://bugs.eclipse.org/bugs/show_bug.cgi?id=409586 and other comments where TBD things are mentioned. 
+
+I had a test case:
+
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+  @interface Illegal {
+  }
+class Y {
+  static class Z {
+	Z() {}
+  }
+}
+class X {
+  @Illegal 
+	Y.Z z;
+}
+
+We should get a error. 
+ ERROR in p\\X.java (at line 14)
+  @Illegal 
+  ^^^^^^^^
+  Type annotations are not allowed on type names used to access static members
+} 
+
+We copy the bindings to types from fields at as you have already mentioned in 
+ASTNode.copySE8AnnotationsToType(initializationScope, field, annotations);
+
+The call to the function originates from resolveTypeFor (SourceTypeBinding.java)
+
+The annotation is associated with fieldDecl(this.scope.referenceContext.fields) and not the field. 
+
+
+
+Thanks
+Shankha
+I have a fix. Will put it up soon. It is something on lines of this:
+
+Create annnotation bindings form field declarations and subsequently take it from there.
+
+
+Thanks
+Created attachment 235619
+Patch
+
+Up for review.
+Patch with all the changes. 
+
+RunAllJava8Tests results are fine. Have Given RunAllJDTCore tests a run. Will update with the results.
+
+I had two questions. I will investigate them also myself.
+
+1) I have a call to 
+	checktypeAnnotations(this.scope, fieldDecl.type, fieldDecl.annotations);
+
+At Line no : 1644 SourceTypeBinding.java
+
+The first parameter should be  field.scope instead of this.scope?
+
+2) I have a call to 
+      checktypeAnnotations(methodDecl.scope, returnType, methodDecl.annotations)
+
+Line No: 1830 SourceTypeBinding.java
+
+The first parameter should be  this.scope instead of methodDecl.scope?
+
+3) At various places we rely on instanceof checks:
+
+e.g.  a) checkTypeAnnotations
+      b) computeInnerEntryInfo
+particularly for determining it is a array binding.
+Can't we check for Binding.ARRAY_TYPE.
+
+Thanks
+Thanks, I'll review this in a couple of days. Appreciate your patience.
+RunAllJDTCore Results are fine.
+(1) I think the .classpath change is not intended to be included.
+
+(2) Thanks for the many tests, Comparing with javac 8b104, I see the
+following differences:
+
+(a) javac is not issuing any error for: 
+
+class X {
+	Y.Z foo() {
+		Y.Z z = null;
+		return z;
+	}
+	Y.Z bar() {
+		Y.Z z = (@Illegal Y.Z)null; // NO ERROR HERE.
+		return z;
+	}
+}
+
+This is a bug in javac.
+
+(b) Looking at test415308b: javac issues an error in
+Y.@Illegal YY.Z z = null;
+
+X.java:20: error: enclosing static nested class cannot be annotated
+                Y.@Illegal YY.Z z = null;
+                                ^
+
+We compile this code fine. Javac behavior is inconsistent though: 
+
+Y.@Illegal YY.Z[] z = null; does not generate any error.
+
+(c) In test415308c, we emit one error while javac emits two - Here again
+javac behavior looks suspect.
+
+
+Shankha, we should not name legal annotations as Illegal as it could
+be confusing for a future reader.
+
+More comments will follow.
+Created attachment 235707
+reviewed patch
+
+Shankha and I reviewed the earlier patch, cleaned up and polished a few
+issues. The present patch is under test.
+I ran the tests. 
+
+The following test case fails:
+
+NullAnnotationTest.java : test_enum_field_02
+
+package tests;
+import org.eclipse.jdt.annotation.*;
+public class X {
+    enum A { B }
+    public static void main(String ... args) {
+         test(A.B);
+    }
+    static void test(@NonNull A a) {// ------------> ERROR
+        System.out.println(a.ordinal());
+    }
+} 
+
+
+----------\n
+1. ERROR in tests\X.java (at line 8)\n
+	static void test(@NonNull A a) {\n
+	                 ^^^^^^^^\n
+Type annotations are not allowed on type names used to access static members\n
+----------\n
+
+
+I am copying the function as it is in the patch and not on the main branch:
+
+public static void isTypeUseCompatible(TypeReference reference, Scope scope, Annotation[] annotations) {
+  if (annotations == null)
+	return;
+
+  TypeBinding resolvedType = reference == null ? null : reference.resolvedType == null ? null : reference.resolvedType.leafComponentType();
+  if (resolvedType == null || !resolvedType.isNestedType())
+	return;
+
+nextAnnotation:
+  for (int i = 0, annotationsLength = annotations.length; i < annotationsLength; i++) {
+	Annotation annotation = annotations[i];
+
+// --------> We read the metabits here.
+	long metaTagBits = annotation.resolvedType.getAnnotationTagBits();
+
+
+	if ((metaTagBits & TagBits.AnnotationForTypeUse) != 0 && (metaTagBits & TagBits.SE7AnnotationTargetMASK) == 0
+		/*&& (metaTagBits & TagBits.AnnotationNonNull) == 0*/) {
+	  ReferenceBinding currentType = (ReferenceBinding) resolvedType;
+	  while (currentType.isNestedType()) {
+		if (currentType.isStatic()) {
+		  QualifiedTypeReference.rejectAnnotationsOnStaticMemberQualififer(scope, currentType, new Annotation [] { annotation });
+		  continue nextAnnotation;
+		}
+		currentType = currentType.enclosingType();
+	  }
+	}
+  }
+} 
+
+
+The reason is we pass the check:
+
+if ((metaTagBits & TagBits.AnnotationForTypeUse) != 0 && (metaTagBits & TagBits.SE7AnnotationTargetMASK) == 0)
+
+Which we shouldn't have.
+
+I tried putting in a check for detecting if annotations are nonnull.
+	(metaTagBits & TagBits.AnnotationNonNull) == 0
+but it succeeds. I am debugging the case.
+
+
+Thanks
+Created attachment 235787
+New Patch
+
+
+Up for review.
+A new patch has been uploaded. 
+The jdt core code has not been touched. Changes are only with respect to
+test cases.
+
+1) A new file NullAnnotationTest.java
+
+Test case:
+test_enum_field_02
+
+has been modified.
+
+2) NegativeTypeAnnotationTest.java
+
+a) Few test cases had incorrectly named annotation names. They have been corrected.
+
+b) A new test case test415308g has been added for figuring out if we are 
+recognizing enum fields as static and therefore report annotations on nested 
+enum fields.
+
+A comparison for test cases with oracle compiler and eclipse compiler is as follows:
+
+--------------------------------------------------------------------
+1)
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+	Y.Z foo() {
+		@Illegal Y.Z z = null;
+		return z;
+	}
+	Y.Z bar() {
+		Y.Z z = (@Illegal Y.Z)null;
+		return z;
+	}
+}
+
+Eclipse Compiler:
+a. ERROR in X.java (at line 14)
+	@Illegal Y.Z z = null;
+	^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+b. ERROR in X.java (at line 18)
+	Y.Z z = (@Illegal Y.Z)null;
+	         ^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+
+javac:
+X.java:14: error: scoping construct for static nested type cannot be annotated
+		@Illegal Y.Z z = null;
+		         ^
+1 error 
+
+2)
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+	Y.Z[] foo() {
+		@Illegal Y.Z[] z = null;
+		return z;
+	}
+	Y.Z[] bar() {
+		Y.Z[] z = (@Illegal Y.Z[])null;
+		return z;
+	}
+}
+
+Eclipse Compiler:
+a. ERROR in X.java (at line 14)
+	@Illegal Y.Z[] z = null;
+	^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+
+b. ERROR in X.java (at line 18)
+	Y.Z[] z = (@Illegal Y.Z[])null;
+	           ^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+
+javac:
+X.java:14: error: scoping construct for static nested type cannot be annotated
+		@Illegal Y.Z z = null;
+		         ^
+1 error
+
+3)
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class YY {
+		class Z {
+			Z() {}
+		}
+	}
+}
+class X {
+	Y.YY.Z foo() {
+		@Illegal Y.YY.Z z = null;
+		return z;
+	}
+	Y.YY.Z foo2() {
+		Y.@Illegal YY.Z z = null;
+		return z;
+	}
+	Y.YY.Z foo3() {
+		Y.YY.@Illegal Z z = null;
+		return z;
+	}
+} 
+
+Eclipse Compiler:
+a. ERROR in X.java (at line 16)
+	@Illegal Y.YY.Z z = null;
+	^^^^^^^^
+Type annotations are not allowed on type names used to access static members 
+
+javac:
+X.java:16: error: scoping construct for static nested type cannot be annotated
+		@Illegal Y.YY.Z z = null;
+		         ^
+X.java:20: error: enclosing static nested class cannot be annotated
+		Y.@Illegal YY.Z z = null;
+		                ^
+2 errors
+
+4) 
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class YY {
+		class Z {
+			Z() {}
+		}
+	}
+}
+class X {
+	Y.YY.Z[] foo() {
+		@Illegal Y.YY.Z[] z = null;
+		return z;
+	}
+	Y.YY.Z[] foo2() {
+		Y.@Illegal YY.Z[] z = null;
+		return z;
+	}
+	Y.YY.Z[] foo3() {
+		Y.YY.@Illegal Z[] z = null;
+		return z;
+	}
+} 
+
+Eclipse Compiler:
+
+a. ERROR in X.java (at line 16)
+	@Illegal Y.YY.Z[] z = null;
+	^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+
+javac:
+
+X4.java:16: error: scoping construct for static nested type cannot be annotated
+		@Illegal Y.YY.Z[] z = null;
+		         ^
+1 error
+
+5) 
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface IllegalTypeUse {
+}
+@Target({ElementType.TYPE_USE, ElementType.PARAMETER})
+@interface LegalTypeUseParam {
+}
+@Target(ElementType.PARAMETER)
+@interface LegalParam {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+	Y.Z foo(@LegalParam Y.Z z) { //Legal
+		return z;
+	}
+	Y.Z foo2(@LegalTypeUseParam Y.Z z) { //Legal
+		return z;
+	}
+	Y.Z foo3(@IllegalTypeUse @LegalParam Y.Z z) { //Illegal
+		return z;
+	}
+} 
+
+Eclipse Compiler:
+a. ERROR in X.java (at line 25)
+	Y.Z foo3(@IllegalTypeUse @LegalParam Y.Z z) { //Illegal
+	         ^^^^^^^^^^^^^^^
+Type annotations are not allowed on type names used to access static members 
+
+
+javac:
+X.java:22: error: scoping construct for static nested type cannot be annotated
+	Y.Z foo2(@LegalTypeUseParam Y.Z z) { //Legal
+	                            ^
+X5.java:25: error: scoping construct for static nested type cannot be annotated
+	Y.Z foo3(@IllegalTypeUse @LegalParam Y.Z z) { //Illegal
+	                                     ^
+2 errors 
+
+6)
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+   @Illegal 
+	Y.Z z;
+} 
+
+Eclipse Compiler:
+1. ERROR in X.java (at line 13)
+	@Illegal 
+	^^^^^^^^
+Type annotations are not allowed on type names used to access static members 
+
+javac:
+X.java:13: error: scoping construct for static nested type cannot be annotated
+	Y.Z z;
+	^
+1 error
+
+
+7)
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target({ElementType.TYPE_USE, ElementType.FIELD})
+@interface Legal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+   @Legal 
+   Y.Z z;
+}
+
+Eclipse Compiler: No Erros
+
+javac:
+X.java:14: error: scoping construct for static nested type cannot be annotated
+	Y.Z z;
+	^
+1 error
+
+8)
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+@Target(ElementType.TYPE_USE)
+@interface Illegal2 {
+}
+@Target(ElementType.FIELD)
+@interface Legal {
+}
+class Y {
+	static class YY {
+		class Z {
+			Z() {}
+		}
+	}
+}
+class X {
+   @Legal @Illegal @Illegal2
+	Y.@Illegal YY.Z z;
+} 
+
+Eclipse:
+1. ERROR in X.java (at line 21)
+	@Legal @Illegal @Illegal2
+	       ^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+2. ERROR in X.java (at line 21)
+	@Legal @Illegal @Illegal2
+	                ^^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+
+javac:
+X.java:21: error: scoping construct for static nested type cannot be annotated
+	Y.@Illegal YY.Z z;
+	^
+X.java:21: error: enclosing static nested class cannot be annotated
+	Y.@Illegal YY.Z z;
+	                ^
+2 errors
+
+9)
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+   public @Illegal Y.Z foo() { return null;}
+} 
+
+Eclipse Compiler:
+
+a. ERROR in X.java (at line 13)
+	public @Illegal Y.Z foo() { return null;}
+	       ^^^^^^^^
+Type annotations are not allowed on type names used to access static members 
+
+javac:
+X.java:13: error: scoping construct for static nested type cannot be annotated
+   public @Illegal Y.Z foo() { return null;}
+                   ^
+1 error
+
+10) 
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	static class Z {
+		Z() {}
+	}
+}
+class X {
+   public @Illegal Y.Z[] foo() { return null;}
+} 
+
+
+Eclipse Compiler:
+1. ERROR in X.java (at line 13)
+	public @Illegal Y.Z[] foo() { return null;}
+	       ^^^^^^^^
+Type annotations are not allowed on type names used to access static members 
+
+javac:
+X.java:13: error: scoping construct for static nested type cannot be annotated
+   public @Illegal Y.Z[] foo() { return null;}
+                   ^
+1 error 
+
+
+11) 
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface Illegal {
+}
+class Y {
+	enum A { B }
+}
+class X {
+	@Illegal Y.A foo(@Illegal Y.A a) {
+		return a;
+	}
+} 
+
+Eclipse Compiler:
+a. ERROR in X.java (at line 11)
+	@Illegal Y.A foo(@Illegal Y.A a) {
+	^^^^^^^^
+Type annotations are not allowed on type names used to access static members
+
+b. ERROR in X.java (at line 11)
+	@Illegal Y.A foo(@Illegal Y.A a) {
+Type annotations are not allowed on type names used to access static members 
+
+javac:
+X.java:11: error: scoping construct for static nested type cannot be annotated
+	@Illegal Y.A foo(@Illegal Y.A a) {
+	         ^
+X.java:11: error: scoping construct for static nested type cannot be annotated
+	@Illegal Y.A foo(@Illegal Y.A a) {
+	                          ^
+2 errors
+-----------------------------------------------------------------------
+
+After going through the errors I believe the eclipse compiler is reporting all the errors correctly and there are no false errors being reported.
+
+Thanks
+(In reply to shankha banerjee from comment #29)
+> Created attachment 235787 [details]
+> New Patch
+
+RunAllJDTCore results are fine.
+
+Thanks
+(In reply to shankha banerjee from comment #29)
+> Created attachment 235787 [details]
+> New Patch
+
+Version b108 has been used for testing.
+
+Thanks
+SignOff Comment:
+
+My contribution complies with http://www.eclipse.org/legal/CoO.php
+Thanks Shankha, Test and fix released here: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=e593164022433d17467e437ca5f1d1580fcf9c34

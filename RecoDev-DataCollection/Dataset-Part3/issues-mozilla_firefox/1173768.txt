@@ -1,0 +1,152 @@
+
+
+
+Created attachment 8620954
+Screenshot
+
+STR:
+
+1. Open today's Nightly
+2. go to http://ororo.tv/en/shows/madmen#1-1
+3. click the fullscreen icon on the bottom right
+4. when the page is fullscreen, hit the [esc] key on your keyboard
+
+ER:
+go back to normal mode, tabs in titlebar, extra space in titlebar, placeholders around the tabs in the correct places
+
+AR:
+placeholders and titlebar spacing are all confused about not being in fullscreen
+
+specifically, see attachment
+
+Resizing the window fixes things.
+*** Bug 1174000 has been marked as a duplicate of this bug. ***
+I must have met this problem when I was implementing bug 1105939... Not sure what was going wrong again... Will check.
+Is it really a regression of bug 1161802?
+(In reply to Xidorn Quan [:xidorn] (UTC+12) from comment #4)
+> Is it really a regression of bug 1161802?
+
+It didn't happen the day before it landed, and it does now, so unless there's something else that broke it...
+(In reply to :Gijs Kruitbosch from comment #5)
+> (In reply to Xidorn Quan [:xidorn] (UTC+12) from comment #4)
+> > Is it really a regression of bug 1161802?
+> 
+> It didn't happen the day before it landed, and it does now, so unless
+> there's something else that broke it...
+
+Now confirmed with a local backout of bug 1161802.
+It seems the last resize of exiting fullscreen is dispatched with sizemode still being fullscreen, hence TabsInTitlebar._update is not executed correctly.
+Seems to be a regression from bug 1161802 patch 2.
+Weird. The only thing that patch effectively does is moving the fullscreen event to be triggered after changes of the window.
+
+Though pointerlock code is moved as well, but doesn't seem to be related. Also I tried to revert the change to santizer.js, but that doesn't make any difference as well.
+
+However, as far as I can see, there is only one listener to fullscreen event in desktop browser, which is in the browser-fullScreen.js. But code there doesn't seem to change sizemode attribute of the document element (which is used in TabsInTitlebar._update).
+
+On the other hand, it seems to me that the sizemode attribute is changed by nsXULWindow::SavePersistentAttributes(), but that function is called from a timer which is started by sizemode change. But the patch doesn't change when sizemode change happens.
+
+Anyone has idea how this change affects the sizemode attribute?
+Doesn't seem to be the reason mentioned in comment 7. The old code just follows exactly the same path for sizemode and TabsInTitlebar._update, although the path doesn't make sense to me.
+Created attachment 8621976
+patch
+
+This patch also fixes one minor bug left from bug 1105939 that the fullscreen button is not positioned correctly after exiting DOM fullscreen.
+Comment on attachment 8621976
+patch
+
+sounds like we should listen to the sizemodechange event instead of or in addition to the resize event
+That still won't work, because sizemodechange is dispatched synchronously when the sizemode of the window changes, but sizemode attribute is changed asynchronously.
+
+In addition, even at the time of sizemodechange event, corresponding UI elements are not ready either. Actually, they won't be ready until fullscreen event is handled (because they are changed there).
+
+Comment 7 and comment 9 are misleading. Fixing them won't help on this bug.
+And fullscreen event is handled after all resize and sizemodechange event. Hence we have to add another update there to ensure the UI correctly reflects the changes.
+(In reply to Xidorn Quan [:xidorn] (UTC+12) from comment #14)
+> And fullscreen event is handled after all resize and sizemodechange event.
+> Hence we have to add another update there to ensure the UI correctly
+> reflects the changes.
+
+Why is the UI still updating during the resize event?
+
+And if that can't be avoided, the patch should probably make sure that we don't update stuff twice. The things in TabsInTitlebar's code cause sync reflows and will interfere with any transition. IOW, if we can't avoid the results of measurements during the resize event being inaccurate, we should avoid doing anything based on the resize event in the case where we were in (DOM?) fullscreen and are moving back to normal/maximized windows, and bail out early.
+(In reply to Xidorn Quan [:xidorn] (UTC+12) from comment #13)
+> Actually, they won't be ready until
+> fullscreen event is handled (because they are changed there).
+
+Who is changing them then, and why, and can't they change them sooner? (e.g. in response to the resize/sizemodechange event)
+(In reply to :Gijs Kruitbosch from comment #16)
+> Who is changing them then, and why,
+
+The handler of fullscreen event changes that. It unhides the toolbar.
+
+> and can't they change them sooner? (e.g.
+> in response to the resize/sizemodechange event)
+
+Our fullscreen event handler relies on the document state for that change. And we need to flip the document state after the window change (which was what bug 1161802 for).
+
+We can get rid of that dependency (between fullscreen event handler and the document state), but it would produce more reflow because of the toolbar hiding animation when entering DOM fullscreen.
+Though, what we probably can do is, dispatching fullscreen event in different place for entering and leaving. For entering, after the document state flips, for leaving, before the window change. But that would be more tricky.
+(In reply to Xidorn Quan [:xidorn] (UTC+12) from comment #13)
+> That still won't work, because sizemodechange is dispatched synchronously
+> when the sizemode of the window changes, but sizemode attribute is changed
+> asynchronously.
+
+TabsInTitlebar could use window.windowState instead of the sizemode attribute, right?
+previous comment submitted too early; I assume TabsInTitlebar relies on style changes that require the sizemode attribute, so things might not be that simple.
+(In reply to Dão Gottwald [:dao] from comment #20)
+> previous comment submitted too early; I assume TabsInTitlebar relies on
+> style changes that require the sizemode attribute, so things might not be
+> that simple.
+
+Please note again that, the core problem of this bug is not when sizemode attribute is changed. It is about when the toolbar is actually displayed.
+
+Before fullscreen event is dispatched, the toolbar is not displayed at all. Even if the sizemode attribute has correct value, TabsInTitlebar._update still won't get proper geometry of UI controls, which then results to weird appearance.
+*** Bug 1174633 has been marked as a duplicate of this bug. ***
+So the thing effectively affects the UI is the removal of "inFullscreen" attributes in FullScreen.toggle().
+
+I tried to move `TabsInTitlebar.updateAppearance(true);` around in that method, and found that, if the update happens before `*.removeAttribute("inFullscreen");`, the titlebar is messed up. If we call if after that, everything is fine.
+Created attachment 8622806
+patch
+*** Bug 1175200 has been marked as a duplicate of this bug. ***
+Comment on attachment 8622806
+patch
+
+Review of attachment 8622806:
+-----------------------------------------------------------------
+
+Have you checked if this introduces race conditions if switching in and out of fullscreen mode quickly? Have you checked if there are any other effects on windows/linux?
+
+::: browser/base/content/browser.js
+@@ +5067,5 @@
+>          return;
+>        }
+> +      // Don't update right now if we are leaving fullscreen, since the UI is
+> +      // still changing in the consequent "fullscreen" event. Code there will
+> +      // call this update again when everything is ready.
+
+nit: "this function", not "this update".
+
+@@ +5073,5 @@
+> +      if (this._lastSizeMode == "fullscreen") {
+> +        return;
+> +      }
+> +    }
+> +    this._lastSizeMode = sizemode;
+
+You're delaying this until the second call in the fullscreen case, which means the value will be wrong in case we ever rely on it for other things. Please ensure this gets updated even if we early-return.
+
+(I somewhat prefer leaving the update inside the if-block, but I guess moving it does not actually hurt.)
+*** Bug 1175589 has been marked as a duplicate of this bug. ***
+Created attachment 8624131
+patch
+
+Unfortunately, the previous patch really cause some problem on Windows :(
+
+This should work fine on Windows and OS X.
+Created attachment 8624132
+patch
+
+Forgot to address the review comment.
+https://hg.mozilla.org/integration/fx-team/rev/502391d38d88
+https://hg.mozilla.org/mozilla-central/rev/502391d38d88
+*** Bug 1176450 has been marked as a duplicate of this bug. ***

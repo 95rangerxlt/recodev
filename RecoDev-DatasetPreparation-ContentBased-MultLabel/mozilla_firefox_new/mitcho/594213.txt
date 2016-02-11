@@ -1,0 +1,535 @@
+In multiple instances now, we've had to commit then back out things from moz-central because tests fail, even though they all pass locally, or sometimes even on try server.
+
+Moreover, when this has happened, they always fail with a similar signature:
+
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_dragdrop.js | The number of children in group one is decreased by 1 - Got 1, expected 0
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_dragdrop.js | The number of children in group two is increased by 1 - Got 1, expected 2
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_dragdrop.js | Found an unexpected tab at the end of test run: about:blank
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_group.js | Test timed out
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_launch.js | Tab View is hidden
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_launch.js | Test timed out
+...
+
+I now have an idea for why this has happened, so I'm going to try to improve the test.
+
+In multiple instances now, we've had to commit then back out things from moz-central because tests fail, even though they all pass locally, or sometimes even on try server.
+
+Moreover, when this has happened, they always fail with a similar signature:
+
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_dragdrop.js | The number of children in group one is decreased by 1 - Got 1, expected 0
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_dragdrop.js | The number of children in group two is increased by 1 - Got 1, expected 2
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_dragdrop.js | Found an unexpected tab at the end of test run: about:blank
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_group.js | Test timed out
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_launch.js | Tab View is hidden
+TEST-UNEXPECTED-FAIL | chrome://mochikit/content/browser/browser/base/content/test/tabview/browser_tabview_launch.js | Test timed out
+...
+
+I now have an idea for why this has happened, so I'm going to try to improve the test.
+Here's the idea, as I told Ian on IRC:
+
+[7:50pm] mitcho: iangilman: so, in the dragdrop test
+[7:51pm] mitcho: basically, when we fail, we fail after the simulateDragDrop
+[7:51pm] mitcho: the message is "The number of children in group one is decreased by 1"
+[7:51pm] mitcho: and if you look at simulateDragDrop
+[7:52pm] mitcho: the last thing we do is dispatch the drop event
+[7:52pm] mitcho: so I'm thinking
+[7:52pm] mitcho: depending on how fast things are moving
+[7:52pm] mitcho: if from the end of simulateDragDrop, until we move a few lines to the is()
+[7:53pm] mitcho: we haven't finished all of the response to the drop
+[7:53pm] mitcho: the test will fail
+[7:53pm] mitcho: so one of the things I sent to the tryserver is the css margin patch, but with this last bit of the test wrapped in a setTimeout(...,100)
+[7:53pm] mitcho: just to test this hypothesis.
+[7:54pm] mitcho: if that is indeed the cause of the failures, we need to come up with a reliable way to wait for some event at that point
+[7:56pm] iangilman: mitcho: sounds good
+
+[8:06pm] iangilman: same as the secret to comedy
+[8:06pm] aza: TIMING
+[8:07pm] mitcho: lol
+Created attachment 472868
+Proposed patch
+
+The main fix is moving the test checks to a function subscribed against the new childAdded event. It was renamed from tabAdded as tabRemoved is used elsewhere to mark the removal of a tab from the entire system, not just from a group, and moved so that it is fired more consistently. childRemoved was also added for parallelism.
+
+Requesting feedback from Raymond, the original author of the test.
+
+Requesting review simultaneously, however, as the patch is minor and Dietrich is also well aware of the pain this test has caused.
+Comment on attachment 472868
+Proposed patch
+
+Looks good to me.
+Comment on attachment 472868
+Proposed patch
+
+Still having some issues... investigating...
+Created attachment 472891
+Proposed patch, v2
+
+1. dragdrop: Made the computation of the offset more accurate.
+2. dragdrop: Made some changes to simulateDragDrop which make it a tad more accurate and better for later tests where things aren't actually moved (not a critical change).
+3. group: Updated to correspond with the previously noted change to the childAdded (née "tabAdded") event.
+
+Right now when running the whole suite, browser_tabview_launch (which runs after dragdrop and group) fails on "Tab View button exists". Raymond will investigate.
+Indeed, it looks like browser_tabview_launch is failing because browser_tabview_group is not finishing cleanly. It's leaving tabview open right before finishing:
+
+http://img.skitch.com/20100908-n89w2rsrx3wt7kubajgx9rjf8t.jpg
+Here for reference is a list of bugs which were committed to moz-central once but were then backed out because of test failures which match this signature:
+
+Pushed by Ehsan, Tuesday: Bug 588999, Bug 591706, Bug 592586
+Pushed by Dietrich, Monday: Bug 592586, Bug 591147, Bug 590742
+Pushed by Josh Matthews, Saturday: Bug 591167, Bug 591705, Bug 591706, Bug 592586, Bug 591147, Bug 587040
+
+WARNING: This is not to mean that these patches would pass perfectly if the tests were fixed... it just means that they *may* have been false failures due to the bad tests.
+Raymond and I agreed on IRC that there browser_tabview_group had conceptual issues (we were clicking a DOM element in tabview while tabview was hidden) so we are rewriting it. Raymond is now touching it up.
+Created attachment 472939
+Proposed patch v3
+Comment on attachment 472939
+Proposed patch v3
+
+In browser_tabview_dragdrop.js:
+
+* now that srcElement is a TabItem rather then a DOM element, change its name to something more appropriate
+
+In browser_tabview_group.js:
+
+* if I understand correctly, this test assumes there is still a group open from the last test, is that correct? Shouldn't every test be self-contained? Seems brittle to depend on the state left by the previous test.
+
+In general:
+
+* there are a couple of Utils.log calls. Is that allowed in tests? I think if you actually want to spit out some diagnostic text, there is a special test function for that. Otherwise, if it's just short-term debugging, please clean it out.
+
+Other than that, looks good. Please let us know how the try server likes it.
+(In reply to comment #10)
+> Comment on attachment 472939 [details]
+> Proposed patch v3
+> 
+> In browser_tabview_dragdrop.js:
+> 
+> * now that srcElement is a TabItem rather then a DOM element, change its name
+> to something more appropriate
+
+Will change that.
+
+> 
+> In browser_tabview_group.js:
+> 
+> * if I understand correctly, this test assumes there is still a group open from
+> the last test, is that correct? Shouldn't every test be self-contained? Seems
+> brittle to depend on the state left by the previous test.
+> 
+
+When the browser opens and we go into the panaroma UI, there should always be a group with a tabItem.  That's not depending on the last test because when we run the group test standalone, it also passes.
+
+> In general:
+> 
+> * there are a couple of Utils.log calls. Is that allowed in tests? I think if
+> you actually want to spit out some diagnostic text, there is a special test
+> function for that. Otherwise, if it's just short-term debugging, please clean
+> it out.
+> 
+That's something for short-term debugging, will clean that out.
+
+> Other than that, looks good. Please let us know how the try server likes it.
+Pushed it to the try server few hours ago and still waiting for the results.
+(In reply to comment #12)
+> Pushed it to the try server few hours ago and still waiting for the results.
+
+Raymond, is your push to try the "5fdcf0bfa01b Raymond Lee – Bug 588999 - Add Tab Candy escape button to Tab Candy view [r+a=dietrich]"? Looks like it just has a fragileness to the new exit button test, but overall it's looking much better.
+
+I'll try to send to try later today with other patches with the updated tests.
+Mitcho, I pushed another to try earlier than that one. The commit rev is 4c4ab3871351
+(In reply to comment #14)
+> Mitcho, I pushed another to try earlier than that one. The commit rev is
+> 4c4ab3871351
+
+Oh cool. So it looks like at least they pass, without any additional patches. I'll push some now together with some of the patches which previously failed.
+Created attachment 473060
+Proposed patch v4
+
+Addressed the points mentioned in comment #11
+Just got try results. I sent the following two sequences:
+
+Bug 588999, Bug 591706, Bug 592586 (which Ehsan pushed yesterday), together with this patch for the tests
+
+Bug 592586, Bug 591147, Bug 590742 (which Dietrich pushed the day before), together with this patch for the tests
+
+Both passed mochitest-other! YAY!
+Comment on attachment 473060
+Proposed patch v4
+
+looks good; lets land this thing
+Comment on attachment 473060
+Proposed patch v4
+
+
+>+      
+>+      this._sendToSubscribers("childAdded",{groupItemId: this.id, item:item});
+>+      
+nit: space after comma
+
+>       UI.setReorderTabsOnHide(this);
+>     } catch(e) {
+>       Utils.log('GroupItem.add error', e);
+>     }
+>   },
+> 
+>   // ----------
+>   // Function: remove
+>@@ -701,16 +704,19 @@ window.GroupItem.prototype = Utils.exten
+>       if (typeof item.setResizable == 'function')
+>         item.setResizable(true);
+> 
+>       if (!this._children.length && !this.locked.close && !this.getTitle() && !options.dontClose) {
+>         this.close();
+>       } else if (!options.dontArrange) {
+>         this.arrange();
+>       }
+>+
+>+      this._sendToSubscribers("childRemoved",{groupItemId: this.id, item:item});
+>+
+>     } catch(e) {
+>       Utils.log(e);
+>     }
+>   },
+> 
+>   // ----------
+>   // Function: removeAll
+>   // Removes all of the groupItem's children.
+>@@ -1196,17 +1202,16 @@ window.GroupItem.prototype = Utils.exten
+>             width: window.innerWidth,
+>             height: window.innerHeight
+>           }, {
+>             duration: 270,
+>             complete: function() {
+>               iQ(newItem.container).css({opacity: 1});
+>               newItem.zoomIn(!url);
+>               $anim.remove();
+>-              self._sendToSubscribers("tabAdded", {groupItemId: self.id});
+>             }
+>           });
+>         }
+>       });
+>   },
+> 
+>   // ----------
+>   // Function: reorderTabItemsBasedOnTabOrder
+>diff --git a/browser/base/content/test/tabview/browser_tabview_dragdrop.js b/browser/base/content/test/tabview/browser_tabview_dragdrop.js
+>--- a/browser/base/content/test/tabview/browser_tabview_dragdrop.js
+>+++ b/browser/base/content/test/tabview/browser_tabview_dragdrop.js
+>@@ -15,16 +15,17 @@
+>  *
+>  * The Initial Developer of the Original Code is
+>  * Mozilla Foundation.
+>  * Portions created by the Initial Developer are Copyright (C) 2010
+>  * the Initial Developer. All Rights Reserved.
+>  *
+>  * Contributor(s):
+>  * Raymond Lee <raymond@appcoast.com>
+>+ * Michael Yoshitaka Erlewine <mitcho@mitcho.com>
+>  *
+>  * Alternatively, the contents of this file may be used under the terms of
+>  * either the GNU General Public License Version 2 or later (the "GPL"), or
+>  * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+>  * in which case the provisions of the GPL or the LGPL are applicable instead
+>  * of those above. If you wish to allow use of your version of this file only
+>  * under the terms of either the GPL or the LGPL, and not to allow others to
+>  * use your version of this file under the terms of the MPL, indicate your
+>@@ -50,27 +51,25 @@ function onTabViewWindowLoaded() {
+>   let contentWindow = document.getElementById("tab-view").contentWindow;
+>   let [originalTab] = gBrowser.visibleTabs;
+> 
+>   // create group one and two
+>   let padding = 10;
+>   let pageBounds = contentWindow.Items.getPageBounds();
+>   pageBounds.inset(padding, padding);
+> 
+>-  let box = new contentWindow.Rect(pageBounds);
+>-  box.width = 300;
+>-  box.height = 300;
+>-
+>-  let groupOne = new contentWindow.GroupItem([], { bounds: box });
+>+  let boxOne = new contentWindow.Rect(20, 20, 300, 300);
+>+  let groupOne = new contentWindow.GroupItem([], { bounds: boxOne });
+>   ok(groupOne.isEmpty(), "This group is empty");
+> 
+>-  let groupTwo = new contentWindow.GroupItem([], { bounds: box });
+>+  let boxTwo = new contentWindow.Rect(20, 400, 300, 300);
+>+  let groupTwo = new contentWindow.GroupItem([], { bounds: boxTwo });
+> 
+>-  groupOne.addSubscriber(groupOne, "tabAdded", function() {
+>-    groupOne.removeSubscriber(groupOne, "tabAdded");
+>+  groupOne.addSubscriber(groupOne, "childAdded", function() {
+>+    groupOne.removeSubscriber(groupOne, "childAdded");
+>     groupTwo.newTab();
+>   });
+> 
+>   let count = 0;
+>   let onTabViewShown = function() {
+>     if (count == 2) {
+>       window.removeEventListener("tabviewshown", onTabViewShown, false);
+>       addTest(contentWindow, groupOne.id, groupTwo.id, originalTab);
+>@@ -88,72 +87,86 @@ function onTabViewWindowLoaded() {
+>   groupOne.newTab();
+> }
+> 
+> function addTest(contentWindow, groupOneId, groupTwoId, originalTab) {
+>   let groupOne = contentWindow.GroupItems.groupItem(groupOneId);
+>   let groupTwo = contentWindow.GroupItems.groupItem(groupTwoId);
+>   let groupOneTabItemCount = groupOne.getChildren().length;
+>   let groupTwoTabItemCount = groupTwo.getChildren().length;
+>-  is(groupOneTabItemCount, 1, "GroupItem one has a tab");
+>-  is(groupTwoTabItemCount, 1, "GroupItem two has two tabs");
+>+  is(groupOneTabItemCount, 1, "GroupItem one has one tab");
+>+  is(groupTwoTabItemCount, 1, "GroupItem two has one tab as well");
+> 
+>-  let srcElement = groupOne.getChild(0).container;
+>-  ok(srcElement, "The source element exists");
+>+  let tabItem = groupOne.getChild(0);
+>+  ok(tabItem, "The tab item exists");
+> 
+>   // calculate the offsets
+>-  let groupTwoRect = groupTwo.container.getBoundingClientRect();
+>-  let srcElementRect = srcElement.getBoundingClientRect();
+>+  let groupTwoRect = groupTwo.getBounds();
+>+  let groupTwoRectCenter = groupTwoRect.center();
+>+  let tabItemRect = tabItem.getBounds();
+>+  let tabItemRectCenter = tabItemRect.center();
+>   let offsetX =
+>-    Math.round(groupTwoRect.left + groupTwoRect.width/5) - srcElementRect.left;
+>+    Math.round(groupTwoRectCenter.x - tabItemRectCenter.x);
+>   let offsetY =
+>-    Math.round(groupTwoRect.top + groupTwoRect.height/5) -  srcElementRect.top;
+>+    Math.round(groupTwoRectCenter.y - tabItemRectCenter.y);
+> 
+>-  simulateDragDrop(srcElement, offsetX, offsetY, contentWindow);
+>+  function endGame() {
+>+    groupTwo.removeSubscriber(groupTwo, "childAdded");
+> 
+>-  is(groupOne.getChildren().length, --groupOneTabItemCount,
+>-     "The number of children in group one is decreased by 1");
+>-  is(groupTwo.getChildren().length, ++groupTwoTabItemCount,
+>-     "The number of children in group two is increased by 1");
+>-
+>-  let onTabViewHidden = function() {
+>-    window.removeEventListener("tabviewhidden", onTabViewHidden, false);
+>-     groupTwo.closeAll();
+>-  };
+>-  groupTwo.addSubscriber(groupTwo, "close", function() {
+>-    groupTwo.removeSubscriber(groupTwo, "close");
+>-    finish();  
+>-  });
+>-  window.addEventListener("tabviewhidden", onTabViewHidden, false);
+>-  gBrowser.selectedTab = originalTab;
+>+    is(groupOne.getChildren().length, --groupOneTabItemCount,
+>+       "The number of children in group one is decreased by 1");
+>+    is(groupTwo.getChildren().length, ++groupTwoTabItemCount,
+>+       "The number of children in group two is increased by 1");
+>+  
+>+    let onTabViewHidden = function() {
+>+      window.removeEventListener("tabviewhidden", onTabViewHidden, false);
+>+       groupTwo.closeAll();
+>+    };
+>+    groupTwo.addSubscriber(groupTwo, "close", function() {
+>+      groupTwo.removeSubscriber(groupTwo, "close");
+>+      finish();  
+>+    });
+>+    window.addEventListener("tabviewhidden", onTabViewHidden, false);
+>+    gBrowser.selectedTab = originalTab;
+>+  }
+>+  groupTwo.addSubscriber(groupTwo, "childAdded", endGame);
+>+  
+>+  simulateDragDrop(tabItem.container, offsetX, offsetY, contentWindow);
+> }
+> 
+>-function simulateDragDrop(srcElement, offsetX, offsetY, contentWindow) {
+>+function simulateDragDrop(tabItem, offsetX, offsetY, contentWindow) {
+>   // enter drag mode
+>   let dataTransfer;
+> 
+>   EventUtils.synthesizeMouse(
+>-    srcElement, 1, 1, { type: "mousedown" }, contentWindow);
+>+    tabItem, 1, 1, { type: "mousedown" }, contentWindow);
+>   event = contentWindow.document.createEvent("DragEvents");
+>   event.initDragEvent(
+>     "dragenter", true, true, contentWindow, 0, 0, 0, 0, 0,
+>     false, false, false, false, 1, null, dataTransfer);
+>-  srcElement.dispatchEvent(event);
+>+  tabItem.dispatchEvent(event);
+> 
+>   // drag over
+>-  for (let i = 4; i >= 0; i--)
+>-    EventUtils.synthesizeMouse(
+>-      srcElement,  Math.round(offsetX/5),  Math.round(offsetY/4),
+>-      { type: "mousemove" }, contentWindow);
+>-  event = contentWindow.document.createEvent("DragEvents");
+>-  event.initDragEvent(
+>-    "dragover", true, true, contentWindow, 0, 0, 0, 0, 0,
+>-    false, false, false, false, 0, null, dataTransfer);
+>-  srcElement.dispatchEvent(event);
+>-
+>+  if (offsetX || offsetY) {
+>+    let Ci = Components.interfaces;
+>+    let utils = contentWindow.QueryInterface(Ci.nsIInterfaceRequestor).
+>+                              getInterface(Ci.nsIDOMWindowUtils);
+>+    let rect = tabItem.getBoundingClientRect();
+>+    for (let i = 1; i <= 5; i++) {
+>+      let left = rect.left + Math.round(i * offsetX / 5);
+>+      let top = rect.top + Math.round(i * offsetY / 5);
+>+      utils.sendMouseEvent("mousemove", left, top, 0, 1, 0);
+>+    }
+>+    event = contentWindow.document.createEvent("DragEvents");
+>+    event.initDragEvent(
+>+      "dragover", true, true, contentWindow, 0, 0, 0, 0, 0,
+>+      false, false, false, false, 0, null, dataTransfer);
+>+    tabItem.dispatchEvent(event);
+>+  }
+>+  
+>   // drop
+>-  EventUtils.synthesizeMouse(srcElement, 0, 0, { type: "mouseup" }, contentWindow);
+>+  EventUtils.synthesizeMouse(tabItem, 0, 0, { type: "mouseup" }, contentWindow);
+>   event = contentWindow.document.createEvent("DragEvents");
+>   event.initDragEvent(
+>     "drop", true, true, contentWindow, 0, 0, 0, 0, 0,
+>     false, false, false, false, 0, null, dataTransfer);
+>-  srcElement.dispatchEvent(event);
+>+  tabItem.dispatchEvent(event);
+> }
+>diff --git a/browser/base/content/test/tabview/browser_tabview_group.js b/browser/base/content/test/tabview/browser_tabview_group.js
+>--- a/browser/base/content/test/tabview/browser_tabview_group.js
+>+++ b/browser/base/content/test/tabview/browser_tabview_group.js
+>@@ -37,27 +37,38 @@
+> 
+> function test() {
+>   waitForExplicitFinish();
+> 
+>   window.addEventListener("tabviewshown", onTabViewWindowLoaded, false);
+>   TabView.toggle();
+> }
+> 
+>+let originalGroupItem = null;
+>+let originalTab = null;
+>+
+> function onTabViewWindowLoaded() {
+>   window.removeEventListener("tabviewshown", onTabViewWindowLoaded, false);
+>   ok(TabView.isVisible(), "Tab View is visible");
+> 
+>   let contentWindow = document.getElementById("tab-view").contentWindow;
+>+
+>+  is(contentWindow.GroupItems.groupItems.length, 1, "There is one group item on startup");
+>+  originalGroupItem = contentWindow.GroupItems.groupItems[0];
+>+  is(originalGroupItem.getChildren().length, 1, "There should be one Tab Item in that group.");
+>+  contentWindow.GroupItems.setActiveGroupItem(originalGroupItem);
+>+
+>+  [originalTab] = gBrowser.visibleTabs;
+>+
+>   testEmptyGroupItem(contentWindow);
+> }
+> 
+> function testEmptyGroupItem(contentWindow) {
+>   let groupItemCount = contentWindow.GroupItems.groupItems.length;
+>-
+>+  
+>   // create empty group item
+>   let emptyGroupItem = createEmptyGroupItem(contentWindow, 100);
+>   ok(emptyGroupItem.isEmpty(), "This group is empty");
+> 
+>   is(contentWindow.GroupItems.groupItems.length, ++groupItemCount,
+>      "The number of groups is increased by 1");
+> 
+>   emptyGroupItem.addSubscriber(emptyGroupItem, "close", function() {
+>@@ -76,54 +87,79 @@ function testEmptyGroupItem(contentWindo
+>   // click the close button
+>   EventUtils.synthesizeMouse(closeButton[0], 1, 1, {}, contentWindow);
+> }
+> 
+> function testGroupItemWithTabItem(contentWindow) {
+>   let groupItem = createEmptyGroupItem(contentWindow, 200);
+>   let tabItemCount = 0;
+> 
+>-  groupItem.addSubscriber(groupItem, "tabAdded", function() {
+>-    groupItem.removeSubscriber(groupItem, "tabAdded");
+>-    TabView.toggle();
+>-  });
+>-
+>   let onTabViewHidden = function() {
+>     window.removeEventListener("tabviewhidden", onTabViewHidden, false);
+> 
+>     is(groupItem.getChildren().length, ++tabItemCount,
+>        "The number of children in new tab group is increased by 1");
+> 
+>+    ok(!TabView.isVisible(), "Tab View is hidden because we just opened a tab");
+>+
+>+    TabView.toggle();
+>+  };
+>+  let onTabViewShown = function() {
+>+    window.removeEventListener("tabviewshown", onTabViewShown, false);
+>+
+>     let tabItem = groupItem.getChild(groupItem.getChildren().length - 1);
+>     ok(tabItem, "Tab item exists");
+> 
+>     let tabItemClosed = false;
+>     tabItem.addSubscriber(tabItem, "close", function() {
+>       tabItem.removeSubscriber(tabItem, "close");
+>       tabItemClosed = true;
+>     });
+>     tabItem.addSubscriber(tabItem, "tabRemoved", function() {
+>       tabItem.removeSubscriber(tabItem, "tabRemoved");
+> 
+>       ok(tabItemClosed, "The tab item is closed");
+>       is(groupItem.getChildren().length, --tabItemCount,
+>         "The number of children in new tab group is decreased by 1");
+>+        
+>+      ok(TabView.isVisible(), "Tab View is still shown");
+> 
+>-      finish();
+>+      // Now there should only be one tab left, so we need to hide TabView
+>+      // and go into that tab.
+>+      is(gBrowser.tabs.length, 1, "There is only one tab left");
+>+            
+>+      let endGame = function() {
+>+        window.removeEventListener("tabviewhidden", endGame, false);
+>+        ok(!TabView.isVisible(), "Tab View is hidden");
+>+        finish();
+>+      };
+>+      window.addEventListener("tabviewhidden", endGame, false);
+>+
+>+      // after the last selected tabitem is closed, there would be not active
+>+      // tabitem on the UI so we set the active tabitem before toggling the 
+>+      // visibility of tabview
+>+      let tabItems = contentWindow.TabItems.getItems();
+>+      ok(tabItems[0], "A tab item exists");
+>+      contentWindow.UI.setActiveTab(tabItems[0]);
+>+
+>+      TabView.toggle();
+>     });
+> 
+>     // remove the tab item.  The code detects mousedown and mouseup so we stimulate here
+>     let closeButton = tabItem.container.getElementsByClassName("close");
+>     ok(closeButton, "Tab item close button exists");
+> 
+>     EventUtils.sendMouseEvent({ type: "mousedown" }, closeButton[0], contentWindow);
+>     EventUtils.sendMouseEvent({ type: "mouseup" }, closeButton[0], contentWindow);
+>+
+>+    TabView.toggle();
+>   };
+>-
+>   window.addEventListener("tabviewhidden", onTabViewHidden, false);
+>+  window.addEventListener("tabviewshown", onTabViewShown, false);
+>+  
+>   // click on the + button
+>   let newTabButton = groupItem.container.getElementsByClassName("newTabButton");
+>   ok(newTabButton[0], "New tab button exists");
+> 
+>   EventUtils.synthesizeMouse(newTabButton[0], 1, 1, {}, contentWindow);
+> }
+> 
+> function createEmptyGroupItem(contentWindow, padding) {
+Created attachment 473146
+Patch for check-in
+http://hg.mozilla.org/mozilla-central/rev/fa6808a7f8b3
+
+
+Make our tests more robust!
+
+
+
+Bug 594213 - Make our tests more robust [r+a=dietrich] 

@@ -1,0 +1,641 @@
+Now that we've shipped the perftools, we have a better idea how all this works with older geckos and all.
+
+This will let us struggle less with a giant pseudo PerformanceFront that handles all the backwards compat scenarios, and be more similar to how other tools work.
+
+Would let us clean up the front quite a bit, but would still need the current performance front for legacy, but should not need updated. If we needed to, we could still update the legacy front if, for example, something slipped into Gecko 38 that we missed for backwards compat.
+
+Would also allow us to have a headless recording session stored on the backend for Gecko Profiler use cases, and disable streaming if needed.
+
+Once we pull out the the timeline and memory actors into standalone modules, with actors just exposing API (kind of what the memory actor is now, with memory bridge), we can create a PerformanceActor that consumes those modules, and kill off the actors themselves in some cases (I believe there are other consumers of memory actor, and framerate actor, so not in that case?)
+
+This would clean up a lot of client code, as we can stick the uglier data massaging in legacy modules, where I'm less concerned with taking extra time to ensuring everything is optimally performant, etc.
+
+Any downsides to this? Things to think about?
+
+Now that we've shipped the perftools, we have a better idea how all this works with older geckos and all.
+
+This will let us struggle less with a giant pseudo PerformanceFront that handles all the backwards compat scenarios, and be more similar to how other tools work.
+
+Would let us clean up the front quite a bit, but would still need the current performance front for legacy, but should not need updated. If we needed to, we could still update the legacy front if, for example, something slipped into Gecko 38 that we missed for backwards compat.
+
+Would also allow us to have a headless recording session stored on the backend for Gecko Profiler use cases, and disable streaming if needed.
+
+Once we pull out the the timeline and memory actors into standalone modules, with actors just exposing API (kind of what the memory actor is now, with memory bridge), we can create a PerformanceActor that consumes those modules, and kill off the actors themselves in some cases (I believe there are other consumers of memory actor, and framerate actor, so not in that case?)
+
+This would clean up a lot of client code, as we can stick the uglier data massaging in legacy modules, where I'm less concerned with taking extra time to ensuring everything is optimally performant, etc.
+
+Any downsides to this? Things to think about?
+Created attachment 8634438
+Part 1: Add buffer status events to profiler itself
+
+This is gonna be a lot of small patches to make the real actor much nicer.
+ https://treeherder.mozilla.org/#/jobs?repo=try&revision=aa4a36a49e9b
+Created attachment 8635484
+1172180-2.patch
+
+This moves the draining to the memory component itself -- fired at least every `n` milliseconds, and on GC.
+
+ https://treeherder.mozilla.org/#/jobs?repo=try&revision=2e5d5fa4b019
+Comment on attachment 8635484
+1172180-2.patch
+
+Review of attachment 8635484:
+-----------------------------------------------------------------
+
+r=me with comments below
+
+::: toolkit/devtools/server/tests/mochitest/test_memory_allocations_07.html
+@@ +27,5 @@
+> +    }
+> +    function startAllocating () {
+> +      intervalId = setInterval(() => {
+> +        for (var i = 1000; --i;) {
+> +          new Object();
+
+Put these objects in a global array so that it doesn't accidentally get optimized away as dead code by ion.
+
+You can probably add another one or two 0s to the number of iterations here to put more stress on the gc and ensure that the onGC hooks get called sooner. Putting the objects in an array will also help them survive the nursery and put more pressure on the GC as well.
+
+This shoud hopefully cut down on intermittents caused by slow ec2 instances timing out before a gc cycle completes.
+
+I suppose you could also Cu.forceGC like the gc marker tests do.
+
+@@ +55,5 @@
+> +
+> +    startAllocating();
+> +    yield waitUntil(() => eventsFired > 1);
+> +    stopAllocating();
+> +    ok(eventsFired > 1, "Allocation events fired on GC, not because of timer");
+
+Well, you hope so at least. You could assert it has been less than your timeout since you started recording.
+
+::: toolkit/devtools/shared/memory.js
+@@ +139,5 @@
+> +   * @param {number} options.maxLogLength
+> +   *                 The maximum number of allocation events to keep in the
+> +   *                 log. If new allocs occur while at capacity, oldest allocs are lost.
+> +   *                 Must fit in a 32 bit signed integer.
+> +   * @param {number} options.autoDrain
+
+Let's rename this to "drainAllocationsTimeout".
+
+@@ +376,5 @@
+> +   * or on a garbage collection event if autoDrain was set.
+> +   * Drains allocation log and emits as an event and restarts the timer.
+> +   */
+> +  _emitAllocations: function () {
+> +    events.emit(this, "allocations", this.getAllocations());
+
+As we discussed on irc, before we commit to backwards compat for allocs and RDP, we should kill the events and replace this stuff with building up allocs on the server and then sending them all at once after the recording has finished.
+
+No need to incur frequent RDP event overhead if we aren't going to use the events for anything.
+Will review this asap.
+Created attachment 8635616
+1172180-2.patch
+
+Comments addressed -- waiting for fx-team to open again.
+https://hg.mozilla.org/integration/fx-team/rev/d6e11a7b5dbf
+https://hg.mozilla.org/integration/fx-team/rev/8eae214f9f1c
+https://hg.mozilla.org/mozilla-central/rev/d6e11a7b5dbf
+https://hg.mozilla.org/mozilla-central/rev/8eae214f9f1c
+Created attachment 8642186
+1172180-perfactor.patch
+
+Victor, I am so so sorry.
+
+90 files changed, 3326 insertions(+), 2378 deletions(-)
+
+Some high level changes:
+
+* How this now keeps things in sync, there’s a performance actor and a performance-recording actor — the perf actor creates recording actors, attaches data to it, and the form function handles transmitting things like recording config automatically, and profiler data if it has not yet been sent. Timeline data still goes over the performance front and aggregated on the client (because it can be part of several recordings), and this can be tweaked to lazily serve markers when we do non realtime markers.
+
+* All UI should now listen to generic recording state change events, rather than specific recording start/stopped/stopping events due to recordings needing to load lazily (due to console.profile; didn’t have this problem before because events were all handled on the client). We still have some specific RECORDING_STARTED etc events for tests, but can change that in the future. Because the recordings are updated as soon as they hit the client over RDP (thanks to form functions), anytime there’s a status change, we can just look at the state of the recording and react based off of that (because a console.profile recording can be completely finished by the time the UI is loaded). I think this concept of statelessness is pretty nice, and done moderately OK, but can be improved upon in the future quite a bit I think (like anytime there’s a change on the front, just go through the current recordings and update state).
+
+* All markers are still realtime, but some things in place for that to be switched to be lazily loaded in the future upon completion (look how the profiler data is transmitted)
+
+* All the previous “front” and models are moved to toolkit/devtools/performance/legacy — for the most part, this is its own forked code. I gave up on trying to have the same front handle both scenarios, and this makes it easier just to remove in the future. The legacy front no longer handles the memory actor at all (or memory data in the timeline actor) because this isn’t even fully “supported” on Fx42 yet anyway, so got rid of that code.
+
+* Some tests were moved to toolkit/devtools/server/tests as they now test the actor stuff
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=9c3f1857e472
+oh my gosh jordan
+you're supposed to be a manager.
+Comment on attachment 8642186
+1172180-perfactor.patch
+
+Review of attachment 8642186:
+-----------------------------------------------------------------
+
+F?ing jryans for the toolbox changes
+
+::: browser/devtools/framework/toolbox.js
+@@ +2,5 @@
+>   * License, v. 2.0. If a copy of the MPL was not distributed with this
+>   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+>  /* globals gDevTools, DOMHelpers, toolboxStrings, InspectorFront, Selection,
+>     CommandUtils, DevToolsUtils, Hosts, osString, showDoorhanger,
+> +   getHighlighterUtils, PerformanceFront */
+
+s/PerformanceFront/createPerformanceFront/
+
+@@ +2020,5 @@
+>    /**
+> +   * Called as soon as `console.profile` occurs so we can set up the
+> +   * performance tool front. The performance actor handles everything else.
+> +   */
+> +  _onConsoleProfileStart: Task.async(function *(eventName, recording) {
+
+This handler name should be changed, like "_onPerformanceFrontEvent".
+
+::: toolkit/devtools/server/actors/performance-recording.js
+@@ +9,5 @@
+> +const { custom, method, RetVal, Arg, Option, types, preEvent } = protocol;
+> +const { actorBridge } = require("devtools/server/actors/common");
+> +
+> +loader.lazyRequireGetter(this, "events", "sdk/event/core");
+> +loader.lazyRequireGetter(this, "when", "sdk/event/utils", true);
+
+Unused, remove
+
+::: toolkit/devtools/shared/memory.js
+@@ +395,5 @@
+> +  /**
+> +   * Accesses the docshell to return the current process time.
+> +   */
+> +  _getCurrentTime: function () {
+> +    return (this.parent.isRootActor ? this.parent.docShell : this.parent.originalDocShell).now();
+
+This logic is also used in timeline.js -- should probably be codified some place where we don't have to do this, easily accessible to JS
+
+::: toolkit/devtools/shared/profiler.js
+@@ +523,5 @@
+> + * the nsIProfiler in child process content. These should be called from
+> + * the parent process.
+> + */
+> +let mm = null;
+> +exports.PMM_isProfilerActive = function () {
+
+Not sure where these PMM functions should go -- here makes sense (will actually always be a different instance in e10s, so no weirdness ideally), but could also be a e10s/frame script utils thing
+Created attachment 8642550
+1172180-perfactor.patch
+
+Fixed the failing try case; fixed allocations actually being served (bug 1177558), and fixed my own TODO comments in the previous review.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=722fc3b32188
+Comment on attachment 8642550
+1172180-perfactor.patch
+
+Review of attachment 8642550:
+-----------------------------------------------------------------
+
+Toolbox code doesn't seem quite right to me, might just need better comments.
+
+::: browser/devtools/framework/toolbox.js
+@@ +2022,5 @@
+> +   * performance tool front. The performance actor handles everything else.
+> +   */
+> +  _onPerformanceFrontEvent: Task.async(function *(eventName, recording) {
+> +    // For the first event only, if it's a console-profile-start event,
+> +    // the only event that can occur before the panel is loaded, start
+
+If this is "the only event that can occur before the panel is loaded", why do you need to listen for other kinds of events as well?  Can't the panel handle all the others once it is loaded?
+Comment on attachment 8642550
+1172180-perfactor.patch
+
+Review of attachment 8642550:
+-----------------------------------------------------------------
+
+::: browser/devtools/framework/toolbox.js
+@@ +2022,5 @@
+> +   * performance tool front. The performance actor handles everything else.
+> +   */
+> +  _onPerformanceFrontEvent: Task.async(function *(eventName, recording) {
+> +    // For the first event only, if it's a console-profile-start event,
+> +    // the only event that can occur before the panel is loaded, start
+
+To clarify, this is the only event that can be first fired without the panel being loaded -- there can be subsequent events before the panel is loaded. This means if we see a "console-profile-start" event, our panel is not loaded, and we should listen to and store events here until the panel is loaded.
+
+If the first event is not console-profile-start, then unbind this event immediately, as the panel is loaded and we don't need to handle the scenario where we're listening to console.profile() events without the tool being loaded.
+
+That being said, maybe it can just check `getPanel()` to see if it's loaded to be more agnostic.
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #17)
+> Comment on attachment 8642550
+> 1172180-perfactor.patch
+> 
+> Review of attachment 8642550:
+> -----------------------------------------------------------------
+> 
+> ::: browser/devtools/framework/toolbox.js
+> @@ +2022,5 @@
+> > +   * performance tool front. The performance actor handles everything else.
+> > +   */
+> > +  _onPerformanceFrontEvent: Task.async(function *(eventName, recording) {
+> > +    // For the first event only, if it's a console-profile-start event,
+> > +    // the only event that can occur before the panel is loaded, start
+> 
+> To clarify, this is the only event that can be first fired without the panel
+> being loaded -- there can be subsequent events before the panel is loaded.
+> This means if we see a "console-profile-start" event, our panel is not
+> loaded, and we should listen to and store events here until the panel is
+> loaded.
+> 
+> If the first event is not console-profile-start, then unbind this event
+> immediately, as the panel is loaded and we don't need to handle the scenario
+> where we're listening to console.profile() events without the tool being
+> loaded.
+> 
+> That being said, maybe it can just check `getPanel()` to see if it's loaded
+> to be more agnostic.
+
+Hmm, I am still pretty confused...  the words you are saying feel hard to match up with the code as written. :)
+
+Also, a comment about how it's even possible to reach `else if (eventName === "recording-started")` would be helpful.  I guess it's possible due to yielding on panel open when seeding?
+
+Overall, more comments. :)
+Created attachment 8642791
+1172180-perfactor.patch
+
+Ok the toolbox stuff should be cleaner and more clear comments about what's happening.
+
+Overall, the idea is to catch observed recordings that are emitted before the panel is loaded (which will only happen if the performance tools are opened via `console.profile()` recording, otherwise, the only other way is manually opening the tool, which is handled in the normal case
+Comment on attachment 8642791
+1172180-perfactor.patch
+
+Review of attachment 8642791:
+-----------------------------------------------------------------
+
+Thanks, toolbox files are easier to follow now!
+
+::: browser/devtools/framework/toolbox.js
+@@ +2022,5 @@
+> +   * loaded when the first event comes in, immediately unbind this handler, as this is
+> +   * only used to queue up observed recordings before the performance tool can handle them,
+> +   * which will only occur when `console.profile()` recordings are started before the tool loads.
+> +   */
+> +  _onPerformanceFrontEvent: Task.async(function *(eventName, recording) {
+
+Nit: no space before star to match style rules
+
+@@ +2030,5 @@
+> +    }
+> +
+> +    let recordings = this.performance._toBeSeededRecordings = this.performance._toBeSeededRecordings || [];
+> +
+> +    // Before any console recordings, we'll get a `console-profile-start` recording
+
+Nit: event
+Created attachment 8643461
+1172180-perfactor.patch
+
+Removed the memory module's changes -- handled them in bug 1177558.
+Comment on attachment 8642791
+1172180-perfactor.patch
+
+Review of attachment 8642791:
+-----------------------------------------------------------------
+
+Easy to follow, but r- for now. See comments below, should be easy to address them.
+
+::: browser/devtools/framework/toolbox.js
+@@ +2,5 @@
+>   * License, v. 2.0. If a copy of the MPL was not distributed with this
+>   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+>  /* globals gDevTools, DOMHelpers, toolboxStrings, InspectorFront, Selection,
+>     CommandUtils, DevToolsUtils, Hosts, osString, showDoorhanger,
+> +   getHighlighterUtils, createPerformanceFront */
+
+Not a comment directly related to this patch, but:
+
+I hate this, it makes me cringe so much. I used to use /*globals*/ comments when writing Tilt in a different life (and I had jshint nicely integrated with my workflow), but all of it quickly grew out of control. It looks like this is happening now too with eslint, this list is insane, and very hard to maintain. If we're not handling the case when a global isn't used anymore, it's even worse.
+
+@@ +2028,5 @@
+> +      this.performance.off("*", this._onPerformanceFrontEvent);
+> +      return;
+> +    }
+> +
+> +    let recordings = this.performance._toBeSeededRecordings = this.performance._toBeSeededRecordings || [];
+
+"seeded" is kind of a weird word to me here, but I'd accept a comment describing what it means.
+
+@@ +2034,5 @@
+> +    // Before any console recordings, we'll get a `console-profile-start` recording
+> +    // warning us that a recording will come later (via `recording-started`), so
+> +    // start to boot up the tool and populate the tool with any other recordings
+> +    // observed during that time.
+> +    if (eventName === "console-profile-start" && !this.performance._waitForToolOpen) {
+
+Is there a reason we're storing _waitForToolOpen on this.performance? Seems like we're throwing a temporary variable on an object we don't control here. Should store it on `this` instead, under a better name perhaps.
+
+Now that I think about it, _toBeSeededRecordings is also a bit weird in the same way. Don't like storing "private" properties on objects that aren't technically aware of them. Would love to see a better system for this, like a dedicated store or class.
+
+@@ +2045,5 @@
+> +    }
+> +
+> +    // Otherwise, if it's a recording-started event, we've already started loading
+> +    // the tool, so just store this recording in our array to be later populated
+> +    // once the tool loads.
+
+All of this seems super flaky. Are we sure these "rules" will never change or break? Would it possibly be good to have another statement in that conditional that ensures this?
+
+if (eventName === "recording-started" && this.performance._waitForToolOpen) {
+...
+
+::: browser/devtools/performance/panel.js
+@@ +29,5 @@
+>     *         A promise that is resolved when the Performance tool
+>     *         completes opening.
+>     */
+>    open: Task.async(function*() {
+> +    if (this._open) {
+
+Nit: "_opening" would probably be better.
+
+@@ +53,5 @@
+>        Cu.reportError("No PerformanceFront found in toolbox.");
+>      }
+>  
+>      this.panelWin.gFront = front;
+> +    let { PerformanceController } = this.panelWin;
+
+Nit: might as well destructure EVENTS while you're here.
+
+@@ +82,5 @@
+>      if (this._destroyed) {
+>        return;
+>      }
+>  
+> +    let { PerformanceController } = this.panelWin;
+
+Ditto for destructuring EVENTS
+
+::: browser/devtools/performance/performance-controller.js
+@@ +94,5 @@
+>    UI_IMPORT_RECORDING: "Performance:UI:ImportRecording",
+>    // Emitted by the RecordingsView on export button click
+>    UI_EXPORT_RECORDING: "Performance:UI:ExportRecording",
+>  
+> +  // Emitted by the PerformanceController when `stopRecording` request completes.
+
+This sounds very implementation-specific, could you detail more about what a `stopRecording` request is, or at least use a language that doesn't assume knowledge about the performance actor internals?
+
+@@ +156,5 @@
+>    SOURCE_SHOWN_IN_JS_DEBUGGER: "Performance:UI:SourceShownInJsDebugger",
+> +  SOURCE_NOT_FOUND_IN_JS_DEBUGGER: "Performance:UI:SourceNotFoundInJsDebugger",
+> +
+> +  // These are short hands for the RECORDING_STATE_CHANGE event to make refactoring
+> +  // tests easier.
+
+Would reword this comment to something like "Deprecated events which are now handled via RECORDING_STATE_CHANGE".
+
+@@ +161,5 @@
+> +  RECORDING_STARTED: "Performance:RecordingStarted",
+> +  RECORDING_WILL_STOP: "Performance:RecordingWillStop",
+> +  RECORDING_STOPPED: "Performance:RecordingStopped",
+> +
+> +  RECORDINGS_SEEDED: "Performance:RecordingsSeeded",
+
+Document this one.
+
+@@ +174,5 @@
+>   * Initializes the profiler controller and views.
+>   */
+>  let startupPerformance = Task.async(function*() {
+> +  yield PerformanceController.initialize();
+> +  yield PerformanceView.initialize();
+
+Does it matter to have this finish sequentially now? Why?
+
+@@ +182,5 @@
+>   * Destroys the profiler controller and views.
+>   */
+>  let shutdownPerformance = Task.async(function*() {
+> +  yield PerformanceController.destroy();
+> +  yield PerformanceView.destroy();
+
+Ditto.
+
+@@ +317,5 @@
+> +    // the RECORDING_STOPPED event, but in the case of a UI click on a button,
+> +    // the RECORDING_STOPPED event happens from the server, where this request may
+> +    // not have yet finished, so listen to this in tests that fail because the `stopRecording`
+> +    // request is not yet completed. Should only be used in that scenario.
+> +    this.emit(EVENTS.CONTROLLER_STOPPED_RECORDING);
+
+Ugh this is insane. So that's what CONTROLLER_STOPPED_RECORDING is. Would love to have the tests fixed instead of introducing this seemingly useless event.
+
+@@ +346,5 @@
+>      }
+>      // If last recording is not recording, but finalizing itself,
+>      // wait for that to finish
+>      if (latest && !latest.isCompleted()) {
+> +      yield new Promise(resolve => {
+
+Should keep using promise.defer since literally everything in this file isn't a DOM promise.
+
+@@ +350,5 @@
+> +      yield new Promise(resolve => {
+> +        this.on(EVENTS.RECORDING_STATE_CHANGE, function handler (state, model) {
+> +          if (state === "recording-stopped" && model === latest) {
+> +            this.off(EVENTS.RECORDING_STATE_CHANGE, handler);
+> +            resolve();
+
+This looks messy as hell. Add some utility functions somehwere that abstract this instead of nesting all the logic in here.
+
+@@ +376,5 @@
+> +    // Only emit in tests for legacy purposes for shorthand --
+> +    // other things in UI should handle the generic NEW_RECORDING
+> +    // event to handle lazy recordings.
+> +    if (DevToolsUtils.testing) {
+> +      this.emit(EVENTS.IMPORT_RECORDING, recording);
+
+Should probably document this in the events list on the top of this file, about how IMPORT_RECORDING is deprecated.
+
+@@ +444,5 @@
+>  
+>      this.emit(EVENTS.THEME_CHANGED, data.newValue);
+>    },
+>  
+> +  _onFrontEvent: function (eventName, ...data) {
+
+Docs.
+
+@@ +463,5 @@
+>      this.emit(EVENTS.PROFILER_STATUS_UPDATED, data);
+>    },
+>  
+>    /**
+> +   * Stores a recording internally.
+
+@param
+
+@@ +466,5 @@
+>    /**
+> +   * Stores a recording internally.
+> +   */
+> +  _addNewRecording: function (recording) {
+> +    if (PerformanceController._recordings.indexOf(recording) === -1) {
+
+`this` instead of `PerformanceController`, no?
+
+@@ +487,3 @@
+>  
+> +    // Emit the state specific events for tests that I'm too
+> +    // lazy and frusterated to change right now. These events
+
+lol
+
+@@ +558,5 @@
+>      let config = recording.getConfiguration();
+>      return [].concat(features).every(f => config[f]);
+>    },
+>  
+> +  populateRecordings: function (recordings=[]) {
+
+Docs
+
+populateWithRecordings is more accurate
+
+::: browser/devtools/performance/views/details-abstract-subview.js
+@@ +85,5 @@
+>    /**
+>     * Called when recording stops or is selected.
+>     */
+> +  _onRecordingStoppedOrSelected: function(_, state, recording) {
+> +    if (typeof state !== "string") {
+
+My eyes!
+Comment please, why is arguments.length so magical? When is `state` a string?
+
+::: browser/devtools/performance/views/details.js
+@@ +248,5 @@
+>    /**
+>     * Called when recording stops or is selected.
+>     */
+> +  _onRecordingStoppedOrSelected: function(_, state, recording) {
+> +    if (typeof state === "string" && state !== "recording-stopped") {
+
+Ditto.
+
+::: toolkit/devtools/performance/io.js
+@@ +1,1 @@
+> +/* This Source Code Form is subject to the terms of the Mozilla Public
+
+I would really like the moved filed to maintain history. This patch is so big because the moved files are recorded as deleted and recreated again, which makes it hard to review any potential changes in them.
+Comment on attachment 8643461
+1172180-perfactor.patch
+
+See above review.
+Comment on attachment 8642791
+1172180-perfactor.patch
+
+Review of attachment 8642791:
+-----------------------------------------------------------------
+
+::: browser/devtools/framework/toolbox.js
+@@ +2028,5 @@
+> +      this.performance.off("*", this._onPerformanceFrontEvent);
+> +      return;
+> +    }
+> +
+> +    let recordings = this.performance._toBeSeededRecordings = this.performance._toBeSeededRecordings || [];
+
+Changing to `this._performanceQueuedRecordings`
+
+@@ +2034,5 @@
+> +    // Before any console recordings, we'll get a `console-profile-start` recording
+> +    // warning us that a recording will come later (via `recording-started`), so
+> +    // start to boot up the tool and populate the tool with any other recordings
+> +    // observed during that time.
+> +    if (eventName === "console-profile-start" && !this.performance._waitForToolOpen) {
+
+Storing it as `this._performanceToolOpenedViaConsole`.
+
+This is an edge case of one tool, and was looking into a way on the actor level to queue and drain events, but that got messy fast, and would still need to be handled on the toolbox level, because the front/actor shouldn't care about it's subscribers
+
+@@ +2045,5 @@
+> +    }
+> +
+> +    // Otherwise, if it's a recording-started event, we've already started loading
+> +    // the tool, so just store this recording in our array to be later populated
+> +    // once the tool loads.
+
+The rules could change, of course -- to what, I have no idea.
+
+That conditional is no different than what's currently there, as a recording-started event will never fire without the panel being loaded (manually, normal use case) without a console-profile-start event firing
+
+::: browser/devtools/performance/performance-controller.js
+@@ +174,5 @@
+>   * Initializes the profiler controller and views.
+>   */
+>  let startupPerformance = Task.async(function*() {
+> +  yield PerformanceController.initialize();
+> +  yield PerformanceView.initialize();
+
+Other views initialized by the PerformanceView use methods on the controller in their initializers -- this was a race condition we were lucky with before
+
+@@ +317,5 @@
+> +    // the RECORDING_STOPPED event, but in the case of a UI click on a button,
+> +    // the RECORDING_STOPPED event happens from the server, where this request may
+> +    // not have yet finished, so listen to this in tests that fail because the `stopRecording`
+> +    // request is not yet completed. Should only be used in that scenario.
+> +    this.emit(EVENTS.CONTROLLER_STOPPED_RECORDING);
+
+This is no different than other events, this is just a UI response event, due to the nature of the front emitting an event, which will be propogated via RECORDING_STATE_CHANGE (or RECORDING_STOPPED), but that does not imply that this function is completed. This ensures we do not have a race condition in this scenario, otherwise:
+
+clickButtonStopRecording();
+yield once(PerformanceController, EVENTS.RECORDING_STOPPED);
+
+This would fail because the stopRecording() function is not necessarily done when we receive a "recording-stopped" event from the front. This is not because of event renaming or anything, but due to the nature of the cascading events.
+
+@@ +350,5 @@
+> +      yield new Promise(resolve => {
+> +        this.on(EVENTS.RECORDING_STATE_CHANGE, function handler (state, model) {
+> +          if (state === "recording-stopped" && model === latest) {
+> +            this.off(EVENTS.RECORDING_STATE_CHANGE, handler);
+> +            resolve();
+
+Moved to this.waitForStateChangeOnRecording(recording, "recording-stopped")
+Created attachment 8643867
+1172180-perfactor.patch
+
+All comments addressed
+Created attachment 8643870
+1172180-perfactor.patch
+
+Now with threshold set to 40% for detecting the moving of files to track history.
+Reviewing this asap.
+Comment on attachment 8643870
+1172180-perfactor.patch
+
+Review of attachment 8643870:
+-----------------------------------------------------------------
+
+shipit.jpg
+Rebased try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=474ff5cb6342
+Again: https://treeherder.mozilla.org/#/jobs?repo=try&revision=9c44cd0469f1
+Waiting for Fx43 to land this large change.
+https://hg.mozilla.org/integration/fx-team/rev/4e11c910454f
+I backed this out for breaking at least JP mochitests: https://hg.mozilla.org/integration/fx-team/rev/efd4289a8c79
+
+https://treeherder.mozilla.org/logviewer.html#?job_id=4185066&repo=fx-team
+
+
+It's also possible that this broke mochitest-dt as well https://treeherder.mozilla.org/logviewer.html#?job_id=4184116&repo=fx-team
+Thanks, Wes -- created bug 1193110 for that failure
+https://hg.mozilla.org/integration/fx-team/rev/00db61e6f388
+https://hg.mozilla.org/mozilla-central/rev/00db61e6f388
+*** Bug 1142580 has been marked as a duplicate of this bug. ***
+
+
+Create a real PerformanceActor
+
+
+
+Bug 1172180 - part 2 - add ability to auto drain allocation logs in memory component via a timer and on GC. r=fitzgen 
+
+Bug 1172180 - Add polling events for profiler/buffer status on the profiler itself. r=vp 
+
+Bug 1172180 - Create a PerformanceActor, and migrate existing pseudo PerformanceFront to a legacy front. r=vp 
+
+Backed out changeset 4e11c910454f (bug 1172180) for jp and dt failures related to performanceActors CLOSED TREE 
+
+Bug 1172180 - Create a PerformanceActor, and migrate existing pseudo PerformanceFront to a legacy front. r=vp 

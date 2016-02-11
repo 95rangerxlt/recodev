@@ -1,0 +1,314 @@
+It would be great to have a simple API that allows extensions to register listeners for RDP traffic (send and received).
+
+There are hooks in transport instances, but those aren't much suitable for adding multiple listeners that can come from extensions.
+
+Instead, extensions could handle emitted events (on the connection object?). I am thinking about something like as follows:
+
+on(connection, "send", onSend);
+on(connection, "startBulkSend", onStartBulkSend);
+on(connection, "onPacket", onPacket);
+on(connection, "onBulkPacket", onBulkPacket);
+on(connection, "closed", onClosed);
+on(connection, "open", onOpen);
+
+Thoughts?
+
+Honza
+
+It would be great to have a simple API that allows extensions to register listeners for RDP traffic (send and received).
+
+There are hooks in transport instances, but those aren't much suitable for adding multiple listeners that can come from extensions.
+
+Instead, extensions could handle emitted events (on the connection object?). I am thinking about something like as follows:
+
+on(connection, "send", onSend);
+on(connection, "startBulkSend", onStartBulkSend);
+on(connection, "onPacket", onPacket);
+on(connection, "onBulkPacket", onBulkPacket);
+on(connection, "closed", onClosed);
+on(connection, "open", onOpen);
+
+Thoughts?
+
+Honza
+I am not sure who's the best to ask, but... Panos, Brian? ;-)
+
+Honza
+Forwarding request to Ryan
+That sounds fine to me. Bug 1042642 is also similar, which makes me think we should probably fix both at the same time.
+
+Out of curiosity, what is the use case for these new hooks?
+I guess am slightly worried about giving up control of these internals, as I've subtly shifted some of these APIs in the past, which would be harder to do with extensions in the mix.
+
+Could we start with a use case?  I think that would be more enlightening.
+(In reply to J. Ryan Stinnett [:jryans] from comment #4)
+> Could we start with a use case?  I think that would be more enlightening.
+
+E.g. simple packet sniffer and visualization tool for extension developers who deal
+with actors and the protocol.
+
+Honza
+Created attachment 8557901
+bug1126274-1.patch
+
+I am attaching a first patch.
+
+1. Events about send/received packets are emitted by a protocol instance.
+2. In order to get a protocol instance (to setup a listener) there is another event that allows tracking DebuggerClient instances ("debugger-client-connect").
+3. In order to get debugger client for specific toolbox there is "debugger-client-connect" event.
+
+What do you think?
+
+Honza
+Comment on attachment 8557901
+bug1126274-1.patch
+
+Review of attachment 8557901:
+-----------------------------------------------------------------
+
+Is it important to have the client and transport for a specific toolbox?
+
+Or do you just want to know of *any* DebuggerClient that's created?
+
+If we just want a global view of RDP activity, I think it would be enough to emit some event on |DebuggerClient| itself (not from an instance) each time one is made, and then watch the transport events from there.
+
+::: browser/devtools/framework/gDevTools.jsm
+@@ +413,5 @@
+>      else {
+>        // No toolbox for target, create one
+>        toolbox = new devtools.Toolbox(target, toolId, hostType, hostOptions);
+>  
+> +      this.emit("toolbox-create", toolbox);
+
+Nit: created
+
+::: browser/devtools/framework/toolbox.js
+@@ +356,5 @@
+>        };
+>  
+>        // Load the toolbox-level actor fronts and utilities now
+> +      let remotePromise = this._target.makeRemote();
+> +      this.emit("client-available", this._target._client);
+
+I don't think this event is needed.
+
+If you have the |target| (or from the |toolbox|, |toolbox.target|), then you can call |target.makeRemote()| yourself to get a promise, which when resolved would let you access the client.
+
+But this may depend on whether it's really necessary to know about a *specific* toolbox.  See my overall comment.
+
+::: toolkit/devtools/client/dbg-client.jsm
+@@ +27,5 @@
+>  
+>  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+>  Cu.import("resource://gre/modules/NetUtil.jsm");
+>  Cu.import("resource://gre/modules/Services.jsm");
+> +Cu.import("resource:///modules/devtools/gDevTools.jsm");
+
+While I can't think of too many places where |DebuggerClient| is used outside of Firefox, it's generally bad to reference browser files from toolkit, since the toolkit ones are shipped to all devices, but browser files on exist in Firefox.
+
+@@ +396,5 @@
+>     *        If specified, will be called when the greeting packet is
+>     *        received from the debugging server.
+>     */
+>    connect: function (aOnConnected) {
+> +    gDevTools.emit("debugger-client-connect", this);
+
+I think this makes more sense to be emitted by |DebuggerClient|.
+Created attachment 8559844
+bug1126274-2.patch
+
+Thanks for the review Ryan!
+
+(In reply to J. Ryan Stinnett [:jryans] from comment #7)
+> Is it important to have the client and transport for a specific toolbox?
+> Or do you just want to know of *any* DebuggerClient that's created?
+Both scenarios are valid and should be supported I think.
+But, tracking just specific toolbox is definitely more important
+(like the Network panel shows HTTP only for the current page)
+
+> If we just want a global view of RDP activity, I think it would be enough to
+> emit some event on |DebuggerClient| itself (not from an instance) each time
+> one is made, and then watch the transport events from there.
+Yes, it's now done this way, see below.
+
+> ::: browser/devtools/framework/gDevTools.jsm
+> @@ +413,5 @@
+> >      else {
+> >        // No toolbox for target, create one
+> >        toolbox = new devtools.Toolbox(target, toolId, hostType, hostOptions);
+> >  
+> > +      this.emit("toolbox-create", toolbox);
+> 
+> Nit: created
+Fixed
+
+> ::: browser/devtools/framework/toolbox.js
+> @@ +356,5 @@
+> >        };
+> >  
+> >        // Load the toolbox-level actor fronts and utilities now
+> > +      let remotePromise = this._target.makeRemote();
+> > +      this.emit("client-available", this._target._client);
+> 
+> I don't think this event is needed.
+Yeah, I didn't like that event either...
+
+> 
+> If you have the |target| (or from the |toolbox|, |toolbox.target|), then you
+> can call |target.makeRemote()| yourself to get a promise, which when
+> resolved would let you access the client.
+Done
+
+So, a client now needs to listen for "toolbox-created" and do:
+
+toolbox.target.makeRemote();
+let client = toolbox.target.client;
+
+// add listeners
+
+client.addOneTimeListener("closed", event => {
+  // remove listeners
+});
+
+> ::: toolkit/devtools/client/dbg-client.jsm
+> @@ +27,5 @@
+> >  
+> >  Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> >  Cu.import("resource://gre/modules/NetUtil.jsm");
+> >  Cu.import("resource://gre/modules/Services.jsm");
+> > +Cu.import("resource:///modules/devtools/gDevTools.jsm");
+> 
+> While I can't think of too many places where |DebuggerClient| is used
+> outside of Firefox, it's generally bad to reference browser files from
+> toolkit, since the toolkit ones are shipped to all devices, but browser
+> files on exist in Firefox.
+I see, fixed.
+
+> @@ +396,5 @@
+> >     *        If specified, will be called when the greeting packet is
+> >     *        received from the debugging server.
+> >     */
+> >    connect: function (aOnConnected) {
+> > +    gDevTools.emit("debugger-client-connect", this);
+> 
+> I think this makes more sense to be emitted by |DebuggerClient|.
+Done
+
+I am emitting one event on the instance (to me consistent) with
+other (e.g. 'connected' or 'closed' events) and one on the |DebuggerClient|
+object directly (to track all instances).
+
+Note that the event is emitted using "sdk/event/core", so the
+client (an extension) needs to currently load the same SDK as devtools
+(i.e. use the same loader). This is what Dave mentioned on yesterday's
+meeting.
+
+Honza
+Comment on attachment 8559844
+bug1126274-2.patch
+
+Review of attachment 8559844:
+-----------------------------------------------------------------
+
+Okay, I think the events look good!
+
+I'd like to see a basic test that sets up example listeners as an add-on would and logs a packet, just to convince ourselves that this will work fine (and remain working in the future).
+
+I'll try to review more quickly next round!
+Created attachment 8561981
+bug1126274-3.patch
+
+(In reply to J. Ryan Stinnett [:jryans] from comment #9)
+> I'd like to see a basic test that sets up example listeners as an add-on
+> would and logs a packet, just to convince ourselves that this will work fine
+> (and remain working in the future).
+Test is included in the patch
+
+I created a mochitest in the end, since it shows how to register listeners to catch toolbox -> debugger client -> transport objects and intercept RDP packets. XPC shell test would be too simplistic I think. The tests also makes sure that packets are caught from the very beginning (including the first packet from the root actor).
+
+Honza
+Comment on attachment 8561981
+bug1126274-3.patch
+
+Review of attachment 8561981:
+-----------------------------------------------------------------
+
+Great, thanks for the test!
+Thanks for the review Ryan!
+
+Push to try: https://tbpl.mozilla.org/?tree=Try&rev=a2cdc5e5c7c6
+
+Honza
+Yet another push on win
+https://tbpl.mozilla.org/?tree=Try&rev=b7f142ba714e
+
+Honza
+(In reply to Jan Honza Odvarko [:Honza] from comment #13)
+> Yet another push on win
+> https://tbpl.mozilla.org/?tree=Try&rev=b7f142ba714e
+> 
+> Honza
+
+806 INFO TEST-UNEXPECTED-FAIL | browser/devtools/framework/test/browser_toolbox_window_title_changes.js | leaked until shutdown [nsGlobalWindow #858 inner chrome://browser/content/devtools/framework/toolbox-window.xul about:blank] - expected PASS
+807 INFO TEST-UNEXPECTED-FAIL | browser/devtools/framework/test/browser_toolbox_window_title_changes.js | leaked until shutdown [nsGlobalWindow #857 outer about:blank] - expected PASS
+Created attachment 8563375
+bug1126274-4.patch
+
+Ah, thanks Ryan!
+
+Test fixed (a listener left registered), new patch attached, pushed to try again:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=1b3143f17edd
+
+Honza
+Ryan, there is one e10s related error, is it related to the test?
+
+Honza
+
+FATAL ERROR: AsyncShutdown timeout in ShutdownLeaks: Wait for cleanup to be finished before checking for leaks Conditions: [{"name":"DevTools: Wait until toolbox is destroyed","state":"(none)","filename":"resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/framework/toolbox.js","lineNumber":1695,"stack":["resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/framework/toolbox.js:Toolbox.prototype.destroy/leakCheckObse
+(In reply to Jan Honza Odvarko [:Honza] from comment #16)
+> Ryan, there is one e10s related error, is it related to the test?
+> 
+> Honza
+> 
+> FATAL ERROR: AsyncShutdown timeout in ShutdownLeaks: Wait for cleanup to be
+> finished before checking for leaks Conditions: [{"name":"DevTools: Wait
+> until toolbox is
+> destroyed","state":"(none)","filename":"resource://gre/modules/commonjs/
+> toolkit/loader.js ->
+> resource:///modules/devtools/framework/toolbox.js","lineNumber":1695,"stack":
+> ["resource://gre/modules/commonjs/toolkit/loader.js ->
+> resource:///modules/devtools/framework/toolbox.js:Toolbox.prototype.destroy/
+> leakCheckObse
+
+The test seems okay at first glance...  I retriggered the test suite on your Try run a few more times, so we'll see if this happens again.
+Created attachment 8563919
+bug1126274-5.patch
+
+The problem persists, updated patch attached.
+
+Tree try is closed ATM, I'll push as soon as open again.
+
+Honza
+Pushed to try:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=c253646c8bf0
+
+Honza
+Looks good now.
+
+Honza
+Comment on attachment 8563919
+bug1126274-5.patch
+
+Review of attachment 8563919:
+-----------------------------------------------------------------
+
+Looks good!
+https://hg.mozilla.org/integration/fx-team/rev/306eab8d8ffe
+https://hg.mozilla.org/mozilla-central/rev/306eab8d8ffe
+
+
+New API: listening for sent and received RDP packets
+
+
+
+Bug 1126274 - Add new API to listen for sent and received RDP packets. r=jryans 

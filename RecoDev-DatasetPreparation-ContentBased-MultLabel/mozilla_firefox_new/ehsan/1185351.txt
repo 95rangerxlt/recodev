@@ -1,0 +1,398 @@
+Created attachment 8635787
+2015-07-19_145501.png
+
+User Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; rv:39.0) Gecko/20100101 Firefox/39.0
+Build ID: 20150630154324
+
+Steps to reproduce:
+
+1. Create a page with HTTP-Header "Content-Security-Policy: default-src 'self'" and a couple of paragraphs.
+2. Open the page inspector
+3. Inspect one of the paragraphs with the page inspector
+
+
+Actual results:
+
+* A security warning is written to the console: "Content Security Policy: The page's settings blocked the loading of a resource at self"
+* Elements in the page appear to have no height (see screenshot).
+
+
+Expected results:
+
+I expect the page inspector to work even if a CSP-header is set. I guess the page inspector injects scripts or stylesheets into the page and CSP is preventing that.
+
+I don't know if this is a bug or if it's expected behavior.
+
+Created attachment 8635787
+2015-07-19_145501.png
+
+User Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; rv:39.0) Gecko/20100101 Firefox/39.0
+Build ID: 20150630154324
+
+Steps to reproduce:
+
+1. Create a page with HTTP-Header "Content-Security-Policy: default-src 'self'" and a couple of paragraphs.
+2. Open the page inspector
+3. Inspect one of the paragraphs with the page inspector
+
+
+Actual results:
+
+* A security warning is written to the console: "Content Security Policy: The page's settings blocked the loading of a resource at self"
+* Elements in the page appear to have no height (see screenshot).
+
+
+Expected results:
+
+I expect the page inspector to work even if a CSP-header is set. I guess the page inspector injects scripts or stylesheets into the page and CSP is preventing that.
+
+I don't know if this is a bug or if it's expected behavior.
+Are you able to provide a URL to a test page?  That will help us reproduce the issue.
+I created a test page at: http://lando.blis.biz/firefox-csp/
+Thank you, that helps a lot!  I can reproduce this in Nightly.
+
+Not quite sure what this issue is.  Patrick, any ideas since you've worked on the highlighter quite a bit?
+The highlighter script seems to work correctly: nodes are highlighted as the mouse moves over them in the page (in pick mode) or over the nodes in the markup-view.
+The highlighter stylesheet and markup seem to be injected in the page correctly, hovering over the first <p> for example shows the expected result.
+BUT, it appears that the area into which the highlighter is shown is cut off at the bottom and doesn't cover 100% of the height of the viewport as it should.
+If you hover over the <html> tag in the markup-view for instance, you can see that the blue content area of the highlighter only extends as far down as the first <p>.
+
+So this must have something to do with the way the dimensions of container element of the highlighter are calculated.
+This happens for all highlighter types
+After more investigation, I found out that the parent elements of the highlighter had correct dimensions.
+
+All highlighter types use a native-anonymous element injected in the canvasFrame of the HTML document element. This element is styled in ua.css to be fixed positioned, at top z-index and has a 100% width and height. Adding a colored background to this element showed me that it indeed covered 100% of the viewport.
+
+Inside this element, we insert a 100%/100% element for each highlighter we want to show. I confirmed that this element also had the expected dimensions.
+
+However, its child element was the one that was cut off after a couple of hundred pixels. And simply adding this to highlighter.css solved it:
+
+:-moz-native-anonymous .box-model-root {
+  width: 100%;
+  height: 100%;
+}
+
+The odd thing is this rule shouldn't be needed because the 100% dimension is normally added dynamically (and depends on the current zoom value) when scaleRootElement is called:
+https://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/highlighter.js#844
+
+I don't understand CSP well so I don't know why it would block scaleRootElement from running correctly.
+Specifically, this seems to have no effect at all:
+
+let content = doc.insertAnonymousContent(node);
+content.setAttributeForElement(id, "style", "width:100%;height:100%");
+
+doc is the content document, and node is a DOM node we insert into the native-anonymous element described earlier.
+The node is inserted correctly, but setting its style has no effect (setAttributeForElement is defined here: https://dxr.mozilla.org/mozilla-central/source/dom/webidl/AnonymousContent.webidl?offset=400#46
+Hi Christoph: looking at some of the CSP C++ implementation, your name came up and I'm wondering if you could help answer these questions
+
+- is there a way I can get more information about what exactly is being blocked when the following log appears in the console:
+"Content Security Policy: The page's settings blocked the loading of a resource at self" ?
+
+- could CSP be responsible for blocking setting the style attribute on a native-anonymous element in the page? In particular setAttribute is called in AnonymousContent::SetAttributeForElement in /dom/base/AnonymousContent.cpp available to chrome js code via /dom/webidl/AnonymousContent.webidl ?
+
+Thanks for your help.
+Patrick: If I use "Content-Security-Policy: default-src 'none'; style-src 'self' 'unsafe-inline';" the inspector works as expected. So it seems inline styles are responsible for the broken highlighting.
+(In reply to rros from comment #7)
+> Patrick: If I use "Content-Security-Policy: default-src 'none'; style-src
+> 'self' 'unsafe-inline';" the inspector works as expected. So it seems inline
+> styles are responsible for the broken highlighting.
+Thanks for confirming this.
+So I guess the question is: can we not block setting the style if the element receiving the style is the devtools highlighter?
+I would guess we need to alter nsStyleUtil::CSPAllowsInlineStyle[1] so that it ignores the native anonymous case and allows the style.
+
+[1]: https://dxr.allizom.org/mozilla-central/source/layout/style/nsStyleUtil.cpp?offset=800#651
+According to Wikipedia: browsers and add-ins should be exempt from CSP: https://en.wikipedia.org/wiki/Content_Security_Policy#Browser_add-ons_and_extensions_exemption
+
+However, I can't find any mention of this in the spec: http://www.w3.org/TR/CSP/#processing-model
+(In reply to Patrick Brosset [:pbrosset] [:pbro] from comment #6)
+> - is there a way I can get more information about what exactly is being
+> blocked when the following log appears in the console:
+> "Content Security Policy: The page's settings blocked the loading of a
+> resource at self" ?
+
+I agree that console message is not very helpful. What's happening is that CSP blocks an inline style that is applied by some devtool code! See stacktrace underneath!
+
+(In reply to Robert Ros from comment #10)
+> According to Wikipedia: browsers and add-ins should be exempt from CSP:
+> https://en.wikipedia.org/wiki/Content_Security_Policy#Browser_add-
+> ons_and_extensions_exemption
+
+That is correct. Browser code should be excempt from CSP - so this is clearly a bug. I am surprised that no one ran into this problem for such a long time. Thanks for reporting. Potentially because most web pages (that do use CSP) also include 'unsafe-inline' which makes it work. Nevertheless one should not use 'unsafe-inline' if not needed and definitely *not* add 'unsafe-inline' just to make the devtool work correctly :-)
+
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #9)
+> I would guess we need to alter nsStyleUtil::CSPAllowsInlineStyle[1] so that
+> it ignores the native anonymous case and allows the style.
+> 
+> [1]:
+> https://dxr.allizom.org/mozilla-central/source/layout/style/nsStyleUtil.
+> cpp?offset=800#651
+
+I would think so too. In a first attempt of debugging I tried to whitelist and return early if 'aValue' is empty.
+
+> +++ b/layout/style/nsStyleUtil.cpp
+> @@ -656,16 +656,21 @@ nsStyleUtil::CSPAllowsInlineStyle(nsICon
+>                                   nsresult* aRv)
+>   if (aRv) {
+>     *aRv = NS_OK;
+>   }
+> 
+>+  if (aStyleText.IsEmpty()) {
+>+    return true;
+>+  }
+>+
+
+Which worked for a few cases but then 'aValue' was equal to
+> position:absolute;width:100%;height:100%;
+and we ran into the same problem!
+
+So the question is, how many different values are we expecting?
+And, is there a way to distinguish what is 'browser' code and what is page code within :: CSPAllowsInlineStyle?
+Maybe based on the principal, but that needs further investigation!
+We could certainly pass a flag along if that allows us to distinguish devtool injected code from webpage code.
+On a different note, do we also sometimes inject script code for making devtool code work? If so, then potentially we have to do the same thing for inline scripts.
+
+%----- snip -----
+
+#0  nsCSPContext::getAllowsInternal (this=0x7fffca8b9500, aContentType=4, aKeyword=CSP_UNSAFE_INLINE, aNonceOrContent=..., outShouldReportViolation=0x7ffffffea82f, 
+    outIsAllowed=0x7ffffffea84b) at /home/ckerschb/moz/mc/dom/security/nsCSPContext.cpp:419
+#1  0x00007fffe836480f in nsCSPContext::GetAllowsInlineStyle (this=0x7fffca8b9500, outShouldReportViolation=0x7ffffffea82f, outAllowsInlineStyle=0x7ffffffea84b)
+    at /home/ckerschb/moz/mc/dom/security/nsCSPContext.cpp:456
+#2  0x00007fffe8e1711c in nsStyleUtil::CSPAllowsInlineStyle (aContent=0x0, aPrincipal=0x7fffc7ade5e0, aSourceURI=0x7fffc494c200, aLineNumber=0, aStyleText=..., aRv=0x0)
+    at /home/ckerschb/moz/mc/layout/style/nsStyleUtil.cpp:692
+#3  0x00007fffe6b77bea in nsStyledElementNotElementCSSInlineStyle::ParseStyleAttribute (this=0x7fffba667ae0, aValue=..., aResult=..., aForceInDataDoc=false)
+    at /home/ckerschb/moz/mc/dom/base/nsStyledElement.cpp:155
+#4  0x00007fffe6b77b23 in nsStyledElementNotElementCSSInlineStyle::ParseAttribute (this=0x7fffba667ae0, aNamespaceID=0, aAttribute=0x7fffdbf532e0, aValue=..., aResult=...)
+    at /home/ckerschb/moz/mc/dom/base/nsStyledElement.cpp:39
+#5  0x00007fffe844a9ba in nsSVGElement::ParseAttribute (this=0x7fffba667ae0, aNamespaceID=0, aAttribute=0x7fffdbf532e0, aValue=..., aResult=...)
+    at /home/ckerschb/moz/mc/dom/svg/nsSVGElement.cpp:646
+#6  0x00007fffe692d824 in mozilla::dom::Element::SetAttr (this=0x7fffba667ae0, aNamespaceID=0, aName=0x7fffdbf532e0, aPrefix=0x0, aValue=..., aNotify=true)
+    at /home/ckerschb/moz/mc/dom/base/Element.cpp:2201
+#7  0x00007fffe695e357 in mozilla::dom::Element::SetAttr (this=0x7fffba667ae0, aNameSpaceID=0, aName=0x7fffdbf532e0, aValue=..., aNotify=true)
+    at ../../dist/include/mozilla/dom/Element.h:447
+#8  0x00007fffe6929eb6 in mozilla::dom::Element::SetAttribute (this=0x7fffba667ae0, aName=..., aValue=..., aError=...) at /home/ckerschb/moz/mc/dom/base/Element.cpp:1186
+#9  0x00007fffe68e5de3 in mozilla::dom::AnonymousContent::SetAttributeForElement (this=0x7fffc53215e0, aElementId=..., aName=..., aValue=..., aRv=...)
+    at /home/ckerschb/moz/mc/dom/base/AnonymousContent.cpp:83
+#10 0x00007fffe6c86efc in mozilla::dom::AnonymousContentBinding::setAttributeForElement (cx=0x7ffff6b0e800, obj=..., self=0x7fffc53215e0, args=...)
+    at ./AnonymousContentBinding.cpp:165
+#11 0x00007fffe7ac0653 in mozilla::dom::GenericBindingMethod (cx=0x7ffff6b0e800, argc=3, vp=0x7fffda460698) at /home/ckerschb/moz/mc/dom/bindings/BindingUtils.cpp:2599
+#12 0x00007fffeaddce9b in js::CallJSNative (cx=0x7ffff6b0e800, native=0x7fffe7ac03d0 <mozilla::dom::GenericBindingMethod(JSContext*, unsigned int, JS::Value*)>, args=...)
+    at /home/ckerschb/moz/mc/js/src/jscntxtinlines.h:235
+Thanks Christoph for looking into this. What product/component should I move this bug to?
+
+(In reply to Christoph Kerschbaumer [:ckerschb] from comment #11)
+> So the question is, how many different values are we expecting?
+Pretty much any value. Devtools uses a special chrome-only API [1] to inject anonymous content into the page and manipulate it. In particular, this API has the setAttributeForElement method which allows devtools to set any attribute to anything. 
+
+> And, is there a way to distinguish what is 'browser' code and what is page
+> code within :: CSPAllowsInlineStyle?
+> Maybe based on the principal, but that needs further investigation!
+> We could certainly pass a flag along if that allows us to distinguish
+> devtool injected code from webpage code.
+Note that this isn't just devtools using it. The API is available to any chrome-JS code, so addons can use it too for example.
+Passing a flag would work, but looking at the backtrace you added doesn't seem very practical.
+NI? Ehsan who mentored me on the original bug, maybe he can help figure this out.
+
+> On a different note, do we also sometimes inject script code for making
+> devtool code work? If so, then potentially we have to do the same thing for
+> inline scripts.
+No that's not something we're doing so far.
+
+[1] https://dxr.mozilla.org/mozilla-central/source/dom/webidl/AnonymousContent.webidl
+We don't need to figure out whether a style attribute is coming from the browser in this case.  What we need to do is to not do the CSP check for native anonymous content, since it by definition cannot be accessed by content, so there is no point to enforce CSP on it.  I have a patch that does that.
+Created attachment 8651095
+Don't force inline style CSP checks on native anonymous content
+Comment on attachment 8651095
+Don't force inline style CSP checks on native anonymous content
+
+Review of attachment 8651095:
+-----------------------------------------------------------------
+
+Thanks Ehsan!
+
+::: dom/base/nsStyledElement.cpp
+@@ +150,5 @@
+>                                                               nsAttrValue& aResult,
+>                                                               bool aForceInDataDoc)
+>  {
+>    nsIDocument* doc = OwnerDoc();
+> +  bool isNativeAnon = IsInNativeAnonymousSubtree();
+
+So, this is the way we can distinguish native anonymous content - great!
+
+::: dom/base/test/mochitest.ini
+@@ +257,5 @@
+>  [test_anonymousContent_append_after_reflow.html]
+>  [test_anonymousContent_insert.html]
+>  [test_anonymousContent_manipulate_content.html]
+> +[test_anonymousContent_style_csp.html]
+> +support-files = test_anonymousContent_style_csp.html^headers^
+
+nit: there is already a 'support-files =' defined above, you could just append the support file to that list above.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f6176857e5ae
+https://hg.mozilla.org/mozilla-central/rev/f6176857e5ae
+Does it make sense to uplift this to aurora or beta?  See also bug 1195302 for a developer impacted by this.
+Comment on attachment 8651095
+Don't force inline style CSP checks on native anonymous content
+
+Approval Request Comment
+[Feature/regressing bug #]:
+It think that's the main CSP bug: Bug 493857
+
+[User impact if declined]:
+CSP prevents users from inspecting the page if the page is shipped with a CSP that uses style-src without 'unsafe-inline'. Worth mentioning is that Bug 1004703 ignores unsafe-inline if hash-src or nonce-src is specified within CSP, which landed in 40. So potentially we will get more bug reports like this if we don't uplift.
+
+[Describe test coverage new/current, TreeHerder]:
+test landed with this patch on mc.
+
+[Risks and why]: 
+low; because it's only a one line change and because CSP is bypassed if the request originated from an anonymous content.
+
+[String/UUID change made/needed]:
+no
+Yeah, we should definitely get this uplifted.
+Robert, could you please verify this issue is fixed on the latest Nightly? Thanks.
+Comment on attachment 8651095
+Don't force inline style CSP checks on native anonymous content
+
+Fix seems low risk, it has been in Nightly for two days. The patch includes automated tests which is great! Let's uplift to Aurora42 and Beta41.
+Ritu, I tested it in 43.0a1 and it seems the inspector works now, yay! :)
+
+However sometimes I still see the CSP warning: The page's settings blocked the loading of a resource at self ("default-src http://lando.blis.biz").
+
+Steps to reproduce:
+1. Load http://lando.blis.biz/firefox-csp/
+2. Open the Inspector tab in de developer tools
+3. Inspect one of the paragraphs (so it's highlighted)
+4. Switch to the Console tab
+5. Press F5
+
+It's not a big issues, but maybe it can be a little confusing to see this warning.
+Thanks Robert! N-I Christoph. It seems Robert is still getting a CSP warning though page inspector is working now. Do we need to track that as a separate bug?
+(In reply to Robert Ros from comment #23)
+> Ritu, I tested it in 43.0a1 and it seems the inspector works now, yay! :)
+> 
+> However sometimes I still see the CSP warning: The page's settings blocked
+> the loading of a resource at self ("default-src http://lando.blis.biz").
+> 
+> Steps to reproduce:
+> 1. Load http://lando.blis.biz/firefox-csp/
+> 2. Open the Inspector tab in de developer tools
+> 3. Inspect one of the paragraphs (so it's highlighted)
+> 4. Switch to the Console tab
+> 5. Press F5
+> 
+> It's not a big issues, but maybe it can be a little confusing to see this
+> warning.
+
+Well, that problem seems closely related, especially since it uses the same codepath and calls ParseStyleAttribute() [see stacktrace underneath], which is what we updated in this bug.
+
+Unfortunately, I am not super familiar with that code, Ehsan, are we missing something? If so, we should consider filing a new bug, maybe it's only a small issue, then we could still handle the problem within this bug and uplift as well.
+
+
+#0  nsCSPContext::AsyncReportViolation (this=0x7fffc5810400, aBlockedContentSource=0x7fffb9387910, aOriginalURI=0x0, aViolatedDirective=..., aViolatedPolicyIndex=0, 
+    aObserverSubject=..., aSourceFile=..., aScriptSample=..., aLineNum=0) at /home/ckerschb/moz/mc/dom/security/nsCSPContext.cpp:1055
+#1  0x00007fffe82b1a0c in nsCSPContext::LogViolationDetails (this=0x7fffc5810400, aViolationType=7, aSourceFile=..., aScriptSample=..., aLineNum=0, aNonce=..., aContent=...)
+    at /home/ckerschb/moz/mc/dom/security/nsCSPContext.cpp:575
+#2  0x00007fffe8d6d0b1 in nsStyleUtil::CSPAllowsInlineStyle (aContent=0x0, aPrincipal=0x7fffc10b3c80, aSourceURI=0x7fffc221ec00, aLineNumber=0, aStyleText=..., aRv=0x0)
+    at /home/ckerschb/moz/mc/layout/style/nsStyleUtil.cpp:770
+#3  0x00007fffe6aa3965 in nsStyledElementNotElementCSSInlineStyle::ParseStyleAttribute (this=0x7fffb994eaa0, aValue=..., aResult=..., aForceInDataDoc=false)
+    at /home/ckerschb/moz/mc/dom/base/nsStyledElement.cpp:157
+#4  0x00007fffe6aa3883 in nsStyledElementNotElementCSSInlineStyle::ParseAttribute (this=0x7fffb994eaa0, aNamespaceID=0, aAttribute=0x7fffdbe583d0, aValue=..., aResult=...)
+    at /home/ckerschb/moz/mc/dom/base/nsStyledElement.cpp:39
+#5  0x00007fffe839795a in nsSVGElement::ParseAttribute (this=0x7fffb994eaa0, aNamespaceID=0, aAttribute=0x7fffdbe583d0, aValue=..., aResult=...)
+    at /home/ckerschb/moz/mc/dom/svg/nsSVGElement.cpp:646
+#6  0x00007fffe68437b4 in mozilla::dom::Element::SetAttr (this=0x7fffb994eaa0, aNamespaceID=0, aName=0x7fffdbe583d0, aPrefix=0x0, aValue=..., aNotify=false)
+    at /home/ckerschb/moz/mc/dom/base/Element.cpp:2262
+#7  0x00007fffe683a42e in mozilla::dom::FragmentOrElement::CopyInnerTo (this=0x7fffba9a5e80, aDst=0x7fffb994eaa0)
+    at /home/ckerschb/moz/mc/dom/base/FragmentOrElement.cpp:1967
+#8  0x00007fffe8360e3e in mozilla::dom::SVGPathElement::Clone (this=0x7fffba9a5e80, aNodeInfo=0x7fffba6a6780, aResult=0x7fffffff88c0)
+    at /home/ckerschb/moz/mc/dom/svg/SVGPathElement.cpp:63
+#9  0x00007fffe6a6459f in nsNodeUtils::CloneAndAdopt (aNode=0x7fffba9a5e80, aClone=true, aDeep=true, aNewNodeInfoManager=0x0, aReparentScope=..., aNodesWithProperties=..., 
+    aParent=0x7fffbdd7c600, aResult=0x7fffffff8bd8) at /home/ckerschb/moz/mc/dom/base/nsNodeUtils.cpp:461
+#10 0x00007fffe6a6512c in nsNodeUtils::CloneAndAdopt (aNode=0x7fffbde57300, aClone=true, aDeep=true, aNewNodeInfoManager=0x0, aReparentScope=..., aNodesWithProperties=..., 
+    aParent=0x7fffba1c5e20, aResult=0x7fffffff9088) at /home/ckerschb/moz/mc/dom/base/nsNodeUtils.cpp:585
+#11 0x00007fffe6a6512c in nsNodeUtils::CloneAndAdopt (aNode=0x7fffba7b4f00, aClone=true, aDeep=true, aNewNodeInfoManager=0x0, aReparentScope=..., aNodesWithProperties=..., 
+    aParent=0x7fffba47b980, aResult=0x7fffffff9538) at /home/ckerschb/moz/mc/dom/base/nsNodeUtils.cpp:585
+#12 0x00007fffe6a6512c in nsNodeUtils::CloneAndAdopt (aNode=0x7fffba71cca0, aClone=true, aDeep=true, aNewNodeInfoManager=0x0, aReparentScope=..., aNodesWithProperties=..., 
+    aParent=0x7fffba47b8f0, aResult=0x7fffffff99e8) at /home/ckerschb/moz/mc/dom/base/nsNodeUtils.cpp:585
+#13 0x00007fffe6a6512c in nsNodeUtils::CloneAndAdopt (aNode=0x7fffba71cc10, aClone=true, aDeep=true, aNewNodeInfoManager=0x0, aReparentScope=..., aNodesWithProperties=..., 
+    aParent=0x0, aResult=0x7fffffff9d98) at /home/ckerschb/moz/mc/dom/base/nsNodeUtils.cpp:585
+#14 0x00007fffe69ecd8d in nsNodeUtils::Clone (aNode=0x7fffba71cc10, aDeep=true, aNewNodeInfoManager=0x0, aNodesWithProperties=..., aResult=0x7fffffff9d98)
+    at /home/ckerschb/moz/mc/dom/base/nsNodeUtils.h:169
+#15 0x00007fffe6a63fe2 in nsNodeUtils::CloneNodeImpl (aNode=0x7fffba71cc10, aDeep=true, aResult=0x7fffffff9e10) at /home/ckerschb/moz/mc/dom/base/nsNodeUtils.cpp:396
+#16 0x00007fffe6a32052 in nsINode::CloneNode (this=0x7fffba71cc10, aDeep=true, aError=...) at /home/ckerschb/moz/mc/dom/base/nsINode.cpp:2765
+#17 0x00007fffe8f692ef in nsCanvasFrame::DestroyFrom (this=0x7fffc1dc7000, aDestructRoot=0x7fffc1dc6900) at /home/ckerschb/moz/mc/layout/generic/nsCanvasFrame.cpp:237
+#18 0x00007fffe8f7ec79 in nsFrameList::DestroyFramesFrom (this=0x7fffc1dc73d0, aDestructRoot=0x7fffc1dc6900) at /home/ckerschb/moz/mc/layout/generic/nsFrameList.cpp:54
+#19 0x00007fffe8f7e90a in nsContainerFrame::DestroyFrom (this=0x7fffc1dc7370, aDestructRoot=0x7fffc1dc6900) at /home/ckerschb/moz/mc/layout/generic/nsContainerFrame.cpp:203
+#20 0x00007fffe8fc6c29 in nsHTMLScrollFrame::DestroyFrom (this=0x7fffc1dc7370, aDestructRoot=0x7fffc1dc6900) at /home/ckerschb/moz/mc/layout/generic/nsGfxScrollFrame.cpp:137
+#21 0x00007fffe8f7ec79 in nsFrameList::DestroyFramesFrom (this=0x7fffc1dc6960, aDestructRoot=0x7fffc1dc6900) at /home/ckerschb/moz/mc/layout/generic/nsFrameList.cpp:54
+#22 0x00007fffe8f7e90a in nsContainerFrame::DestroyFrom (this=0x7fffc1dc6900, aDestructRoot=0x7fffc1dc6900) at /home/ckerschb/moz/mc/layout/generic/nsContainerFrame.cpp:203
+#23 0x00007fffe8f02bbe in nsIFrame::Destroy (this=0x7fffc1dc6900) at /home/ckerschb/moz/mc/layout/base/../generic/nsIFrame.h:456
+#24 0x00007fffe8ea7954 in nsFrameManager::Destroy (this=0x7fffc0ea19c0) at /home/ckerschb/moz/mc/layout/base/nsFrameManager.cpp:147
+#25 0x00007fffe8e3b1c8 in nsCSSFrameConstructor::WillDestroyFrameTree (this=0x7fffc0ea19c0) at /home/ckerschb/moz/mc/layout/base/nsCSSFrameConstructor.cpp:8499
+#26 0x00007fffe8ecf919 in PresShell::Destroy (this=0x7fffc54cc400) at /home/ckerschb/moz/mc/layout/base/nsPresShell.cpp:1277
+#27 0x00007fffe8e9cc6c in nsDocumentViewer::DestroyPresShell (this=0x7fffda369a00) at /home/ckerschb/moz/mc/layout/base/nsDocumentViewer.cpp:4437
+#28 0x00007fffe8e943bc in nsDocumentViewer::Destroy (this=0x7fffda369a00) at /home/ckerschb/moz/mc/layout/base/nsDocumentViewer.cpp:1669
+#29 0x00007fffe8e9df60 in nsDocumentViewer::Show (this=0x7fffb9b99250) at /home/ckerschb/moz/mc/layout/base/nsDocumentViewer.cpp:1987
+#30 0x00007fffe8ecb2bd in nsPresContext::EnsureVisible (this=0x7fffb9614000) at /home/ckerschb/moz/mc/layout/base/nsPresContext.cpp:2090
+#31 0x00007fffe8edc7df in PresShell::UnsuppressAndInvalidate (this=0x7fffb964ec00) at /home/ckerschb/moz/mc/layout/base/nsPresShell.cpp:3791
+#32 0x00007fffe8ed35eb in PresShell::UnsuppressPainting (this=0x7fffb964ec00) at /home/ckerschb/moz/mc/layout/base/nsPresShell.cpp:3839
+#33 0x00007fffe8e996cf in nsDocumentViewer::LoadComplete (this=0x7fffb9b99250, aStatus=NS_OK) at /home/ckerschb/moz/mc/layout/base/nsDocumentViewer.cpp:1028
+#34 0x00007fffe9540f2d in nsDocShell::EndPageLoad (this=0x7fffc589f800, aProgress=0x7fffc589f828, aChannel=0x7fffb94dd858, aStatus=NS_OK)
+https://hg.mozilla.org/releases/mozilla-aurora/rev/266317ce8b1f
+https://hg.mozilla.org/releases/mozilla-beta/rev/aa07a23e1f75
+(In reply to Christoph Kerschbaumer [:ckerschb] from comment #25)
+> (In reply to Robert Ros from comment #23)
+> > Ritu, I tested it in 43.0a1 and it seems the inspector works now, yay! :)
+> > 
+> > However sometimes I still see the CSP warning: The page's settings blocked
+> > the loading of a resource at self ("default-src http://lando.blis.biz").
+> > 
+> > Steps to reproduce:
+> > 1. Load http://lando.blis.biz/firefox-csp/
+> > 2. Open the Inspector tab in de developer tools
+> > 3. Inspect one of the paragraphs (so it's highlighted)
+> > 4. Switch to the Console tab
+> > 5. Press F5
+> > 
+> > It's not a big issues, but maybe it can be a little confusing to see this
+> > warning.
+
+First things first, I can't reproduce this.
+
+> Well, that problem seems closely related, especially since it uses the same
+> codepath and calls ParseStyleAttribute() [see stacktrace underneath], which
+> is what we updated in this bug.
+> 
+> Unfortunately, I am not super familiar with that code, Ehsan, are we missing
+> something? If so, we should consider filing a new bug, maybe it's only a
+> small issue, then we could still handle the problem within this bug and
+> uplift as well.
+> 
+> 
+> #0  nsCSPContext::AsyncReportViolation (this=0x7fffc5810400,
+> aBlockedContentSource=0x7fffb9387910, aOriginalURI=0x0,
+> aViolatedDirective=..., aViolatedPolicyIndex=0, 
+>     aObserverSubject=..., aSourceFile=..., aScriptSample=..., aLineNum=0) at
+> /home/ckerschb/moz/mc/dom/security/nsCSPContext.cpp:1055
+> #1  0x00007fffe82b1a0c in nsCSPContext::LogViolationDetails
+> (this=0x7fffc5810400, aViolationType=7, aSourceFile=..., aScriptSample=...,
+> aLineNum=0, aNonce=..., aContent=...)
+>     at /home/ckerschb/moz/mc/dom/security/nsCSPContext.cpp:575
+> #2  0x00007fffe8d6d0b1 in nsStyleUtil::CSPAllowsInlineStyle (aContent=0x0,
+> aPrincipal=0x7fffc10b3c80, aSourceURI=0x7fffc221ec00, aLineNumber=0,
+> aStyleText=..., aRv=0x0)
+>     at /home/ckerschb/moz/mc/layout/style/nsStyleUtil.cpp:770
+> #3  0x00007fffe6aa3965 in
+> nsStyledElementNotElementCSSInlineStyle::ParseStyleAttribute
+> (this=0x7fffb994eaa0, aValue=..., aResult=..., aForceInDataDoc=false)
+>     at /home/ckerschb/moz/mc/dom/base/nsStyledElement.cpp:157
+
+This stack shows that CSPAllowsInlineStyle() is being called, so we're not dealing with a native anonymous element here.  What element is this on frame 3?  I find this very odd since that page has no style attribute...
+
+
+Page Inspector doesn't work correctly when a Content-Security-Policy header is used
+
+
+
+Bug 1185351 - Don't force inline style CSP checks on native anonymous content; r=ckerschb 

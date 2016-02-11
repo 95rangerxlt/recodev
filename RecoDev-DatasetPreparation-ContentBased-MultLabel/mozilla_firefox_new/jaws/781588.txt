@@ -1,0 +1,312 @@
+Seems like a pretty long time.
+
+Most of this (55ms) is set_value() in autocomplete.xml:272
+and a lot of the time in there is compiling regular expressions (20ms)
+
+Seems like a pretty long time.
+
+Most of this (55ms) is set_value() in autocomplete.xml:272
+and a lot of the time in there is compiling regular expressions (20ms)
+Here's the profile containing this information:
+http://people.mozilla.com/~bgirard/cleopatra/?report=8b82a8d27b7d12cdab0be1473371d971a2c756f9
+(In reply to Jeff Muizelaar [:jrmuizel] from comment #0)
+> Most of this (55ms) is set_value() in autocomplete.xml:272
+
+This includes both "formatting" (highlighting the host name, formatValue in urlbarBindings.xml) and trimming (trimURL in utilityOverlay.js).
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #2)
+> (In reply to Jeff Muizelaar [:jrmuizel] from comment #0)
+> > Most of this (55ms) is set_value() in autocomplete.xml:272
+> 
+> This includes both "formatting" (highlighting the host name, formatValue in
+> urlbarBindings.xml) and trimming (trimURL in utilityOverlay.js).
+
+formatValue() is 61.5% of set_value()
+
+The rest of the time seems to be handling NS_FOCUS_CONTENT
+and in nsHTMLInputElement::SetValue but there's only a couple of samples so it's hard to say exactly.
+So it's official: setting browser.urlbar.trimURLs to false improves responsiveness.
+Created attachment 660589
+Patch
+
+This patch removes three expensive areas of formatValue.
+
+To help with profiling, I broke the function into three smaller functions.
+
+I noticed that the getter for |this.editor| was 6.8% of formatValue and it was called twice, so I inserted a local variable to hold a reference to it. This is a minor win, but doesn't hurt.
+
+There were three expensive regular expression areas. The attached patch addresses two of them.
+
+The first one that it addresses is a regular expression that was being used to count the number of periods in a domain. I replaced this with a simple linear traversal.
+
+The second one used a RegExp object to get the subdomain. I replaced this with a call to String.slice (with an embedded String.indexOf call). This doesn't work for punycode addresses since the base domain is not represented in the domain string. In this case, the original code is used but this code is only reached if the fast path code is incorrect.
+
+This profile shows the results of these changes:
+> http://people.mozilla.com/~bgirard/cleopatra/?report=22a8024a2dab828cd9249ca9a7a42041d22ff89c
+
+With these changes, formatValue is down to 33.2% of URLBarSetURI (from 61.5%).
+typo edit,
+With these changes, formatValue is down to 33.2% of set_value (from 61.5%).
+Created attachment 660592
+Patch
+
+Whoops, forgot to qref.
+Comment on attachment 660592
+Patch
+
+Review of attachment 660592:
+-----------------------------------------------------------------
+
+It's very puzzling to me why this code re-invents the URI parsing support that we already have in the nsIURI API.  Couldn't we just use that and get rid of all of the regex dance and what-not?
+
+::: browser/base/content/urlbarBindings.xml
+@@ +188,5 @@
+>            if (baseDomain != domain) {
+> +            subDomain = domain.slice(0, domain.indexOf(baseDomain));
+> +            if (subDomain + baseDomain != domain) {
+> +              // IDN domain name, use a slower but IDN-compliant solution.
+> +              let segments = function (s) {
+
+Please give this function a name.  Anonymous functions are a pain to deal with when profiling.
+Created attachment 660809
+Patch v2
+
+I was able to remove the regular expressions in the slow path by converting back to UTF8 if necessary.
+I forgot to mention the update in perf changes. Keeping the old code around next to the new code, I saw this change in performance with this patch:
+http://screencast.com/t/5j2sjwRbl
+With the old implementation removed, formatValue is now down to 26.7% of set_value, from 61.5%.
+I can't use nsIURI to construct the "preHost" part of the URI. Gavin and I talked about doing:
+> preHost = uri.scheme + "://" + (uri.userPass ? uri.userPass + "@" : "")
+but that breaks for IP addresses.
+
+I left that part of this function untouched for this patch.
+(In reply to Jared Wein [:jaws] from comment #9)
+> Created attachment 660809
+> Patch v2
+> 
+> I was able to remove the regular expressions in the slow path by converting
+> back to UTF8 if necessary.
+
+FWIW, ConvertACEtoUTF is also quite poorly implemented. For each node decodeACE converts from from puny to UCS4 to utf16 to utf8. Then it converts utf8 to utf16 to ACE to and compares with the original to make sure that it didn't make any mistakes. Finally the utf8 result will be converted back to utf16 for Javascript.
+
+It would probably be worth timing that call and seeing if it takes an appreciable amount of time. If it does, that function could use a lot of improvement.
+ConvertUTFtoACE is called within the getBaseDomainFromHost function. I could implement a "getBaseDomainFromHostWithoutNormalizing"-function which would remove both directions of the conversion, although I'm not clear on the correctness there. On top of the correctness, there would also be added complexity to the eTLD service API, which might make it confusing down the road.
+
+I plan to implement a small in-memory cache for these so the cost will only be hit approx. once during page load.
+(In reply to Jared Wein [:jaws] from comment #14)
+> ConvertUTFtoACE is called within the getBaseDomainFromHost function. I could
+> implement a "getBaseDomainFromHostWithoutNormalizing"-function which would
+> remove both directions of the conversion, although I'm not clear on the
+> correctness there. On top of the correctness, there would also be added
+> complexity to the eTLD service API, which might make it confusing down the
+> road.
+> 
+> I plan to implement a small in-memory cache for these so the cost will only
+> be hit approx. once during page load.
+
+Have you done timing to see how much time is being spent here? I don't want to over-rotate on the issue. i.e. Let's make the code clean and simple and then figure out if it's running at the speed we expect and if that's acceptable.
+Created attachment 663222
+Patch v3
+
+This patch includes the cache for the range values.
+
+I'm showing that this patch gives us a 50% speedup on this function, but I expected that these changes would give and order of magnitude better speedup instead. Nonetheless, this is a good speed boost.
+
+I included some more details on some parts of the patches in the patch commit message.
+(In reply to comment #16)
+> I'm showing that this patch gives us a 50% speedup on this function, but I
+> expected that these changes would give and order of magnitude better speedup
+> instead. Nonetheless, this is a good speed boost.
+
+Do you know why you did not get the expected benefit out of this patch?
+Comment on attachment 663222
+Patch v3
+
+>Replaced .focused with .hasAttribute("focused") since I found through empirical testing that the hasAttribute executed in < 60% of the time that the property access took.
+
+Percentage changes can be misleading. Is the 60% difference significant? If so, perhaps we should update the underlying getter (assuming the getter itself isn't what causes the overhead):
+
+http://mxr.mozilla.org/mozilla-central/source/toolkit/content/widgets/autocomplete.xml#299
+
+>The property access of this.editor was taking 5% of the formatValue function. Switching it to a field removes this extra overhead.
+
+Are we sure this can be cached across document insertion/removal/etc.? Perhaps Ehsan or Neil can sign off on this.
+
+>The cache size of 20 was chosen as it is 2x the average tab count as determined by https://blog.mozilla.org/ux/2011/08/test-pilot-new-tab-study-results/
+
+It's probably best to spin the cache off to another bug, assuming we still see hot spots here after making the regexp/string parsing changes.
+Created attachment 663230
+Patch v4
+
+This patch removes the cache.
+
+See this profile to see the cost of the .editor getter, http://screencast.com/t/htyD3pPlF8R
+Comment on attachment 663230
+Patch v4
+
+>       <method name="formatValue">
+>         <body><![CDATA[
+>-          if (!this._formattingEnabled || this.focused)
+>+          if (!this._formattingEnabled || this.hasAttribute("focused"))
+>             return;
+
+Again, what's the absolute win here? I don't think we should make micro-optimizations at the cost of convenience without evidence that they really help and that the underlying issue (e.g. property access being slow) can't be fixed.
+
+>-          let rangeLength = preDomain.length + subDomain.length;
+>+          let rangeLength = preDomain.length + subDomain.length,
+>+              startRest = preDomain.length + domain.length;
+>+
+>           if (rangeLength) {
+>             let range = document.createRange();
+>             range.setStart(textNode, 0);
+>             range.setEnd(textNode, rangeLength);
+>             selection.addRange(range);
+>           }
+> 
+>-          let startRest = preDomain.length + domain.length;
+
+What's the point of this change?
+I remember a discussion with Boris at some point where he was talking about how these types of property access can be slow.
+The basic problem is that our JITs don't do a good job of optimizing scripted getters/setters.  Though it's possible that a recent JM (not ion) would.  But do we even turn on JIT in chrome?
+
+In any case, scripted getters will be much slower than slot access (aka field) at the moment.  Especially without JIT.
+(In reply to Boris Zbarsky (:bz) from comment #22)
+> The basic problem is that our JITs don't do a good job of optimizing
+> scripted getters/setters.  Though it's possible that a recent JM (not ion)
+> would.  But do we even turn on JIT in chrome?
+
+According to javascript.options.methodjit.chrome, we do.
+
+Another question would be, when it's clear what absolute cost we're talking about, whether hasAttribute() vs. getAttribute() == "true" makes any difference.
+Comment on attachment 663230
+Patch v4
+
+Review of attachment 663230:
+-----------------------------------------------------------------
+
+::: toolkit/content/widgets/textbox.xml
+@@ +92,5 @@
+>                  onset="if (val) this.setAttribute('clickSelectsAll', 'true');
+>                         else this.removeAttribute('clickSelectsAll'); return val;" />
+>  
+> +      <field name="editor" readonly="true">
+> +        this.inputField.QueryInterface(Components.interfaces.nsIDOMNSEditableElement).editor;
+
+We should just cache the editor on the object and convert this into a lazy getter.  There's no point in going through all of this cruft every time.
+
+@@ +213,5 @@
+>        </handler>
+>  
+>        <handler event="blur" phase="capturing">
+>          <![CDATA[
+> +          this.removeAttribute("focused");
+
+Just curious, does this actually have a perf impact?
+(In reply to Ehsan Akhgari [:ehsan] from comment #24)
+> > +      <field name="editor" readonly="true">
+> > +        this.inputField.QueryInterface(Components.interfaces.nsIDOMNSEditableElement).editor;
+> 
+> We should just cache the editor on the object and convert this into a lazy
+> getter.  There's no point in going through all of this cruft every time.
+
+Fields should be lazy getters, basically.
+Comment on attachment 663230
+Patch v4
+
+Gavin told me that XBL getters are in fact lazy getters, so this already addresses my comment!
+> whether hasAttribute() vs. getAttribute() == "true" makes any difference.
+
+hasAttribute can be made cheaper if it's not already (bug 558516 didn't affect hasAttribute, but that would be easy to change).  What the absolute difference would be is worth measuring.
+(In reply to Ehsan Akhgari [:ehsan] from comment #24)
+> > +          this.removeAttribute("focused");
+> 
+> Just curious, does this actually have a perf impact?
+
+No perf impact, it was just the only instance of 'focused', whereas the others were "focused". It hurt my MXR abilities ;)
+Created attachment 663500
+Patch v5
+
+(In reply to Dão Gottwald [:dao] from comment #20)
+> > 
+> >-          let startRest = preDomain.length + domain.length;
+> 
+> What's the point of this change?
+
+Sorry, this was leftover from an intermediate patch. I didn't mean to include it here.
+(In reply to Dão Gottwald [:dao] from comment #20)
+> Comment on attachment 663230
+> Patch v4
+> 
+> >       <method name="formatValue">
+> >         <body><![CDATA[
+> >-          if (!this._formattingEnabled || this.focused)
+> >+          if (!this._formattingEnabled || this.hasAttribute("focused"))
+> >             return;
+> 
+> Again, what's the absolute win here?
+
+Could you please respond to this?
+Testing using the profiler with interval=1ms:
+
+With .hasAttribute("focused"), average time per formatValue is (30/33) 0.90909090909090909090909090909091 milliseconds
+
+With .focused, average time per formatValue is (45/35) 1.2857142857142857142857142857143 milliseconds
+Those numbers are the running time divided by the instances of the function in the profile. Not super reliable, but there is a noticeable difference.
+So we're talking a 0.3ms difference for the .focused?  That's .... approximately forever. How are we managing that????
+
+Can you try directly measuring the time across formatValue calls using performance.now()?
+Created attachment 663537
+Patch v6
+
+Thanks Boris.
+
+With a performance.now() call at the beginning and one at the end of formatValue to measure the time in the function, I got the following averages:
+
+with .getAttribute("focused") == "true" (365 calls), an average of .111933 ms.
+
+with .focused (350 calls), an average of .113772 ms.
+
+with .hasAttribute("focused") (472 calls), an average of .121024 ms.
+
+So it seems that the overhead for the property accessor is .002 ms on average, and the fast path of .getAttribute helps shave .01 ms off.
+
+Since the win is so miniscule I reverted that line of the patch.
+For comparison, without the patch the performance.now average is 0.15874821 ms.
+Comment on attachment 663537
+Patch v6
+
+Review of attachment 663537:
+-----------------------------------------------------------------
+
+The commit message needs to be updated as it still describes some changes from previous iterations of the patch.
+
+Gavin said:
+> Are we sure this can be cached across document insertion/removal/etc.? Perhaps Ehsan or Neil can sign off on this.
+
+and since Ehsan has looked into that specific part of the patch I'm assuming that is fine.
+(In reply to comment #36)
+> Gavin said:
+> > Are we sure this can be cached across document insertion/removal/etc.? Perhaps Ehsan or Neil can sign off on this.
+> 
+> and since Ehsan has looked into that specific part of the patch I'm assuming
+> that is fine.
+
+Just to make things clear, each input element creates an editor object behind the scenes, and caches it if it's reframed, or removed from the document and then added back in.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f753afbe0d85
+
+Marking as in-testsuite+ since this code path is covered by /browser/base/content/test/browser_urlHighlight.js
+> and the fast path of .getAttribute helps shave .01 ms off.
+
+That sounds like just random noise to me.  getAttribute calls on trunk take about 70ns each for me.  hasAttribute are about the same; I can drop them to 50ns by doing the fast-path thing.  But you're measuring differences between the two of 10000ns or so...
+https://hg.mozilla.org/mozilla-central/rev/f753afbe0d85
+Comment on attachment 663537
+Patch v6
+
+>+              if (!domain.contains(baseDomain)) {
+Should this be endsWith?
+
+
+URLBarSetURI takes about 63ms
+
+
+
+Bug 781588 - [Perf] Refactor formatValue to increase performance by 40%. r=felipe

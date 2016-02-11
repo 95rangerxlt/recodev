@@ -1,0 +1,51 @@
+I have two Java 5 annotation processors, one of which generates a class, one of which performs some semantic checking and contributes problems.
+
+If both are acting on the same class, regardless of the order in the factory path, the problems show up as red squiggles but they do not show up in the Problems pane.
+
+If the class-generating processor is turned off, the problems do show up in the Problems pane.
+
+The problems are definitely getting reported to the Messager interface; my guess is that they are then getting cleared again by the other processor or by reconcile.
+
+Bug exists both in 3.2.2 and 3.3M5eh.
+
+I have two Java 5 annotation processors, one of which generates a class, one of which performs some semantic checking and contributes problems.
+
+If both are acting on the same class, regardless of the order in the factory path, the problems show up as red squiggles but they do not show up in the Problems pane.
+
+If the class-generating processor is turned off, the problems do show up in the Problems pane.
+
+The problems are definitely getting reported to the Messager interface; my guess is that they are then getting cleared again by the other processor or by reconcile.
+
+Bug exists both in 3.2.2 and 3.3M5eh.
+The problem is that if APT generates a file, then IncrementalImageBuilder.buildAfterBatchBuild() is called to compile the new file.  But this of course recompiles existing files as well, because they could have errors because of references to the generated file.  And the compiler, since it is about to recompile the original file, calls IncrementalImageBuilder.updateProblemsFor(), to throw out the existing problems on the unit.  You can see this in action by putting a breakpoint on JavaBuilder.removeProblemsFor(); note that it first removes JDT markers, and then removes all the managed markers, including APT markers.  But, annotation processing is not called again on that unit during this compilation pass, so APT never replaces the removed marker.
+
+It is not yet clear to me what the fix for this should be.  I am not sure why JavaBuilder should be removing the managed markers at all.
+Note that it does not require multiple processors or even multiple annotations for this to happen.  It happens whenever a new type is generated from an existing type, and the existing type is also annotated with an error.  The round of compilation caused by type generation erases the error.  I've changed the bug summary accordingly.
+Created attachment 61934
+Patch for discussion - option 1
+
+Compilation participants *are* called again in buildAfterBatchBuild().  The problem is that APT does not re-process files that it has already processed in an earlier round; this is important, because otherwise it would set off an endless loop of rebuilds.
+
+So, IncrementalImageBuilder removes markers from the the parent file, and then asks APT to re-process it.  APT recognizes the file as already having been processed and returns, reporting no problems.
+
+The attached patch is one option; it prevents JDT from removing managed markers during the "buildAfterBatchBuild" loop.  This works fine, from APT's perspective.  It would be a problem for a different compilation participant that always reprocessed every file.
+
+This is option 1.  Two other options might be:
+
+2. Change JDT so that it does not invoke compilation participants on a given file more than once per build.  (That is, move the logic currently in APT into JDT.)  This has the advantage of guaranteeing that there cannot be an endless loop caused by a compilationParticipant.
+
+3. Change APT so that it caches the problems created when the file is first encountered, and returns the cached problems rather than an empty result when the file is subsequently encountered.  Note we cannot just cache the whole build result, because that shows generated files, which would trigger an endless build loop, I think.
+Created attachment 61936
+Patch for discussion - option 3
+
+Here's a patch showing option 3.  Because of access restrictions there is no way to create a new BuildContext containing just the problems without the generated/removed files, nor any way to modify the content of an existing BuildContext, so I'm just returning the original BuildContext; this results in an additional, superfluous, round of compilation.  I think it can also result in endless recompilation in certain circumstances.
+
+This is not a good solution; I include it only for the sake of discussion.
+To observe the problem, edit jdt.apt.tests.AptBuilderTests to rename the "disabled_testTwoAnnotations" test to "testTwoAnnotations" and execute that test.  It fails, missing an expected APT-contributed problem marker.
+
+Fixed, by caching CategorizedProblems within APT and re-reporting them if JDT asks us to re-process a file we have already processed.
+
+However, this will result in memory bloat in the case where a project has many files with errors, because we have no way to discard the problems until the beginning of the next build.  I will enter a separate bug to address that problem; fixing that will require adding a method to the CompilationParticipant API.
+The bug to address the perf concern is bug 180107.
+
+Closing this bug as the reported problem is now fixed and test case is enabled.

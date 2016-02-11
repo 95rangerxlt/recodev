@@ -1,0 +1,70 @@
+N20060405-0010 + plug-in export
+
+See attached stack trace.
+
+Steps that made it happen for me:
+1. open launch config
+2. edit installed JREs
+3. change default VM for 1.4 execution environment
+
+N20060405-0010 + plug-in export
+
+See attached stack trace.
+
+Steps that made it happen for me:
+1. open launch config
+2. edit installed JREs
+3. change default VM for 1.4 execution environment
+Created attachment 37883
+VM dump
+The only concrete suggestion I can make is to avoid synchronized blocks from within the resource change event (because the same lock is also held during resource changing operations).  
+
+It seems markAsInconsistent() could just be made unsynchronized. Then the only race condition is that fNeedsConsistencyCheck could be set to false by the update job currently running when it really still is inconsistent because of the new resource change event.  If fNeedsConsistencyCheck was set to true at the beginning of the job's run method I think that would be solved.
+IMO this would lead to problems with clearing the UpdateJob.
+
+if (fUpdateJob != null) {        <== could result in true
+	fUpdateJob.cancel();     <== could result in an NPE when the update
+                                     job got cleared in the meantime
+}
+
+John, before I introduce special lock objects to handle this case why can't I simple change the run method of the update job in the following way (execute it in a workspace runnble):
+
+protected IStatus run(IProgressMonitor pm) {
+	try {
+		ResourcesPlugin.getWorkspace().run(new IWorkspaceRunnable() {
+			public void run(IProgressMonitor monitor) throws CoreException {
+				OpenTypeHistory history= OpenTypeHistory.getInstance();
+				history.internalCheckConsistency(monitor);
+			}
+		}, pm);
+		return new Status(IStatus.OK, JavaPlugin.getPluginId(), IStatus.OK, "", null); //$NON-NLS-1$
+	} catch (CoreException e) {
+		return e.getStatus();
+	}
+}
+
+The job is waiting for the workspace scheduling rule anyways.
+I don't think using a workspace runnable will avoid the deadlock, because the workspace lock is not held while a workspace runnable is executing (we only acquire the lock at the end of the operation in order to broadcast change events, but while the runnable is executing we don't hold a lock).
+
+The race condition with the update job can be solved this way:
+
+Job toCancel = fUpdateJob;
+if (toCancel != null) {
+        toCancel.cancel();
+}
+
+I think this still has the problem that if markAsInconsistent is called twice concurrently you may get two update jobs scheduled.  Since this is only called from a resource change event it shouldn't be possible for it to be called multiple times.
+
+A cleaner solution would be to make the update job a singleton instance.  This would ensure there is never more than one scheduled.  Note that a useful feature of jobs is that if you call schedule() while a job is running, it will be automatically rescheduled as soon as it completes. I.e., you are guaranteed that if you call schedule() the job will start running some time after that moment.
+John, 
+
+after thinking about our dicussion from Friday again and looking at the VM dump I am still pretty sure that putting the IWorkspace#run around the code in UpdateJob would solve the problem. If it wouldn't the dead lock wouldn't occur in the first place. Worker 4 frist locks the history and then tries to execute a workspace runnable. If I put a workspace runnable around then this would block worker 0 to enter the event notification code and JDT Core could execute the code.
+
+However such a fix could basically hold back event notification for a larger period of time which for sure is discouraged. So I followed your advice and made the update job a singleton and fNeedsConsistencyCheck volatile. 
+
+Behaviour wise this will not make a difference: with the current code it was already possible that the history was indeed inconsistent but markAsInconsistent hasn't been called yet since the event notification didn't happen yet. The UI handles this case already.
+
+John, if you have some time I would appreciate if you could have a look at the patch since its a bigger change in a sensitive area.
+Created attachment 38086
+The patch
+Patch released for RC1.

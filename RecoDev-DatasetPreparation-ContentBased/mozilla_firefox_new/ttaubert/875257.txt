@@ -1,0 +1,180 @@
+Currently there is a reflow after swapping a new tab's docShell with the one from a preloaded browser. This is caused because a resize is detected:
+
+http://mxr.mozilla.org/mozilla-central/source/layout/base/nsPresShell.cpp#1878
+
+The first step to make this work is to keep the preload browser's size in sync with the content area's size so that there really is no need to reflow.
+
+As a second step we need to find out why the subdocument size returns 0x0 here:
+
+http://mxr.mozilla.org/mozilla-central/source/content/base/src/nsFrameLoader.cpp#1849
+
+If I hard-code it to the right content area size there is no reflow after swapping docShells.
+
+Currently there is a reflow after swapping a new tab's docShell with the one from a preloaded browser. This is caused because a resize is detected:
+
+http://mxr.mozilla.org/mozilla-central/source/layout/base/nsPresShell.cpp#1878
+
+The first step to make this work is to keep the preload browser's size in sync with the content area's size so that there really is no need to reflow.
+
+As a second step we need to find out why the subdocument size returns 0x0 here:
+
+http://mxr.mozilla.org/mozilla-central/source/content/base/src/nsFrameLoader.cpp#1849
+
+If I hard-code it to the right content area size there is no reflow after swapping docShells.
+What I found out so far:
+
+nsLineLayout::ReflowFrame() calls nsIFrame::SetSize(0, 0) on our <xul:browser>'s frame. Not sure why yet, investigating further.
+Created attachment 753758
+make sure there is no reflow after swapping in a preloaded newtab page
+
+If we swap docShells of identically sized browsers then there will be no reflow after swapping. To do this all we need is to set the preloading browser's size accordingly.
+
+However, this is a little more complicated since the preloading browser is contained in the hidden window and re-used for multiple windows. To always have correctly sized preloaded new tab pages we therefore need to have a map using the <tabbrowser> size as a key and preloading <browser>s a values.
+
+I modified the existing code so that HiddenBrowser is no longer a singleton but can now be instantiated. HiddenBrowsers manages all HiddenBrowser objects and returns the one matching a given size. It also creates, removes and updates its internal map when it detects that a new browser window was opened or closed, or when a preloaded docShell with an unkown size was requested.
+
+In the case of an unknown docShell size we just update all existing browsers (creating, resizing, removing as needed) and return the matching one. That of course means we need to reflow here but there's no way around that. This lazy approach is I think totally fine because users will not resize their browser windows all the time and even if they would it's quite hard to register for size changes of the <tabbrowser> elements that could be resized by toolbars and by social stuff, etc.
+Comment on attachment 753758
+make sure there is no reflow after swapping in a preloaded newtab page
+
+Review of attachment 753758:
+-----------------------------------------------------------------
+
+r=me with the following feedback addressed.
+
+How were you able to tell if no reflows occurred? Is it possible to write a test for this so we can make sure it doesn't regress?
+
+::: browser/modules/BrowserNewTabPreloader.jsm
+@@ +153,5 @@
+>    observe: function Preferences_observe(aSubject, aTopic, aData) {
+>      let {url, enabled} = this;
+>      this._url = this._enabled = null;
+>  
+>      if (enabled && !this.enabled) {
+
+This might be easier to follow if you rename enabled to prevEnabled and url to prevUrl.
+
+@@ +161,2 @@
+>      } else if (this._browser && url != this.url) {
+> +      HiddenBrowsers.updateBrowserURLs(this.url);
+
+I don't understand why we would update the URL of these hidden browsers. If the user changed their about:config pref to start loading a non-about:newtab URL, we probably shouldn't kick off a load of that URL for each browser window. In fact, if the url is not about:newtab, we should probably remove all of the browsers and disable this feature.
+
+@@ +207,5 @@
+> +    if (this._browsers.has(key)) {
+> +      return this._browsers.get(key);
+> +    }
+> +
+> +    // We should never be here. Return the first browser we find.
+
+Cu.reportError?
+
+@@ +220,5 @@
+> +  observe: function (subject, topic, data) {
+> +    if (topic === TOPIC_TIMER_CALLBACK) {
+> +      this._updateTimer = null;
+> +      this._updateBrowserSizes();
+> +    } else {
+
+explicitly check that topic is in this._topics?
+
+@@ +255,5 @@
+> +      let browser;
+> +      if (toRemove.length) {
+> +        // Let's just resize one of the superfluous
+> +        // browsers and put it back into the map.
+> +        browser = toRemove.shift();
+
+browser = toRemove.pop(); so that we don't have to move all the other items in the array. From my understanding, the order of these shouldn't matter.
+(In reply to Jared Wein [:jaws] from comment #3)
+> How were you able to tell if no reflows occurred? Is it possible to write a
+> test for this so we can make sure it doesn't regress?
+
+That's on my todo list. I figured this won't be easy but I think we really need this.
+
+> >      let {url, enabled} = this;
+> >      this._url = this._enabled = null;
+> >  
+> >      if (enabled && !this.enabled) {
+> 
+> This might be easier to follow if you rename enabled to prevEnabled and url
+> to prevUrl.
+
+Good point.
+
+> @@ +161,2 @@
+> >      } else if (this._browser && url != this.url) {
+> > +      HiddenBrowsers.updateBrowserURLs(this.url);
+> 
+> I don't understand why we would update the URL of these hidden browsers. If
+> the user changed their about:config pref to start loading a non-about:newtab
+> URL, we probably shouldn't kick off a load of that URL for each browser
+> window. In fact, if the url is not about:newtab, we should probably remove
+> all of the browsers and disable this feature.
+
+Hmmm, right. That might now be a couple of browsers and not a single one anymore. I thought about add-on authors that might want to use this facility as well but could also just disable the preloading pref if they don't want to.
+
+> > +    if (this._browsers.has(key)) {
+> > +      return this._browsers.get(key);
+> > +    }
+> > +
+> > +    // We should never be here. Return the first browser we find.
+> 
+> Cu.reportError?
+
+Of course.
+
+> > +    if (topic === TOPIC_TIMER_CALLBACK) {
+> > +      this._updateTimer = null;
+> > +      this._updateBrowserSizes();
+> > +    } else {
+> 
+> explicitly check that topic is in this._topics?
+
+Really? We can only be called for stuff in _topics and the timer callback.
+
+> > +      if (toRemove.length) {
+> > +        // Let's just resize one of the superfluous
+> > +        // browsers and put it back into the map.
+> > +        browser = toRemove.shift();
+> 
+> browser = toRemove.pop(); so that we don't have to move all the other items
+> in the array. From my understanding, the order of these shouldn't matter.
+
+Right, the order doesn't matter. Ok let's do that.
+(In reply to Tim Taubert [:ttaubert] from comment #4)
+> > > +    if (topic === TOPIC_TIMER_CALLBACK) {
+> > > +      this._updateTimer = null;
+> > > +      this._updateBrowserSizes();
+> > > +    } else {
+> > 
+> > explicitly check that topic is in this._topics?
+> 
+> Really? We can only be called for stuff in _topics and the timer callback.
+
+Makes sense, I just had to go look for what topics we were observing :)
+
+I'm fine with you not making this change.
+Created attachment 753778
+enable new tab page preloading only for about:newtab
+Thanks!
+
+https://hg.mozilla.org/integration/fx-team/rev/48d776679499
+https://hg.mozilla.org/integration/fx-team/rev/b649a45e1b9a
+https://hg.mozilla.org/mozilla-central/rev/48d776679499
+https://hg.mozilla.org/mozilla-central/rev/b649a45e1b9a
+Why is about:newtab hard-coded instead of using the default value of the pref, as was done in bug 724239?
+(In reply to Mathnerd314 from comment #9)
+> Why is about:newtab hard-coded instead of using the default value of the
+> pref, as was done in bug 724239?
+
+I think it was just an oversight. Please file a new bug and mark it as blocking this bug.
+
+
+Make sure there is no reflow after swapping in a preloaded newtab page
+
+
+
+Bug 875257 - Make sure there is no reflow after swapping in a preloaded newtab page; r=jaws 
+
+Bug 875257 - Enable new tab page preloading only for about:newtab; r=jaws 

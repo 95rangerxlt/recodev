@@ -1,0 +1,931 @@
+In bug 942601, we have reports of pinned tabs with 300+ history children. I believe that 10 would be largely sufficient, and more generally, we should probably make this pref-controlled.
+
+In bug 942601, we have reports of pinned tabs with 300+ history children. I believe that 10 would be largely sufficient, and more generally, we should probably make this pref-controlled.
+Making this a mentored bug.
+The code that requires patching is SessionHistoryInternal.collect, in file SessionHistory.jsm: http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/SessionHistory.jsm?from=SessionHistory.jsm#70
+
+Olli, can you confirm that it should be sufficient to replace |i = 0| with |i = Math.max(0, history.count - some limit)|?
+Yeah, that should do it.
+NO
+
+What if the history index is 0?
+(In reply to onemen.one from comment #3)
+> NO
+> 
+> What if the history index is 0?
+
+What's the problem with that case?
+If you start save history from index n and the user history is on index x and x<n you will not save the page user now viewing
+In what order is the history saved? Is history.getEntryAtIndex(0, false) the most or least recent entry?
+
+(In reply to onemen.one from comment #5)
+> If you start save history from index n and the user history is on index x
+> and x<n you will not save the page user now viewing
+You mean if a user used the back button and is viewing a previous entry? I agree that in this case it should save a range around the currently active entry, and everything from there up to the most recent entry.
+Sure, let's make it two preferences/constants:
+- number of entries before the current index;
+- number of entries after the current index.
+
+And, unless I'm mistaken, history.getEntryAtIndex(0, false) is the oldest.
+I'd like to take this.
+
+So with that change it would simply be |i = Math.max(0, history.index - some limit)| instead?
+
+I'm inclined to say that the user would expect everything *after* the current entry to be saved (across a restart of the browser, say - assuming that's affected by this). My reasoning is:
+1) If you go back to a past entry then browse somewhere else, everything that was there previously will be lost - so going back to a previous entry is likely either temporary, or if it isn't, the entries after it will be lost anyway.
+2) The only way to *keep* forward history is to open links in a new tab or window, which is a very deliberate action and implies that the forward history is important.
+
+One way to be sure would be if there were 'last access' timestamps associated with the entries, but bug 943352 implies to me that there aren't right now.
+
+Should |some limit| be some hardcoded value or a user-exposed preference? If hardcoded, should it be a |const| at the top of the function? (I'm not too familiar with JS best practices)
+Thanks for picking that patch.
+
+Let's do it as follows:
+- Math.max(0, history.index - some limit)
+- the limit is set as a preference "browser.sessionstore.max_history".
+
+If you have any question, don't hesitate to reach out here or over IRC (irc://irc.mozilla.org/#introduction).
+Wait why do we need to do this? There already is browser.sessionhistory.max_entries and that purges SH entries automatically. If that bug is about the number of children we should name the pref differently and/or think about making the change in SHistory itself.
+Well, bug 942601 seems to indicate that we can have lots of SH entries.
+Also, we should not collect them instead of purging them, shouldn't we?
+Yes, I was talking about SHEntries belonging to a docShell. Those are automatically capped and we just won't see them when iterating after they've been purged. I'm pretty sure we don't do the same recursively though, for children of SHEntries. Looks like we should, and probably in SHistory.
+Note: browser.sessionhistory.max_entries seems to be implemented here: http://dxr.mozilla.org/mozilla-central/source/docshell/shistory/src/nsSHistory.cpp#356 – and if I understand the code correctly, it cannot be set to a value lower than 50.
+Hmm, interesting find. I think I agree with having our own limits then. After all crash recovery and session restoration should probably be fine with a limit under 50. There could also be use cases for people to set it to '1' to basically only ever restore the most recent entry.
+
+Do we also want to cap the number of children per entry?
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #13)
+> Note: browser.sessionhistory.max_entries seems to be implemented here:
+> http://dxr.mozilla.org/mozilla-central/source/docshell/shistory/src/
+> nsSHistory.cpp#356 – and if I understand the code correctly, it cannot be
+> set to a value lower than 50.
+
+I think we could lower that limit if needed.
+The number 50 seems rather random
+https://bugzilla.mozilla.org/show_bug.cgi?id=112282#c57
+The problem in bug 942601 doesn't seem like it would benefit from this bug as stated. The limit of 50 history entries is respected, but the amount of facebook and twitter child elements keeps increasing with every reload regardless. It looks like bug 934935 might fix that case as well.
+
+A generic cap on children per entry might still be a good idea though, in case there are things beside dynamic iframes that can exhibit this behavior. Should we close this bug, morph it to take care of that instead, or still consider lowering the history entry cap (using the pref this time)?
+There's already a children-related bug here: bug 936271. Let's continue with both bugs.
+(In reply to Emanuel Hoogeveen [:ehoogeveen] from comment #16)
+> A generic cap on children per entry might still be a good idea though, in
+> case there are things beside dynamic iframes that can exhibit this behavior.
+> Should we close this bug, morph it to take care of that instead, or still
+> consider lowering the history entry cap (using the pref this time)?
+
+Yeah, I'd limit that to 10. Websites could easily restore "older" values whenever they think it's necessary (note that most webapps already take care of restoring state themselves).
+Did you have time to continue with that bug, Emanuel?
+Created attachment 8359768
+Only store a subset of session history entries to file
+
+Yes, sorry about the delay. Asking for feedback on this patch, which is something of a hybrid of the discussion above. This patch:
+1) Sets the lower limit on browser.sessionhistory.max_entries to 1 (but maintains the default of 50).
+2) Implements two new options, browser.sessionhistory.max_serialize_back and browser.sessionhistory.max_serialize_forward, set to 10 by default, and uses them to serialize only a subset of the session history entries to file.
+
+The idea is that using a bit of extra RAM to save more history during the current session isn't so bad, but there's no reason to store all of it in the sessionstore file. Let me know what you think of this approach.
+
+One thing I'm not sure of is whether this will correctly restore the currently active history entry: I don't see where history.index is saved, and since with this patch we're only storing a subset of the total entries to file, the index might not be correct.
+Comment on attachment 8359768
+Only store a subset of session history entries to file
+
+Review of attachment 8359768:
+-----------------------------------------------------------------
+
+Looks good so far.
+Can you add a test?
+
+::: b2g/app/b2g.js
+@@ +71,5 @@
+>  /* session history */
+>  pref("browser.sessionhistory.max_total_viewers", 1);
+>  pref("browser.sessionhistory.max_entries", 50);
+> +pref("browser.sessionhistory.max_serialize_back", 10);
+> +pref("browser.sessionhistory.max_serialize_forward", 10);
+
+Session Restore is not used on B2G, so let's not pollute the prefs.
+
+::: browser/app/profile/firefox.js
+@@ +403,5 @@
+>  // {moz:official} expands to "official"
+>  pref("browser.search.official", true);
+>  #endif
+>  
+>  pref("browser.sessionhistory.max_entries", 50);
+
+Could you document these preferences?
+Also, these are Session Restore related, so they should be browser.sessionstore.foo
+
+@@ +405,5 @@
+>  #endif
+>  
+>  pref("browser.sessionhistory.max_entries", 50);
+> +pref("browser.sessionhistory.max_serialize_back", 10);
+> +pref("browser.sessionhistory.max_serialize_forward", 10);
+
+Also, by default, I believe that max_serialize_forward should not be limited.
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ +91,5 @@
+>      let webNavigation = docShell.QueryInterface(Ci.nsIWebNavigation);
+>      let history = webNavigation.sessionHistory;
+>  
+>      if (history && history.count > 0) {
+> +      const l = Math.max(0, history.index - gMaxSerializeBack);
+
+From the top of my head, I can't remember whether 0 is the oldest or most recent history entry. Have you checked? If so, can you add a comment to that effect? Maybe also in nsISHistory.idl.
+
+Also, |l| and |r| are not very good names. Maybe |oldest| and |latest|?
+
+@@ +92,5 @@
+>      let history = webNavigation.sessionHistory;
+>  
+>      if (history && history.count > 0) {
+> +      const l = Math.max(0, history.index - gMaxSerializeBack);
+> +      const r = Math.min(history.count, history.index + gMaxSerializeForward);
+
+I'd say that if gMaxSerializeForward == 0, we should have r == history.count.
+
+@@ +109,5 @@
+>                "for the focused window/tab. See bug 669196.");
+>        }
+>  
+>        // Ensure the index isn't out of bounds if an exception was thrown above.
+> +      data.index = Math.min(r - l + 1, data.entries.length);
+
+That's why |l| is a bad name.
+
+::: docshell/shistory/src/nsSHistory.cpp
+@@ +338,5 @@
+>                        &sHistoryMaxTotalViewers);
+> +  // Ensure that the maximum amount of session entries to store is at least one
+> +  if (gHistoryMaxSize < 1) {
+> +    gHistoryMaxSize = 1;
+> +  }
+
+I believe that this is unrelated. We probably do not need to patch nsSHistory.cpp for this bug.
+
+@@ -354,5 @@
+> -  int32_t defaultHistoryMaxSize =
+> -    Preferences::GetDefaultInt(PREF_SHISTORY_SIZE, 50);
+> -  if (gHistoryMaxSize < defaultHistoryMaxSize) {
+> -    gHistoryMaxSize = defaultHistoryMaxSize;
+> -  }
+
+I don't understand why you remove that check.
+
+::: mobile/android/app/mobile.js
+@@ +111,5 @@
+>  /* session history */
+>  pref("browser.sessionhistory.max_total_viewers", 1);
+>  pref("browser.sessionhistory.max_entries", 50);
+> +pref("browser.sessionhistory.max_serialize_back", 10);
+> +pref("browser.sessionhistory.max_serialize_forward", 10);
+
+Session Restore is completely different on mobile, so let's not pollute the prefs.
+
+@@ +308,5 @@
+>  pref("browser.history.grouping", "day");
+>  pref("browser.history.showSessions", false);
+>  pref("browser.sessionhistory.max_entries", 50);
+> +pref("browser.sessionhistory.max_serialize_back", 10);
+> +pref("browser.sessionhistory.max_serialize_forward", 10);
+
+Why twice?
+Created attachment 8361262
+v2 - Only store a subset of session history entries to file
+
+Thanks for the comments! I've attached a patch that should address all of them, details below. I'll look into writing a test for this tomorrow.
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #21)
+> Session Restore is not used on B2G, so let's not pollute the prefs.
+
+Done.
+
+> Could you document these preferences?
+> Also, these are Session Restore related, so they should be
+> browser.sessionstore.foo
+
+Done.
+
+> Also, by default, I believe that max_serialize_forward should not be limited.
+
+Done.
+
+> From the top of my head, I can't remember whether 0 is the oldest or most
+> recent history entry. Have you checked? If so, can you add a comment to that
+> effect? Maybe also in nsISHistory.idl.
+> 
+> Also, |l| and |r| are not very good names. Maybe |oldest| and |latest|?
+
+Yes, 0 is the oldest; comments added. I ended up going with |oldest| and |newest| because it sounded better - let me know if you disagree.
+
+> I'd say that if gMaxSerializeForward == 0, we should have r == history.count.
+
+I went with gMaxSerializeForward == -1 for this instead since "don't restore entries newer than the one I'm currently viewing" is conceptually valid, and it matches the behavior of the forward button (which doesn't include the current entry).
+
+> > +      data.index = Math.min(r - l + 1, data.entries.length);
+> 
+> That's why |l| is a bad name.
+
+Indeed! This helped me realize that I had made an off-by-one error in the code above it as well. I changed the limit to |history.count - 1| and the loop condition to <= to be more intuitive.
+
+> ::: docshell/shistory/src/nsSHistory.cpp
+> I believe that this is unrelated. We probably do not need to patch
+> nsSHistory.cpp for this bug.
+
+> I don't understand why you remove that check.
+
+This was removing the lower limit of 50 entries in response to comment #14, but that can be done in another bug.
+
+> Session Restore is completely different on mobile, so let's not pollute the
+> prefs.
+
+Done. I added some defaults in SessionHistory.jsm so that it doesn't depend on the preferences existing.
+
+> Why twice?
+
+I added the new preferences everywhere that browser.sessionhistory.max_entries was defined - apparently there's some redundancy here :)
+https://tbpl.mozilla.org/?tree=Try&rev=b8e49bdaa73f
+
+This currently causes failures in browser/components/sessionstore/test/browser_447951.js and browser/browser/components/sessionstore/test/browser_pageshow.js. The former fails in a way I would expect - that test will have to be adjusted in some way. I'll have to figure out what the latter is doing. Otherwise the try run is about as green as the base changeset.
+Comment on attachment 8361262
+v2 - Only store a subset of session history entries to file
+
+Cancelling review for now until I fix the tests. I also don't think my getIntPref usage was correct.
+Created attachment 8361852
+v3 - Only store a subset of session history entries to file
+
+Mochitest-bc looks good with this on try: https://tbpl.mozilla.org/?tree=Try&rev=e96aea6e8edb
+
+Changes compared to v2:
+1) Added a getIntPref helper function that takes a default value and used it in getting the preferences.
+2) Fixed setting data.index (which I had completely misunderstood before) and changed the comment to clarify what is being done.
+3) Rebased to fx-team tip to pick up bug 952092. The try run above was based off m-c but the rebase was trivial.
+
+Still needs additional tests.
+Comment on attachment 8361852
+v3 - Only store a subset of session history entries to file
+
+Review of attachment 8361852:
+-----------------------------------------------------------------
+
+Looks good.
+Could you add a test ensuring that your patch does what you hope?
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ +95,5 @@
+> +      // History.getEntryAtIndex(history.count - 1, ...) is the newest entry.
+> +      let newest = Math.min(history.count - 1, history.index + gMaxSerializeForward);
+> +      if (gMaxSerializeForward < 0) {
+> +        newest = history.count - 1;
+> +      }
+
+I'd prefer:
+
+let newest;
+if (gMaxSerializeForward < 0) {
+  newest = ...
+} else {
+  newest = ...
+}
+
+Same for oldest.
+Comment on attachment 8361852
+v3 - Only store a subset of session history entries to file
+
+Review of attachment 8361852:
+-----------------------------------------------------------------
+
+Emanuel, thank you for working on this! I however found some nits the we should really fix before landing this. Please see below:
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ +23,5 @@
+> +function getIntPref(aPrefName, aDefVal) {
+> +  try {
+> +    return Services.prefs.getIntPref(aPrefName);
+> +  } catch(ex) {
+> +    return (aDefVal !== undefined ? aDefVal : null);
+
+Why are we so cautious here and introduce a function to read a pref that we know exists? We don't do this elsewhere.
+
+@@ +32,5 @@
+> +// The preference value that determines how many
+> +// past (back button) entries to serialize and restore.
+> +XPCOMUtils.defineLazyGetter(this, "gMaxSerializeBack", function () {
+> +  const PREF = "browser.sessionstore.max_serialize_back";
+> +  const gMaxSerializeBackDef = 10;
+
+We really don't need a fallback value for a pref we know exists.
+
+@@ +37,5 @@
+> +
+> +  // Observer that updates the cached value when the preference changes.
+> +  Services.prefs.addObserver(PREF, () => {
+> +    this.gMaxSerializeBack = getIntPref(PREF, gMaxSerializeBackDef);
+> +  }, false);
+
+We can't add observers in the frame script without removing them on frame script destruction. I would just read the pref directly without all the caching done here, it's not like we run this code in a hot loop.
+Also, should we really touch metro.js? They do have their own SessionStore implementation, don't they?
+Do all platforms inherit settings from browser/app/profile/firefox.js ? I was worried that Metro, Android and B2G would end up with these settings undefined, but if they inherit the defaults it would simplify things indeed (unfortunately I can't really test any of these platforms myself).
+Ah, right, thanks for catching all of this, Tim.
+Emanuel: no, the platforms don't inherit firefox.js. But since Metro, Android and B2G don't use Session Restore, that's not a problem.
+Created attachment 8364958
+Part 1 v4: Only store a subset of session history entries to file
+
+Thanks for the comments David, Tim!
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #26) 
+> I'd prefer:
+> 
+> let newest;
+> if (gMaxSerializeForward < 0) {
+>   newest = ...
+> } else {
+>   newest = ...
+> }
+> 
+> Same for oldest.
+
+Done.
+
+(In reply to Tim Taubert [:ttaubert] from comment #27) 
+> Why are we so cautious here and introduce a function to read a pref that we
+> know exists? We don't do this elsewhere.
+ 
+> We really don't need a fallback value for a pref we know exists.
+
+> We can't add observers in the frame script without removing them on frame
+> script destruction. I would just read the pref directly without all the
+> caching done here, it's not like we run this code in a hot loop.
+
+Removed the fallback and caching - much simpler this way! I also renamed the variables since they aren't global anymore.
+Created attachment 8364960
+Part 2 v1: Add tests to make sure the new preferences work as expected
+
+This should test all the added functionality. I made sure it passes locally (and fails if I change any of the tests), and try looks good so far [1] (failures should show up in bc). I included tests to make sure the preferences exist everywhere this ends up getting run, just in case.
+
+[1] https://tbpl.mozilla.org/?tree=Try&rev=401eef4e1c1b
+Comment on attachment 8364958
+Part 1 v4: Only store a subset of session history entries to file
+
+Review of attachment 8364958:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_447951.js
+@@ +14,5 @@
+> +  gPrefService.setIntPref("browser.sessionstore.max_serialize_forward", -1);
+> +  registerCleanupFunction(function () {
+> +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_back");
+> +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_forward");
+> +  });
+
+Ok, that's a good start.
+Can you know add a new test to ensure that setting browser.sesionstore.max_serialize_{back, forward} actually does something?
+
+e.g.
+* for a few values of N, set max_serialize_back to N, move N + 1 times in history, check the value returned by getTabState(), ensure that it contains exactly N entries
+* same story for max_serialize_forward
+Please ignore my latest comment, I hadn't realized that there were two patches.
+Comment on attachment 8364960
+Part 2 v1: Add tests to make sure the new preferences work as expected
+
+Review of attachment 8364960:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser.ini
+@@ +40,5 @@
+>    browser_597315_c1.html
+>    browser_597315_c2.html
+>    browser_662743_sample.html
+>    browser_739531_sample.html
+> +  browser_943339_sample.html
+
+Please name your test browser_history_cap
+
+@@ +173,5 @@
+>  [browser_739805.js]
+>  [browser_819510_perwindowpb.js]
+>  skip-if = os == "linux" # Intermittent failures, bug 894063
+>  [browser_833286_atomic_backup.js]
+> +[browser_943339_serialize_cap.js]
+
+Same here
+
+::: browser/components/sessionstore/test/browser_943339_sample.html
+@@ +1,5 @@
+> +<!DOCTYPE html>
+> +<meta charset="utf-8">
+> +<title>Testcase for bug 943339</title>
+> +
+> +<a href="#end">click me</a>
+
+I don't think you need this file at all.
+Just use http://example.com/something as a base URL.
+
+::: browser/components/sessionstore/test/browser_943339_serialize_cap.js
+@@ +4,5 @@
+> +"use strict";
+> +
+> +/**
+> + * This test ensures that the preferences that control how many back and
+> + * forward button session history entries we restore work correctly. It adds
+
+not "restore", just "store"
+
+@@ +9,5 @@
+> + * a number of entries to the session history, selects the middle one, then
+> + * restores them and checks that the restored state matches the preferences.
+> + */
+> +
+> +function test() {
+
+Could you rewrite the test using add_task and promises instead of waitForExplicitFinish() and callbacks?
+Created attachment 8365739
+Part 2 v2: Add tests to make sure the new preferences work as expected
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #35)
+> Please name your test browser_history_cap
+
+Done.
+
+> ::: browser/components/sessionstore/test/browser_943339_sample.html
+> 
+> I don't think you need this file at all.
+> Just use http://example.com/something as a base URL.
+
+Great, less clutter :)
+
+> > + * This test ensures that the preferences that control how many back and
+> > + * forward button session history entries we restore work correctly. It adds
+> 
+> not "restore", just "store"
+
+Done.
+
+> > +function test() {
+> 
+> Could you rewrite the test using add_task and promises instead of
+> waitForExplicitFinish() and callbacks?
+
+Done :) I hope I did it correctly, since I couldn't find a lot of documentation.
+Comment on attachment 8365739
+Part 2 v2: Add tests to make sure the new preferences work as expected
+
+Review of attachment 8365739:
+-----------------------------------------------------------------
+
+Looks good. Now we just need to go a little further.
+
+::: browser/components/sessionstore/test/browser_history_cap.js
+@@ +9,5 @@
+> + * a number of entries to the session history, selects the middle one, then
+> + * restores them and checks that the restored state matches the preferences.
+> + */
+> +
+> +add_task(function() {
+
+Could you give names to your functions?
+Also, it's better to use |function*|, as they really are generators.
+
+@@ +17,5 @@
+> +    let maxBack;
+> +    try {
+> +      maxBack = gPrefService.getIntPref("browser.sessionstore.max_serialize_back");
+> +    } catch (ex) {}
+> +    ok(maxBack !== undefined, "browser.sessionstore.max_serialize_back exists.");
+
+isnot(maxBack, undefined, "...")
+
+@@ +30,5 @@
+> +    let browser = tab.linkedBrowser;
+> +    yield promiseBrowserLoaded(browser);
+> +    SyncHandlers.get(browser).flush();
+> +
+> +    let tabState = {entries: []};
+
+Nit: move this variable closer to where you're starting to use it.
+
+@@ +43,5 @@
+> +
+> +    // Zero-based index of middle session history entry.
+> +    const middleEntry = ((maxEntries - 1) / 2) | 0;
+> +
+> +    const baseURL = "http://example.com/test#"
+
+Nit: For debugging purposes, could you make that "http://example.com/browser_history_cap#"? This makes it easier to debug some weird issues when we have stuff leaking from one test into the next one.
+
+@@ +59,5 @@
+> +    ise(tabState.entries.length, maxBack + 1 + maxFwd,
+> +      "The expected number of session history entries was restored.");
+> +    ise(tabState.index, maxBack + 1, "The restored tab-state index is correct");
+> +    ise(tabState.entries[tabState.index - 1].url, baseURL + middleEntry,
+> +      "... and its URL matches the entry we selected.");
+
+Could you take the opportunity to check that the other entries have the correct url, too?
+
+@@ +68,5 @@
+> +    gPrefService.clearUserPref("browser.sessionhistory.max_entries");
+> +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_back");
+> +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_forward");
+> +  }
+> +});
+
+Could you add a second test in which maxBack + 1 + maxFwd > maxEntries?
+Note to self: Setting browser.sessionhistory.max_entries to a value < 50 probably doesn't even work, because the lower limit is still in place. The first test doesn't strictly care, but the second one would.
+Created attachment 8368110
+Part 2 v3: Add tests to make sure the new preferences work as expected
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #37)
+> > +add_task(function() {
+> 
+> Could you give names to your functions?
+> Also, it's better to use |function*|, as they really are generators.
+
+Done. I asked in #jsapi whether to use |function* foo()| or |function *foo()| and spawned a heated discussion! Went with the latter since that's what the SM folks seem to agree on, but..
+
+> > +    ok(maxBack !== undefined, "browser.sessionstore.max_serialize_back exists.");
+> 
+> isnot(maxBack, undefined, "...")
+
+Done. isnot(null, undefined, "...") will also fail, but that's fine here (if not very obvious) since we want an integer anyway.
+
+> > +    let tabState = {entries: []};
+> 
+> Nit: move this variable closer to where you're starting to use it.
+
+Done.
+
+> > +    const baseURL = "http://example.com/test#"
+> 
+> Nit: For debugging purposes, could you make that
+> "http://example.com/browser_history_cap#"? This makes it easier to debug
+> some weird issues when we have stuff leaking from one test into the next one.
+
+Done, good idea.
+
+> > +    ise(tabState.entries[tabState.index - 1].url, baseURL + middleEntry,
+> > +      "... and its URL matches the entry we selected.");
+> 
+> Could you take the opportunity to check that the other entries have the
+> correct url, too?
+
+Done. The test now checks all URLs for the first test and 5, 3 and 3 for the second set of tests.
+
+> Could you add a second test in which maxBack + 1 + maxFwd > maxEntries?
+
+Done. I added tests for the following situations:
+1) data.index - maxBack < 0 && data.index + 1 + maxFwd > maxEntries
+2) data.index == 1 && data.entries.length > maxFwd + 1
+3) data.index == maxEntries && data.entries.length > maxBack + 1
+
+That should cover all the possibilities.
+Both parts look green on try (aside from infra failure and orange that looks unrelated): https://tbpl.mozilla.org/?tree=Try&rev=92db281b337f
+Comment on attachment 8368110
+Part 2 v3: Add tests to make sure the new preferences work as expected
+
+Review of attachment 8368110:
+-----------------------------------------------------------------
+
+Looks good to me, but I'd like a second look from Tim.
+
+::: browser/components/sessionstore/test/browser_history_cap.js
+@@ +9,5 @@
+> + * a number of entries to the session history, selects the middle one, then
+> + * restores them and checks that the restored state matches the preferences.
+> + */
+> +
+> +add_task(function *testPreferencesExist() {
+
+Nit: test_preferences_exist.
+(same thing for the other tests)
+
+@@ +93,5 @@
+> +    let maxEntries = gPrefService.getIntPref("browser.sessionhistory.max_entries");
+> +    if (maxEntries < 5) {
+> +      maxEntries = 5;
+> +      gPrefService.setIntPref("browser.sessionhistory.max_entries", maxEntries);
+> +    }
+
+Let's just set it to 10 arbitrarily.
+
+@@ +105,5 @@
+> +    // Zero-based index of middle session history entry.
+> +    const middleEntry = ((maxEntries - 1) / 2) | 0;
+> +
+> +    let tabState = {entries: []};
+> +    const baseURL = "http://example.com/browser_history_cap#"
+
+Just to be make debugging easier, could you use "http://example.com/browser_history_cap_2#" or something such?
+
+@@ +106,5 @@
+> +    const middleEntry = ((maxEntries - 1) / 2) | 0;
+> +
+> +    let tabState = {entries: []};
+> +    const baseURL = "http://example.com/browser_history_cap#"
+> +    for (let i = 0; i < maxEntries; i++) {
+
+Why not make the tab state hold much fewer entries than maxEntries?
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #41)
+> Why not make the tab state hold much fewer entries than maxEntries?
+
+I initially wanted to test pushing |maxEntries + overflow| (with overflow == 10, say) and setting tabState.index to |maxEntries + overflow| as well, with the idea that setTabState would discard the earliest entries - but setTabState doesn't like getting an index > maxEntries (it hangs), so I scrapped that idea. As the test is now I could just set maxEntries to 10 and use that everywhere.
+Comment on attachment 8368110
+Part 2 v3: Add tests to make sure the new preferences work as expected
+
+Review of attachment 8368110:
+-----------------------------------------------------------------
+
+Thank you for writing tests, Emanuel! I would really like to clean this up a little before we can get this landed though.
+
+(And of course what David said :)
+
+::: browser/components/sessionstore/test/browser_history_cap.js
+@@ +9,5 @@
+> + * a number of entries to the session history, selects the middle one, then
+> + * restores them and checks that the restored state matches the preferences.
+> + */
+> +
+> +add_task(function *testPreferencesExist() {
+
+I appreciate your thorough testing but this seems a little overkill. We usually don't test whether prefs exist or not.
+
+@@ +31,5 @@
+> +  try {
+> +    tab = gBrowser.addTab();
+> +    let browser = tab.linkedBrowser;
+> +    yield promiseBrowserLoaded(browser);
+> +    SyncHandlers.get(browser).flush();
+
+That flush isn't needed.
+
+@@ +43,5 @@
+> +    // Make sure the session history can hold enough entries for this test
+> +    const maxEntries = maxBack + 1 + maxFwd + 2;
+> +    if (gPrefService.getIntPref("browser.sessionhistory.max_entries") < maxEntries) {
+> +      gPrefService.setIntPref("browser.sessionhistory.max_entries", maxEntries);
+> +    }
+
+This would be easier to read if you would just set the pref, unconditionally.
+
+@@ +46,5 @@
+> +      gPrefService.setIntPref("browser.sessionhistory.max_entries", maxEntries);
+> +    }
+> +
+> +    // Zero-based index of middle session history entry.
+> +    const middleEntry = (maxEntries - 1) / 2 | 0;
+
+The values are const, do you need to calculate that? It would be a little easier to follow if we would group those const values at the top of the test without calculating. So anyone reading the code doesn't have to copy/paste that into the console.
+
+@@ +68,5 @@
+> +
+> +    const indexURLOffset = middleEntry - (tabState.index - 1);
+> +    for (let i = 0; i < tabState.entries.length; i++) {
+> +      ise(tabState.entries[i].url, baseURL + (i + indexURLOffset).toString(),
+> +          "URL of restored entry matches the expected URL.");
+
+You can just is() and get rid of the .toString() call.
+
+@@ +73,5 @@
+> +    }
+> +  } finally {
+> +    if (tab) {
+> +      gBrowser.removeTab(tab);
+> +    }
+
+Let's please not do the try-catch-finally-cleanup dance. Wrapping the whole function in try/catch is bad. We have other tests that just call .removeTab() at the end. A timeout with an extra tab around isn't bad, our test harness can handle that.
+
+@@ +76,5 @@
+> +      gBrowser.removeTab(tab);
+> +    }
+> +    gPrefService.clearUserPref("browser.sessionhistory.max_entries");
+> +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_back");
+> +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_forward");
+
+You can make sure to clean up prefs using registerCleanupFunction() at the top of the test.
+
+@@ +86,5 @@
+> +  try {
+> +    tab = gBrowser.addTab();
+> +    let browser = tab.linkedBrowser;
+> +    yield promiseBrowserLoaded(browser);
+> +    SyncHandlers.get(browser).flush();
+
+No flush needed.
+
+@@ +162,5 @@
+> +
+> +    const indexURLOffset = (maxEntries - 1) - maxBack;
+> +    for (let i = maxBack - 2; i <= maxBack; i++) {
+> +      ise(restoredTabState.entries[i].url, baseURL + (i + indexURLOffset).toString(),
+> +          "URL of restored entry matches the expected URL.");
+
+Same ise() usage problem here. Can you please replace the ise() calls by is() in the file? I know this function exists but we frankly never use it in other tests.
+
+@@ +167,5 @@
+> +    }
+> +  } finally {
+> +    if (tab) {
+> +      gBrowser.removeTab(tab);
+> +    }
+
+Same comment about try/catch for the whole test.
+Created attachment 8371417
+Part 2 v4: Add tests to make sure the new preferences work as expected
+
+I removed the preference check and combined the other add_tasks into one to avoid duplicating all the setup; tests still pass locally. Some more details below.
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #41)
+> Nit: test_preferences_exist.
+> (same thing for the other tests)
+
+I combined the tests into one add_task since they can use the same setup now, and named it test_history_cap.
+ 
+> @@ +93,5 @@
+> > +    let maxEntries = gPrefService.getIntPref("browser.sessionhistory.max_entries");
+> > +    if (maxEntries < 5) {
+> > +      maxEntries = 5;
+> > +      gPrefService.setIntPref("browser.sessionhistory.max_entries", maxEntries);
+> > +    }
+> 
+> Let's just set it to 10 arbitrarily.
+
+After all the other simplifications I used 9, so that middleEntry is more obvious - an even number of entries technically wouldn't have a middle entry :)
+
+> Just to be make debugging easier, could you use
+> "http://example.com/browser_history_cap_2#" or something such?
+
+I didn't end up doing this since all the tests now use the same generated state.
+
+> Why not make the tab state hold much fewer entries than maxEntries?
+
+Done - all the tests now use 9 entries.
+
+(In reply to Tim Taubert [:ttaubert] from comment #43)
+> > +add_task(function *testPreferencesExist() {
+> 
+> I appreciate your thorough testing but this seems a little overkill. We
+> usually don't test whether prefs exist or not.
+
+OK, I took this part out. I only added it to make sure the test is only run where the history cap applies, but everything came back green anyway.
+
+> > +    SyncHandlers.get(browser).flush();
+> 
+> That flush isn't needed.
+
+Done.
+
+> @@ +43,5 @@
+> > +    // Make sure the session history can hold enough entries for this test
+> > +    const maxEntries = maxBack + 1 + maxFwd + 2;
+> > +    if (gPrefService.getIntPref("browser.sessionhistory.max_entries") < maxEntries) {
+> > +      gPrefService.setIntPref("browser.sessionhistory.max_entries", maxEntries);
+> > +    }
+> 
+> This would be easier to read if you would just set the pref, unconditionally.
+
+Done, much cleaner now.
+
+> > +    // Zero-based index of middle session history entry.
+> > +    const middleEntry = (maxEntries - 1) / 2 | 0;
+> 
+> The values are const, do you need to calculate that? It would be a little
+> easier to follow if we would group those const values at the top of the test
+> without calculating. So anyone reading the code doesn't have to copy/paste
+> that into the console.
+
+Done, I moved maxEntries and middleEntry to the top and set them to 9 and 4 respectively.
+
+> > +      ise(tabState.entries[i].url, baseURL + (i + indexURLOffset).toString(),
+> 
+> You can just is() and get rid of the .toString() call.
+
+Done.
+
+> @@ +73,5 @@
+> > +    }
+> > +  } finally {
+> > +    if (tab) {
+> > +      gBrowser.removeTab(tab);
+> > +    }
+> 
+> Let's please not do the try-catch-finally-cleanup dance. Wrapping the whole
+> function in try/catch is bad. We have other tests that just call
+> .removeTab() at the end. A timeout with an extra tab around isn't bad, our
+> test harness can handle that.
+
+Done.
+
+> > +    gPrefService.clearUserPref("browser.sessionhistory.max_entries");
+> > +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_back");
+> > +    gPrefService.clearUserPref("browser.sessionstore.max_serialize_forward");
+> 
+> You can make sure to clean up prefs using registerCleanupFunction() at the
+> top of the test.
+
+Done - I wasn't sure if that worked with the add_task + promise setup (I couldn't really find documentation for any of this so I followed the example of other tests).
+Comment on attachment 8371417
+Part 2 v4: Add tests to make sure the new preferences work as expected
+
+Review of attachment 8371417:
+-----------------------------------------------------------------
+
+Much better, thanks!
+
+::: browser/components/sessionstore/test/browser_history_cap.js
+@@ +28,5 @@
+> +
+> +  // Make sure the session history can hold enough entries for this test
+> +  gPrefService.setIntPref("browser.sessionhistory.max_entries", maxEntries);
+> +
+> +  let tabState = {entries: []};
+
+let tabState = {entries: [], index: middleEntry + 1};
+
+@@ +36,5 @@
+> +
+> +  let maxBack = 2;
+> +  gPrefService.setIntPref("browser.sessionstore.max_serialize_back", maxBack);
+> +  let maxFwd = 3;
+> +  gPrefService.setIntPref("browser.sessionstore.max_serialize_forward", maxFwd);
+
+Nit: please move those lines to the top, above the registerCleanupFunction() call.
+
+@@ +62,5 @@
+> +  // Set maxBack and maxFwd such that maxBack + 1 + maxFwd == maxEntries + 2
+> +  maxBack = (maxEntries / 2 | 0) + 1;
+> +  gPrefService.setIntPref("browser.sessionstore.max_serialize_back", maxBack);
+> +  maxFwd  = maxEntries - (maxEntries / 2 | 0);
+> +  gPrefService.setIntPref("browser.sessionstore.max_serialize_forward", maxFwd);
+
+maxBack and maxFwd are 5, right? Can we just set those values without calculating?
+Comment on attachment 8371417
+Part 2 v4: Add tests to make sure the new preferences work as expected
+
+Review of attachment 8371417:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_history_cap.js
+@@ +33,5 @@
+> +  for (let i = 0; i < maxEntries; i++) {
+> +    tabState.entries.push({url: baseURL + i});
+> +  }
+> +
+> +  let maxBack = 2;
+
+Nit: move this to the top, with middleEntry, etc.
+Created attachment 8371591
+Part 2 v5: Add tests to make sure the new preferences work as expected
+
+Comments addressed, carrying forward r=Yoric and r=ttaubert.
+
+Looks like there was a bit of mid-airing in the reviews :)
+
+(In reply to Tim Taubert [:ttaubert] from comment #45)
+> > +  let tabState = {entries: []};
+> 
+> let tabState = {entries: [], index: middleEntry + 1};
+
+Done, and moved the comment up along with it.
+
+> > +  let maxBack = 2;
+> > +  gPrefService.setIntPref("browser.sessionstore.max_serialize_back", maxBack);
+> > +  let maxFwd = 3;
+> > +  gPrefService.setIntPref("browser.sessionstore.max_serialize_forward", maxFwd);
+> 
+> Nit: please move those lines to the top, above the registerCleanupFunction()
+> call.
+
+Done. I put the setIntPref("browser.sessionhistory.max_entries", ...) there too so they're set in the same order as they're cleared.
+
+> > +  maxBack = (maxEntries / 2 | 0) + 1;
+> > +  gPrefService.setIntPref("browser.sessionstore.max_serialize_back", maxBack);
+> > +  maxFwd  = maxEntries - (maxEntries / 2 | 0);
+> > +  gPrefService.setIntPref("browser.sessionstore.max_serialize_forward", maxFwd);
+> 
+> maxBack and maxFwd are 5, right? Can we just set those values without
+> calculating?
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #46)
+> > +  let maxBack = 2;
+> 
+> Nit: move this to the top, with middleEntry, etc.
+
+Done; instead of reusing maxBack and maxFwd I added separate constants for the different parts at the top of the test. Now all the configurable parts are at the top of the test :)
+Comment on attachment 8364958
+Part 1 v4: Only store a subset of session history entries to file
+
+David, you marked this as f+ before you saw the tests, but all the review comments should be addressed.
+Comment on attachment 8364958
+Part 1 v4: Only store a subset of session history entries to file
+
+Review of attachment 8364958:
+-----------------------------------------------------------------
+
+Looks good to me. Thanks for the patch, and let's take a look at http://telemetry.mozilla.org/#nightly/29/FX_SESSION_RESTORE_FILE_SIZE_BYTES and hope that size decreases :)
+Still looking pretty green on try [1], so setting checkin-needed :)
+
+[1] https://tbpl.mozilla.org/?tree=Try&rev=0c4ca3c2ad70
+https://hg.mozilla.org/integration/fx-team/rev/a67d0af3e92e
+https://hg.mozilla.org/integration/fx-team/rev/7ae9aac54c8b
+https://hg.mozilla.org/mozilla-central/rev/a67d0af3e92e
+https://hg.mozilla.org/mozilla-central/rev/7ae9aac54c8b
+Has this the possibility to be uplifted to Aurora? There's quite a few sites that spam session restore, and the sooner a fix is in release, the better.

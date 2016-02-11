@@ -1,0 +1,140 @@
+Happens with bug 700333 (WinXP only) and bug 702776 (Linux only)
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_highlighter.js | transparent veil box width matches dimensions of element (no zoom) - Got 0, expected 22
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_highlighter.js | transparent veil box width matches width of element (2x zoom) - Got 937, expected 44
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_highlighter.js | transparent veil box height matches width of element (2x zoom) - Got 76, expected 44
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_iframeTest.js | selection matches div2 node - Got [object HTMLDivElement], expected [object HTMLDivElement]
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_iframeTest.js | highlighter matches selection - Got [object HTMLDivElement], expected [object HTMLDivElement]
+
+Happens with bug 700333 (WinXP only) and bug 702776 (Linux only)
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_highlighter.js | transparent veil box width matches dimensions of element (no zoom) - Got 0, expected 22
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_highlighter.js | transparent veil box width matches width of element (2x zoom) - Got 937, expected 44
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_highlighter.js | transparent veil box height matches width of element (2x zoom) - Got 76, expected 44
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_iframeTest.js | selection matches div2 node - Got [object HTMLDivElement], expected [object HTMLDivElement]
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/devtools/highlighter/test/browser_inspector_iframeTest.js | highlighter matches selection - Got [object HTMLDivElement], expected [object HTMLDivElement]
+The tests in browser_inspector_highlighter.js don't take into account the fact that the veil is animated with a transition, so it "takes time" before reaching its final size. Adding a executeSoon or a setTimeout(..., 100) fixes the first problem.
+Same thing for browser_inspector_iframeTest.js. Adding an executeSoon fixed the problem.
+
+So here, we are facing 2 race condition bugs.
+Ok, so I realize that even without the patch from bug 702776, these tests fail.
+Created attachment 575145
+fix
+
+Apparently, this fixes the problem under Linux. Let's see if it works WinXP (see https://tbpl.mozilla.org/?tree=Try&rev=560a277e1926 Can't reproduce on my WinXP build).
+
+Also, I am not sure to understand why Dao's patch "switch" the events order in the test. Can the transition be a bit "slower" with Dao's patch?
+
+If this patch fixes the problem, I'll investigate this.
+Apparently, it is working for Win XP too.
+So I have a fix, but I can't explain why it works:
+Let's only talk about browser_inspector_iframeTest.js for now.
+
+If I wrap this part:
+
+    is(InspectorUI.selection, div2, "selection matches div2 node");
+    is(InspectorUI.highlighter.highlitNode, div2, "highlighter matches selection");
+
+    finish();
+
+into a `executeSoon()`, it works (if not, it fails with the above errors, and `InspectorUI.selection` is `div1`).
+
+So it would mean that `performTestComparisons2` is call before `InspectorUI.selection` is updated.
+So it would mean that `InspectorUI.INSPECTOR_NOTIFICATIONS.HIGHLIGHTING` is fired before `InspectorUI.selection` is set.
+
+But this is not the case: In `IUI_select`,
+      this.selection = aNode;
+      if (!this.inspecting) {
+        this.highlighter.highlightNode(this.selection);
+      }
+(`InspectorUI.INSPECTOR_NOTIFICATIONS.HIGHLIGHTING` is fired in `highlightNode`).
+
+Help?
+The transitions don't impact the results in the first and second test (tested with transitions disabled).
+(In reply to Paul Rouget [:paul] from comment #6)
+> So it would mean that `performTestComparisons2` is call before
+> `InspectorUI.selection` is updated.
+> So it would mean that `InspectorUI.INSPECTOR_NOTIFICATIONS.HIGHLIGHTING` is
+> fired before `InspectorUI.selection` is set.
+> 
+> But this is not the case: In `IUI_select`,
+>       this.selection = aNode;
+>       if (!this.inspecting) {
+>         this.highlighter.highlightNode(this.selection);
+>       }
+> (`InspectorUI.INSPECTOR_NOTIFICATIONS.HIGHLIGHTING` is fired in
+> `highlightNode`).
+> 
+> Help?
+
+so, that shouldn't happen. I wonder if there's some JIT optimization that's causing this to fire out of order? Otherwise I have no idea why this could happen.
+Dave brought up that these machines are almost certainly running on VMs. Offering as another datapoint.
+(In reply to Paul Rouget [:paul] from comment #6)
+
+> So it would mean that `performTestComparisons2` is call before
+> `InspectorUI.selection` is updated.
+> So it would mean that `InspectorUI.INSPECTOR_NOTIFICATIONS.HIGHLIGHTING` is
+> fired before `InspectorUI.selection` is set.
+> 
+> But this is not the case: In `IUI_select`,
+>       this.selection = aNode;
+>       if (!this.inspecting) {
+>         this.highlighter.highlightNode(this.selection);
+>       }
+> (`InspectorUI.INSPECTOR_NOTIFICATIONS.HIGHLIGHTING` is fired in
+> `highlightNode`).
+
+Are we getting an unexpected element being highlighted before the one we expect?
+(In reply to Dave Camp (:dcamp) from comment #10)
+> Are we getting an unexpected element being highlighted before the one we
+> expect?
+
+Yes. Div1 is the selected node in these tests, not Div2. Actually, the problem is that InspectorUI.INSPECTOR_NOTIFICATIONS.HIGHLIGHTING is fired more often than expected. For example, even if the last `inspectNode` is commented, `finishTestComparisons` is still called.
+
+I don't know why yet. I can reproduce this now on my machine, it's going to be much easier to debug.
+Found the problem: we add an observer listening to the HIGHLIGHTING message in a function that is, itself, an observer called for the HIGHLIGHTING message.
+
+We are doing something like that:
+
+addObserver(function obs1() {           // For div1
+  // Remove obs1
+
+  addObserver(function obs2() {         // For div2
+     // Do something.
+  }, HIGHLIGHTING);
+
+  // executeSoon(Highlight div2)
+
+}, HIGHLIGHTING);
+
+We see "// Do something" being called for 'div1'.
+
+So an observer is added while the list of observer for the same message are being called, appended at the end of the list of the observers that are been unrolled at this exact same time.
+
+Moving the addObserver in executeSoon fixes the problem.
+
+#yodawg
+Created attachment 575417
+patch v1
+try-build running https://tbpl.mozilla.org/?tree=Try&rev=6cb4440d092e (with Dao's patch + this patch)
+Apparently, this is working: https://tbpl.mozilla.org/?tree=Try&rev=6cb4440d092e
+Comment on attachment 575417
+patch v1
+
+This patch is needed to fix bug 700333.
+Comment on attachment 575417
+patch v1
+
+testfix only, should be safe for aurora.
+https://hg.mozilla.org/integration/fx-team/rev/85f5dc707f6c
+https://hg.mozilla.org/mozilla-central/rev/85f5dc707f6c
+test-only fixes. Prevents test-failures from follow-up fixes.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/a3c26d14bbb2
+Marking qa- as I don't think this is something QA needs to verify. Please mark qa+ if this is not the case.
+
+
+Figure out why browser_inspector_highlighter.js and browser_inspector_iframeTest.js fail when the style of the highlighter toolbar change
+
+
+
+Bug 703237 - Figure out why browser_inspector_highlighter.js and browser_inspector_iframeTest.js fail when the style of the highlighter toolbar change; r=rcampbell 

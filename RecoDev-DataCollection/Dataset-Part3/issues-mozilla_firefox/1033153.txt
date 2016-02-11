@@ -1,0 +1,559 @@
+Bug 966471 added a DOM-side API for this.  This bug is about the debugger bits.
+
+Bug 966471 added a DOM-side API for this.  This bug is about the debugger bits.
+In the UI, I think adding
+
+  <state>: "pending"
+
+or
+
+  <state>: "fulfilled"
+  <value>: 42
+
+or
+
+  <state>: "rejected"
+  <reason>: Error("some error")
+
+to the variables view would work well. It's pretty similar to what we do for other special values that aren't exactly in scope (like returns/exceptions when stepping out).
+
+But how should we extend the RDP to handle this? Should we add a new type of request for this, or bundle it in with getting properties? I'm leaning towards the latter. Perhaps something like:
+
+Request:
+
+  { to: objectActorID,
+    type: "promiseState" }
+
+Response:
+
+  { from: objectActorID,
+    promiseState: <PromiseState> }
+
+where <PromiseState> is one of:
+
+  { state: "pending" }
+  { state: "fulfilled", value: fulfilledValueGrip }
+  { state: "rejected", reason: reasonValueGrip }
+
+Or if there is an error, we use the usual { error, message } response. A known error would be:
+
+  { error: "objectNotPromise",
+    message: "<actorID> is not a Promise" }
+
+Panos, what do you think?
+
+I think I can squeeze a couple cycles out for this. Taking the bug.
+I like the presentation ideas. Perhaps also use green color for "fulfilled" and red for "failed"?
+
+I'm confused as to which of the protocol options you prefer: you say that you are leaning towards bundling the extra promise properties with the prototypeAndProperties response, but then you sketch a new request type. I think that bundling the PromiseState object with the prototypeAndProperties response would be best, like we did with safeGetterValues for DOM objects:
+
+{
+  from: "actor",
+  prototype: {...},
+  ownProperties: {...},
+  safeGetterValues: {...},
+  promiseState: {...}
+}
+
+A missing "promiseState" property would indicate that the object is not a native promise.
+
+Requiring an additional request would complicate further the frontend code for no good reason IMO.
+
+On an unrelated note, we don't have an API to list all live promises in the page, right? So this is only about inspecting the promise objects in scope.
+Would it make sense to treat this information like more Class-specific properties to include directly in the object grip? Grips are all about providing data for summary views.
+Sorry meant to say former, not latter. If you guys are ok with bundling in the grip, that would be easier, but I wasn't sure how much we wanted to bloat grips.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #4)
+> Sorry meant to say former, not latter. If you guys are ok with bundling in
+> the grip, that would be easier, but I wasn't sure how much we wanted to
+> bloat grips.
+
+Well, I hope I'm not misunderstanding. Certainly, we shouldn't bloat grips with data nobody will use. But if we're sure we're going to use that data, then providing it up front in the grip is actually a reduction in traffic. I was assuming that the way we display promise objects is going to include some of this state information, right up front.
+
+I don't think there's any hard and fast rule about what goes in a grip, and what is retrieved by separate requests. I guess you want to multiply the size of the data by the likelihood we won't use it, yielding you units of ... expected wasted bytes?
+Created attachment 8450528
+Part 1: WIP add RDP support
+
+Here's some WIP. Unfortunately, I don't have access to the |PromiseDebugging| interface inside the devtools loader jsm and I get the following error:
+
+System JS : ERROR resource://gre/modules/devtools/Loader.jsm:60 - ReferenceError: PromiseDebugging is not defined
+JavaScript error: resource://gre/modules/devtools/Loader.jsm, line 60: PromiseDebugging is not defined
+
+However, inside a scratchpad w/ browser context, I have no problems and can access + use the |PromiseDebugging| interface just fine.
+
+bz, any idea how to get the |PromiseDebugging| interface inside of a jsm?
+Gah.  I wish we'd just expose the web platform everywhere...  :(
+
+Bobby, I assume you don't want PromiseDebugging added to the list in since adding to the list InitGlobalObject()?  If so, where _should_ it be added?  Might be nice to update that comment to have that info...
+(In reply to Boris Zbarsky [:bz] from comment #7)
+> Gah.  I wish we'd just expose the web platform everywhere...  :(
+
+That would work if these APIs were all written and tested to be agnostic to the existence of a Window, but they aren't.
+
+> Bobby, I assume you don't want PromiseDebugging added to the list in since
+> adding to the list InitGlobalObject()?  If so, where _should_ it be added? 
+> Might be nice to update that comment to have that info...
+
+You need to add PromiseDebugging to GlobalProperties here:
+
+http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/src/xpcprivate.h#3299
+
+then hook it up here:
+
+http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/src/Sandbox.cpp#796
+
+and here:
+
+http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/src/Sandbox.cpp#751
+
+and then add an xpcshell test.
+
+Once you do that, you can do:
+
+Cu.importGlobalProperties(['PromiseDebugging']) and everything is peachy.
+
+I'm open to suggestions to improving this workflow.
+(In reply to Bobby Holley (:bholley) from comment #8)
+> Cu.importGlobalProperties(['PromiseDebugging']) and everything is peachy.
+> 
+> I'm open to suggestions to improving this workflow.
+
+Is there any way we can avoid Cu? :ejpbruel is doing a lot of work to get the debugger server running inside Workers so that we can make Workers debuggable, and we don't have access to Cu there.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #9)
+> (In reply to Bobby Holley (:bholley) from comment #8)
+> > Cu.importGlobalProperties(['PromiseDebugging']) and everything is peachy.
+> > 
+> > I'm open to suggestions to improving this workflow.
+> 
+> Is there any way we can avoid Cu? :ejpbruel is doing a lot of work to get
+> the debugger server running inside Workers so that we can make Workers
+> debuggable, and we don't have access to Cu there.
+
+The Cu is the least of your problems when it comes to workers. The implementation itself needs to be Worker-friendly, may be a lot of work and at the very least requires a lot of careful auditing.
+
+Boris has a proposal for an IDL annotation to expose interfaces on non-Window globals, which sounds promising. I'm mulling it over.
+The implementation of PromiseDebugging is quite worker-friendly and will stay that way.
+Are promises even available in Workers? If not, then the debugger server can simply disable the promise inspection facilities when it's in a worker, and nobody will know.
+
+If they are, well, the server can't be expected to inspect stuff without the necessary tools. We could make promise inspection not work in workers. But the best outcome is obviously to expose the inspection stuff everywhere.
+> Are promises even available in Workers? 
+
+Absolutely.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #9)
+> Is there any way we can avoid Cu? :ejpbruel is doing a lot of work to get
+> the debugger server running inside Workers so that we can make Workers
+> debuggable, and we don't have access to Cu there.
+
+Perhaps Eddy can add a shim in his WorkerDebuggerManager (or whatever it's called) that's implemented in C++, to expose PromiseDebugging from there.
+Sounds like we should just do bug 1017988 and implement something custom for non-DOM scopes.
+Created attachment 8507466
+inspect-promises-pt-1.patch
+Created attachment 8507467
+inspect-promises-pt-2.patch
+Created attachment 8507468
+inspect-promises-pt-3.patch
+
+This one is still a WIP and needs proper tests.
+Created attachment 8507469
+inspect-promises-pt-4.patch
+Comment on attachment 8507466
+inspect-promises-pt-1.patch
+
+Review of attachment 8507466:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/script.js
+@@ +34,5 @@
+>  // collections, etc.
+>  let OBJECT_PREVIEW_MAX_ITEMS = 10;
+>  
+>  /**
+> + * TODO FITZGEN
+
+Woops, will add a doc comment here; ignore for now.
+Created attachment 8507470
+Screen Shot 2014-10-18 at 9.32.17 PM.png
+Comment on attachment 8507466
+inspect-promises-pt-1.patch
+
+Review of attachment 8507466:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/Loader.jsm
+@@ +63,5 @@
+>    "Timer": Object.create(Timer),
+>    "toolkit/loader": loader,
+>    "xpcInspector": xpcInspector,
+>    "promise": promise,
+> +  "PromiseDebugging": PromiseDebugging
+
+Is this usable even inside a worker?  Eddy will be sad if not.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +36,5 @@
+>  
+>  /**
+> + * TODO FITZGEN
+> + */
+> +Debugger.Object.prototype.getPromiseState = function () {
+
+The D.O API docs should be updated to add this new method.
+
+Isn't this bad since other users of the Debugger can't access this unless the script actor has been loaded?  It seems like this should implemented alongside the rest of D.O instead of here.
+
+@@ +3130,5 @@
+>      };
+>  
+>      if (this.obj.class != "DeadObject") {
+> +      // Expose internal Promise state.
+> +      if (this.obj.class == "Promise") {
+
+Doesn't this belong in |ObjectActorPreviewers| instead of here?
+Comment on attachment 8507467
+inspect-promises-pt-2.patch
+
+Review of attachment 8507467:
+-----------------------------------------------------------------
+
+Redirecting to Victor, who I expect will have stronger opinions about this part.
+> Is this usable even inside a worker?
+
+It's usable in a chrome worker global.
+
+Whether it's usable in the globals we're using for worker debugging, I can't tell you without seeing where we set those globals up.  But it would be quite possible to make it visible there, yes.  The actual implementation is thread-agnostic.
+Comment on attachment 8507468
+inspect-promises-pt-3.patch
+
+Review of attachment 8507468:
+-----------------------------------------------------------------
+
+Redirecting to Victor, who I expect will have stronger opinions about this part.
+Comment on attachment 8507469
+inspect-promises-pt-4.patch
+
+Review of attachment 8507469:
+-----------------------------------------------------------------
+
+::: browser/devtools/webconsole/console-output.js
+@@ +3111,5 @@
+>      };
+>  
+>      let shown = 0;
+> +
+> +    if (this.objectActor.class == "Promise") {
+
+It seems like this should be registered as a new |ObjectRenderer|, which can be done by class.
+(In reply to J. Ryan Stinnett [:jryans] from comment #26)
+> Comment on attachment 8507469
+> inspect-promises-pt-4.patch
+> 
+> Review of attachment 8507469:
+> -----------------------------------------------------------------
+> 
+> ::: browser/devtools/webconsole/console-output.js
+> @@ +3111,5 @@
+> >      };
+> >  
+> >      let shown = 0;
+> > +
+> > +    if (this.objectActor.class == "Promise") {
+> 
+> It seems like this should be registered as a new |ObjectRenderer|, which can
+> be done by class.
+
+That's what I initially did, but we still want to render the rest of the object properties if anyone set them. So maybe we should add a "internal state for class"-renderer extension to the object renderer?
+(In reply to J. Ryan Stinnett [:jryans] from comment #22)
+> Comment on attachment 8507466
+> inspect-promises-pt-1.patch
+> 
+> Review of attachment 8507466:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/devtools/Loader.jsm
+> @@ +63,5 @@
+> >    "Timer": Object.create(Timer),
+> >    "toolkit/loader": loader,
+> >    "xpcInspector": xpcInspector,
+> >    "promise": promise,
+> > +  "PromiseDebugging": PromiseDebugging
+> 
+> Is this usable even inside a worker?  Eddy will be sad if not.
+
+Yes, it should be.
+
+> ::: toolkit/devtools/server/actors/script.js
+> @@ +36,5 @@
+> >  
+> >  /**
+> > + * TODO FITZGEN
+> > + */
+> > +Debugger.Object.prototype.getPromiseState = function () {
+> 
+> The D.O API docs should be updated to add this new method.
+> 
+> Isn't this bad since other users of the Debugger can't access this unless
+> the script actor has been loaded?  It seems like this should implemented
+> alongside the rest of D.O instead of here.
+
+
+Each actor gets its own instance of Debugger, and this is by design. I don't think we want to document this extension because it isn't supposed to be visible elsewhere.
+Comment on attachment 8507468
+inspect-promises-pt-3.patch
+
+Review of attachment 8507468:
+-----------------------------------------------------------------
+
+It's not immediately obvious to me why the same logic exists both in the controller and the variables view. Can you please explain?
+Comment on attachment 8507467
+inspect-promises-pt-2.patch
+
+Review of attachment 8507467:
+-----------------------------------------------------------------
+
+This looks good.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #27)
+> (In reply to J. Ryan Stinnett [:jryans] from comment #26)
+> > Comment on attachment 8507469
+> > inspect-promises-pt-4.patch
+> > 
+> > Review of attachment 8507469:
+> > -----------------------------------------------------------------
+> > 
+> > ::: browser/devtools/webconsole/console-output.js
+> > @@ +3111,5 @@
+> > >      };
+> > >  
+> > >      let shown = 0;
+> > > +
+> > > +    if (this.objectActor.class == "Promise") {
+> > 
+> > It seems like this should be registered as a new |ObjectRenderer|, which can
+> > be done by class.
+> 
+> That's what I initially did, but we still want to render the rest of the
+> object properties if anyone set them. So maybe we should add a "internal
+> state for class"-renderer extension to the object renderer?
+
+Ah, I see.  Okay, I think it would still be good to have the separate renderer for the Promise, so we don't have to dump it here in the general Object one.  And then yes, some kind of internal state or at least breaking up the object renderer so it's possible to invoke what you need to render the remaining properties seems good. 
+
+Also, please add a test for this case of "Promise with an extra property".
+(In reply to J. Ryan Stinnett [:jryans] from comment #22)
+> @@ +3130,5 @@
+> >      };
+> >  
+> >      if (this.obj.class != "DeadObject") {
+> > +      // Expose internal Promise state.
+> > +      if (this.obj.class == "Promise") {
+> 
+> Doesn't this belong in |ObjectActorPreviewers| instead of here?
+
+No because the server is free to skip previews all it wants (for example once nesting gets too deep). This is really more similar to whether the object is frozen or whatever (which we include in the grip), rather than a preview of its properties or items (which we might include /some/ of in the preview, but are mostly accessed through a second round trip).
+
+I initially did include this in the preview, but it was way cleaner to move it directly onto the grip.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #32)
+> (In reply to J. Ryan Stinnett [:jryans] from comment #22)
+> > @@ +3130,5 @@
+> > >      };
+> > >  
+> > >      if (this.obj.class != "DeadObject") {
+> > > +      // Expose internal Promise state.
+> > > +      if (this.obj.class == "Promise") {
+> > 
+> > Doesn't this belong in |ObjectActorPreviewers| instead of here?
+> 
+> No because the server is free to skip previews all it wants (for example
+> once nesting gets too deep). This is really more similar to whether the
+> object is frozen or whatever (which we include in the grip), rather than a
+> preview of its properties or items (which we might include /some/ of in the
+> preview, but are mostly accessed through a second round trip).
+> 
+> I initially did include this in the preview, but it was way cleaner to move
+> it directly onto the grip.
+
+Okay, makes sense to me!
+Comment on attachment 8507466
+inspect-promises-pt-1.patch
+
+Review of attachment 8507466:
+-----------------------------------------------------------------
+
+Nick addressed my concerns in the comments.
+
+r+ assuming you fix the TODO comment.
+(In reply to Victor Porof [:vporof][:vp] from comment #29)
+> Comment on attachment 8507468
+> inspect-promises-pt-3.patch
+> 
+> Review of attachment 8507468:
+> -----------------------------------------------------------------
+> 
+> It's not immediately obvious to me why the same logic exists both in the
+> controller and the variables view. Can you please explain?
+
+We have two different code paths:
+
+1) Populating the whole variables view from a single value/variable: VariablesViewController.prototype.populate.
+
+This is used by the webconsole when you click on a value in the console for deeper inspection, or in the scratchpad when you do Cmd+I.
+
+2) When a variable in a scope or a nested property is being populated: VariablesView.prototype.setGrip.
+
+This is used by the debugger or when you have some object's property that references another object.
+
+To be clear: I think this is a mess and the separation of concerns between the VV and its controller isn't clear to me at all, but this is what was required to make it work in the debugger, the console, and the scratchpad.
+
+If you know a better way...
+Created attachment 8509011
+inspect-promises-pt-1.patch
+
+Carrying over r+
+(In reply to Nick Fitzgerald [:fitzgen] from comment #35)
+> (In reply to Victor Porof [:vporof][:vp] from comment #29)
+> > Comment on attachment 8507468
+> > inspect-promises-pt-3.patch
+> > 
+> > Review of attachment 8507468:
+> > -----------------------------------------------------------------
+> > 
+> > It's not immediately obvious to me why the same logic exists both in the
+> > controller and the variables view. Can you please explain?
+> 
+> We have two different code paths:
+> 
+> 1) Populating the whole variables view from a single value/variable:
+> VariablesViewController.prototype.populate.
+> 
+> This is used by the webconsole when you click on a value in the console for
+> deeper inspection, or in the scratchpad when you do Cmd+I.
+> 
+> 2) When a variable in a scope or a nested property is being populated:
+> VariablesView.prototype.setGrip.
+> 
+> This is used by the debugger or when you have some object's property that
+> references another object.
+> 
+> To be clear: I think this is a mess and the separation of concerns between
+> the VV and its controller isn't clear to me at all, but this is what was
+> required to make it work in the debugger, the console, and the scratchpad.
+> 
+> If you know a better way...
+
+Gah nevermind, ignore this comment. you were right and if we only do this at the VariablesViewController.prototype.populate level, everything works out. Now just need to write some tests.
+Created attachment 8509799
+inspect-promises-pt-2.patch
+
+Carrying over r+.
+Created attachment 8509800
+inspect-promises-pt-3.patch
+Created attachment 8509801
+inspect-promises-pt-4.patch
+Try push: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=9956b7d2ccc5
+(Removing "blocking" bugs that don't actually block inspecting promise state in the debugger/console/etc)
+Comment on attachment 8509801
+inspect-promises-pt-4.patch
+
+Review of attachment 8509801:
+-----------------------------------------------------------------
+
+Cool! :)
+Comment on attachment 8509800
+inspect-promises-pt-3.patch
+
+Review of attachment 8509800:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/test/browser_dbg_variables-view-06.js
+@@ +17,5 @@
+> +
+> +  const variables = panel.panelWin.DebuggerView.Variables;
+> +  ok(variables, "Should get the variables view.");
+> +
+> +  const scope = [...variables][0];
+
+Cute.
+
+::: browser/devtools/shared/widgets/VariablesView.jsm
+@@ +2432,5 @@
+> +    if (this._valueGrip.preview) {
+> +      // DOMNodes get special treatment since they can be linked to the inspector
+> +      if (this._valueGrip.preview.kind === "DOMNode") {
+> +        this._linkToInspector();
+> +      }
+
+This change is unnecessary. Remove from patch.
+Comment on attachment 8509800
+inspect-promises-pt-3.patch
+
+Review of attachment 8509800:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/test/browser_dbg_variables-view-06.js
+@@ +17,5 @@
+> +
+> +  const variables = panel.panelWin.DebuggerView.Variables;
+> +  ok(variables, "Should get the variables view.");
+> +
+> +  const scope = [...variables][0];
+
+I don't get it - can someone enlighten me?
+(In reply to Bobby Holley (:bholley) from comment #45)
+> Comment on attachment 8509800
+> inspect-promises-pt-3.patch
+> 
+> Review of attachment 8509800:
+> -----------------------------------------------------------------
+> 
+> ::: browser/devtools/debugger/test/browser_dbg_variables-view-06.js
+> @@ +17,5 @@
+> > +
+> > +  const variables = panel.panelWin.DebuggerView.Variables;
+> > +  ok(variables, "Should get the variables view.");
+> > +
+> > +  const scope = [...variables][0];
+> 
+> I don't get it - can someone enlighten me?
+
+The VariablesView has a Symbol.iterator method that yields each scope it contains. This is just a not-so-efficient way to get the first scope.
+(In reply to Victor Porof [:vporof][:vp] from comment #44)
+> ::: browser/devtools/shared/widgets/VariablesView.jsm
+> @@ +2432,5 @@
+> > +    if (this._valueGrip.preview) {
+> > +      // DOMNodes get special treatment since they can be linked to the inspector
+> > +      if (this._valueGrip.preview.kind === "DOMNode") {
+> > +        this._linkToInspector();
+> > +      }
+> 
+> This change is unnecessary. Remove from patch.
+
+Not sure how this happened...
+
+Anyways, will fix up this + stupid test failures and land :)
+Created attachment 8510672
+inspect-promises-pt-1.patch
+
+Carrying over r+
+Created attachment 8510673
+inspect-promises-pt-2.patch
+
+Carrying over r+
+Created attachment 8510674
+inspect-promises-pt-3.patch
+
+Carrying over r+
+Created attachment 8510675
+inspect-promises-pt-4.patch
+
+Carrying over r+
+Comment on attachment 8510674
+inspect-promises-pt-3.patch
+
+Actually carrying over r+
+Yay try is open again: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=d2896bc25ebd
+https://hg.mozilla.org/integration/fx-team/rev/d7e69b0484ee
+https://hg.mozilla.org/integration/fx-team/rev/d4ed6c1353b5
+https://hg.mozilla.org/integration/fx-team/rev/7ab817145c8d
+https://hg.mozilla.org/integration/fx-team/rev/2548cc70c191
+https://hg.mozilla.org/mozilla-central/rev/d7e69b0484ee
+https://hg.mozilla.org/mozilla-central/rev/d4ed6c1353b5
+https://hg.mozilla.org/mozilla-central/rev/7ab817145c8d
+https://hg.mozilla.org/mozilla-central/rev/2548cc70c191
+Added to the release notes with "DOM Promises inspection" as wording.

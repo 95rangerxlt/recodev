@@ -1,0 +1,568 @@
+Looking at my directory %profile/sessionstore-backups/, I see way too many upgrade.js-* files.
+
+Normally, these files should be removed progressively, by the SessionWorker, but apparently, they are not. This is bad for privacy and it takes disk space.
+
+The objective of this bug is to find out why we do not remove the old upgrade backups, and to make sure that we now do. The code may be found in http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/SessionWorker.js, in method `write`.
+
+Looking at my directory %profile/sessionstore-backups/, I see way too many upgrade.js-* files.
+
+Normally, these files should be removed progressively, by the SessionWorker, but apparently, they are not. This is bad for privacy and it takes disk space.
+
+The objective of this bug is to find out why we do not remove the old upgrade backups, and to make sure that we now do. The code may be found in http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/SessionWorker.js, in method `write`.
+Can you please assign this bug to me? - Thanks.
+Created attachment 8537293
+patch
+
+My first attempt to keep the 3 (can be adjusted) most recent backups and clears the older ones.
+Comment on attachment 8537293
+patch
+
+Review of attachment 8537293:
+-----------------------------------------------------------------
+
+Good start, thanks.
+Can you fix the comments below?
+
+After this, we'll need to discuss unit testing. You should take a look at browser_upgrade_backup.js, as we'll need to extend it to:
+- make sure that we are removing backups if there are too many of them;
+- make sure that we are keeping exactly `maxUpgradeBackups` backups;
+- make sure that we are not removing the backup that we have just created;
+- make sure that we only remove backups on the first write, not afterwards.
+
+Note: I will be unreachable for 2 weeks starting Saturday, so don't worry if I do not respond in the meantime.
+
+::: browser/components/sessionstore/SessionWorker.js
+@@ +79,5 @@
+>  
+>    /**
+> +   * Determines how many backups should be kept
+> +   */
+> +  maxBackups: 3,
+
+This is the maximal number of *upgrade* backups, so maxUpgradeBackups.
+
+Generally, we use upper-case for constants. However, in this case, it would be better if this value were initialized from the main thread, as it would simplify testing. Take a look at http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/SessionFile.jsm?from=SessionFile.jsm#251 and http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/SessionWorker.js#87 to see how we initialize the worker. We could add an argument `options` with a field `maxUpgradeBackups`.
+
+@@ +176,5 @@
+>      let upgradeBackupComplete = false;
+>      if (this.upgradeBackupNeeded
+>        && (this.state == STATE_CLEAN || this.state == STATE_UPGRADE_BACKUP)) {
+> +      // Find all previous backups
+> +      let iterator = new File.DirectoryIterator(this.Paths.backups);
+
+You declare `iterator` in the right place, but please move the call to `new File.DirectoryIterator` to inside the `try/finally`.
+
+@@ +177,5 @@
+>      if (this.upgradeBackupNeeded
+>        && (this.state == STATE_CLEAN || this.state == STATE_UPGRADE_BACKUP)) {
+> +      // Find all previous backups
+> +      let iterator = new File.DirectoryIterator(this.Paths.backups);
+> +      var backups = [];
+
+Please use `let` instead of `var`.
+
+@@ +179,5 @@
+> +      // Find all previous backups
+> +      let iterator = new File.DirectoryIterator(this.Paths.backups);
+> +      var backups = [];
+> +      try {
+> +        iterator.forEach(function (file) { backups.push(file._path); });
+
+Using values that start with a "_" is not recommended, so please don't use `_path`. Rather, use `file.path` or `file.name`.
+
+Also, you should filter before pushing, we don't need to expand then shrink the array.
+
+@@ +180,5 @@
+> +      let iterator = new File.DirectoryIterator(this.Paths.backups);
+> +      var backups = [];
+> +      try {
+> +        iterator.forEach(function (file) { backups.push(file._path); });
+> +        backups = backups.filter(function (file) { return file.match(/upgrade.js-/) !== null; });
+
+In general, `startsWith` is better than regexps to check for a prefix, as it is faster and more memory-efficient.
+
+Also, instead of hardcoding "upgrade.js", use `this.Paths.upgradeBackupPrefix`.
+
+@@ +189,5 @@
+> +      }
+> +
+> +      // If too many backups exist, delete them
+> +      if (backups.length > this.maxBackups) {
+> +        backups.sort(function (a, b) {
+
+You don't need the function here. Also, this sorting works only because all the file names have the same number of characters, so alphanumerical order (used by `sort`) is the same as natural order. This deserves a comment.
+
+@@ +191,5 @@
+> +      // If too many backups exist, delete them
+> +      if (backups.length > this.maxBackups) {
+> +        backups.sort(function (a, b) {
+> +            return a < b;
+> +          }).splice(this.maxBackups).forEach(function (file) {
+
+The call to `splice` doesn't really make sense in JS (it would in Haskell) – it copies the entire array just to make sure that `forEach` doesn't have to walk it entirely.
+
+The following would be more efficient
+
+backups.sort(...).forEach((file, i) => {
+  if (i >= this.MAX_UPGRADE_BACKUPS) {
+    return;
+  }
+  File.remove(file);
+});
+
+@@ +200,1 @@
+>        try {
+
+For safety reasons, we should write the new backup before removing the old ones. Of course, we need to make sure that we do not remove the file that we have just written.
+So, how are things going, Fabian?
+Created attachment 8548983
+patch2 - taking comments from the first patch into account
+Comment on attachment 8548983
+patch2 - taking comments from the first patch into account
+
+Review of attachment 8548983:
+-----------------------------------------------------------------
+
+Code looks good, with a few changes detailed below.
+Have you looked at browser_upgrade_backup.js? I'd like you to extend it with the tests I mentioned in comment 3.
+
+::: browser/components/sessionstore/SessionFile.jsm
+@@ +256,4 @@
+>      SessionWorker.post("init", [
+>        result.origin,
+>        this.Paths,
+> +        10
+
+Could you make this a named constant and document it? Say MAX_UPGRADE_BACKUPS. Also, 3 is probably sufficient for most users.
+
+::: browser/components/sessionstore/SessionWorker.js
+@@ +79,5 @@
+>  
+>    /**
+> +   * Determines how many backups should be kept.
+> +   */
+> +  maxUpdateBackups: 10,
+
+Let's keep it `null` until we have a value to put. Also, I'd prefer `maxUpgradeBackups` to `maxUpdateBackups` (here and below) as it's clearer.
+
+@@ +86,5 @@
+>     * Initialize (or reinitialize) the worker
+>     *
+>     * @param {string} origin Which of sessionstore.js or its backups
+>     *   was used. One of the `STATE_*` constants defined above.
+>     * @param {object} paths The paths at which to find the various files.
+
+Don't forget to document `maxUpdateBackups`.
+
+@@ +201,5 @@
+> +      } finally {
+> +        if (iterator) {
+> +          iterator.close();
+> +        }
+> +      }
+
+You should also apply the `exn = exn || ex` trick (see above), here and below, to make sure that we do as much as we can before failing.
+Any news?
+It's a shame, the code was almost complete. De-assigning, if someone wants to pick up this bug.
+Why? I sent you a detailed report where and how I was stuck on the unit tests. I tried to contact you on IRC several times but you never responded. The only thing I didn't do is post here because I thought it'd be superfluous...
+Ah, stuff was lost in communication. Sorry about the misunderstanding, but good to hear that you're still on it :)
+
+In the future, don't trust irc, and don't hesitate to leave a message here with a needinfo request, that's the most efficient way to make sure that we do not lose the communication.
+
+What's blocking you at the moment?
+From my mail:
+
+Here is the full code for my own unit test, first the function that contains the actual test and second the function that retrieves the backups: http://pastebin.com/KBX1PTH3. Output of the test: http://pastebin.com/LQXRE4DT.
+
+The path doesn't exist on my filesystem, I'm not sure whether that's because it doesn't get created or because it gets wiped afterwards. I assume it gets wiped as I'm creating files which doesn't throw exceptions.
+
+I'm not quite sure how I should call the generator function since I want it to execute the whole function.
+So how does it look, do you have an idea why it wouldn't work or what I might try instead?
+I'm not sure that's the issue, but you should rewrite `getUpgradeBackups` as follows:
+
+let getUpgradeBackups = Task.async(function*() {
+  // Your existing code
+});
+
+and then call it with `yield getUpgradeBackups()`. I suspect that your current code doesn't handle the `yield iterator.forEach` correctly because you are not in a Task.
+*** Bug 1140360 has been marked as a duplicate of this bug. ***
+OK thanks for the tips, I managed to get that working. However, I can't get the SessionWorker to delete upgrade backups because it doesn't seem to find them. I have verified that the number "maxUpgradeBackups" is set as expected but the directoryIterator doesn't loop over any files. This is the iterator code in SessionWorker.js:
+
+iterator = new File.DirectoryIterator(this.Paths.backups);
+iterator.forEach(function (file) {
+    //...
+}, this);
+
+The same iterator (except that it uses "yield iterator.forEach(...)" as it's in a generator function) reads the backups directory as expected in the unit test. Do you have an idea why that might be?
+
+Also, is there a better way to get information about the SessionWorker than creating files?
+Could you attach the latest version of your patch and mark me as `feedback?`? This will be easier for me with the code.
+
+> Also, is there a better way to get information about the SessionWorker than creating files?
+
+I'm not sure I understand this question.
+Created attachment 8575272
+Patch (work in progress...)
+
+I modified 3 files (SessionWorker.js with the main changes, SessionFile.jsm to initialize SessionWorker maxUpgradeBackups value, test/browser_upgrade_backups.js where I added the tests).
+
+What I meant was, I wanted to get some information about internal state during the tests. In the unit test, I used info(...) and in the SessionWorker I created files where I wrote data to. Since I don't really seem to have a console, that's what I came up with. Is there a better way?
+
+Another question: Can I retrieve the value of maxUpgradeBackups from SessionFile? At the end of the test I want to compare the number of currently present backups to maxUpgradeBackups (rather than the hard-coded value).
+Comment on attachment 8575272
+Patch (work in progress...)
+
+Review of attachment 8575272:
+-----------------------------------------------------------------
+
+At first glance, I don't see any issue. Could you attach the full output of the test?
+Also, what happens if you replace `yield iterator.forEach(...)` with `yield iterator.nextBatch()`?
+
+Also, you could add at the start of the test
+
+  Services.prefs.setBoolPref("toolkit.osfile.log", true)
+
+to get more data on what's going on with file I/O. It could help with debugging.
+I'm assuming you are referring to `yield iterator.forEach(...)` on line 74 of the test (in `getUpgradeBackups()`) - making the change results in a DataCloneError. I'm not sure why I should change that function since it seems to work (it iterates over all the files that I expect to be there).
+
+The issue seems to be that the SessionWorker's DirectoryIterator (line 197) doesn't iterate over any files. I found that out by placing a `File.writeAtomic(...)` inside the iterator's forEach function (which didn't create any files).
+
+That statement certainly added a lot more output... At the moment I only output the backups found by `getUpgradeBackups()` (the info lines beginning with *********) and the files that `getUpgradeBackups()` found that are not upgrade backups (the info lines beginning with ----------). You can find it output here: http://pastebin.com/4sLdL6Vi
+My bad, I had misunderstood comment 15.
+You can use `dump()` to print information to the console from SessionWorker.js, if this helps with debugging.
+
+For instance, you can add after line 197
+  dump(`DirectoryIterator created: ${iterator.exists()}\n`);
+to be informed if `iterator` is created successfully and if the directory exists, and in the `catch` of line 203
+  dump(`DirectoryIterator error: ${exn}\n`);
+
+Mmmh... While looking at it, I also realize that this shouldn't be `file.name.startsWith(upgradeBackupPrefix)` but rather `file.path.startsWith(upgradeBackupPrefix)`, since `upgradeBackupPrefix` contains the entire path.
+Thanks for the tip about `dump(...)`, that's what I've been looking for. :)
+
+I think I'm certain that the issue is due to the fact that the SessionWorker isn't being reset after the previous test ("test_upgrade_backup") and thus `SessionFile.write("")` doesn't do much (or anything at all?). I was assuming that it would be reset somewhere, that each test is started with the same initial state (which, as far as I know, is common practice with unit tests).
+
+Is there a way to reset the SessionWorker so that I can call `SessionFile.write("")` which will then check the upgrade backups? The only somewhat relevant function in SessionFile is `wipe()` but that only wipes files in the sessionstore directories.
+I think I know what's wrong. If I read your code correctly, it executes only if
+1/ `upgradeBackupNeeded` is `true`;
+2/ our state is either `STATE_CLEAN` or `STATE_UPGRADE_BACKUP`;
+3/ this is our first call to `SessionFile.write`.
+
+We get 1/ only if we have just upgraded Firefox, i.e. if preference "browser.sessionstore.upgradeBackup.latestBuildID" is either unset or different from `Services.appinfo.platformBuildID`. Take a look at what `test_upgrade_backup` does to force an upgrade backup.
+
+To get 2/, the easiest is to make sure that there is a well-formed JSON file at Paths.clean.
+
+To get 3/, call SessionFile.read(), then SessionFile.write().
+
+P.S. mochitests are unfortunately not unit tests but integration tests, which makes them harder to write/use.
+Created attachment 8577291
+Backup removal seems to be fine, but...
+
+Ah, so that is what some of the first lines in `test_upgrade_backup` were for... that worked, thanks!
+
+Removing backups (and testing the removal) seems to work. However, I copied part of `test_upgrade_backup` to make sure that a new backup is being created. This is where one of the tests fails (the file `Paths.upgradeBackup` doesn't exist).
+
+This is from comment 3, where you initially mentionned testing:
+
+> After this, we'll need to discuss unit testing. You should take a look at
+> browser_upgrade_backup.js, as we'll need to extend it to:
+> - make sure that we are removing backups if there are too many of them;
+> - make sure that we are keeping exactly `maxUpgradeBackups` backups;
+> - make sure that we are not removing the backup that we have just created;
+> - make sure that we only remove backups on the first write, not afterwards.
+
+I'd say these are covered, but failing on the third point. Is there a valid reason why my test code doesn't create a new backup?
+
+Also, I'd prefer to compare the number of backups in the test to the actual value of `maxUpgradeBackups` (rather than the hardcoded 3) but I don't suppose that's possible...
+Comment on attachment 8577291
+Backup removal seems to be fine, but...
+
+Review of attachment 8577291:
+-----------------------------------------------------------------
+
+Not being able to verify that we didn't erase the most up-to-date backup is a tad annoying.
+
+Does
+ is(Services.prefs.getCharPref(PREF_UPGRADE), buildID, "upgrade backup should be set");
+return what you expect?
+
+::: browser/components/sessionstore/test/browser_upgrade_backup.js
+@@ +43,5 @@
+> +  // prepare test
+> +  const PREF_UPGRADE = "browser.sessionstore.upgradeBackup.latestBuildID";
+> +  let buildID = Services.appinfo.platformBuildID;
+> +  info("Let's see if we remove backups if there are too many");
+> +  Services.prefs.setCharPref(PREF_UPGRADE, "");
+
+Could you factor out these few lines between both tests?
+
+@@ +59,5 @@
+> +  let backups = yield getUpgradeBackups();
+> +
+> +  // trigger new backup
+> +  yield SessionFile.read(); // First call to read() initializes the SessionWorker
+> +  yield SessionFile.write(""); // First call to write() triggers the backup
+
+[and the cleanup]
+
+@@ +63,5 @@
+> +  yield SessionFile.write(""); // First call to write() triggers the backup
+> +
+> +  // a new backup should have been created
+> +  is(Services.prefs.getCharPref(PREF_UPGRADE), buildID, "upgrade backup should be set");
+> +  is((yield OS.File.exists(Paths.upgradeBackup)), true, "upgrade backup file has been created");
+
+So, if I understand correctly, this is the line that fails? If so, that's a bit scary.
+
+@@ +79,5 @@
+> +
+> +  yield SessionFile.write(""); // Second call to write() should not trigger anything
+> +
+> +  backups = yield getUpgradeBackups();
+> +  is(backups.length, 3, "second call to SessionFile.write() didn't remove more backups");
+
+Well, you should check that these are still the same backups (or at least they have the same names).
+> Not being able to verify that we didn't erase the most up-to-date backup is
+> a tad annoying.
+
+I agree, which is why I tried adding a new test. What this test checks is that after the `SessionFile.write()` call, a backup file exists that hasn't existed before the call. 
+
+> Does
+>  is(Services.prefs.getCharPref(PREF_UPGRADE), buildID, "upgrade backup
+> should be set");
+> return what you expect?
+
+Yes. I don't really know what that call does exactly but the result is the same as in `test_upgrade_backup` so I assume it's fine.
+
+> Could you factor out these few lines between both tests?
+
+What do you mean by that?
+
+> > +  is(Services.prefs.getCharPref(PREF_UPGRADE), buildID, "upgrade backup should be set");
+> > +  is((yield OS.File.exists(Paths.upgradeBackup)), true, "upgrade backup file has been created");
+> 
+> So, if I understand correctly, this is the line that fails? If so, that's a
+> bit scary.
+
+The second test here (the one that tests that a file `Paths.upgradeBackup` exists) is the one that fails. The other one passes
+
+> Well, you should check that these are still the same backups (or at least
+> they have the same names).
+
+I'm already doing that :) I'm filtering `newBackups` so that all backups that have been present before the call to `SessionFile.write()` are removed. All remaining backups are "new backups", they have been created by the SessionWorker. I test that the number of such new backups is 1. This test fails as well (the number of remaining backups that were not present before the call is 0), it seems like SessionWorker doesn't create a backup (which is why the earlier test fails too).
+(In reply to Fabian Furger from comment #25)
+> > Not being able to verify that we didn't erase the most up-to-date backup is
+> > a tad annoying.
+> 
+> I agree, which is why I tried adding a new test. What this test checks is
+> that after the `SessionFile.write()` call, a backup file exists that hasn't
+> existed before the call. 
+
+Are you talking of `test_upgrade_backup_removal` or a new test that I haven't seen yet?
+
+> > Does
+> >  is(Services.prefs.getCharPref(PREF_UPGRADE), buildID, "upgrade backup
+> > should be set");
+> > return what you expect?
+> 
+> Yes. I don't really know what that call does exactly but the result is the
+> same as in `test_upgrade_backup` so I assume it's fine.
+
+When we upgrade Firefox and write an upgrade backup, we note the id of the latest backup in the preferences to make sure that we don't overwrite this backup on the next launch.
+
+> > Could you factor out these few lines between both tests?
+> 
+> What do you mean by that?
+
+I mean that these few lines are the same in both tests and could be put in a function.
+
+> 
+> > > +  is(Services.prefs.getCharPref(PREF_UPGRADE), buildID, "upgrade backup should be set");
+> > > +  is((yield OS.File.exists(Paths.upgradeBackup)), true, "upgrade backup file has been created");
+> > 
+> > So, if I understand correctly, this is the line that fails? If so, that's a
+> > bit scary.
+> 
+> The second test here (the one that tests that a file `Paths.upgradeBackup`
+> exists) is the one that fails. The other one passes
+
+Yeah, that's the scary part :)
+It means that the backup was written, but it doesn't exist anymore. Could you, during this investigation, add some logging to SessionWorker.js to 
+1/ confirm that the backup is created correctly;
+2/ find it whether you have erased the file by accident?
+
+> > Well, you should check that these are still the same backups (or at least
+> > they have the same names).
+> 
+> I'm already doing that :) I'm filtering `newBackups` so that all backups
+> that have been present before the call to `SessionFile.write()` are removed.
+> All remaining backups are "new backups", they have been created by the
+> SessionWorker.
+
+Ah, right. Could you add a few words in the test to explain this?
+
+> I test that the number of such new backups is 1. This test
+> fails as well (the number of remaining backups that were not present before
+> the call is 0), it seems like SessionWorker doesn't create a backup (which
+> is why the earlier test fails too).
+
+That's also not a good sign.
+Created attachment 8582349
+Fixed bug in backup removal and got the tests to run successfully
+
+OK, it looks like it's all working fine now. Apart from removing the wrong backups in the SessionWorker, there was also an issue with the other test that created the nextUpgradeBackup which was then causing one of my tests to fail. Removing that backup file before running my test fixes this.
+
+I refactored those couple of lines that are responsible for setting up the test. Since 3 out of the 4 lines are variables that are used for checks later on, I returned these in an object, I hope that is OK.
+Comment on attachment 8582349
+Fixed bug in backup removal and got the tests to run successfully
+
+Review of attachment 8582349:
+-----------------------------------------------------------------
+
+This looks good. Thanks for finding the bug.
+
+::: browser/components/sessionstore/SessionFile.jsm
+@@ +199,3 @@
+>     */
+>    _isClosed: false,
+> +  
+
+Nit: please make sure that you don't add whitespace at the end of lines.
+
+@@ +201,5 @@
+> +  
+> +  /**
+> +   * Number of old upgrade backups that are being kept
+> +   */
+> +  MAX_UPGRADE_BACKUPS: 3,
+
+Now that the code works, we should turn this into a preference. See
+  https://dxr.mozilla.org/mozilla-central/source/browser/app/profile/firefox.js#1069 
+for defining the preference and
+  Preferences.get(YOUR_PREF_NAME, defaultValue)
+for reading it.
+
+You will need to import resource://gre/modules/Preferences.jsm if it hasn't been imported yet.
+
+::: browser/components/sessionstore/SessionWorker.js
+@@ +87,5 @@
+>     *
+>     * @param {string} origin Which of sessionstore.js or its backups
+>     *   was used. One of the `STATE_*` constants defined above.
+>     * @param {object} paths The paths at which to find the various files.
+> +   * @param {int} maxUpgradeBackups The number of old upgrade backups that should be kept.
+
+Nit: it's `@param {number}`.
+
+::: browser/components/sessionstore/test/browser_upgrade_backup.js
+@@ +7,5 @@
+>  
+>  const Paths = SessionFile.Paths;
+>  
+> +/**
+> + * Prepares some data for the tests and returns it in an object.
+
+That comment is quite obscure. Please document what it does on preferences and the fields returned.
+
+@@ +15,5 @@
+> +
+> +  result.PREF_UPGRADE = "browser.sessionstore.upgradeBackup.latestBuildID";
+> +  result.buildID = Services.appinfo.platformBuildID;
+> +  Services.prefs.setCharPref(result.PREF_UPGRADE, "");
+> +  result.contents = JSON.stringify({"browser_upgrade_backup.js": Math.random()});
+
+For instance, this is an arbitrary JSON-parsable string.
+
+@@ -14,4 @@
+>  });
+>  
+>  add_task(function* test_upgrade_backup() {
+> -  const PREF_UPGRADE = "browser.sessionstore.upgradeBackup.latestBuildID";
+
+Let's just make this a toplevel constant, instead of putting it in a function.
+
+@@ +83,5 @@
+> +  let test = yield prepareTest();
+> +  info("Let's see if we remove backups if there are too many");
+> +  yield OS.File.writeAtomic(Paths.clean, test.contents);
+> +
+> +  // if the nextUpgradeBackup already exists (from another test), remove it
+
+You could use SessionFile.wipe(), to make sure that nothing is left from previous tests.
+
+@@ +103,5 @@
+> +  // trigger new backup
+> +  yield SessionFile.read(); // First call to read() initializes the SessionWorker
+> +  yield SessionFile.write(""); // First call to write() triggers the backup and the cleanup
+> +
+> +  // a new backup should have been created
+
+(and should still exist)
+Created attachment 8585141
+Taking comment 28 into account
+
+I did most of what you wanted in comment 28. Some notes:
+
+- I put maxUpgradeBackups into the preference. As you rightly pointed out, I forgot to remove trailing whitespaces before. `firefox.js` contains many trailing whitespaces and I automatically removed them, I'm not sure that is desired (doing two unrelated changes in one patch). What's the policy on that? I did small unrelated changes like that before (like fixing a typo in a comment) and I figured when it was just 1 or 2 lines it would be fine...
+
+> That comment is quite obscure. Please document what it does on preferences and the fields returned.
+
+Well that would be because I wasn't sure what exactly this code did :D I put something more meaningful (but possibly not quite right) there now.
+
+> You could use SessionFile.wipe(), to make sure that nothing is left from previous tests.
+
+I've tried this before. However, then I get the following exception:
+
+`15 INFO TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_upgrade_backup.js | Uncaught exception - at :0 - Unix error 2 during operation open on file /tmp/tmp5kRk0N.mozrunner/sessionstore-backups/upgrade.js-20080101010101 (No such file or directory)`
+
+This is thrown when creating the first of my dummy upgrade backups. I assume the issue is that the backup path doesn't exist. I couldn't find a way to create directories from the `OS.File` for workers.
+I just wanted you to not add whitespace at the end of your own lines. Automatically removing all whitespace is not considered a good idea. Can you revert on that and ask for review again? At the moment, there is too 
+much noise in the patch for me to review it comfortably.
+Created attachment 8585357
+Not removing firefox.js trailing whitespaces
+
+Sure, sorry about that.
+Comment on attachment 8585357
+Not removing firefox.js trailing whitespaces
+
+Review of attachment 8585357:
+-----------------------------------------------------------------
+
+Looks good.
+Do you have Try access to launch the tests on all platforms?
+Nope. I did some work on another bug and the mentor there put it on Try.
+Try results will appear here: https://treeherder.mozilla.org/#/jobs?repo=try&revision=effcd01923c4
+You should request L1 access, I'll vouch for you. All the details are here: https://www.mozilla.org/hacking/committer/
+I've created the request here: https://bugzilla.mozilla.org/show_bug.cgi?id=1150393
+
+I see there's one issue on Try but that doesn't seem to be realted to my changes, right? What's next?
+The next step is landing the code.
+Oh, wait, it looks like your patch doesn't have a commit message. Have you looked at
+ https://developer.mozilla.org/en-US/docs/Mercurial_FAQ#How_can_I_generate_a_patch_for_somebody_else_to_check-in_for_me.3F
+Created attachment 8587476
+Patch created by exporting hg commit
+
+I had some more issues after our discussion earlier today but I think I know why and got it fixed so that I can build and run the tests again.
+
+This time I created the patch by exporting the commit as you suggested, I think it's now what you were looking for. Thank you again for your patience and help :-)
+Comment on attachment 8587476
+Patch created by exporting hg commit
+
+Review of attachment 8587476:
+-----------------------------------------------------------------
+
+Looks good :)
+Let's try to land it.
+https://hg.mozilla.org/integration/fx-team/rev/589365e1f7c3
+https://hg.mozilla.org/mozilla-central/rev/589365e1f7c3
+So it looks like this is now finally done! Well that was... interesting :-) David, do you have another bug that I might tackle next?
+\o/
+
+Would you be interested in working in another session restore-related bug?
+Bug 1147822 is not a mentored bug [yet] but I'd be happy to mentor you through it.
+
+
+[Session Restore] Session Restore doesn't clean up its upgrade backups
+
+
+
+Bug 1107941 - Removing old upgrade backups if too many exist. Max upgrade backups is defined in preferences. Tested with mochi tests. r=Yoric 

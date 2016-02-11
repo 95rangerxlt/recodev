@@ -1,0 +1,616 @@
+The reflow actor (bug 997198) only observes reflows in the tabActor's window, but reflows from child windows don't seem to bubble, so we'll need to go through them (via the docshell tree) and list for reflows there too, also listening to frames loaded and unloaded.
+
+There are at least 3 places in our actors that have this kind of window management process:
+
+- the inspector actor:
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/inspector.js#834
+listens to frame load/unload to update the markup-view
+
+- the stylesheets actor:
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/stylesheets.js#121
+lists the stylesheets in the main document and recursively looks for <iframe> nodes in it to list their stylesheets too
+https://mxr.mozilla.org/mozilla-central/source/browser/devtools/styleeditor/StyleEditorUI.jsm#117
+On the client side, listens to navigation events to list stylesheets again.
+
+- the newly introduced storage actor:
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/storage.js#1501
+listens to window created and removed
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/storage.js#1528
+listens to pageshow and pagehide events
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/storage.js#1455
+lists all windows and inner windows
+
+Bug 977043 is cleaning this up a bit, so let's wait for this one to be fixed first.
+
+I like the pool management code in the storage actor, I think it should be part of the tab actor.
+The tab actor could provide a method to any child actor that needs to know the list of windows, and events to notify of windows being added and removed.
+
+The reflow actor (bug 997198) only observes reflows in the tabActor's window, but reflows from child windows don't seem to bubble, so we'll need to go through them (via the docshell tree) and list for reflows there too, also listening to frames loaded and unloaded.
+
+There are at least 3 places in our actors that have this kind of window management process:
+
+- the inspector actor:
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/inspector.js#834
+listens to frame load/unload to update the markup-view
+
+- the stylesheets actor:
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/stylesheets.js#121
+lists the stylesheets in the main document and recursively looks for <iframe> nodes in it to list their stylesheets too
+https://mxr.mozilla.org/mozilla-central/source/browser/devtools/styleeditor/StyleEditorUI.jsm#117
+On the client side, listens to navigation events to list stylesheets again.
+
+- the newly introduced storage actor:
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/storage.js#1501
+listens to window created and removed
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/storage.js#1528
+listens to pageshow and pagehide events
+https://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/storage.js#1455
+lists all windows and inner windows
+
+Bug 977043 is cleaning this up a bit, so let's wait for this one to be fixed first.
+
+I like the pool management code in the storage actor, I think it should be part of the tab actor.
+The tab actor could provide a method to any child actor that needs to know the list of windows, and events to notify of windows being added and removed.
+Created attachment 8421761
+bug1007021-reflow-actor-observe-iframes-navigated-pages v1.patch
+
+With this patch, the reflow actor now listens to reflow in all windows including in the docshelltree of the current debuggee tab, and also reacts to newly created windows and removed windows.
+
+What I essentially did was extract the code from the StorageActor into a separate module that can be required by any actor that needs it.
+
+The API of this new module is pretty simple:
+- it has a .windows property that lists the windows
+- it emits a window-ready event
+- it emits a window-destroyed event
+
+I have tested this successfully in a number of use cases:
+- BFcache: hitting back/forward to reload pages from history
+- Pages with iframes
+- B2G
+- Browser toolbox
+
+Left to do:
+- add new automated tests for the layout-view, to check that it refreshes when reflows occur after navigation and within iframes
+- uncomment the few lines I commented out in WindowsTracker.prototype._isValidLocation
+- check how this can integrate with TabActor. It's definitely something that TabActor should be responsible for doing. It does some of it already, but not all (like window-destroyed)
+- file bugs to use this in the various actors that need it (StorageActor, StyleEditor, InspectorActor, ...)
+Comment on attachment 8421761
+bug1007021-reflow-actor-observe-iframes-navigated-pages v1.patch
+
+Review of attachment 8421761:
+-----------------------------------------------------------------
+
+windows.js looks like DebuggerProgressListener from webbrowser.js.
+Feel free pulling it out in a dedicated module if that can help,
+but keep in mind, that right now, it is a bit entangled with TabActor implementation...
+
+::: toolkit/devtools/server/actors/windows.js
+@@ +54,5 @@
+> +  destroy: function() {
+> +    this.destroyed = true;
+> +    this.layoutHelper = null;
+> +
+> +    Services.obs.removeObserver(this, "content-document-global-created", false);
+
+Here your are using `content-document-global-created`, but in webbrowser.js, for the ThreadActor usage, we are listening for DOMWindowCreated event,
+which seems to be dispatched with other conditions, sooner and not in a thread:
+http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.cpp#2660
+DOMWindowCreated might be a better event for debugger usage, and most likely a good one for others.
+
+That brings me to the point of sharing what is already being done in webbrowser.js.
+I think it would be better to integrate with DebugerProgressListener:
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webbrowser.js#1369
+which already listen for all these events and dispatch events on the tab actor, like window-ready:
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webbrowser.js#942
+It would be better to listen to existing window-ready and may be tweak it if needed,
+to introduce any useful new similar event.
+
+The benefit of reusing DebugerProgressListener is that I'm sending fake events to implement the frame selection support in bug 977043, attachment 8395769.
+(One day I'll close this bug, but that's kind of big side project that move forward whenever I have some spare time)
+
+@@ +71,5 @@
+> +   * Given a docshell, recursively find out all the child windows from it.
+> +   * @param {nsIDocShell} rootDocShell The docshell from which all inner windows
+> +   * need to be extracted.
+> +   */
+> +  _fetchChildWindows: function(rootDocShell) {
+
+You should be able to iterate over all docshells without recursion, with code like that:
+
+let containedDocShells = rootDocShell.getDocShellEnumerator(
+  Ci.nsIDocShellTreeItem.typeAll,
+  Ci.nsIDocShell.ENUMERATE_FORWARDS);
+while (containedDocShells.hasMoreElements()) {
+  let childDocShell = containedDocShells.getNext();
+  childDocShell = childDocShell.QueryInterface(Ci.nsIInterfaceRequestor)
+                               .getInterface(Ci.nsIWebProgress);
+}
+(In reply to Alexandre Poirot (:ochameau) from comment #2)
+> Comment on attachment 8421761
+> bug1007021-reflow-actor-observe-iframes-navigated-pages v1.patch
+> 
+> Review of attachment 8421761:
+> -----------------------------------------------------------------
+> 
+> windows.js looks like DebuggerProgressListener from webbrowser.js.
+> Feel free pulling it out in a dedicated module if that can help,
+> but keep in mind, that right now, it is a bit entangled with TabActor
+> implementation...
+> 
+> ::: toolkit/devtools/server/actors/windows.js
+> @@ +54,5 @@
+> > +  destroy: function() {
+> > +    this.destroyed = true;
+> > +    this.layoutHelper = null;
+> > +
+> > +    Services.obs.removeObserver(this, "content-document-global-created", false);
+> 
+> Here your are using `content-document-global-created`, but in webbrowser.js,
+> for the ThreadActor usage, we are listening for DOMWindowCreated event,
+> which seems to be dispatched with other conditions, sooner and not in a
+> thread:
+> http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.
+> cpp#2660
+> DOMWindowCreated might be a better event for debugger usage, and most likely
+> a good one for others.
+
+
+Actually, switching to DOMWindowCreated wont make any difference. See [0]. Both the event and notification are sent one after another. Infact, the notification is sync, so it will have no delay..
+
+
+[0] http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.cpp#2714
+> That brings me to the point of sharing what is already being done in
+> webbrowser.js.
+> I think it would be better to integrate with DebugerProgressListener:
+>  
+> http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/
+> webbrowser.js#1369
+> which already listen for all these events and dispatch events on the tab
+> actor, like window-ready:
+>  
+> http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/
+> webbrowser.js#942
+> It would be better to listen to existing window-ready and may be tweak it if
+> needed,
+> to introduce any useful new similar event.
+> 
+> The benefit of reusing DebugerProgressListener is that I'm sending fake
+> events to implement the frame selection support in bug 977043, attachment
+> 8395769 [details] [diff] [review].
+> (One day I'll close this bug, but that's kind of big side project that move
+> forward whenever I have some spare time)
+
+Yeah, I am also towards merging all similar code. but afaik, there are no equivalent of window-destroyed events, or am I missing something ?
+
+> You should be able to iterate over all docshells without recursion, with
+> code like that:
+> 
+> let containedDocShells = rootDocShell.getDocShellEnumerator(
+>   Ci.nsIDocShellTreeItem.typeAll,
+>   Ci.nsIDocShell.ENUMERATE_FORWARDS);
+> while (containedDocShells.hasMoreElements()) {
+>   let childDocShell = containedDocShells.getNext();
+>   childDocShell = childDocShell.QueryInterface(Ci.nsIInterfaceRequestor)
+>                                .getInterface(Ci.nsIWebProgress);
+> }
+
+This is nice, assuming this works across webapps boundaries etc.
+(In reply to Girish Sharma [:Optimizer] from comment #3)
+> Yeah, I am also towards merging all similar code. but afaik, there are no
+> equivalent of window-destroyed events, or am I missing something ?
+Definitely, the goal of extracting this window tracking code from the storage actor and asking you guys for feedback on the bug was precisely to try and merge these similar things.
+So far the identified differences are:
+- no notifications when windows are getting destroyed (or would will-navigate give the same information?)
+- no easy way to list the windows
+- entangled with tabActor as Alex said, but that should be relatively easy to change, and it's not a big issue because that's where we want this information to be.
+(In reply to Girish Sharma [:Optimizer] from comment #3)
+> Actually, switching to DOMWindowCreated wont make any difference. See [0].
+> Both the event and notification are sent one after another. Infact, the
+> notification is sync, so it will have no delay..
+
+Oh right, I took JS_FireOnNewGlobalObject for DOMWindowCreated...
+
+> Yeah, I am also towards merging all similar code. but afaik, there are no
+> equivalent of window-destroyed events, or am I missing something ?
+
+Yes, but we are already listening for DOMWindowCreated, pageshow and pagehide.
+So in DebugProgressListener, we should be able to fire all necessary events to the tab actors.
+For now, `window-ready` is only fired on DOMWindowCreated, so there is some fine tuning
+needed to dispatch new events. (window-ready isn't used by any actor yet,
+so you may change it to whatever helps all tab actors)
+(In reply to Alexandre Poirot (:ochameau) from comment #5)
+> (In reply to Girish Sharma [:Optimizer] from comment #3)
+> > Actually, switching to DOMWindowCreated wont make any difference. See [0].
+> > Both the event and notification are sent one after another. Infact, the
+> > notification is sync, so it will have no delay..
+> 
+> Oh right, I took JS_FireOnNewGlobalObject for DOMWindowCreated...
+> 
+> > Yeah, I am also towards merging all similar code. but afaik, there are no
+> > equivalent of window-destroyed events, or am I missing something ?
+> 
+> Yes, but we are already listening for DOMWindowCreated, pageshow and
+> pagehide.
+> So in DebugProgressListener, we should be able to fire all necessary events
+> to the tab actors.
+> For now, `window-ready` is only fired on DOMWindowCreated, so there is some
+> fine tuning
+> needed to dispatch new events. (window-ready isn't used by any actor yet,
+> so you may change it to whatever helps all tab actors)
+Cool, I'm working on a new patch now, I will probably send a review request your way when ready.
+Created attachment 8426206
+bug1007021-tabactor-windows-management v1.patch
+
+Managing windows, take 2.
+
+This patch builds on ochameau's recent changes to the TabActor to also emit events when windows are destroyed, and to easily expose the list of windows and docshells on the TabActor class.
+
+Using this, I changed the reflow actor part to listen to reflows in all windows.
+I also added a couple of new tests for the layout-view.
+
+Alex, a review from you on my changes in webbrowser.js would be great.
+Brian, you reviewed the original reflow actor patch, do you mind taking a look at my changes in layout.js?
+
+Thanks
+Oh, a couple more notes about the previous patch:
+- I tested it successfully in a number of cases: debugging of a local content page, debugging of a remote content page, as well as using the browser toolbox.
+- About the browser toolbox: in this mode, the TabActor that other tab-level actors get in their init is actually the RootActor, that's why I changed root.js a little bit, so that it implements some of the same methods as TabActor.
+Comment on attachment 8426206
+bug1007021-tabactor-windows-management v1.patch
+
+Review of attachment 8426206:
+-----------------------------------------------------------------
+
+Changes in layout.js look good
+
+::: browser/devtools/layoutview/test/browser_layoutview_update-after-navigation.js
+@@ +57,5 @@
+> +  info("Checking that the layout-view shows the right value after update");
+> +  is(sizeElt.textContent, "200x100");
+> +});
+> +
+> +addTest("Go back to the first page",
+
+May also add in a test for reloading the page
+Comment on attachment 8426206
+bug1007021-tabactor-windows-management v1.patch
+
+Review of attachment 8426206:
+-----------------------------------------------------------------
+
+Looks great, but I think there is some space for races.
+See my comment in watch().
+
+::: toolkit/devtools/server/actors/root.js
+@@ +179,5 @@
+> +      docShells.push(docShellsEnum.getNext());
+> +    }
+> +
+> +    return docShells;
+> +  },
+
+The root actor is such a strange beast!
+It is kind of TabActor, but no, it doesn't inherit from it,
+so we have to start copy pasting.
+If I follow correctly this allows to make the layout actor to work with the root actor, but we are going to miss the window-ready/destroyed event, right?
+I just want to follow and ensure that this modification is really needed. I don't think fixing such root actor weirdness has to be part of your patch.
+
+::: toolkit/devtools/server/actors/webbrowser.js
+@@ +992,5 @@
+>    },
+>  
+> +  _windowDestroyed: function (window) {
+> +    let isTopLevel = window == this.window;
+> +    dumpn("window-destroyed: " + window.location + " isTopLevel:" + isTopLevel);
+
+nit: I think the dumpn() in windowReady was a leftover, landed by mistake. Panos suggested me to not add such log.
+
+@@ +1449,5 @@
+> +    handler.addEventListener("pagehide", this._onWindowHidden, true);
+> +
+> +    // Maintain the list of windows so that we can filter out irrelevant
+> +    // inner-window-destroyed events
+> +    this._windows = new Set(this._tabActor.windows);
+
+In bug 977043 attachment 8395769, for toolbox frame support, I'm about to call `watch` multiple times, as, on b2g we are going to watch more than just one docshell per tab actor.
+Could you start defining _windows in DebuggerProgressListener contructor, and here, fill it?
+But then it also means that you can't use tabActor.windows as it isn't per docshell. So you would have to list the windows for just the given docshell here and in unwatch.
+
+Also there is a race between when we call `watch()` (on tab actor attach) and when you are using `tabActor.windows` in layout.js (after EVENT_BATCHING_DELAY on ReflowActor initialization).
+If you hit such race, you will list tabActor.windows first, then miss a inner window being created before watch is being called.
+In order to simplify all such APIs and prevent such races, in the SDK, we used to call create/destroy listeners for already existing windows. Here, in watch, we would dispatch window-ready for all existing windows when we call watch().
+Would that work for tab actor usages you have identified?
+
+Finally, keeping such list of windows reference would be unecessary if we had an equivalent of DOMWindowCreated but for destroy. May be that's something we can add to the platform?
+It seems easy to dispatch similar event, but it may be hard to find the precise spot where we can still dispatch it: 
+http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.cpp#2729
+http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.cpp#1609
+Thanks Alex for the review
+
+(In reply to Alexandre Poirot (:ochameau) from comment #10)
+> Comment on attachment 8426206
+> bug1007021-tabactor-windows-management v1.patch
+> 
+> Review of attachment 8426206:
+> -----------------------------------------------------------------
+> 
+> Looks great, but I think there is some space for races.
+> See my comment in watch().
+> 
+> ::: toolkit/devtools/server/actors/root.js
+> @@ +179,5 @@
+> > +      docShells.push(docShellsEnum.getNext());
+> > +    }
+> > +
+> > +    return docShells;
+> > +  },
+> 
+> The root actor is such a strange beast!
+> It is kind of TabActor, but no, it doesn't inherit from it,
+> so we have to start copy pasting.
+> If I follow correctly this allows to make the layout actor to work with the
+> root actor, but we are going to miss the window-ready/destroyed event, right?
+> I just want to follow and ensure that this modification is really needed. I
+> don't think fixing such root actor weirdness has to be part of your patch.
+Yes your analysis is correct, this change makes the layout actor work with the root actor but the ready/destroy events won't be sent.
+I added these simple windows/docshells getters in the RootActor so that my layout actor would work in Browser Toolbox mode.
+Indeed, in this mode, the TabActor that is normally passed to tab-level actors when initialized is in fact the RootActor.
+I don't think it's a big problem to land these getters in this patch, I do agree though that we should probably file a separate bug to work on the TabActor/RootActor relationship.
+Maybe we ought to create a new actor (perhaps called BrowserActor) that plays the role the TabActor normally plays, but in Browser Toolbox mode.
+I think RootActor should always remain the root and shouldn't inherit from TabActor.
+
+> ::: toolkit/devtools/server/actors/webbrowser.js
+> @@ +992,5 @@
+> >    },
+> >  
+> > +  _windowDestroyed: function (window) {
+> > +    let isTopLevel = window == this.window;
+> > +    dumpn("window-destroyed: " + window.location + " isTopLevel:" + isTopLevel);
+> 
+> nit: I think the dumpn() in windowReady was a leftover, landed by mistake.
+> Panos suggested me to not add such log.
+Ok thanks for catching that. I removed the dumpn calls.
+
+> @@ +1449,5 @@
+> > +    handler.addEventListener("pagehide", this._onWindowHidden, true);
+> > +
+> > +    // Maintain the list of windows so that we can filter out irrelevant
+> > +    // inner-window-destroyed events
+> > +    this._windows = new Set(this._tabActor.windows);
+> 
+> In bug 977043 attachment 8395769, for toolbox
+> frame support, I'm about to call `watch` multiple times, as, on b2g we are
+> going to watch more than just one docshell per tab actor.
+> Could you start defining _windows in DebuggerProgressListener contructor,
+> and here, fill it?
+> But then it also means that you can't use tabActor.windows as it isn't per
+> docshell. So you would have to list the windows for just the given docshell
+> here and in unwatch.
+> 
+> Also there is a race between when we call `watch()` (on tab actor attach)
+> and when you are using `tabActor.windows` in layout.js (after
+> EVENT_BATCHING_DELAY on ReflowActor initialization).
+> If you hit such race, you will list tabActor.windows first, then miss a
+> inner window being created before watch is being called.
+> In order to simplify all such APIs and prevent such races, in the SDK, we
+> used to call create/destroy listeners for already existing windows. Here, in
+> watch, we would dispatch window-ready for all existing windows when we call
+> watch().
+> Would that work for tab actor usages you have identified?
+I'll work on these race conditions. Thanks for bringing up the B2G use case. I'll make sure this works and submit a new patch.
+
+> Finally, keeping such list of windows reference would be unecessary if we
+> had an equivalent of DOMWindowCreated but for destroy. May be that's
+> something we can add to the platform?
+> It seems easy to dispatch similar event, but it may be hard to find the
+> precise spot where we can still dispatch it: 
+> http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.
+> cpp#2729
+> http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.
+> cpp#1609
+Yes definitely. When I started working on this patch, it's the first thing I was looking for.
+I don't feel very confident adding this new event to the platform though.
+(In reply to Alexandre Poirot (:ochameau) from comment #10)
+> In bug 977043 attachment 8395769, for toolbox
+> frame support, I'm about to call `watch` multiple times, as, on b2g we are
+> going to watch more than just one docshell per tab actor.
+> Could you start defining _windows in DebuggerProgressListener contructor,
+> and here, fill it?
+> But then it also means that you can't use tabActor.windows as it isn't per
+> docshell. So you would have to list the windows for just the given docshell
+> here and in unwatch.
+Well the whole point of this is that it knows the list of all windows so that other actors can use it to do things with it.
+Why do you want to call watch several times?
+As far as I can understand the code, calling it once per tabActor should be enough since it will then emit its events for all windows in it.
+So, if my understanding is correct, then initializing the set of windows in watch isn't really a problem even if you call watch many times. It will just reset `this._windows` to the full list of windows in the tabActor everytime.
+I might be missing something here though.
+
+> Also there is a race between when we call `watch()` (on tab actor attach)
+> and when you are using `tabActor.windows` in layout.js (after
+> EVENT_BATCHING_DELAY on ReflowActor initialization).
+> If you hit such race, you will list tabActor.windows first, then miss a
+> inner window being created before watch is being called.
+> In order to simplify all such APIs and prevent such races, in the SDK, we
+> used to call create/destroy listeners for already existing windows. Here, in
+> watch, we would dispatch window-ready for all existing windows when we call
+> watch().
+> Would that work for tab actor usages you have identified?
+I hadn't thought about this race condition. Is there no guaranty that TabActor._attach is called before other tab-level actors are initialized?
+In any case, I like your solution to dispatch the window-ready event for pre-existing windows, so I went ahead and did that.
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #12)
+> (In reply to Alexandre Poirot (:ochameau) from comment #10)
+> > In bug 977043 attachment 8395769, for toolbox
+> > frame support, I'm about to call `watch` multiple times, as, on b2g we are
+> > going to watch more than just one docshell per tab actor.
+> > Could you start defining _windows in DebuggerProgressListener contructor,
+> > and here, fill it?
+> > But then it also means that you can't use tabActor.windows as it isn't per
+> > docshell. So you would have to list the windows for just the given docshell
+> > here and in unwatch.
+> Well the whole point of this is that it knows the list of all windows so
+> that other actors can use it to do things with it.
+> Why do you want to call watch several times?
+> As far as I can understand the code, calling it once per tabActor should be
+> enough since it will then emit its events for all windows in it.
+> So, if my understanding is correct, then initializing the set of windows in
+> watch isn't really a problem even if you call watch many times. It will just
+> reset `this._windows` to the full list of windows in the tabActor everytime.
+> I might be missing something here though.
+
+On b2g, we are watching multiple different root docshells. So we are going to call watch() with multiple different docshells. Opening an activity or using window.open within an app is going to create such new root docshell.
+(In reply to Alexandre Poirot (:ochameau) from comment #13)
+> On b2g, we are watching multiple different root docshells. So we are going
+> to call watch() with multiple different docshells. Opening an activity or
+> using window.open within an app is going to create such new root docshell.
+Ok, thanks, I get it now.
+I've changed a little bit how the DebuggerProgressListener works so that it doesn't matter if you call the watch/unwatch methods as many times as you want with different docShells.
+It still needs to track known windows though because the only way to be alerted when a window is destroyed is by using the observer's inner-window-destroy event, which is fired while a window is being destroyed. Because of this, I track known windows by their window IDs and compare that the ID I receive during a inner-window-destroyed.
+
+I tried using the dom-window-destroy which, supposedly, is fired just before the window is destroyed and which comes with the reference to the window (which would be great because I would just need to compare that object with the list of windows per docShell being watched). But that event didn't seem to be reliable at all, or maybe I just don't understand it. It got fired before I even executed the code that was supposed to remove the window I was testing.
+
+Anyway, it works now. I just have a leak apparently on try that I need to take care of.
+I'll file a separate bug for putting a DOMWindowDestroyed event in place in nsGlobalWindow, which would simplify the code (remove the need for tracking windows at all).
+bug 1016952 filed for DOMWindowDestroyed
+Created attachment 8431536
+bug1007021-tabactor-windows-management v2.patch
+
+- added a new test with page reload as suggested by Brian in comment 9,
+- found and fixed a leak I introduced with the latest patch (in the event that the browser is closed before the toolbox, when detaching the tabActor, the docShell has already been freed, and so we don't call unwatch on the progressListener, which was a problem for me since I added a Services.obs observer that was never removed),
+- while working on this leak, I also refactored test browser_styleeditor_private_perwindowpb.js (which was the one that showed me the leak) so it takes less time to run and is easier to read,
+- made it so that the progressListener's watch method can be called with several docShells
+Created attachment 8432389
+bug1007021-tabactor-windows-management v3.patch
+
+I introduced a typo in the last patch that's up for review.
+Here's an ongoing try build with that typo fixed: https://tbpl.mozilla.org/?tree=Try&rev=6db9a02af7aa
+It's the same patch otherwise.
+Comment on attachment 8432389
+bug1007021-tabactor-windows-management v3.patch
+
+Review of attachment 8432389:
+-----------------------------------------------------------------
+
+I suggested some tweaks here and there, but it shouldn't require another review cycle.
+Thanks a lot for having addressed all review comment I made!
+
+I feel that there is still something wrong with window-destroyed event handling.
+I think we should continue looking into this in a dedicated followup as your patch isn't
+that much related to this particular code.
+The discussion in bug 1016952 comment 6 highlights that we may just be wrong by trying to do something
+with the window object during destroy! It looks like what you are doing with a Map and inner-window-destroyed
+is really close to dom-window-destroy event.
+
+I'm wondering if storage.js code is working as expected over here:
+http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/storage.js#277
+  let host = this.getHostName(window.location);
+If I'm following :bz comment correctly, window.location may be bogus
+(it can end up being already set to a value for the next document or throw?).
+Could you take a look at window.location in window-destroyed of your patch
+and see if that's returns something correct without throwing?
+
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #14)
+> I tried using the dom-window-destroy which, supposedly, is fired just before
+> the window is destroyed and which comes with the reference to the window
+> (which would be great because I would just need to compare that object with
+> the list of windows per docShell being watched). But that event didn't seem
+> to be reliable at all, or maybe I just don't understand it. It got fired
+> before I even executed the code that was supposed to remove the window I was
+> testing.
+
+This event is fired for the about:blank document loaded first in (almost) all frames!
+So whenever you open a new tab, this event will be fired for this about:document
+being immediately created and destroyed.
+We miss the related DOMWindowCreated for all these about:blank documents...
+We may be able to filter them out with the same condition being used over here:
+  http://mxr.mozilla.org/mozilla-central/source/dom/base/nsGlobalWindow.cpp#2719
+The benefit of using dom-window-destroy would be to get rid of this Map
+and use getDocShell(window).getSameTypeParentIgnoreBrowserAndAppBoundaries() == tabActor.rootDocShell
+to filter windows.
+
+::: toolkit/devtools/server/actors/layout.js
+@@ +399,5 @@
+>    },
+>  
+>    _stop: function() {
+> +    // Check that the tabActor still exists first
+> +    if (this.tabActor.docShell) {
+
+nit: what about using one of the flags we have like exited (true when the connection is closed or when the tab is gone [TabClose]) or attached (false when the client asked to detach) ?
+
+::: toolkit/devtools/server/actors/webbrowser.js
+@@ +1517,5 @@
+>        return;
+>      }
+>  
+>      // pageshow events for non-persisted pages have already been handled by a
+>      // prior DOMWindowCreated event.
+
+Same thing here, this comment is helpful, but I think it can be even more!
+What about adding this?
+  // otherwise, when `persisted` is true, the page just got unfrozen
+  // from the bfcache, so act as if it has just been created
+
+@@ +1523,5 @@
+>        return;
+>      }
+>  
+>      let window = evt.target.defaultView;
+>      this._tabActor._windowReady(window);
+
+Shouldn't you `this._knownWindowIDs.set(this._getWindowID(window), window);` in this method? (looks like you would only need to do this if evt.type != "pageshow")
+
+@@ +1532,5 @@
+> +      return;
+> +    }
+> +
+> +    // In this case, let the inner-window-destroyed observer handle this
+> +    if (evt.type === "pagehide" && !evt.persisted) {
+
+nit: onWindowHidden is only registered for pagehide events.
+Also the comment doesn't help much understanding this code.
+What about something like this:
+// `persisted` is set when the page is put and freezed in the bfcache,
+// so act as if the page has been destroyed
+
+@@ +1541,5 @@
+> +    this._tabActor._windowDestroyed(window);
+> +  }, "DebuggerProgressListener.prototype.onWindowHidden"),
+> +
+> +  observe: DevToolsUtils.makeInfallible(function(subject, topic) {
+> +    if (!this._tabActor.attached || !this._knownWindowIDs) {
+
+nit: you wouldn't have to check for _knownWindowIDs if you only called clear() in detroy event, which sounds fine enough.
+Created attachment 8432544
+bug1007021-tabactor-windows-management v4.patch
+
+Thanks :ochameau and :bgrins for the reviews.
+Here's a new patch with all your comments addressed.
+
+I agree we probably need a new bug to follow up on the DOMWindowDestroyed thing (bug 1016952) and clean this up.
+
+Last try was green, here's a new one with the latest changes: https://tbpl.mozilla.org/?tree=Try&rev=f32f04c57295
+(In reply to Alexandre Poirot (:ochameau) from comment #18)
+> I'm wondering if storage.js code is working as expected over here:
+> http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/
+> storage.js#277
+>   let host = this.getHostName(window.location);
+> If I'm following :bz comment correctly, window.location may be bogus
+> (it can end up being already set to a value for the next document or throw?).
+> Could you take a look at window.location in window-destroyed of your patch
+> and see if that's returns something correct without throwing?
+Let's take a look at this in bug 1013930.
+Created attachment 8433131
+bug1007021-tabactor-windows-management v5.patch
+
+Final rebased patch.
+Try: https://tbpl.mozilla.org/?tree=Try&rev=f32f04c57295
+Carried R+ over.
+Fixed in fx-team: https://hg.mozilla.org/integration/fx-team/rev/5271561d7ea6
+https://hg.mozilla.org/mozilla-central/rev/5271561d7ea6
+
+
+Reflow actor should observe reflows in all frames
+
+
+
+Bug 1007021 - The ReflowActor observes iframes and works after page navigations; r=bgrins r=ochameau 

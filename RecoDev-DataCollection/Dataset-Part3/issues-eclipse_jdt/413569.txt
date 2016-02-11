@@ -1,0 +1,652 @@
+The AST for a multi-dimensional array type with annotations on the array dimensions is not well-formed. The problem is that for ArrayType nodes, the linearization of the AST (i.e. the source order of AST nodes) doesn't correspond to the language model. This is a new problem, not bug 403834 or bug 391894 comment 4.
+
+Example:
+
+import java.lang.annotation.*;
+
+@Target(ElementType.TYPE_USE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@interface A {
+	int value() default 0;
+}
+
+public class TestArrayAnnotations {
+	@A(3) String @A(1)[] @A(2)[] arr =
+			new @A(3) String @A(1)[11] @A(2)[12];
+}
+
+The AST node for the type of field 'arr' is:
+
+ASTNode type/property  Source range
+---------------------  ---------------------------------
+ArrayType              String @A(1)[] @A(2)[]
++annotations                          @A(2)
++componentType         String @A(1)[]
+ +annotations                 @A(1)
+ +componentType        String
+  +name                String
+
+The problem is that this componentType is just a parsing artifact, but it doesn't make sense from a semantic point of view. As http://types.cs.washington.edu/jsr308/specification/java-annotation-design.html#array-syntax explains, the type nesting in the language model is actually going like this:
+
+ArrayType        @A(3) String @A(1)[] @A(2)[]
++annotations                  @A(1)
++componentType   @A(3) String         @A(2)[]
+ +annotations                         @A(2)
+ +componentType  @A(3) String
+  +annotations   @A(3)
+  +name                String
+
+As long as nobody could actually distinguish the different array brackets, we could live with that. I.e. it usually doesn't matter whether the component type of String[][] is String[] with the first or with the second set of brackets.
+
+But as soon as we add annotations, the picture changes. With the current AST node structure, it's e.g. impossible to implement bug 409586 correctly, because the top-level ArrayType's annotation is "@A(2)", but the binding of the top-level ArrayType must have annotation "@A(1)", because that's the annotation on the outermost array brackets.
+
+The type "String @A(1)[]" doesn't exist from a language point of view, because the annotation "@A(1)" annotates the type String[][], not a String[].
+
+The only way I see how we could reconcile AST nodes and bindings would be to replace the nestable ArrayType by a FlatArrayType node with these properties:
++componentType: Type (cannot be another FlatArrayType)
++dimensions: List<ExtraDimension>
+
+Then, the binding of the FlatArrayType would be identical to the binding of the leftmost dimension.
+
+The AST for a multi-dimensional array type with annotations on the array dimensions is not well-formed. The problem is that for ArrayType nodes, the linearization of the AST (i.e. the source order of AST nodes) doesn't correspond to the language model. This is a new problem, not bug 403834 or bug 391894 comment 4.
+
+Example:
+
+import java.lang.annotation.*;
+
+@Target(ElementType.TYPE_USE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@interface A {
+	int value() default 0;
+}
+
+public class TestArrayAnnotations {
+	@A(3) String @A(1)[] @A(2)[] arr =
+			new @A(3) String @A(1)[11] @A(2)[12];
+}
+
+The AST node for the type of field 'arr' is:
+
+ASTNode type/property  Source range
+---------------------  ---------------------------------
+ArrayType              String @A(1)[] @A(2)[]
++annotations                          @A(2)
++componentType         String @A(1)[]
+ +annotations                 @A(1)
+ +componentType        String
+  +name                String
+
+The problem is that this componentType is just a parsing artifact, but it doesn't make sense from a semantic point of view. As http://types.cs.washington.edu/jsr308/specification/java-annotation-design.html#array-syntax explains, the type nesting in the language model is actually going like this:
+
+ArrayType        @A(3) String @A(1)[] @A(2)[]
++annotations                  @A(1)
++componentType   @A(3) String         @A(2)[]
+ +annotations                         @A(2)
+ +componentType  @A(3) String
+  +annotations   @A(3)
+  +name                String
+
+As long as nobody could actually distinguish the different array brackets, we could live with that. I.e. it usually doesn't matter whether the component type of String[][] is String[] with the first or with the second set of brackets.
+
+But as soon as we add annotations, the picture changes. With the current AST node structure, it's e.g. impossible to implement bug 409586 correctly, because the top-level ArrayType's annotation is "@A(2)", but the binding of the top-level ArrayType must have annotation "@A(1)", because that's the annotation on the outermost array brackets.
+
+The type "String @A(1)[]" doesn't exist from a language point of view, because the annotation "@A(1)" annotates the type String[][], not a String[].
+
+The only way I see how we could reconcile AST nodes and bindings would be to replace the nestable ArrayType by a FlatArrayType node with these properties:
++componentType: Type (cannot be another FlatArrayType)
++dimensions: List<ExtraDimension>
+
+Then, the binding of the FlatArrayType would be identical to the binding of the leftmost dimension.
+A less drastic change than replacing ArrayType with a new FlatArrayType would be to keep ArrayType but change the way multi-level array types are represented in JLS8 ASTs:
+- add property "extraDimensions" of type List<ExtraDimension> which represents "deeper" array levels along with their annotations
+- explain the problem with nested ArrayTypes and that the ASTParser doesn't create them any more
+- this would effectively change the meaning of ArrayType#get/setComponentType() for multi-dimensional array types, since that property would then always contain the (non-array) element type
+Markus/others: Two discussion points - Please comment.
+
+1) The source range for AST node has a startposition and a length. For the given example @A(3) String @A(1)[] @A(2)[], the component type (first level) will have " @A(3) String         @A(2)[]"  which would not be continous in the source. This would have to be taken care by providing a list of source positions (say an array of sourcestart and base) rather than a single pair for this node [The astviewer code/other clients may also be affected]. 
+
+2) Regarding set/getComponent(): I think the current meaning is more logical as it returns the component of the current level and hence the first solution itself looks better and more intuitive, though more drastic. Prefer the first proposal of FlatArrayType (with modifications, if any)
+(In reply to comment #2)
+The goal of comment 1 was to keep the API stable for the common case where there's only one array dimension. If we keep the ArrayType API as it is, but just turn the nesting around so that it matches the second structure from comment 0, then we would accept that there are ArrayTypes with gaps in their source range.
+
+I don't think many clients would be interested in the actual non-contiguous source positions. That's mostly the ASTRewrite's business. More problematic is that NodeFinder can't distinguish the top-level ArrayType from the first component type "@A(3) String         @A(2)[]" if they both have the same outer source range. Adding more NodeFinder methods that can also deal with gaps doesn't sound worth the hassle.
+
+Re 2), I agree that changing the meaning of set/getComponent() probably makes it even harder for clients to correctly adapt to JLS8, so I think we have to go with FlatArrayType. Let's call it ArrayType2, so that it appears in content assist next to the old ArrayType.
+
+Class ExtraDimension should be renamed to Dimension or ArrayDimension, but existing "extraDimensions" properties should keep that name.
+
+ArrayCreation also needs to use the new ArrayType2.
+(In reply to comment #3)
+With existing ArrayType itself, we can model the array by changing the association of annotations to reflect the tree shown in comment 1 (reproduced below for the sake of clarity)
+
+ArrayType        @A(3) String @A(1)[] @A(2)[] --> ArrayType
++annotations                  @A(1)           --> for Outermost dimension
++componentType   @A(3) String         @A(2)[] --> ComponenType will be ArrayType
+ +annotations                         @A(2)   --> for inner dimension
+ +componentType  @A(3) String                 --> Type
+  +annotations   @A(3)                        --> for the basic element
+  +name                String
+
+Keeping this type would also mean no change to get/set ComponentType() as well.
+
+>  More problematic
+> is that NodeFinder can't distinguish the top-level ArrayType from the first
+> component type "@A(3) String         @A(2)[]" if they both have the same
+> outer source range. Adding more NodeFinder methods that can also deal with
+> gaps doesn't sound worth the hassle.
+
+It can be noted that there can be utmost one gap for a legitimate selection represented by a node. We can model this gap by a ASTNode.(gapStart, gapLength) which can be an additional check in the NodeFinder methods to differentiate between the nodes having same outer ranges.
+(In reply to comment #1)
+> A less drastic change than replacing ArrayType with a new FlatArrayType
+> would be to keep ArrayType but change the way multi-level array types are
+> represented in JLS8 ASTs:
+> - add property "extraDimensions" of type List<ExtraDimension> which
+> represents "deeper" array levels along with their annotations
+> - explain the problem with nested ArrayTypes and that the ASTParser doesn't
+> create them any more
+> - this would effectively change the meaning of
+> ArrayType#get/setComponentType() for multi-dimensional array types, since
+> that property would then always contain the (non-array) element type
+
+I prefer this for the following reason:
+
+Looks like we have to make a compromise one way or other. Either we can logically represent the array type or the way it's written (left to right). And considering that the former has still issues we don't have answer to, my vote is for altering the Array type to return it's leaf type (SimpleType etc.) and set of annotatable dimensions. Only change I would like to propose is:
+
+Instead of using the existing component type, if we come up with new ones and deprecating the current ones, that will simplify a lot of things.
+(In reply to comment #5)
+I'm not completely sure what exactly you propose. Do you want to keep ArrayType, but
+- deprecate and disable get/setComponentType() and property "componentType" for level JLS8 ASTs, and instead
+- add a new property "elementType" of type Type (reuse getter, add setter) and
+- add a new property "dimensions" of type List<ExtraDimension>?
+
+That would be similar to the FlatArrayType or ArrayType2 from comment 3, but without adding a new ASTNode class. That also sounds good to me. It would spare existing clients from changing the type of ArrayType variables and keep Type#isArrayType() straightforward.
+
+
+(In reply to comment #4)
+Yes, that could work, but it would still violate the guarantee in ASTParser#setKind(int): "Source ranges nest properly: the source range for a child is always within the source range of its parent, and the source ranges of sibling nodes never overlap."
+
+In the example, the source ranges of siblings would overlap:
+> +annotations                  @A(1) []
+> +componentType   @A(3) String          @A(2)[]
+
+And since this change will break existing clients anyway, we better go for a solution that doesn't have these problems.
+(In reply to comment #6)
+> (In reply to comment #5)
+> I'm not completely sure what exactly you propose. Do you want to keep
+> ArrayType, but
+> - deprecate and disable get/setComponentType() and property "componentType"
+> for level JLS8 ASTs, and instead
+> - add a new property "elementType" of type Type (reuse getter, add setter)
+> and
+> - add a new property "dimensions" of type List<ExtraDimension>?
+> 
+> That would be similar to the FlatArrayType or ArrayType2 from comment 3, but
+> without adding a new ASTNode class. That also sounds good to me. It would
+> spare existing clients from changing the type of ArrayType variables and
+> keep Type#isArrayType() straightforward.
+
+Yes, that's what I meant.
+OK, looks like we have a conclusion. The fix should also take bug 413942 into account: First revert the bad parts of c3894f02481a65e7c5a6b2e211e3716b20cd9dd8 and 01023454337af8ada2f5699e5de8fcd7a8d40840 (and maybe other commits) until ArrayType and the array-related changes in ASTConverter look like before JLS8. Then make sure the new implementation for JLS8 considers bug 413942 comment 0:
+
+> The strategy should not be to scan over annotations, but to use the
+> annotation nodes' source ranges to update the start position and then only
+> scan for the brackets after the annotation node.
+The existing AST#newArrayType(..) APIs will also have to be deprecated and replaced by an API that doesn't rely on ArrayType#setComponentType().
+
+I don't think an AST#new* API should deep-inspect the given argument node, so the "elementType" argument should not be allowed to be an ArrayType. The new API could be:
+
+* @param elementType the element type (must not be an ArrayType)
+* @param dimensions the dimensions, or <code>null</code> to create an un-annotated one-dimensional array type
+*/
+public ArrayType newArrayType(Type elementType, List<ExtraDimension> dimensions)
+
+
+Note that this bug is the main blocker for progress in JDT UI.
+Created attachment 235485
+Proposed Patch
+
+New ArrayType implementation with ElementType and Dimensions as concluded for JLS8 and above.
+have the debug options at https://bugs.eclipse.org/bugs/show_bug.cgi?id=404986 used to verify proper nesting of nodes ? Have other such options Markus has pointed in the past been used to verify all is well ?
+Created attachment 235631
+Proposed Patch - WIP
+
+Thanks Srikanth for the comment. Some of the issues were not addressed fully in the earlier patch. Adding a WIP patch which addresses the issues. In addition, there are some errors thrown when dom/ast/debug is true (tracing as suggested by Markus), which are not related to ArrayType but have been missed out - just that these came into light while debugging ArrayTypes. Will raise separate bugs for the same.
+(In reply to Manoj Palat from comment #12)
+
+> Will raise separate bugs for the same.
+An umbrella bug 417659 raised.
+Created attachment 235650
+Proposed Patch
+
+Given that this is a blocker, uploading the patch for review asap. Please note that all the tests specified in bug 413942 have been checked manually at level JLS1.8 (and malformed to be at level <1.8 as the case may be) and some of these tests have been added in the patch (remaining ones will be added as a patch to bug 413942)
+Created attachment 235670
+Proposed Patch
+
+Jay: This patch includes all the test cases listed in bug 413942 and more, and some corrections/additions.
+Manoj, here are my comments:
+
+1. NaivASTFlattener#getArrayTypeComponentType - Method needs a better name, it doesn't get/return anything. E.g. visitArrayComponentType()
+
+ArrayType:
+
+2. Since ArrayType#componentType and elementType are mutually exclusive, and private anyway, can we use the same field internally for both properties?
+
+3. There is one warning about deprecate method being used.
+
+4. org.eclipse.jdt.core.dom.ArrayType.COMPONENT_TYPE_PROPERTY java doc should mention not being supported for JLS 8.
+
+Similarly, ELEMENT_TYPE_PROPERTY should mention that it is supported only from JLS8
+
+5. getDimensionNo() could use a better name, perhaps, getDimension() or getDimensionAt() ?
+
+ASTConverter:
+
+6. In annotateType(), the first assignment to the local variable 'annotationsStart' is not necessary.
+
+7. In the same method, the following can be reduced to a simple if condition. I agree it was an existing code, nevertheless, it's unncessary.
+
+8. convert(ArrayAllocationExpression expression) - the local variable 'savedStart' can be avoided or its declaration can be pushed further down.
+
+9. setArrayTypeAnnotationsAndSource() - local variable 'lastIndex' can be avoided or the - 1 operation can be avoided at the least. Similar code is present in convertToArray()
+
+10. The method convertToArray() is called twice, but only once is it preceded by retrieveEndOfDimensionsPosition(). This needs to be understood.
+
+11. The code that sets the source ranges for dimensions on array allocation expression and source ranges for annotations in convertType() can be combined? Also consider moving relevant codes that constructs the array type can be moved to one or two methods that can be reused.
+
+This review doesn't cover ASTRewriteAnalyzer. Will add if found anything later.
+Created attachment 235703
+Proposed Patch
+
+Jay: Thanks for the quick review. Have reworked based on the comments. Since some of the comments applied to the existing code as well, have done some cleanup to the existing code to avoid repetitions/multiple calls etc though did not attempt to do a major refactoring of the existing code since that may affect the stability of clients. These changes are primarily in ASTConverter(most) and some in rewriter code.
+(In reply to Manoj Palat from comment #17)
+> Created attachment 235703 [details]
+> Proposed Patch
+
+Manoj, here are some more comments after reviewing the latest patch and AST rewrite part.
+
+ASTConverter:
+
+1. else if (token == TerminalTokens.TokenNameRPAREN) {--lParenCount; continue;}
+
+This code is not consistent with our format style. Please reformat. Can you also auto format all the newly added code to fix other inconsistent formatting too?
+
+2. Method convertToArray() - the parameter 'int noDimensions' better sounds as 'dimensions' or noOfDimensions. I prefer the former.
+
+ASTRewriteAnalyzer:
+3. Methods internalExtraDimensionRewrite() and internalExtraDimensionAddition():
+These methods do not have any relevant code for (astLevelGTE8 == false) and we don't need the parameter for anything else. Hence it can simply be rewritten without that parameter and invoked with a (astLevelGTE8 == true) check.
+
+4. The following code at AST level JLS4, doesn't show any of the nodes as malformed in the ASTView.
+
+public int [] foo() @Marker(value = "three") [] {return null;}
+
+When I debugged, I do found the array type being flagged as MALFORMED, but it doesn't get added to the method declaration node or any other node (in JLS 4 and below) as method declaration in JLS 4 and below only encoded the extra dimension as an int value. However, the following works alright in JLS4:
+
+int [] [] i = new int [2] @Marker(value = "three") [3];
+
+I am wondering if we should treat the extra dimensions for methods case specially for JLS4 and below and not create the enclosing array types for the extra dimensions?
+
+AST: 
+
+5. In the javadoc, it's more helpful if you provide a code link or type name instead of 'annotatable type', e.g. <code>IAnnotatableType></code>
+
+6. Please make '< JLS8', '>= JLS8' etc. to be consistent with other phrases, such as 'less than JLS8' etc.
+
+7. Remove the irrelevant whitespace change around 'wouldblow'
+
+ArrayType:
+
+8. In the type's Javadoc, shouldn't we refer to ExtraDimension instead of literals '[]' for level 8 and above? Plus, we should also document multiple dimensions, like '{ExtraDimension}'.
+
+9. ArrayType#DIMENSIONS_PROPERTY - Javadoc should have '@link ExtraDimension' and not '@link Annotation'
+
+10. Nitpicking, method getDimensions() - If your idea is to keep the code easier to understand in a procedural way, it makes more sense if the if/else is reversed.
+
+11. ASTConverterTestAST8_2 - Some test method directly call the deprecated API instead of the deprecated local methods. They should call the local ones and the test methods themselves should not be deprecated.
+
+12. Similar changes requires for ASTTest.java
+
+13. ASTRewritingStatementsTest - Last whitespace change is irrelevant.
+
+14. Same file, last test has two additional white spaced after removal of annotatons on dimensions. Please look at it and see if they are required.
+
+15. TypeAnnotationsConverterTest -  String [] [] [] [] - do we need these spaces if there are no annotations on dimensions?
+
+That's all I have. You might want to check with Markus if he wants to do additional testing too.
+Created attachment 235766
+Proposed Patch
+
+> 4. The following code at AST level JLS4, doesn't show any of the nodes as
+> malformed in the ASTView.
+> ...
+
+Good catch Jay. This was found to be an issue with the existing ArrayType implementation and manifests not only in the MD node, but also in (around 5 more places) where array type is not used but the element type of the same is used. Corrected at all these places. The enclosing node is now flagged as malformed.
+
+For the last two space related items for which bug 417923 has been raised. Rest addressed.
+(In reply to Manoj Palat from comment #19)
+> Created attachment 235766 [details]
+> Proposed Patch
+This patch also addresses a) all the testcases mentioned in bug 413942 comment 0 and b) 4 (out of 16) failures mentioned in bug 417659 comment 0.
+I plan to review the patch in a day or two, but if Jay's review is complete
+please go ahead and release - my review can happen post release and any
+issues found could be addressed in follow ups. Thanks.
+(In reply to Srikanth Sankaran from comment #21)
+> I plan to review the patch in a day or two, but if Jay's review is complete
+> please go ahead and release - my review can happen post release and any
+> issues found could be addressed in follow ups. Thanks.
+
+Thanks Srikanth.
+Released by http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=b3031b3455034eac76b444fd20cbebeea6a2f5ff
+Fixed
+(In reply to Manoj Palat from comment #22)
+
+> Released by
+> http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/
+> ?id=b3031b3455034eac76b444fd20cbebeea6a2f5ff
+
+Note for additional reviwewers: 
+
+1. The checkin comment for the commit id refers to a wrong bug.
+
+2. The meat of the changes are in: 
+
+dom/AST.java
+dom/ASTConverter.java
+dom/ASTMatcher.java
+dom/ArrayType.java
+dom/NaiveASTFlattener.java
+dom/rewrite/ASTRewriteAnalyzer.java
+dom/rewrite/ASTRewriteFlattener.java
+
+I am yet to review these files, but I have reviewed all others that were
+part of the commit and here are the comments so far:
+
+1. getDimensionAt(0) - would return the right most dimension. Is this what 
+really we want ? This looks like ripe grounds for confusion since 
+ArrayType#dimensions().get(0) would return the leftmost dimension.
+I don't see a right or wrong ordering per se, not even sure there is a
+natural ordering. Perhaps we can get rid of this method altogether ?
+It is a convenience method after all ? I don't see a request for it
+on this bug either. If we choose to retain this method, the javadoc should
+clearly call out what clients should expect.
+
+2. ArrayType.getElementType() - Javadoc needs polish. (the part about
+"until it reaches a non-array type until JLS4" reads odd) In fact we may
+be able to get rid of the second para altogether ?
+
+3. org.eclipse.jdt.core.dom.ArrayType.getComponentType() needs polish.
+"@deprecated from JLS8 and later, the recursive structure is not valid" We
+could rid of the part about "the recursive structure is not valid" and
+simply point clients to use getElementType() instead. 
+
+4. Javadoc of org.eclipse.jdt.core.dom.ArrayType.ELEMENT_TYPE_PROPERTY 
+should call out that this can never be an array.
+
+5. Is there a cycle risk in ArrayType.ELEMENT_TYPE_PROPERTY ? Given 4, 
+I don't think so.
+
+6. Should we rename ExtraDimension to be just Dimension ? We don't use 
+these for just extra dimensions anymore. The type could just be 
+Dimension and the property could be EXTRA_DIMENSIONS_PROPERTY where it 
+actually captures extra dimensions.
+
+7. Again, is there a cycle risk in ArrayType#DIMENSIONS_PROPERTY ?
+ 
+8. In tests such as testBug409586, it is convenient if before each block of
+AST travel and assertion chunk, the relevant source code line is copied as
+a comment. Otherwise, a future reviewer has to keep flipping back and forth
+to confirm the test is doing the right thing.
+
+9. ASTConverterJavadocFlattener.visit(ArrayType): Please hoist the calls to
+node.getDimensions() and node.dimensions() to outside the loop.
+
+10. Please take one more look at 
+ASTRewritingStatementsTest.testBug400568_a_since_8() and
+ASTRewritingStatementsTest.testBug400568_since_8() to make sure they are
+doing what is intended.
+11. Javadoc of AST.newArrayType(Type):
+
+   - an AnnotatableType instead of a AnnotatableType.
+   - @param: level*s* less than JLS8
+   - @exception IllegalArgumentException if
+         level is greater than or equal to JLS8 and type not an array type ???
+
+12. Javadoc of AST.newArrayType(Type, int):
+    - @param elementType the element type (can be an array type for JLS8 ...
+      Is this true ? This is not what the code is doing - it throws an IAE.
+    - @exception: the number of dimensions is greater than 1000
+      We can restrict to 255. Java does not allow 256 or above.
+    - @exception IllegalArgumentException if:
+      for levels from JLS8 and later, if the element type is not an array type ???
+
+13. NaiveASTFlattener.visit(ArrayType): pull dimensions.size() to the
+    initializer of the for loop.
+
+14. ArrayType.ELEMENT_TYPE_PROPERTY: Should this encode AnnotatableType instead
+    of Type ? (in both javadoc and code)
+
+15. ArrayType.componentType: javadoc, capitalize R in reused.
+
+16. ArrayType.dimensions: javadoc, first line, remove "extra"
+
+17. ArrayType#memSize: should be 3 * 4 and not 2 * 4.
+
+18. ASTRewriteFlattener.visit(ArrayCreation):
+    - astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8 ? true : false;
+      could simply be:
+      astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8 ?
+   - for (int i= 0; i < list.size(); i++)
+     pull up list.size() to for loop's initializer.
+   - I think this is dead code:
+     // add "<annotations> []" for each extra array dimension
+     for (int i= list.size(); i < dimensions; i++) {
+	internalVisitExtraDimensionAnnotations(arrayType, i, astLevelGTE8);
+	this.result.append("[]"); //$NON-NLS-1$
+     }
+19. ASTRewriteAnalyzer.visit(ArrayCreation):
+    - astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8 ? true : false;
+      could simply be:
+      astLevelGTE8 = node.getAST().apiLevel() >= AST.JLS8 ?
+
+20. ASTRewriteAnalyzer.internalExtraDimensionAddition: is this better
+named as insertAnnotationsOnDimension, Likewise is internalExtraDimensionRewrite
+better named as rewriteAnnotationsOnDimension.  I didn't fully understand
+the change in visit(ArrayCreation) - I hope we have some torture tests
+that exercise this code ? 
+
+I have just ASTConverter left to do.
+Via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=1ca61ba390ea54fcabd09223853d7a3d6816c249, I released a bunch
+of clean ups: Basically more verbose - more consistent names for methods/variables
+(e.g annotation not annot, dimensions not dims etc, given we have a good
+code completion facility, we don't have to worry about typing long names :))
+
+My review is complete, Thanks for following up on the comments posted
+Manoj. Just release any changes you make, no need for another look through.
+(In reply to Srikanth Sankaran from comment #26)
+
+> My review is complete, Thanks for following up on the comments posted
+> Manoj. Just release any changes you make, no need for another look through.
+
+Let us wait on the AnnotatableType use in element
+type - others can be pursued and closed.
+(In reply to Srikanth Sankaran from comment #27)
+Manoj, please wait with this until tomorrow.
+
+I'm about to release a bunch of additional fixes for this bug. I'll also rename ExtraDimension to Dimension.
+> I'm about to release a bunch of additional fixes for this bug.
+
+Done with http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=810d2a46e73e304780d3a58f117d6c63103b4e72
+
+General rule for Javadocs: The main audience is users of the latest API level. Always put the contract for the current and future API levels first. Only mention the "in JLS4 and earlier" case at the end.
+
+> 1. getDimensionAt(0)
+
+This method was badly documented, redundant, and the only call to it in ASTConverter was wrong, e.g. for this method declaration:
+    void foo(@A int @B[] @C[] @D... arg)
+Removed the method, fixed the callers, and added ASTConverter18Test#test413569().
+
+> 5. Is there a cycle risk in ArrayType.ELEMENT_TYPE_PROPERTY ? Given 4, I don't think so.
+
+Yes, there is a cycle risk. Cycle risk is based on ASTNode types, not on semantic constraints. See ChildPropertyDescriptor#cycleRisk(). The "instanceof ArrayType" check in ArrayType#setElementType(Type) only protects against a 1-level cycle, but the ArrayType node could be inserted into one of its descendants at a deeper level (e.g. as type arguments of a ParameterizedType).
+
+> 14. ArrayType.ELEMENT_TYPE_PROPERTY: Should this encode AnnotatableType instead of Type?
+
+No, can also be a ParameterizedType.
+
+---
+
+Remaining issues to be investigated:
+
+a) ASTRewriteAnalyzer#visit(ArrayType): The rewriteNodeList(..., " ") call looks fishy. In the normal case (no annotations on dimensions), I wouldn't expect a space between consecutive [], e.g.: int[][]. No DOM test failed when I changed the last argument to "".
+ASTRewriteFlattener#visit(ArrayType) looks similar: I'd expect the separator to be "", not " ".
+
+Please write two ASTRewrite tests that don't use any annotations:
+- create a new ArrayType with n > 1 dimensions
+- rewrite an existing ArrayType and insert a dimension
+
+b) The examples in bug 413942 seem to work now, but ASTConverter still does too much scanning. In essence, every retrieve*(..) method that counts nesting levels or skips over unknown tokens is bad. Some of this skipping code even seems to be unused nowadays. I saw this pattern in retrieveEndOfElementTypeNamePosition, retrieveEndOfPotentialExtendedDimensions, retrieveExtraDimension, retrieveDimensionAndSetPositions, retrieveRightBrace.
+ASTConverter#extractSubArrayType() needs proper Javadoc.
+
+(In reply to Markus Keller from comment #29)
+> a) ASTRewriteAnalyzer#visit(ArrayType): The rewriteNodeList(..., " ") call
+> looks fishy....
+
+Sorry, I didn't see bug 417923. This can be addressed there.
+
+> I'll also rename ExtraDimension to Dimension.
+
+Done with http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=43bf242c384a6b4ad5daf26c5b4617ec68564235
+
+I have no more planned changes in JDT Core.
+(In reply to Markus Keller from comment #29)
+
+> > 14. ArrayType.ELEMENT_TYPE_PROPERTY: Should this encode AnnotatableType instead of Type?
+> 
+> No, can also be a ParameterizedType.
+
+Thanks a lot for the changes Markus. The comments are getting scattered
+across multiple bugs, thinking a bit more, here is what I suggest as a
+possible course of action as follow up to 
+
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=418782#c4 and
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=418782#c5:
+
+Let us say this is as good as it gets for now and wait for the AST switch
+in the UI project and for things to stabilize. Once things are in a good
+shape, we can revisit this issue of whether the abstraction AnnotatableType
+could be done away with altogether - perhaps in 4-6 weeks time, we will be in a
+better position to evaluate this question.
+
+Given we are going to live with these APIs for several years to come, I would
+like to believe that my concerns are misplaced. I have a strong gut feel that
+the present abstractions are the not the cleanest and that
+
+    - Doing away with AnnotatableType and moving to a has-a model than is-a
+      model with respect to annotations.
+    - Making the abstract type Type return an unmodifiable empty list for
+      annotations() and having the various other annotatable abstractions 
+      override and return a modifiable but possibly empty list for annotations()
+    - Making ArrayType and ParameterizedType directly annotatable - in fact
+      everything other than UnionType and IntersectionType should be
+      annotatable, because only these two are prohibited by the language
+      from being annotated.
+    - Ensuring that it is not allowed to come/end up with 
+     (@NonNull List)<String>, likewise for other places where there could
+      be more than one place to annotate a type.
+    - Moving Dimension back to ExtraDimension and making ArrayType be
+      implicitly an one dimensional array and store only extra dimensions
+      in its dimensions property
+
+may result in a cleaner solution. I can believe I may have 
+overlooked/oversimplified somethings, but this is the gist.
+
+All this amounts to rework which could have been avoided if these points
+were raised earlier, but you know the excuse :)
+
+I fully agree that we should declare the present APIs frozen for now and
+not churn until UI absorbs these and stabilizes.
+(In reply to Srikanth Sankaran from comment #31)
+>     - Making ArrayType and ParameterizedType directly annotatable - in fact
+>       everything other than UnionType and IntersectionType should be
+>       annotatable, because only these two are prohibited by the language
+>       from being annotated.
+
+I don't think that would be an improvement. I think the difference between the DOM AST and on the other hand compiler ast / type bindings / javax.lang.model is that the DOM AST is mostly a syntactic device with pattern matching and ASTRewrite as major usages. For these usages, it's important that the AST structure is as simple, predictable, and uniform as possible, and with properly nested source ranges.
+
+If we allowed annotations on a ParameterizedType node as well as on the PT's type property (a simple or qualified type), then we would have multiple ways of representing the same source code in the AST, since the annotations could be on both types. That calls for trouble and makes refactoring implementations very hard to get right. In the compiler / bindings world, it's fine to have just one representation of a parameterized type (without access to the simple/qualified name any more), because once a type is resolved, the compiler's job is done and you know you will never care about the source form any more.
+
+The compiler rarely has to care about the simple name of a type anymore after everything is resolved. But for refactorings and for users of the IDE, a simple name node is usually the base entity, and type arguments / array dimensions are a mere "decoration".
+
+Maybe we could come up with a better design if we could start the simple/qualified type/name story from scratch now, but that train has left 10 years ago.
+
+
+>     - Moving Dimension back to ExtraDimension and making ArrayType be
+>       implicitly an one dimensional array and store only extra dimensions
+>       in its dimensions property
+
+This sounds intriguing, but puts additional load on clients that have to manipulate array types. Instead of a uniform access to all dimensions, clients would have to write everything twice: first for the primary dimension, and then for all the other dimensions.
+
+A good (i.e. bad) precedent for this is the InfixExpression node. The structure
+
+     Expression InfixOperator Expression { InfixOperator Expression }
+
+is a huge pain in practice since everyone forgets about the extendedOperands first, and when they realize the problem, they have to add horrible hacks to make it also work for more than 2 operands. Simple things like processing all operands or removing an operand (bug 418924) become unnecessarily complicated. The whole org.eclipse.jdt.internal.corext.dom.fragments package is devoted to this problem.
+(In reply to Markus Keller from comment #32)
+> (In reply to Srikanth Sankaran from comment #31)
+> >     - Making ArrayType and ParameterizedType directly annotatable - in fact
+> >       everything other than UnionType and IntersectionType should be
+> >       annotatable, because only these two are prohibited by the language
+> >       from being annotated.
+
+
+> For these usages, it's
+> important that the AST structure is as simple, predictable, and uniform as
+> possible, and with properly nested source ranges.
+
+> If we allowed annotations on a ParameterizedType node as well as on the PT's
+> type property (a simple or qualified type), then we would have multiple ways
+> of representing the same source code in the AST, since the annotations could
+> be on both types.
+
+This was not the suggestion. The suggestion was to document as well enforce
+one way of annotating a parameterized type.
+
+> Maybe we could come up with a better design if we could start the
+> simple/qualified type/name story from scratch now, but that train has left
+> 10 years ago.
+
+I miss the connection between this point and whether AnnotatableType 
+should/could be done away with and making annotations a has-a property.
+
+> >     - Moving Dimension back to ExtraDimension and making ArrayType be
+> >       implicitly an one dimensional array and store only extra dimensions
+> >       in its dimensions property
+> 
+> This sounds intriguing, but puts additional load on clients that have to
+> manipulate array types. 
+
+Great point. This does not preclude ArrayType from being an AnnotableType.
+annotations() on ArrayType could simply defect to dimensions()[0].annotations()
+providing uniform access to someone everyone who requires it - This would
+amount to providing two ways of doing the same thing, but they fall in 
+either/or mode as opposed to this and that with the infix extended operands
+case. This will also serve to removing the discrimination between what could 
+be AnnotatableType and what could not and making them look closer and closer
+together at which point the need for AnnotatableType could go away.
+
+(As it is I think your changes to https://bugs.eclipse.org/bugs/show_bug.cgi?id=419748 and potential changes from https://bugs.eclipse.org/bugs/show_bug.cgi?id=419748#c2 make AnnotableType less referred to in JDT/Core.)
+
+I am conscious about clogging your inbox with this discussion while other
+more pressing work is engaging you - by all means, let us defer it by a few
+weeks - in the mean time we will also have better feel for the API from
+actual adoption stand point.
+
+(Also, just a note that I am not dogmatic about it, just want a well considered
+decision, well before the API freeze - even if it is only to say "this works,
+just no need to change anything")
+(In reply to Srikanth Sankaran from comment #25)
+
+released commits for comment 24 as well (except for point 17 and dead code for point 18 as they are valid)
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=e56e767173dc5b5ba970e3e7ca9256e9541ebffc

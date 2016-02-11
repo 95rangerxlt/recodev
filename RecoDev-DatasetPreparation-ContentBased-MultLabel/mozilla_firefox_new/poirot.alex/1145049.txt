@@ -1,0 +1,739 @@
+I've only been able to reproduce this issue on WebIDE, when openening, closing et reopening a toolbox against an app. When you reopen the toolbox, the node picker doesn't work and you see the following exception:
+  onPacket threw an exception: Error: Server did not specify an actor, dropping packet: 
+  {"type":"pickerNodePicked","node":{"node":...
+
+The issue is this promise:
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/inspector.js#3169
+  this._highlighterPromise
+
+When we close the toolbox on WebIDE, we keep the connection/client up.
+But we do call inspectorFront.destroy and highligherFront.destroy method (from toolbox.js).
+But there is no cleanup made on the inspector actor itself, so that this promise is kept when we fetch a new inspector actor on toolbox reopen.
+Given that we do call highlighterFront.destroy, the highlighter is now broken and we need to instanciate a new one.
+
+I've only been able to reproduce this issue on WebIDE, when openening, closing et reopening a toolbox against an app. When you reopen the toolbox, the node picker doesn't work and you see the following exception:
+  onPacket threw an exception: Error: Server did not specify an actor, dropping packet: 
+  {"type":"pickerNodePicked","node":{"node":...
+
+The issue is this promise:
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/inspector.js#3169
+  this._highlighterPromise
+
+When we close the toolbox on WebIDE, we keep the connection/client up.
+But we do call inspectorFront.destroy and highligherFront.destroy method (from toolbox.js).
+But there is no cleanup made on the inspector actor itself, so that this promise is kept when we fetch a new inspector actor on toolbox reopen.
+Given that we do call highlighterFront.destroy, the highlighter is now broken and we need to instanciate a new one.
+Created attachment 8579929
+patch v1
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=28b2f391b907
+
+This patch introduce a destroy method on the actor, not just the front.
+And we call release instead of destroy when closing the toolbox.
+
+I'm bit lost with protocol.js and the magic "release" method...
+Is that what we should do when we want to call Front *and* Actor destroy methods?
+I don't fully understand the purpose of the magic of release.
+
+Also I haven't verified, but do you know if actor's destroy method is called
+when the connection/client is closed?
+That to ensure the actor is cleaned up if the dev pull the cable or has poor USB cable that introduce disconnections.
+
+Note that I discovered this issue while trying to run test remotely on luciddream \o/
+Comment on attachment 8579929
+patch v1
+
+Review of attachment 8579929:
+-----------------------------------------------------------------
+
+My understanding of protocol.js actors WRT disconnection is that parent actors take care of cleaning up children actors. Which means that nothing takes care of cleaning up parent actors when the server is disconnected.
+What I've been doing for top-level protocol.js actors is add this:
+
+  /**
+   * Since <something>Actor doesn't have a protocol.js parent actor that takes
+   * care of its lifetime, implementing disconnect is required to cleanup.
+   */
+  disconnect: function() {
+    this.destroy();
+  },
+
+disconnect is called automatically by the debugger server (see ActorPool.cleanup).
+Then up to you to add anything you want in destroy.
+
+My understanding of release is it's more useful for short-lived actors that the client knows when to create and destroy. So for example, the client-side right now receives new NodeActors when new DOM nodes have to be displayed in the inspector-panel, and the inspector-panel knows when it doesn't need them anymore, so it calls release, which is a special protocol.js method that simply calls destroy if there's one.
+
+So I don't think you should be adding release to InspectorActor, but instead add the disconnect method I suggested.
+Is disconnect going to be called if we keep the client up?
+If I'm not mistaken, that's what happens in luciddream and WebIDE.
+We close the toolbox, but we don't close the client.
+We should clean things up on "detach". There is many things being done at that time, it also correlate to close event on target on the client side. But I'm not sure any generic event is dispatched on server side. The TabActor receives a detach request that isn't observable by other tools.
+
+So that I think adding a disconnect method on InspectorActor will help handling USB cable pulling,
+but shouldn't fix the issue I'm seeing in WebIDE/luciddream when opening a toolbox twice against the same app.
+Created attachment 8583903
+patch v2
+
+Here is a similar patch with additional `disconnect` method.
+
+But it looks like `disconnect` isn't called when we just close the toolbox from WebIDE.
+It seems to only be called when you unplug the device or shut the client/connection down somehow.
+
+So that I have to keep the new `release` request. But that's painful, and this patch
+isn't enough, as we now have to handle old actors without `release` method :'(
+
+The good thing I learned is that when you call `release` on the front,
+it will call both `destroy` method, on the front and the actor.
+
+I'm now looking at why disconnect isn't called on detach,
+from what I understand about TabActor and protocol.js,
+disconnect seems to be meants to be called on TabActor.detach()
+(detach remove the pool and call ActorPool.cleanup which itself should call actor.disconnect)
+Oh crap, I broke that destruction chain long time ago over here:
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/childtab.js#60
+
+Actors were broken on detach and not properly re-created on next toolbox creation.
+Most likely the solution is to let the actors be destroyed on detach and ensure that they do work again on attach.
+Yep, If I comment the form() overloading, inspector's disconnect method gets called as you expected!
+But then, if I reopen a toolbox, the inspector is blank.
+If I remember correctly, that's because we don't recreate new tab actors, or don't fetch new tab actor ids.
+So, something in e10s codepath is wrong here.
+But, implementing disconnect on top level protocol.js actor should be enough regarding cleanup. It should cover all the important cases where we do need to cleanup.
+Created attachment 8584127
+Fix child process - v1
+
+Ok, so here is why I introduced this not very glorious form() overload in childtab.js:
+Because DebuggerServer.connectToChild returns directly the ContentActor's form,
+we end up caching the form in the webapps actors and connectToChild's aOnDisconnect
+isn't called on detach (that prevent removing the cached form in the webapps actor).
+And because we end up reusing same form between two toolboxes,
+we have to ensure keeping the same tab actors alive.
+In order to keep them alive (i.e. not remove them from the pool, i.e. not calling disconnect on them, i.e. introducing the bug where disconnect isn't called on detach),
+I'm adding them to _tabActorPool2 in ContentActor.form method,
+so that TabActor._detach, doesn't clean _tabActorPool2, but just _tabActorPool.
+
+That was just error prone. We really want to destroy tab actor on detach
+and later recreate some new ones on attach.
+In order to do that, we have to make it so that connectToChild reports the actor form
+as disconnected/detached.
+In this patch I make it so that aOnDisconnect is also called on detach.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=aed5b1b04e60
+Created attachment 8584128
+inspector patch v3
+
+And here is a simplier inspector patch, that doesn't involve changing inspector actor requests.
+With the child process fix, the inspector actor correctly cleans up when closing a toolbox in webide!
+Created attachment 8585472
+Fix child processes - v2
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=da915b7ae959
+
+I refactored the code a bit to ensure we do the same cleanup when we:
+- disconnect/unplug the device (connection close event)
+- close/kill the app (message-manager-disconnect)
+- detach
+
+See comment 8 for more details about this patch.
+Created attachment 8585474
+inspector patch v4
+
+So I imagine that's the patch you were expecting ?
+Comment on attachment 8585472
+Fix child processes - v2
+
+Review of attachment 8585472:
+-----------------------------------------------------------------
+
+Are we sure |childID| still serves a purpose?
+
+pbrosset recently changed DebuggerServer._onConnection[1] so that it now also includes a "server ID" prefix from the parent process.  Isn't that enough to uniquely distinguish what's happening in the child (server ID + connection ID + actor ID made by allocID in parent)?
+
+[1] https://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/main.js#973
+
+::: toolkit/devtools/server/actors/childtab.js
+@@ +21,5 @@
+>   *        The conection to the client.
+>   * @param chromeGlobal
+>   *        The content script global holding |content| and |docShell| properties for a tab.
+> + * @param childID
+> + *        The ID identifying this particular TabActor from the parent process.
+
+This ID is not "from the parent process" though, right?  It's created in |child.js|, in the child process.
+
+::: toolkit/devtools/server/child.js
+@@ +52,5 @@
+>      let id = DebuggerServer.childID++;
+>  
+>      let conn = DebuggerServer.connectToParent(prefix, mm);
+>      connections.set(id, conn);
+>  dump("child.js post connectToParent: " + Components.classes["@mozilla.org/memory-reporter-manager;1"].getService(Components.interfaces.nsIMemoryReporterManager).residentUnique + "\n");
+
+These dump lines are surprising to see, but I guess they are from some other local patch?  I don't see them in fx-team.
+
+::: toolkit/devtools/server/main.js
+@@ +894,5 @@
+>  
+> +    let destroy = DevToolsUtils.makeInfallible(function () {
+> +      // provides hook to actor modules that need to exchange messages
+> +      // between e10s parent and child processes
+> +      DebuggerServer.emit("disconnected-from-child:" + childID, { mm: mm, childID: childID });
+
+Does this message work at all??  Doesn't |childID| come for a separate namespace per child process?  So, for each b2g app, there can be "childID == 1" for each app.  It's not the ID of the process as I understand it.
+Comment on attachment 8585474
+inspector patch v4
+
+Review of attachment 8585474:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/inspector.js
+@@ +3120,5 @@
+>      this.tabActor = tabActor;
+>    },
+>  
+> +  destroy: function () {
+> +    delete this._highlighterPromise;
+
+Why not just setting it to null? I guess it makes no difference, but it'd be more consistent with the rest of the destroy methods in devtools I've seen so far.
+Also maybe nullify this.tabActor.
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #13)
+> Comment on attachment 8585474 
+> > +  destroy: function () {
+> > +    delete this._highlighterPromise;
+> 
+> Why not just setting it to null? I guess it makes no difference, but it'd be
+> more consistent with the rest of the destroy methods in devtools I've seen
+> so far.
+> Also maybe nullify this.tabActor.
+
+Yep. I also nullify other promises. I didn't realised we had other such scenario!
+(In reply to J. Ryan Stinnett [:jryans] from comment #12)
+> Comment on attachment 8585472
+>
+> Are we sure |childID| still serves a purpose?
+
+Oh I totally missed that while reviewing patrick's patch for loader.id.
+I removed childID in the new patch and use prefix instead as ID.
+Created attachment 8586366
+Fix child processes - v3
+Created attachment 8586367
+inspector patch v5
+
+With new try:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=89e4c9ab7f1b
+Comment on attachment 8586366
+Fix child processes - v3
+
+Review of attachment 8586366:
+-----------------------------------------------------------------
+
+Looks good to me!
+
+::: toolkit/devtools/server/docs/lazy-actor-modules.md
+@@ +75,5 @@
+>   */
+>  
+>  let gTrackedMessageManager = new Set();
+>  
+> +exports.setupParentProcess = function setupParentProcess({ mm, prefix}) {
+
+Nit: space before }
+Created attachment 8586701
+Fix child processes - v4
+
+Fix nit.
+New try with just these two patches:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=39f610141c0b
+Previous one included inpector test refactoring, which may easily introduce errors.
+Created attachment 8587359
+interdiff
+Created attachment 8587362
+Fix child processes - v5
+
+Ryan, I had to delay the call to sendAsyncMessage. (See interdiff patch)
+Even if "Async", it prevents the `detach` request to finish correctly.
+So that client.close() never finishes as it call `detach` for all TabActor.
+It ended up breaking tests in mochitests-e10s.
+
+New try:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=fa61678be391
+Comment on attachment 8587362
+Fix child processes - v5
+
+Review of attachment 8587362:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/childtab.js
+@@ +60,5 @@
+> +    // We have to send this message on the next event loop,
+> +    // that to allow `detach` request to finish.
+> +    // As the code handling debug:detach is going to synchronously close the
+> +    // child connection.
+> +    setTimeout(function () {
+
+I need a arrow function here...
+attaching new patch with just that.
+Created attachment 8587398
+Fix child processes - v6
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=0739d86a3c9c
+Comment on attachment 8587398
+Fix child processes - v6
+
+Review of attachment 8587398:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/childtab.js
+@@ +60,5 @@
+> +    // We have to send this message on the next event loop,
+> +    // that to allow `detach` request to finish.
+> +    // As the code handling debug:detach is going to synchronously close the
+> +    // child connection.
+> +    setTimeout(() => {
+
+Would `setImmediate` be better here?  Or do you really need an actual delay time (seems to default to 4 ms)?
+Created attachment 8589113
+Fix child processes - v7
+
+Hum. The failing mochitests highlighted the fact that
+we may not just get rid of the TabActor at all.
+
+My previous patch tried to ensure we forget about any references 
+of a TabActor whose `detach` method has been called.
+But a test explicitely asserted that we can keep using actor which such state.
+
+I think it is reasonable to keep this assertion alive.
+`exit` request sounds more like this. We really shouldn't be using a TabActor
+after exit is called, but not detach. We can re-attach later on.
+
+So in this new patch, I just ensure that the tab actor*s* (inspector, console, ...)
+are cleaned up on detach, but not the *TabActor* itself.
+It forces me to tweak the webapps actors to stop caching connectToChild results
+(i.e. the original TabActor grip/form)
+Instead, it now uses the same trick than RemoteBrowserActor
+and sends a debug:form message manager message to retrieve an up-to-date form/grip.
+
+Also, important detail of this patch, I moved TabActor.docShell nullication
+from detach to exit, in order to keep the TabActor possibly working on re-attach.
+Hopefully this won't introduce a leak in tests:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=f5e7d6582630
+
+I kept the various cleanup introduced in previous patches, like:
+- stop using childID and use prefix instead,
+- do same cleanup in connectToChild if the connection closes or the app is closed/crashed.
+
+If the patch is too hairy, please tell me, I can split it.
+Comment on attachment 8589113
+Fix child processes - v7
+
+Review of attachment 8589113:
+-----------------------------------------------------------------
+
+Seems to work well when testing!
+
+::: toolkit/devtools/server/actors/childtab.js
+@@ +59,2 @@
+>    }
+> +  return TabActor.prototype.exit.call(this);
+
+Nit: TabActor.exit() does not return anything... but no harm either.
+
+::: toolkit/devtools/server/main.js
+@@ +939,5 @@
+>      Services.obs.addObserver(onMessageManagerClose,
+>                               "message-manager-close", false);
+>  
+> +    // Listen for connection close to cleanup things
+> +    // when user unplug the device or we loose the connection somehow.
+
+Nit: loose -> lose
+Created attachment 8590270
+interdiff
+
+I had to fix yet another leak.
+This time because we are not cleaning docShell attribute when we disconnect.
+For some reason (that would be interesting to know!),
+a TabActor stays alive even if disconnected.
+And because we are only calling _detach and not exit, we are not clearing the docShell reference.
+I think it makes sense to call exit on disconnect, as we do some more cleanups.
+
+Then, I still have a hard to debug test failure (browser/devtools/shared/test/browser_toolbar_tooltip.js)
+But it is related to the inspector patch:
+Just the child process fix patch:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=72d4cb47ef0a
+Both patches:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=b3abc18d4665
+Created attachment 8590271
+Fix child processes - v8
+
+Sorry for keeping submitting different patches for the same bug,
+but I'm finding more and more issues as I'm looking at this :/
+
+Hopefully I can land this patch and figure out the inspector one after.
+Created attachment 8590390
+Stop leaking tab actors and root actor on disconnect.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=7786629bcc92
+To follow comment 27, here is a patch to prevent leaking the TabActor,
+at least, during this test. That doesn't prevent leaking it in production code :x
+We were keeping the ActorPool from root actor alive on disconnect. (_tabActorPool)
+And also, from the connection, we were keeping the RootActor alive (rootActor).
+We do leak the DebuggerServerConnection, but I can't find why...
+New try with necessary patches to address tooltip.js error:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=8cc816b898f4
+Created attachment 8590514
+Fix browser_toolbar_webconsole_errors_count when run independently.
+Created attachment 8590515
+Cleanup correctly tests run from browser/devtools/shared/test
+Created attachment 8590516
+Fix exception when using SimpleTest.expectUncaughtException
+Comment on attachment 8590514
+Fix browser_toolbar_webconsole_errors_count when run independently.
+
+Carrying review from bug 1137285.
+\o/ Try is finally green, so I just need the browser-test.js review before landing!
+Comment on attachment 8590516
+Fix exception when using SimpleTest.expectUncaughtException
+
+Review of attachment 8590516:
+-----------------------------------------------------------------
+
+Terrible! I guess we could also use a fat-arrow function here, right?
+Created attachment 8591633
+interdiff
+
+Fix various leaks.
+This most important one is: this.walker.destroy()
+It allows to unregister the listeners set by the walker when we destroy the inspector.
+(Fix the reported leak here - https://treeherder.mozilla.org/#/jobs?repo=try&revision=1744b443412d)
+It ended up leaking the related docshell.
+
+Also, we were leaking all `_refMap` content...
+
+The `disconnect` method allows to properly cleanup the highlighter in case of unexpected disconnection.
+Created attachment 8591635
+inspector patch v6
+Comment on attachment 8591635
+inspector patch v6
+
+See comment 37 for interdiff and more info about this patch.
+Hopefully, that's my last patch in the quest of refactoring the inspector tests!!
+(but not the last one to kill all these leaks :s)
+(In reply to Ted Mielczarek [:ted.mielczarek] from comment #36)
+> Comment on attachment 8590516
+> Fix exception when using SimpleTest.expectUncaughtException
+> 
+> Review of attachment 8590516:
+> -----------------------------------------------------------------
+> 
+> Terrible! I guess we could also use a fat-arrow function here, right?
+
+Yes! It sounds like it would be a cleanup against all these methods. It sounds weird to make it just for this method. Will do a followup cleanup, this patch queue is already complex enough!
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=6f274933ca9c
+Comment on attachment 8591635
+inspector patch v6
+
+Review of attachment 8591635:
+-----------------------------------------------------------------
+
+Looks ok to me.
+New try with just this bug's patches. I have to start landing some, this is becoming too big patch queue!
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=85398c2f6606
+Created attachment 8592139
+inspector patch v7
+
+I had to remove the WalkerActor._refMap cleaning as it introduced some test failure.
+But we should really be cleaning it as we are most likely leaking a lot of actors
+because of this.
+I'll try to followup with various leak fixes.
+
+New try:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=3a5f206b338e
+Thanks for filing the cleanup bug as a followup!
+Created attachment 8592275
+inspector patch v8
+
+So I hit another leak in styles.js.
+We weren't cleaning up PageStyleActor, which itself,
+wasn't collecting StyleRuleActor.
+I verified, and now, we do not leak PageStyleActor anymore
+(I was chasing this leak for a long time!)
+
+I reintroduced the cleanup of refMap in Walker.destroy.
+
+The only leaks I'm still aware with all these patches is WalkerActor and Connection.
+Before we were leaking everything, TabActorPools and all the actors.
+Really all actors (attachment 8590390 fixed that).
+Now, we have to be careful to not leak each actor and the inspector ones were all
+leaked by keeping references between themself and for some still unknown reason
+WalkerActor is kept alive.
+
+New try:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=50b1908485b8
+
+Waiting for green try before asking for a new review...
+Comment on attachment 8592275
+inspector patch v8
+
+Try is finally green!!
+See comment 46 for more details.
+It should be good now. Both try are green on this bug and bug 1137285, with inspector tests refactoring.
+There is still some leak, described in comment 46, so I may continue fixing some in followups, but it looks like I reach the end of this quest (having landable patches).
+Comment on attachment 8592275
+inspector patch v8
+
+Review of attachment 8592275:
+-----------------------------------------------------------------
+
+Looking at these code changes make me very scared ... like, we had an unmanage method before, but weren't using it?
+I couldn't find anything wrong with them, and they seem to do the job. Also, if try is green, I'm happy.
+
+::: toolkit/devtools/server/actors/styles.js
+@@ +329,5 @@
+>  
+>        // If this font comes from a @font-face rule
+>        if (font.rule) {
+> +        let styleActor = StyleRuleActor(this, font.rule);
+> +        this.fontStyleActors.add(styleActor);
+
+I'm ok with doing this for now, to get rid of the leak, but it looks like this should instead go through _styleRef to create the actor and reference it in the map, in order to clean it up on destroy, instead of having to manage another data structure (this.fontStyleActors).
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #48)
+> Comment on attachment 8592275
+> inspector patch v8
+> 
+> Review of attachment 8592275:
+> -----------------------------------------------------------------
+> 
+> Looking at these code changes make me very scared ... like, we had an
+> unmanage method before, but weren't using it?
+
+There is something weird happening around protocol.js destroy/unmanage.
+I think it should call each actor's destroy method automagically once
+we ensure calling the top actor destroy method,
+but it looks like it isn't.
+
+In styles.js, we aren't calling child actors, StyleRuleActor's destroy method explicitely.
+In inspector.js, we were only calling NodeActor's destroy explicitely when calling releaseNode,
+which is called when we load another document or the document unloads,
+but not when we shutdown the inspector.
+
+I also discovered that calling actor.destroy() is going to call parentActor.unmanage(actor),
+so I may be able to simplify this code.
+I'll look into that in a followup.
+
+> I couldn't find anything wrong with them, and they seem to do the job. Also,
+> if try is green, I'm happy.
+> 
+> ::: toolkit/devtools/server/actors/styles.js
+> @@ +329,5 @@
+> >  
+> >        // If this font comes from a @font-face rule
+> >        if (font.rule) {
+> > +        let styleActor = StyleRuleActor(this, font.rule);
+> > +        this.fontStyleActors.add(styleActor);
+> 
+> I'm ok with doing this for now, to get rid of the leak, but it looks like
+> this should instead go through _styleRef to create the actor and reference
+> it in the map, in order to clean it up on destroy, instead of having to
+> manage another data structure (this.fontStyleActors).
+
+I thought that it had to be different and not go thought _styleRef...
+I'll clean that up in a followup if you don't mind.
+Green try:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=90fc5e34d026
+
+Landed in fx-team:
+https://hg.mozilla.org/integration/fx-team/rev/fb97412bef73
+https://hg.mozilla.org/integration/fx-team/rev/69819d44541f
+https://hg.mozilla.org/integration/fx-team/rev/6c4285b179df
+https://hg.mozilla.org/integration/fx-team/rev/d800c6c9493d
+https://hg.mozilla.org/integration/fx-team/rev/4cf74e040c0a
+https://hg.mozilla.org/integration/fx-team/rev/75cc30c9a401
+Actually the try with just these patch was this one:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=8c7de62a12e4
+sorry had to back this out for test failures like https://treeherder.mozilla.org/logviewer.html#?job_id=2688239&repo=fx-team
+Yet another cleanup exception. I can't get why I didn't got it on try...
+No such actor for ID: server1.conn0.pagestyle27
+STACK!!!!
+Front<.request@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/server/protocol.js:1169:14
+frontProto/</proto[name]@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/server/protocol.js:1321:14
+PageStyleFront<.getApplied<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/server/actors/styles.js:936:21
+TaskImpl_run@resource://gre/modules/Task.jsm:314:40
+TaskImpl@resource://gre/modules/Task.jsm:275:3
+createAsyncFunction/asyncFunction@resource://gre/modules/Task.jsm:249:14
+ElementStyle.prototype.populate@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/styleinspector/rule-view.js:203:21
+CssRuleView.prototype._populate@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/styleinspector/rule-view.js:1699:12
+CssRuleView.prototype.refreshPanel/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/styleinspector/rule-view.js:1689:14
+Handler.prototype.process@resource://gre/modules/Promise.jsm -> resource://gre/modules/Promise-backend.js:867:23
+this.PromiseWalker.walkerLoop@resource://gre/modules/Promise.jsm -> resource://gre/modules/Promise-backend.js:746:7
+this.PromiseWalker.scheduleWalkerLoop/<@resource://gre/modules/Promise.jsm -> resource://gre/modules/Promise-backend.js:688:37
+Promise*this.PromiseWalker.scheduleWalkerLoop@resource://gre/modules/Promise.jsm -> resource://gre/modules/Promise-backend.js:688:5
+this.PromiseWalker.schedulePromise@resource://gre/modules/Promise.jsm -> resource://gre/modules/Promise-backend.js:709:7
+Promise.prototype.then@resource://gre/modules/Promise.jsm -> resource://gre/modules/Promise-backend.js:417:5
+CssRuleView.prototype.refreshPanel@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/styleinspector/rule-view.js:1688:12
+RuleViewTool.prototype.refresh@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/styleinspector/style-inspector.js:89:7
+EventEmitter_emit@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/event-emitter.js:137:11
+Inspector_scheduleLayoutChange/this._timer<@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/inspector/inspector-panel.js:1052:9
+
+The inspector setup a setTimeout before the toolbox destruction, which, itself ask the RuleView to update and call PageStyleActor's getApplied request. All that seems to be done before we start destroying the toolbox/actors. At least the fronted code is executed before...
+A very bad combination of setTimeout/executeSoon make this getApplied request being sent before front destruction on the client side, but it is processed on server side after actor removal :x
+I don't see any sane way to handle such scenario yet.
+https://hg.mozilla.org/integration/fx-team/rev/708a1520feb8
+https://hg.mozilla.org/integration/fx-team/rev/19218cddab14
+https://hg.mozilla.org/integration/fx-team/rev/28ff56f62434
+https://hg.mozilla.org/integration/fx-team/rev/a9afd5f34b4c
+https://hg.mozilla.org/integration/fx-team/rev/e5b5cc483ff7
+I landed all the patches but the inspector one, attachment 8592275, as this is the on introducing test failures:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=e381230b2c57
+New try with attachment 8586367, a simplier cleanup that doesn't prevent leaks:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=ec2efff94843
+It looks like this simple patch doesn't break tests.
+Even if that's not enough to make bug 1137285 to pass, I'm considering landing it and continue improving cleanup in followups. Hopefully that will be as green on fx-team than on try!!
+https://hg.mozilla.org/mozilla-central/rev/708a1520feb8
+https://hg.mozilla.org/mozilla-central/rev/19218cddab14
+https://hg.mozilla.org/mozilla-central/rev/28ff56f62434
+https://hg.mozilla.org/mozilla-central/rev/a9afd5f34b4c
+https://hg.mozilla.org/mozilla-central/rev/e5b5cc483ff7
+https://hg.mozilla.org/integration/fx-team/rev/2ca7b0c1463e
+Not quite completely fixed, I needed this last changeset. Will reopen if it happens to still break on fx-team and not on try...
+Backed out for linux32 debug browser_responsiveui.js failures.
+https://hg.mozilla.org/integration/fx-team/rev/55e63542c8cc
+
+https://treeherder.mozilla.org/logviewer.html#?job_id=2784830&repo=fx-team
+14 INFO TEST-UNEXPECTED-FAIL | browser/devtools/responsivedesign/test/browser_responsiveui.js | A promise chain failed to handle a rejection: - Protocol error (noSuchActor): No such actor for ID: server1.conn1.pagestyle27
+https://hg.mozilla.org/integration/fx-team/rev/ef1fb0e0911d
+Bug 1155168 seems to help, at least it fixes the leak locally:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=0c3c213b23c6
+New try has the previous wasn't complete:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=44b35a38f1ed
+Looks like try is really green with the smaller patch I attempted to land in comment 60:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=44b35a38f1ed
+But also if I land the last, bigger patch, with more cleanups:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=d3ad329c7bef
+https://hg.mozilla.org/integration/fx-team/rev/ef6fd70cccf5
+Comment on attachment 8592275
+inspector patch v8
+
+Backed out:
+https://hg.mozilla.org/integration/fx-team/rev/b51862673081
+
+I really don't get it. Why does it fail only on fx-team whereas it pass on Try and locally... I verified and the failing test is run on try so I don't know. Is there a special mozconfig on fx-team or any other environment specifics??
+Ok, ok. 
+So bug 1155168 just made this exception much more intermittent, and that now only happens on linux32-debug...
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=820648f5dee6
+At least, it makes sense, even if that's not really handy...
+Created attachment 8658758
+inspector patch v9
+
+After a 6+ months quest to cleanup inspector destruction codepath,
+I might be able to land this old cleanup...
+
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=1f21145b58c9
+
+I've updated the patch in order to "manage" the actors instead
+of keeping a reference and destroying them manually.
+Comment on attachment 8658758
+inspector patch v9
+
+Review of attachment 8658758:
+-----------------------------------------------------------------
+
+Looks like tests are green now!!
+I launched a bunch of new runs to confirm that there isn't any obvious intermittent.
+Created attachment 8659300
+cleanup in destroy to prevent leaks - v1
+
+Another patch to prevent leaking actor dependencies
+if one happens to leak.
+
+My experience on inspector related actors is that we can
+easily start leaking one actor and if it happens to leak,
+we are also leaking all its dependencies (i.e. all object ref stored as attribute).
+
+This patch just ensure nullifying most attributes
+and unregister listeners.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=463edc639c8f
+Comment on attachment 8659300
+cleanup in destroy to prevent leaks - v1
+
+Review of attachment 8659300:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/styles.js
+@@ +154,5 @@
+>    },
+>  
+> +  destroy: function () {
+> +    if (!this.walker)
+> +      return;
+
+nit: please wrap the if's body in {} to conform to our ESLint's rules.
+
+@@ +1038,5 @@
+>    },
+>  
+> +  destroy: function () {
+> +    if (!this.rawStyle)
+> +      return;
+
+nit: please wrap the if's body in {} to conform to our ESLint's rules.
+https://hg.mozilla.org/integration/fx-team/rev/cf8240fca7de8f27a2efa028d426bed143d09fed
+bug 1145049 - Fix nodepicker when reopening toolbox for the same app. r=pbrosset
+
+https://hg.mozilla.org/integration/fx-team/rev/c34db58fa00778f38d8872e65a8eb7a6e9f6162c
+Bug 1145049 - Cleanup inspector related actors to avoid leaking stuff if any actor is leaked. r=pbrosset
+https://hg.mozilla.org/mozilla-central/rev/cf8240fca7de
+https://hg.mozilla.org/mozilla-central/rev/c34db58fa007
+
+
+Node picker is broken when reopening a toolbox for the same app
+
+
+
+Bug 1145049 - Clean inspector on detach/disconnect. r=pbrosset 
+
+Bug 1145049 - Prevent caching tab actors in child processes. r=jryans 
+
+Bug 1145049 - Fix browser_toolbar_webconsole_errors_count when run independently. r=bgrins
+
+Bug 1145049 - Cleanup correctly tests run from browser/devtools/shared/test. r=bgrins 
+
+Bug 1145049 - Stop leaking tab actors and root actor on disconnect. r=jryans 
+
+Bug 1145049 - Fix exception when using SimpleTest.expectUncaughtException. r=ted 
+
+Backed out changeset 75cc30c9a401 (bug 1145049) 
+
+Backed out changeset 4cf74e040c0a (bug 1145049) 
+
+Backed out changeset d800c6c9493d (bug 1145049) 
+
+Backed out changeset 6c4285b179df (bug 1145049) 
+
+Backed out changeset 69819d44541f (bug 1145049) 
+
+Backed out changeset fb97412bef73 (bug 1145049) for dt3 test failures 
+
+Backed out changeset 145f6347bb11 (bug 1137285) depending on the backout of bug 1145049 
+
+Bug 1145049 - Prevent caching tab actors in child processes. r=jryans 
+
+Bug 1145049 - Fix browser_toolbar_webconsole_errors_count when run independently. r=bgrins
+
+Bug 1145049 - Cleanup correctly tests run from browser/devtools/shared/test. r=bgrins 
+
+Bug 1145049 - Stop leaking tab actors and root actor on disconnect. r=jryans 
+
+Bug 1145049 - Fix exception when using SimpleTest.expectUncaughtException. r=ted 
+
+Bug 1145049 - Clean inspector on detach/disconnect. r=pbrosset 
+
+Backed out changeset 2ca7b0c1463e (bug 1145049) for linux32 debug browser_responsiveui.js failures. 
+
+Bug 1145049 - Clean inspector on detach/disconnect. r=pbrosset 
+
+Backed out changeset ef6fd70cccf5 (bug 1145049) 
+
+bug 1145049 - Fix nodepicker when reopening toolbox for the same app. r=pbrosset 
+
+Bug 1145049 - Cleanup inspector related actors to avoid leaking stuff if any actor is leaked. r=pbrosset 

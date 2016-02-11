@@ -1,0 +1,626 @@
+Currently, immediately after startup, session restore collects and writes state, purely for the sake of changing one flag on the disk. That's not good.
+
+Bug 887394 will ensure that we do not collect the state. We can go further and keep the flag outside of the file, either by storing it in preferences or by storing it as the presence/absence of an empty lock file.
+
+Currently, immediately after startup, session restore collects and writes state, purely for the sake of changing one flag on the disk. That's not good.
+
+Bug 887394 will ensure that we do not collect the state. We can go further and keep the flag outside of the file, either by storing it in preferences or by storing it as the presence/absence of an empty lock file.
+Steven will be working on that as soon as bug 888373 has a usable patch.
+David, while shutting down the Session Worker is told to write the final session asynchronously, and introduced in Bug 914581 this write will block "profile-before-change" using AsyncShutdown.jsm
+
+If I'm understanding things correctly, this means AsyncShutdown ensures our write will happen before "profile-before-change" finishes. This is handled internally by an observer on "profile-before-change" which won't complete until the promise for the write has resolved.
+
+Now, the CrashMonitor also uses an observer on "profile-before-change" to set the "profile-before-change" checkpoint.
+
+So in theory, it would be possible for the checkpoint observer to run first and indicate "profile-before-change" has happened, then firefox crash without the write having been completed. Since this notification is the last possible in the crash monitor, I wouldn't detect this type of crash in session store using the crash monitor mechanism.
+
+Am I misunderstanding something, and reading the "profile-before-change" checkpoint will guarantee the session file was written? If this is a problem, do you have any thoughts on how we can work around this? Could we make Session Stores final write block on a notification that happens before "profile-before-change"?
+(In reply to Steven MacLeod [:smacleod] from comment #2)
+> David, while shutting down the Session Worker is told to write the final
+> session asynchronously, and introduced in Bug 914581 this write will block
+> "profile-before-change" using AsyncShutdown.jsm
+> 
+> If I'm understanding things correctly, this means AsyncShutdown ensures our
+> write will happen before "profile-before-change" finishes. This is handled
+> internally by an observer on "profile-before-change" which won't complete
+> until the promise for the write has resolved.
+> 
+> Now, the CrashMonitor also uses an observer on "profile-before-change" to
+> set the "profile-before-change" checkpoint.
+> 
+> So in theory, it would be possible for the checkpoint observer to run first
+> and indicate "profile-before-change" has happened, then firefox crash
+> without the write having been completed. Since this notification is the last
+> possible in the crash monitor, I wouldn't detect this type of crash in
+> session store using the crash monitor mechanism.
+
+That is correct.
+
+> Am I misunderstanding something, and reading the "profile-before-change"
+> checkpoint will guarantee the session file was written? If this is a
+> problem, do you have any thoughts on how we can work around this? Could we
+> make Session Stores final write block on a notification that happens before
+> "profile-before-change"?
+
+You are absolutely right, we have a problem.
+The simplest solution would probably be to have the CrashMonitor observe profile-before-change2 instead of (or in addition to) profile-before-change.
+A better (but more sophisticated) solution would be to make AsyncShutdown extensible enough that one could wait for the completion of a shutdown phase. We will probably want something roughly along these lines eventually, but I don't want to rush in that direction until we have a clearer idea of what we need.
+Remind me, which crash information exactly do we need for this feature? Does it need to be profile-before-change or would e.g. quit-application be sufficient?
+Session store is using AsyncShutdown to add its final write as a blocker to profile-before-change, so we need to know that profile-before-change fully completed, not just started. quit-application would not be sufficient.
+So, Steven, can you confirm that watching profile-before-change2 in the crash monitor would be sufficient?
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #6)
+> So, Steven, can you confirm that watching profile-before-change2 in the
+> crash monitor would be sufficient?
+
+I thought the plan was to have the crash monitor observe the new "sessionstore-final-state-write-complete" introduced in Bug 921581. 
+
+Once the crash monitor has this notification, and Bug 918024 lands, we should be able to move forward here. I have a patch I'll finish up and post soon.
+You are right, my bad.
+Created attachment 833087
+Patch - Remove state write and switch to CrashMonitor
+Comment on attachment 833087
+Patch - Remove state write and switch to CrashMonitor
+
+Review of attachment 833087:
+-----------------------------------------------------------------
+
+This looks so much better \o/
+
+There's two places where you do |!checkpoints["sessionstore-final-state-write-complete"]|. Can we do better and maybe move this to Utils.jsm and offer something like |Utils.afterCrash()|? (We should pick a better name though ;) The method could then return a promise and do the check for us. The promise would just resolve to a boolean.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +419,5 @@
+>            // restore it
+>            LastSession.setState(state.lastSessionState);
+>  
+>            let lastSessionCrashed =
+> +            !crashCheckpoints["sessionstore-final-state-write-complete"];
+
+(here)
+
+@@ +895,5 @@
+>        // Even if additional windows are opened and wait
+>        // for initialization as well, the first opened
+>        // window should execute first, and this.onLoad
+>        // will be called with the initialState.
+> +      this._promiseReadyForInitialization.then((data) => {
+
+nit: this could be |.then(data => {|
+or maybe even |.then(([checkpoints]) => {|
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +85,5 @@
+> +    Promise.all([
+> +      SessionFile.read(),
+> +      CrashMonitor.previousCheckpoints
+> +    ]).then((data) => {
+> +      this._onSessionFileRead.apply(this, data);
+
+Nit: |.then(data => this._onSessionFileRead(...data), Cu.reportError)|
+
+@@ +148,5 @@
+>        if (!doResumeSessionOnce)
+>          delete this._initialState.lastSessionState;
+>  
+>        let resumeFromCrash = Services.prefs.getBoolPref("browser.sessionstore.resume_from_crash");
+> +      let lastSessionCrashed = !aCheckpoints["sessionstore-final-state-write-complete"]
+
+(and here)
+Comment on attachment 833087
+Patch - Remove state write and switch to CrashMonitor
+
+Review of attachment 833087:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +385,5 @@
+>      this._initPrefs();
+>      this._initialized = true;
+>    },
+>  
+> +  initSession: function ssi_initSession(crashCheckpoints) {
+
+Please document crashCheckpoints.
+
+@@ +419,5 @@
+>            // restore it
+>            LastSession.setState(state.lastSessionState);
+>  
+>            let lastSessionCrashed =
+> +            !crashCheckpoints["sessionstore-final-state-write-complete"];
+
+Please handle the case in which crashCheckpoints == null.
+
+@@ +886,5 @@
+> +        this._promiseReadyForInitialization = Promise.all([
+> +          CrashMonitor.previousCheckpoints,
+> +          deferred.promise,
+> +          gSessionStartup.onceInitialized
+> +        ]);
+
+I don't like this promiseReadyForInitialization that contains a weird array of unrelated data. I'd rather use Task.jsm here.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +13,5 @@
+>   * under the circumstances described below.  If the auto-start Private Browsing
+>   * mode is active, however, the session is never restored.
+>   *
+>   * Crash Detection
+> + * The CrashMonitor will be used to check if the final session state was
+
+Nit: Please use the present, not the future.
+
+@@ +16,5 @@
+>   * Crash Detection
+> + * The CrashMonitor will be used to check if the final session state was
+> + * successfully written at shutdown of the last session. If we did not reach
+> + * 'sessionstore-final-state-write-complete', then it's assumed that the browser
+> + * had previously crashed and that we should restore the session.
+
+"has"
+
+@@ +81,5 @@
+>        gOnceInitializedDeferred.resolve();
+>        return;
+>      }
+>  
+> +    Promise.all([
+
+I don't find this use of Promise.all very readable. I would prefer using Task.jsm here.
+
+@@ +86,5 @@
+> +      SessionFile.read(),
+> +      CrashMonitor.previousCheckpoints
+> +    ]).then((data) => {
+> +      this._onSessionFileRead.apply(this, data);
+> +    }, Cu.reportError);
+
+Side-note: Cu.reportError without any context is not very useful. Let's not change this for the moment, but we'll need an alternative.
+
+@@ +97,5 @@
+>      string.data = aData;
+>      return string;
+>    },
+>  
+> +  _onSessionFileRead: function sss_onSessionFileRead(aStateString, aCheckpoints) {
+
+Please document aCheckpoints. Don't hesitate to take this opportunity to document aStateString.
+
+@@ +148,5 @@
+>        if (!doResumeSessionOnce)
+>          delete this._initialState.lastSessionState;
+>  
+>        let resumeFromCrash = Services.prefs.getBoolPref("browser.sessionstore.resume_from_crash");
+> +      let lastSessionCrashed = !aCheckpoints["sessionstore-final-state-write-complete"]
+
+You should handle the case in which aCheckpoints == null.
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #11)
+> > +        this._promiseReadyForInitialization = Promise.all([
+> > +          CrashMonitor.previousCheckpoints,
+> > +          deferred.promise,
+> > +          gSessionStartup.onceInitialized
+> > +        ]);
+> 
+> I don't like this promiseReadyForInitialization that contains a weird array
+> of unrelated data. I'd rather use Task.jsm here.
+
+What would Task.jsm improve here? Promise.all() is intended to be used for tasks that run in parallel and we want to synchronize their finalization.
+
+Task.jsm is rather made to handle sequential async tasks. Sure, you can use it to re-implement Promise.all() but I don't agree that this is any more readable.
+(In reply to Tim Taubert [:ttaubert] from comment #12)
+> (In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment
+> #11)
+> > > +        this._promiseReadyForInitialization = Promise.all([
+> > > +          CrashMonitor.previousCheckpoints,
+> > > +          deferred.promise,
+> > > +          gSessionStartup.onceInitialized
+> > > +        ]);
+> > 
+> > I don't like this promiseReadyForInitialization that contains a weird array
+> > of unrelated data. I'd rather use Task.jsm here.
+> 
+> What would Task.jsm improve here? Promise.all() is intended to be used for
+> tasks that run in parallel and we want to synchronize their finalization.
+
+I agree. However, here, we end up with an array of unrelated stuff, which is quite fragile + hard to document.
+
+Here, this would be a simple
+
+let checkpoints = yield CrashMonitor.previousCheckpoints;
+yield deferred.promise;
+yield gSessionStartup.onceInitialized;
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #13)
+> (In reply to Tim Taubert [:ttaubert] from comment #12)
+> I agree. However, here, we end up with an array of unrelated stuff, which is
+> quite fragile + hard to document.
+> 
+> Here, this would be a simple
+> 
+> let checkpoints = yield CrashMonitor.previousCheckpoints;
+> yield deferred.promise;
+> yield gSessionStartup.onceInitialized;
+
+Other than the |let checkpoints| I don't see much difference. We could add a line of documentation for all the promises passed to Promise.all() as well. Also we wouldn't wait three ticks when all promises have been resolved already.
+
+I do like Task.jsm a lot but I just don't think it's the right tool for the job here. I however value getting this patch landed a lot more than to keep talking about this :)
+Yeah, I'm not going to insist further :)
+Created attachment 8335082
+Patch - Remove state write and switch to CrashMonitor v2
+Comment on attachment 8335082
+Patch - Remove state write and switch to CrashMonitor v2
+
+Review of attachment 8335082:
+-----------------------------------------------------------------
+
+Looks good to me, thanks.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +911,5 @@
+> +        this._promiseReadyForInitialization = Promise.all([
+> +          Utils.lastSessionCrashed(),
+> +          gSessionStartup.onceInitialized,
+> +          deferred.promise
+> +        ]);
+
+Nit: In that case, could you document what _promiseReadyForInitialization resolves to?
+
+::: browser/components/sessionstore/src/Utils.jsm
+@@ +62,5 @@
+> +   *                   crashed.
+> +   */
+> +  lastSessionCrashed: function () {
+> +    if (!this.lastSessionCrashedPromise) {
+> +      this.lastSessionCrashedPromise = //Object.freeze(
+
+Why is this commented out?
+Note that the fields of Promise are already immutable, so it's probably not necessary to freeze a Promise object.
+Created attachment 8335403
+Patch - Remove state write and switch to CrashMonitor v3
+
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #17)
+> Why is this commented out?
+> Note that the fields of Promise are already immutable, so it's probably not
+> necessary to freeze a Promise object.
+
+Ah, that was just some cruft from experimenting that I missed when cleaning up, thanks for catching it!
+Created attachment 8349647
+Patch - Remove state write and switch to CrashMonitor v4
+
+Rebased on top of latest Crash Monitor patch which is currently landing.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=38d939623de4
+Created attachment 8350140
+Patch - Remove state write and switch to CrashMonitor v5
+
+Fixed the test breakages shown in try push:
+
+The browser_665702-state_session.js failure was just a result of me removing the "state" key which we previously used for crash detection.
+
+The xpcshell failures were due to nsiSessionStartup no longer completing initialization since it now needs the Crash Monitor. I explicitly initialize the Crash Monitor for these tests now.
+
+It would be good to get one of you (Yoric or Tim) to do a review of these test changes (The rest of the patch should be the same).
+
+I've made another try push: https://tbpl.mozilla.org/?tree=Try&rev=843c614dd2ab
+Created attachment 8350172
+Patch - Remove state write and switch to CrashMonitor v6
+
+(In reply to Steven MacLeod [:smacleod] from comment #20) 
+> The xpcshell failures were due to nsiSessionStartup no longer completing
+> initialization since it now needs the Crash Monitor. I explicitly initialize
+> the Crash Monitor for these tests now.
+
+Updated the patch to make the Crash Monitor initialization much less hacky, and more explicit.
+
+Results *should* be the same, but I've pushed to try again just to be safe:
+https://tbpl.mozilla.org/?tree=Try&rev=fcc387a7b137
+Comment on attachment 8350172
+Patch - Remove state write and switch to CrashMonitor v6
+
+Review of attachment 8350172:
+-----------------------------------------------------------------
+
+Thanks!
+Comment on attachment 8350172
+Patch - Remove state write and switch to CrashMonitor v6
+
+Review of attachment 8350172:
+-----------------------------------------------------------------
+
+I like the patch, but I believe that a little work is needed to make it work nicely in case of a crash just before an upgrade.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +929,5 @@
+>              deferred.resolve();
+>            }
+>          }, "browser-delayed-startup-finished", false);
+>  
+> +        // We are ready for initialization as soon as: we have determined if the
+
+Nit: Please make this comment a list.
+
+::: browser/components/sessionstore/src/Utils.jsm
+@@ +93,5 @@
+> +   * Determines if the last session crashed.
+> +   * @return {Promise} A promise which resolves to true if the last session
+> +   *                   crashed.
+> +   */
+> +  lastSessionCrashed: function () {
+
+I'd prefer something along the lines of |hasLastSessionCrashed|.
+
+@@ +94,5 @@
+> +   * @return {Promise} A promise which resolves to true if the last session
+> +   *                   crashed.
+> +   */
+> +  lastSessionCrashed: function () {
+> +    if (!this.lastSessionCrashedPromise) {
+
+Generally, we prefer writing:
+
+if (this.lastSessionCrashedPromise) {
+  return this.lastSessionCrashedPromise;
+}
+// ...
+return this.lastSessionCrachedPromise;
+
+to avoid nesting code when it's not necessary.
+
+@@ +102,5 @@
+> +            // If the Crash Monitor could not load a checkpoints file it will
+> +            // provide null, and we will assume this is the first run of the
+> +            // browser since the Crash Monitor was introduced. In the case,
+> +            // we'll just have to assume we didn't crash.
+> +            return false;
+
+That won't work during an upgrade. In this case, you still need to fallback to the old mechanism (read-only).
+
+::: browser/components/sessionstore/test/unit/head.js
+@@ +20,5 @@
+> +
+> +    // We need the Crash Monitor initialized for sessionstartup to run
+> +    // successfully.
+> +    Components.utils.import("resource://gre/modules/CrashMonitor.jsm");
+> +    CrashMonitor.init();
+
+It's surprising that the Crash Monitor isn't initialized yet.
+I'd be more comfortable if you wrapped this in a try/catch, explaining that you want to make sure that it's in case the crash monitor is already initialized.
+Steven, any progress on this? Would be great to have this landed :)
+Created attachment 8359850
+Patch - Remove state write and switch to CrashMonitor v7
+
+I've restructured the patch to use |state.session.state| as a fallback for crash detection after upgrade. I've also moved all of the crash detection code to SessionStartup, and exposed |lastSessionCrashed| in the idl for SessionStore.jsm to use.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=3f81767c9d27
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #23)
+> It's surprising that the Crash Monitor isn't initialized yet.
+> I'd be more comfortable if you wrapped this in a try/catch, explaining that
+> you want to make sure that it's in case the crash monitor is already
+> initialized.
+
+It doesn't appear to be initialized. I thought it wouldn't be for an xpcshell test?
+Comment on attachment 8359850
+Patch - Remove state write and switch to CrashMonitor v7
+
+Review of attachment 8359850:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +107,5 @@
+>      if (this._initialized) {
+>        // Initialization is complete, nothing else to do
+>        return;
+>      }
+> +    this._initialized = true;
+
+I think we could actually get rid of this._initialized completely if it weren't for _ensureInitialized() below. At least we don't have to check here as _onSessionFileRead() won't be called twice, right? This is just legacy sync init code.
+
+@@ +135,5 @@
+> +
+> +    let resumeFromCrash = Services.prefs.getBoolPref("browser.sessionstore.resume_from_crash");
+> +
+> +    CrashMonitor.previousCheckpoints.then(checkpoints => {
+> +      if (!checkpoints) {
+
+Nit: if (checkpoints) would be easier so I wouldn't have to negate that in my head :)
+
+@@ +144,5 @@
+> +        // so we will check for its existence and fallback.
+> +        this._lastSessionCrashed = !(this._initialState &&
+> +                                     this._initialState.session &&
+> +                                     this._initialState.session.state) ||
+> +                                   (this._initialState.session.state == STATE_RUNNING_STR)
+
+This is missing a semicolon and I have quite a hard time following that logic. Can you re-arrange that so that it's a little more readable? Also, does that mean that if this._initialState.session.state is somehow undefined that we say lastSessionCrashed=true? That's the opposite of the former behavior where lastSessionCrashed=(session && session.state == "running");
+
+@@ +185,5 @@
+> +   * @param aStateString
+> +   *        string The Session State string read from disk
+> +   * @returns {State} a Session State object
+> +   */
+> +  _parseStateString: function (aStateString) {
+
+Nit: function (stateString) {
+
+@@ +190,5 @@
+> +    let state = null;
+> +    // parse the session state into a JS object
+> +    // remove unneeded braces (added for compatibility with Firefox 2.0 and 3.0)
+> +    if (aStateString.charAt(0) == '(')
+> +      aStateString = aStateString.slice(1, -1);
+
+Looks like we can get rid of that backwards compat code?
+
+@@ +203,5 @@
+> +      // evalInSandbox will throw if aStateString is not parse-able.
+> +      try {
+> +        var s = new Cu.Sandbox("about:blank", {sandboxName: 'nsSessionStartup'});
+> +        state = Cu.evalInSandbox("(" + aStateString + ")", s);
+> +      } catch(ex) {
+
+That code could also be removed, no?
+Comment on attachment 8359850
+Patch - Remove state write and switch to CrashMonitor v7
+
+Review of attachment 8359850:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/nsISessionStartup.idl
+@@ +61,5 @@
+>    const unsigned long RESUME_SESSION = 2;
+>    const unsigned long DEFER_SESSION = 3;
+>  
+>    readonly attribute unsigned long sessionType;
+> +  readonly attribute bool lastSessionCrashed;
+
+I'd prefer calling it |previousSessionCrashed|.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ -786,5 @@
+> -
+> -          // _loadState changed from "stopped" to "running". Save the session's
+> -          // load state immediately so that crashes happening during startup
+> -          // are correctly counted.
+> -          SessionFile.writeLoadStateOnceAfterStartup(STATE_RUNNING_STR);
+
+\o/
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +70,5 @@
+>    // the state to restore at startup
+>    _initialState: null,
+>    _sessionType: Ci.nsISessionStartup.NO_SESSION,
+>    _initialized: false,
+> +  _lastSessionCrashed: null,
+
+Could you document that field?
+
+@@ +85,5 @@
+>        gOnceInitializedDeferred.resolve();
+>        return;
+>      }
+>  
+> +    SessionFile.read().then(this._onSessionFileRead.bind(this), console.error);
+
+You didn't need to change the layout of these lines, did you?
+
+@@ +125,4 @@
+>  
+> +    this._initialState =  this._parseStateString(aStateString);
+> +
+> +    let doResumeSessionOnce = Services.prefs.getBoolPref("browser.sessionstore.resume_session_once");
+
+Could you take the opportunity to rename doResumeSession and doResumeSessionOnce to something a little more meaningful such as shouldResumeSession[Once]?
+
+@@ +132,5 @@
+> +    // If this is a normal restore then throw away any previous session
+> +    if (!doResumeSessionOnce)
+> +      delete this._initialState.lastSessionState;
+> +
+> +    let resumeFromCrash = Services.prefs.getBoolPref("browser.sessionstore.resume_from_crash");
+
+Could we rename this to |resumingFromCrash|?
+
+@@ +154,5 @@
+>  
+>        // Report shutdown success via telemetry. Shortcoming here are
+>        // being-killed-by-OS-shutdown-logic, shutdown freezing after
+>        // session restore was written, etc.
+> +      Services.telemetry.getHistogramById("SHUTDOWN_OK").add(!this._lastSessionCrashed);
+
+Nit: Indentation issue?
+Note for self: this should probably move to the CrashManager, rather than Session Restore. Food for followup bug?
+
+@@ +175,4 @@
+>        // We're ready. Notify everyone else.
+>        Services.obs.notifyObservers(null, "sessionstore-state-finalized", "");
+>        gOnceInitializedDeferred.resolve();
+> +    }, console.error);
+
+Are you sure that we want to eat errors here? This was not the original semantics.
+Created attachment 8361415
+Patch - Remove state write and switch to CrashMonitor v8
+
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #27)
+> Could we rename this to |resumingFromCrash|?
+
+I think the current "resumeFromCrash" is more accurate. This pref indicates if we *should* resume the session after crashes, not if the current session *is* resuming from a crash.
+
+
+> Nit: Indentation issue?
+
+I don't see any indentation issues?
+
+
+> Are you sure that we want to eat errors here? This was not the original
+> semantics.
+
+I think an error here would be unexpected and truly exceptional. Is there something you suggest other than logging it?
+
+
+(In reply to Tim Taubert [:ttaubert] from comment #26)
+> This is missing a semicolon and I have quite a hard time following that
+> logic. Can you re-arrange that so that it's a little more readable? Also,
+> does that mean that if this._initialState.session.state is somehow undefined
+> that we say lastSessionCrashed=true? That's the opposite of the former
+> behavior where lastSessionCrashed=(session && session.state == "running");
+
+I've split out the conditional to make it more readable, and provided a more descriptive comment about how the semantics relate to the old session.state flag and the crash monitor checkpoints.
+
+Yes if session.state is undefined I'm saying we crashed as well. You're correct, this is semantically different from the previous code, but will work correctly with how Session Store actually wrote the flag (We're using the flags existence to decide if the sessionstore.js we're loading came from a version that had the Crash Monitor or not).
+
+Tim, could you do a quick pass of the changes I made to the confusing conditional and the documentation to let me know if it's more clear. I've also fixed a xpcshell-test that broke.
+
+I think this should pretty much be land-able now.
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=707a55228e60
+Comment on attachment 8361415
+Patch - Remove state write and switch to CrashMonitor v8
+
+Review of attachment 8361415:
+-----------------------------------------------------------------
+
+LGTM.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +150,5 @@
+> +        // If this is the first run after an update, sessionstore.js should
+> +        // still contain the session.state flag to indicate if the session
+> +        // crashed. If it is not present, we will assume this was not the first
+> +        // run after update and the checkpoints file was somehow corrupted or
+> +        // removed by a crash.
+
+Ah, right. Thanks for clarifying this.
+(In reply to Steven MacLeod [:smacleod] from comment #28)
+> > Could we rename this to |resumingFromCrash|?
+> 
+> I think the current "resumeFromCrash" is more accurate. This pref indicates
+> if we *should* resume the session after crashes, not if the current session
+> *is* resuming from a crash.
+
+I was talking of the variable, not the pref. I won't insist, thoug.
+
+> > Nit: Indentation issue?
+> 
+> I don't see any indentation issues?
+
+Maybe a fluke of splinter.
+
+> > Are you sure that we want to eat errors here? This was not the original
+> > semantics.
+> 
+> I think an error here would be unexpected and truly exceptional. Is there
+> something you suggest other than logging it?
+
+Well, if you cannot handle the error yourself, don't catch it and let the caller catch it. If nobody catches it, it will be reported automatically.
+Created attachment 8361589
+Patch - Remove state write and switch to CrashMonitor v9
+https://hg.mozilla.org/integration/fx-team/rev/10256adb9f9e
+https://hg.mozilla.org/mozilla-central/rev/10256adb9f9e
+
+
+[Session Restore] Don't save state right after startup when restoring the initial session
+
+
+
+Bug 887780 - Stop writing state immediately after startup and switch to CrashMonitor for crash detection. r=Yoric, r=ttaubert

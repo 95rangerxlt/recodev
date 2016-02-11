@@ -1,0 +1,351 @@
+Now that we only show 25 results by default and stop searching when we hit 25, we shouldn't bother searching for more than what we show. Potentially we could have an even smaller chunk size than maxResults, e.g., 13, to grab half the results now and half later.
+
+Now that we only show 25 results by default and stop searching when we hit 25, we shouldn't bother searching for more than what we show. Potentially we could have an even smaller chunk size than maxResults, e.g., 13, to grab half the results now and half later.
+Created attachment 299919
+v1
+Now that I think about it some more.. Maybe the chunk size should be something like 10. That's how many rows we show by default, so there'll be a full drop down. Maybe even 5 to keep it a factor of 25 and gives a sense of progress with items incrementally appearing. With a timeout of 100ms, it'll take 5 callbacks to fill the maxResults, so at least half a second.. but only .2 seconds to have a drop down full.
+Comment on attachment 299919
+v1
+
+r=sspitzer, thanks edward!
+
+note to drivers, in addition to make this prefs, edward has also reduced the default chunk size from 100 to 25.
+
+this should help the scenario where the user has a lot of places and what we are searching for is NOT going to be found (example:  ddddddd.....dddddd)
+Comment on attachment 299919
+v1
+
+a1.9+=damons
+again, we want to goldilocks chunk size, but I fear 10 might be too small.
+
+we want it as big as possible, but not so big that we lag.
+
+big is good in the scenario when the hit rate is lower.  For example, think of
+"https:" as your search term.  imagine 5% (I made that up) of your places with
+a non zero frecency are http: sites.
+
+if I choose a small chunk size, it will take more chunks (at 100 ms a chunk,
+right) to find the first result, and more chunks (again, at 100ms a chunk) to
+find 10 matches.  (10 being the magic number of how many we show in the drop
+down by default.)
+
+with a bigger chunk size (say 100), it should take fewer chunks to find the
+first result, and fewer to find 10 matches.
+
+but 100 is causing us lags.
+
+so, we need to goldilocks this value, and we want to test a search with 0% hit
+rate on a large places.sqlite.  I believe elmer is has a places.sqlite and a
+test case "dddddd....dd" that he can use to see if our lower chunk size (of 25)
+solves the problem.
+
+there is a chance that even with a chunksize of 1 we lag for him, due to
+something we haven't thought of yet, right?
+
+but at least he can try the default (25) and (1), thanks to this patch, and
+then we can decide what to do next.
+
+does that sound good to you (and dietrich)?
+That was true back when we searched in "time chunks", but the way the query works is. "We must get this many chunks before returning"
+
+The reason why searching for something that /doesn't/ match anything is that the DB is exhausing *all* the places to realize, oh, I don't have enough to return 25 pages, or even 5 pages.
+
+I just tried 5 and it's pretty responsive even on a debug build.
+
+The only thing chunk size affects right now is how long it takes to fill the list.
+
+We'll need a separate optimization to look at aPrevResults and see that 1) it completed its search and 2) it has zero results, so we shouldn't bother searching.
+Seth: I would agree with how you described chunks working if the query was like this..
+
+SELECT .. FROM (SELECT .. ORDER BY frecency DESC LIMIT 25) WHERE title LIKE ..
+
+But the query right now is
+
+SELECT .. WHERE title LIKE .. ORDER BY frecency DESC LIMIT 25
+
+We *must* get 25 results before we return unless we run out of pages to check.
+edward, you may have just pointed out the *real* problem with the lag!
+
+first, to clarify, our query is SELECT ... WHERE h.frecency <> 0 AND TITLE LIKE .... ORDER BY h.frecency DESC LIMIT x OFFSET y
+
+but I think you are right:
+
+"We *must* get 25 results before we return unless we run out of pages to check."
+
+but if you are right, then we're not chunking!
+
+think about the "ddddd....ddd" example.  We aren't going to find 25, so we are going to have to search through all of places before we find 0 results, and that is not going to chunk.
+
+we need to break up the problem space.
+
+so, we need to fix the code, to do this:
+
+SELECT * FROM moz_places WHERE h.frencency <> 0 ORDER BY h.frecency DESC LIMIT x OFFSET y
+
+This will ALWAYS break up the problem into chunks, which is how we prevent autocomplete from causing lag while typing in the url.
+
+Once we have those chunks, we THEN need to do check the h.title, h.url. and b.title of each result row, looking for a match.  (Note, this has to happen in C++, on each result, and not in SQL)
+
+Once we hit our max results, we can stop.  Otherwise we wait 100 ms (now a pref, thanks to you), and then we do the next "y" (LIMIT x OFFSET y)
+
+note, I think we want to go back to chunks of 100 once we make this fix.
+
+I don't think this is going to be too difficult to implement.
+
+does this all make sense?
+> SELECT * FROM moz_places WHERE h.frencency <> 0 ORDER BY h.frecency DESC LIMIT
+x OFFSET y
+
+not literally, of course.  it is more like this, notice what I am removing:
+
+113   nsCString sql = NS_LITERAL_CSTRING(
+114     "SELECT h.url, h.title, f.url, b.id, b.parent, b.title "
+115     "FROM moz_places h "
+116     "LEFT OUTER JOIN moz_bookmarks b ON b.fk = h.id "
+117     "LEFT OUTER JOIN moz_favicons f ON h.favicon_id = f.id "
+118     "WHERE h.frecency <> 0 AND ");
+119 
+120   if (mAutoCompleteOnlyTyped)
+121     sql += NS_LITERAL_CSTRING("h.typed = 1 AND ");
+
+
+#if 0
+
+123   // NOTE:
+124   // after migration or clear all private data, we might end up with
+125   // a lot of places with frecency = -1 (until idle)
+126   //
+127   // XXX bug 412736
+128   // in the case of a frecency tie, break it with h.typed and h.visit_count
+129   // which is better than nothing.  but this is slow, so not doing it yet.
+130   sql += NS_LITERAL_CSTRING(
+131     "(b.title LIKE ?1 ESCAPE '/' OR " 
+132      "h.title LIKE ?1 ESCAPE '/' OR "
+133      "h.url LIKE ?1 ESCAPE '/') "
+
+#endif 
+
+134     "ORDER BY h.frecency DESC LIMIT ?2 OFFSET ?3");
+
+
+
+> That was true back when we searched in "time chunks", but the way the query
+> works is. "We must get this many chunks before returning"
+
+you are right about how it used to work, I used the date to chunk, and did not use limit / offset, so that's why it didn't lag before.
+
+> I just tried 5 and it's pretty responsive even on a debug build.
+
+with a big enough places.sqlite, even if you use 1 as your chunk size, we will lag if the search term is no where to be found (see ddddd...ddd)
+
+We need to implement what I suggest in comment #8.  My apologies for just now realizing it!
+
+
+
+Seth: We can get chunking as I described earlier.
+
+SELECT .. FROM .. ORDER BY frecency DESC LIMIT .. OFFSET ..
+
+Then use that result to filter pages.
+
+One problem with this though is aHasMoreResults won't be right because potentially we hit a chunk that has no matches.
+
+We could then change |hasMore| to |needsMore| based on the maxResults.
+> Seth: We can get chunking as I described earlier.
+>
+> SELECT .. FROM .. ORDER BY frecency DESC LIMIT .. OFFSET ..
+
+if you are saying we can get chunking if we stop doing LIKE, then I we are staying the same thing.
+
+or are you saying something else?
+
+> One problem with this though is aHasMoreResults won't be right because
+> potentially we hit a chunk that has no matches.
+
+I think we can keep the code as is.  aHasMoreResults will still be set to true if we have more rows (whether or not any of the match.)
+
+the only time it is set to false is if we have our 25 matches, or we have no more rows.
+
+the second part of the fix I am suggesting (the first being we fix mDBAutoCompleteQuery, as described above) is to fix nsNavHistory::AutoCompleteFullHistorySearch()
+
+we need to do something like this:
+
+
+579   // Determine the result of the search
+580   while (NS_SUCCEEDED(mDBAutoCompleteQuery->ExecuteStep(&hasMore)) &&
+hasMore) {
+581     *aHasMoreResults = PR_TRUE;
+582     nsAutoString entryURL;
+583     rv = mDBAutoCompleteQuery->GetString(kAutoCompleteIndex_URL, entryURL);
+584     NS_ENSURE_SUCCESS(rv, rv);
+585 
+586     // prevent duplicates.  this can happen when chunking as we
+587     // may have already seen this URL from our tag search or an earlier
+588     // chunk.
+589     PRBool dummy;
+590     if (!mCurrentResultURLs.Get(entryURL, &dummy)) {
+591       nsAutoString entryTitle, entryFavicon, entryBookmarkTitle;
+592       rv = mDBAutoCompleteQuery->GetString(kAutoCompleteIndex_Title,
+entryTitle);
+593       NS_ENSURE_SUCCESS(rv, rv);
+594       rv = mDBAutoCompleteQuery->GetString(kAutoCompleteIndex_FaviconURL,
+entryFavicon);
+595       NS_ENSURE_SUCCESS(rv, rv);
+596       PRInt64 itemId = 0;
+597       rv = mDBAutoCompleteQuery->GetInt64(kAutoCompleteIndex_ItemId,
+&itemId);
+598       NS_ENSURE_SUCCESS(rv, rv);
+599 
+600       PRInt64 parentId = 0;
+601       // only bother to fetch parent id and bookmark title 
+602       // if we have a bookmark (itemId != 0)
+603       if (itemId) {
+604         rv = mDBAutoCompleteQuery->GetInt64(kAutoCompleteIndex_ParentId,
+&parentId);
+605         NS_ENSURE_SUCCESS(rv, rv);
+606         rv =
+mDBAutoCompleteQuery->GetString(kAutoCompleteIndex_BookmarkTitle,
+entryBookmarkTitle);
+607         NS_ENSURE_SUCCESS(rv, rv);
+608       }
+
+at this point, using CaseInsensitiveFindInReadable() see if
+mCurrentSearchString is in the url, page title or bookmark title.
+
+if we have a match, then:
+
+609 
+610       // don't show rss feed items as bookmarked,
+611       // but do show rss feed URIs as bookmarked.
+612       //
+613       // NOTE:  because we use mCurrentResultURLs to remove duplicates,
+614       // the first url wins.
+615       // so we might not show it as a "star" if the parentId we get first
+is
+616       // the one for the livemark item, and not the bookmark item,
+617       // we may not show the "star" even though we should.
+618       // XXX bug 412734
+619       PRBool isBookmark = (itemId && 
+620                            !mLivemarkFeedItemIds.Get(parentId, &dummy)) ||
+621                            mLivemarkFeedURIs.Get(entryURL, &dummy);  
+622 
+623       // new item, append to our results and put it in our hash table.
+624       nsCAutoString faviconSpec;
+625       faviconService->GetFaviconSpecForIconString(
+626         NS_ConvertUTF16toUTF8(entryFavicon), faviconSpec);
+627 
+628       // if the search string is in the bookmark title, show that in the
+629       // result (instead of the page title)
+630       PRBool matchInBookmarkTitle = itemId && 
+631         CaseInsensitiveFindInReadable(mCurrentSearchString,
+entryBookmarkTitle);
+632 
+633       rv = mCurrentResult->AppendMatch(entryURL, 
+634         matchInBookmarkTitle ? entryBookmarkTitle : entryTitle, 
+635         NS_ConvertUTF8toUTF16(faviconSpec), 
+636         isBookmark ? NS_LITERAL_STRING("bookmark") :
+NS_LITERAL_STRING("favicon"));
+637       NS_ENSURE_SUCCESS(rv, rv);
+638 
+639       mCurrentResultURLs.Put(entryURL, PR_TRUE);
+640 
+641       if (mCurrentResultURLs.Count() >= mAutoCompleteMaxResults) {
+642         *aHasMoreResults = PR_FALSE;
+643         break;
+644       }
+
+} else {
+
+this entry did not on page title, url, or bookmark title.
+
+}
+
+645     }
+646   }
+647 
+648   return NS_OK;
+649 }
+
+does that make sense?
+
+I was talking about doing the processing in SQL rather us manually with the select select.
+
+SELECT h.url, h.title .. FROM (SELECT h.url, h.title .. FROM moz_places.. WHERE h.frecency <> 0 ORDER BY h.frecency DESC LIMIT 50 OFFSET 100) WHERE h.url LIKE '%blah%'
+
+But I couldn't think of a good way to determine when we should stop searching because a chunk could return nothing either because nothing matched or we're at the end. In that case we could go with the code you originally had that SELECT COUNT(*) FROM moz_places WHERE ... and see if mCurrentChunk is past that.
+
+But I'll implement what you suggested with just grabbing everything in the chunk and filtering results ourself.
+> I was talking about doing the processing in SQL rather us manually with the
+> select select.
+
+Ah, now I get it, thanks for explaining with some SQL.
+
+> But I couldn't think of a good way to determine when we should stop searching
+> because a chunk could return nothing either because nothing matched or we're > at the end. 
+
+Right, that's the problem.
+
+> In that case we could go with the code you originally had that SELECT
+> COUNT(*) FROM moz_places WHERE ... and see if mCurrentChunk is past that.
+
+Right, we could do that to know when to stop.
+
+You are right, if we choose the right SQL and keep track of count ourselves, we could make SQL do the work for us.
+
+> But I'll implement what you suggested with just grabbing everything in the
+> chunk and filtering results ourself.
+
+I would recommend doing that first, as I claim it will be a simple fix.
+
+As for what our chunk size should be, let's do 100.  But we might be able to tune it *higher*.  Now it's a matter of "how long does it take to get <x> results from sql and do all the string compares?"
+
+As a spin off bug, we can deep dive into:  "if we switch to doing the work in SQL (as you describe above), how much does that improve perf?  if it improves perf, that allows us to increase chunk size, which is good (for reasons stated previously)."
+
+Note, I'm not 100% convinced that SQL LIKE vs what I suggest in C++ is necessarily a perf gain, as at some point both have to do the same number of string compares, right?
+Created attachment 299943
+v1.1
+
+Back to 100 default for use with bug 414507
+Comment on attachment 299943
+v1.1
+
+r=sspitzer, yes let's do 100 to start with.  thanks edward.
+Checking in browser/app/profile/firefox.js;
+/cvsroot/mozilla/browser/app/profile/firefox.js,v  <--  firefox.js
+new revision: 1.262; previous revision: 1.261
+done
+Checking in toolkit/components/places/src/nsNavHistory.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavHistory.cpp,v  <--  nsNavHistory.cpp
+new revision: 1.233; previous revision: 1.232
+done
+Checking in toolkit/components/places/src/nsNavHistory.h;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavHistory.h,v  <--  nsNavHistory.h
+new revision: 1.125; previous revision: 1.124
+done
+Checking in toolkit/components/places/src/nsNavHistoryAutoComplete.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsNavHistoryAutoComplete.cpp,v  <--  nsNavHistoryAutoComplete.cpp
+new revision: 1.35; previous revision: 1.34
+done
+Note: I probably won't be able to test this before this evening (European time).
+My observations with a 2008012904 nightly build on Linux:
+
+- I don't see any lag anymore (as far as I can determine), both typing when
+  results are found and when no results are found. Works really great now.
+
+- I hit bug 414581 a lot now, but that is probably expected.
+
+- Playing with the prefs introduced with this patch seems to have no effect
+  at all on the autocomplete behaviour for me. I set both prefs (timeout and
+  chunkSize) to crazy values like 10000 and still don't see any difference(?)
+
+- When forcing autocomplete to search the entire DB by searching for entries
+  that I know will result in fewer than 25 matches for the complete history,
+  it takes around 15 seconds to build the list incrementally (history size in
+  places.sqlite is slightly over 16000 entries). CPU is at 30-40% (2 GHz P4).
+
+
+Change default search chunk size and timeout and let users adjust them
+
+
+
+Bug 414489 - Change default search chunk size and timeout and let users adjust them. r=sspitzer, a1.9=mconnor 

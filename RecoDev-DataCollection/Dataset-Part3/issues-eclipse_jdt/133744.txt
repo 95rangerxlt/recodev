@@ -1,0 +1,247 @@
+The Sun apt tool implementation of the overrides() method in this interface returns true when the first parameter 'sub' denotes a concrete method that implements the second parameter 'sup' that is method defined in an interface. The JDT APT tool in eclipse returns false. Judging by the javadoc comment in the API (reproduced below), I'm assuming the Sun apt tool has the correct behavior:
+
+"When a non-abstract method overrides an abstract one, the former is also said to implement the latter."
+
+The Sun apt tool implementation of the overrides() method in this interface returns true when the first parameter 'sub' denotes a concrete method that implements the second parameter 'sup' that is method defined in an interface. The JDT APT tool in eclipse returns false. Judging by the javadoc comment in the API (reproduced below), I'm assuming the Sun apt tool has the correct behavior:
+
+"When a non-abstract method overrides an abstract one, the former is also said to implement the latter."
+Assigning to Tim Hanson. Tim, do you think this is related to the different type universes from JDT?
+Sounds like it is a a multi-verse bug.
+
+Doug, can you post a small sample that demonstrates the problem?
+
+For example:
+
+abstract class MyIterator implements Iterator {
+
+    @Implement(Iterator.class)
+    public boolean hasNext() {
+        return false;
+    }
+}
+
+I have an annotation processor that checks whether the above hasNext() method actually implements a method in java.utilIterator. It uses the com.sun.mirror AST to get a handle to a MethodDeclaration for this method and also for the method declared in Iterator. It then uses the Declarations object retrieved from the apt environment to test whether the method in MyIterator overrides the method in Iterator. The Sun apt tool implementation returns true, the JDT APT implementation returns false.
+Can you also post a simplified example of the code in your annotation processor that demonstrates the problem?
+
+The following method is at the core of my processor. It is used to check a given method (i.e. overridingMethod) against all the methods in its declaring class's interface hierarchy. The error occurs when 'type' is an InterfaceDeclaration instance.
+
+MethodDeclaration findOverridingMethod(
+    com.sun.mirror.declaration.MethodDeclaration overridingMethod,
+    com.sun.mirror.declaration.TypeDeclaration type)
+{
+    com.sun.mirror.utils.Declarations utils = utils();
+    for (MethodDeclaration method : type.getMethods()) {
+        if (utils.overrides(overridingMethod, method)) {
+            return method;
+        }
+    }
+    return null;
+}
+
+I can't really distill the bug down further than this. I hope it's enough to go on.
+In particular, what I am interested in is how you get the MethodDeclaration overridingMethod & the TypeDeclaration.
+
+I assume you get the method from getDeclarationsAnnotatedWith(implementsType) - yes? and then the type from method.getAnnotation(Implements.class).getValue().
+
+Is that true?
+Actually, the outer most loop in my processor is:
+
+AnnotationProcessingEnvironment env = ...;
+Collection<TypeDeclaration> typeDeclarations = env.getTypeDeclarations();
+    for (TypeDeclaration typeDeclaration : typeDeclarations) {
+        for (MethodDeclaration method : typeDeclaration.getMethods()) {
+             if (!method.getModifiers().contains(Modifier.STATIC)) {
+             ....
+        }
+    }
+}
+
+To walk up the superclass or interface hierachy of a method, I get its declaringType which is a TypeDeclaration instance. I then use the Types utility object (obtained from the environment) to convert this instance to a DeclaredType:
+
+    DeclaredType dt = typeUtils().getDeclaredType(method);
+
+Note that I do this for *every* declared method in the environment, whether it has a @Implement annotation or not (as I also would to detect the omission of the annotation). As such, annotation values and how I get a hold of them should have no bearing on why the implementation of Declarations.override() in JDT APT is behaving the way it is. Or am I missing something?
+Created attachment 38018
+decompiled class file
+
+I've attached the decompiled class file.
+(In reply to comment #8)
+> Created an attachment (id=38018) [edit]
+> decompiled class file
+> 
+> I've attached the decompiled class file.
+ 
+Is this an accidental post to the wrong bug? I'm not sure how it applies otherwise.
+Sorry. Yes, that was an accidental post to the wrong bug.
+
+This should be fixed now.
+(In reply to comment #11)
+> This should be fixed now.
+> 
+
+Which Eclipse download will include the fix? I have downloaded 3.2RC1 and my annotation processor still produces the same false negatives that aren't produced by Sun's apt. If possible, could you also list the sources that were involved in the fix. Thanks.
+It's fixed in HEAD. It's not in RC1, but it will be in RC2.
+Created attachment 46839
+Eclipse project demonstrating bug in JDT APT
+
+This Eclipse project shows that the JDT-APT still differs from the Sun implementation. The test.Test class uses an annotation which produces different errors by the annotations.ImplementChecker class depending on whether it's run under Sun's apt or Eclipse JDT-APT. It seems to have something to do with methods in transitively implemented interfaces being detected as overridden by one implementation and not by the other.
+The Sun apt and JDT-APT implementations of the following method still differ as shown by the previous attachment:
+
+com.sun.mirror.util.Declarations.overrides()
+I've repro'ed the bug and found the problem.
+
+The problem is that in the call to Types.getDeclaredType(..), when constructing a type from the declaration, we are not using the existing DOM pipeline to construct the new type. Since they are from different universes, they are not comparable.
+
+I'm working on a fix now.
+It turns out the simple solution doesn't work. I tried replacing the call to createASTs that was happening in this context with a call back into the open pipeline, and the results weren't the same.
+
+For example, the pipeline call just failed to handle the differing binding key that is created for a secondary type. It would also return null for valid types randomly. It's possible that it's also not handling the generic type bindings.
+
+Assigning to Walter for further investigation with the jdt.core team.
+Created attachment 46906
+Proposed patch
+
+Here is the patch. This fixes the bug with the following caveat:
+
+1) It does not work with calls to getTypeDeclaration() when the DeclaredType is: (Generic) and (either a member type or a secondary type)
+
+ie, this will work as long as ExtraIterator is moved into its own file. The failures mentioned above are due to JDT bugs. I will open seperate bugzilla entries for them.
+Committed to HEAD; needs to be integrated to 3.2.x.
+
+See Bug 152060 for the underlying JDT BindingKey problem.
+Merged into 3.2.1 and released.
+Can you please explain how I determine which Eclipse download will contain this fix? After seeing that it's "merged into 3.2.1 and released", I am downloading the M20060726-0800 version (Stream Maintenance Build) as I can't see a build explicitly labeled 3.2.1. However, I suspect that this does not contain the fix for this bug as it is not mentioned in the build notes under jdt-core for this build.
+Hi, Doug.  What "released" means in this context is that I've updated the files that the Eclipse build engine uses to decide what file versions to sync to when it builds a plug-in.  So, the changes will be picked up by the next 3.2 maintenance build.
+
+The 3.2 maintenance build schedule is down at the very bottom of http://www.eclipse.org/eclipse/platform-releng/buildSchedule.html.  It shows the builds happen on Wednesday mornings.  So, you should be able to pick this up late on Wednesday.  It's not there yet.  If you need it sooner, another possibility would be to get the latest code for the org.eclipse.jdt.apt.core plug-in from CVS and build it yourself.  Send me some email if you want to pursue this path and need instructions.
+Thanks. I've downloaded the latest maintenance build and it appears as
+though the bug has been *mostly* fixed. However, there is still some
+kind of issue with generic code. The annotation processor I submitted
+with the bug report now does just fine with this class:
+
+class FlatteningIterator implements Iterator {
+    
+    private Iterator _outerIterator;
+    private Iterator _innerIterator;
+    
+    private FlatteningIterator(final Iterable iterable) {
+        _outerIterator = iterable.iterator();
+    }
+    
+    @Implement(Iterator.class)
+    public boolean hasNext() {
+        while (_innerIterator == null || !_innerIterator.hasNext()) {
+            if (!_outerIterator.hasNext()) {
+                return false;
+            }
+            _innerIterator =
+               ((Iterable) _outerIterator.next()).iterator();    
+          
+        }
+        return true;
+    }
+    
+    @Implement(Iterator.class)
+    public Object next() {
+        if (!hasNext()) {
+            return null;
+        }
+        return _innerIterator.next();
+    }
+    
+    @Implement(Iterator.class)
+    public void remove() {
+        throw new UnsupportedOperationException();
+    }
+}
+
+But shows false negatives (i.e. says the 3 annotated methods do not
+implement any methods in Iterator) with this class:
+
+class GenericFlatteningIterator<Element_Type> implements
+Iterator<Element_Type> {
+    
+    private Iterator<Iterable<Element_Type>> _outerIterator;
+    private Iterator<Element_Type> _innerIterator;
+    
+    private GenericFlatteningIterator(final
+Iterable<Iterable<Element_Type>>
+iterable) {
+        _outerIterator = iterable.iterator();
+    }
+    
+    @Implement(Iterator.class)
+    public boolean hasNext() {
+        while (_innerIterator == null || !_innerIterator.hasNext()) {
+            if (!_outerIterator.hasNext()) {
+                return false;
+            }
+            _innerIterator = _outerIterator.next().iterator();
+
+        }
+        return true;
+    }
+    
+    @Implement(Iterator.class)
+    public Element_Type next() {
+        if (!hasNext()) {
+            return null;
+        }
+        return _innerIterator.next();
+    }
+    
+    @Implement(Iterator.class)
+    public void remove() {
+        throw new UnsupportedOperationException();
+    }
+}
+
+
+This seems to indicate that there is still a problem with the JDT-APT
+implementation of com.sun.mirror.util.Declarations.overrides() as it is
+the core of my annotation processor.
+Created attachment 48337
+Anno processor plug-in project
+Created attachment 48338
+Target code for processor
+Created attachment 48341
+Patch that uses correct parser
+A concise repro for the remaining problem:
+=============================================
+1. Import the attached "types" plug-in project into a workspace.  It contains an annotation processor which checks whether an annotated type happens to contain a method that overrides Iterator.hasNext().  Run or debug the plug-in as an Eclipse application.
+
+2. In the target Eclipse instance, import the attached "foo" Java project into the workspace.  It contains an annotation declaration, and a trivial Java class that implements Iterator<T>.
+
+3. Watch the console output of the host Eclipse instance, as the "foo" project is built and/or reconciled.  Note that the answer should always be "does override".
+
+In Eclipse 3.2GA, the results are:
+
+Phase = RECONCILE
+Original type declaration test.Test does NOT override hasNext()
+Converted type declaration test.Test does NOT override hasNext()
+Phase = BUILD
+Original type declaration test.Test does override hasNext()
+Converted type declaration test.Test does NOT override hasNext()
+
+
+In Eclipse 3.2 M20060810, which contains the fix that originally resolved this bug, the results are:
+
+Phase = RECONCILE
+Original type declaration test.Test does NOT override hasNext()
+Converted type declaration test.Test does override hasNext()
+Phase = BUILD
+Original type declaration test.Test does override hasNext()
+Converted type declaration test.Test does override hasNext()
+
+
+The remaining fix:
+====================
+The cause is that the AST we get from ReconcileContext.getAST3() creates type bindings that are not comparable with the type bindings that come from the ASTRequestor pipeline that we open in the APT reconcile environment.
+
+The fix is to avoid calling ReconcileContext.getAST3() to get an AST root, and instead use the same parser that we create in openPipeline().
+
+I've attached a patch that achieves this.  I'd like to lobby to get this included in 3.2.1, even though it is late in the game, because this problem is going to affect pretty much anyone who does anything interesting with the results of Env.getTypeDeclarations().
++1 to fix for 3.2.1. This is a small change that fixes an incompatibility between reconcile and build.
+I would also obviously liked to see this fixed in 3.2.1. However, I'm wondering how useful it is to have this fixed without having bug 151364 fixed as I am now having my annotation processor fail due to that bug. I'm starting to suspect that these two bugs are closely related somehow. The reason for this is that I have to guard against a null entry when iterating over the result of Env.getTypeDeclarations(). I don't know how this could happen but maybe it's related to the NullPointerException in bug 151364.
+Fixed in HEAD - need to fix in 3.2.1 and update map files.
+Fixed in both HEAD and R3_2_1; updated map files in both branches.

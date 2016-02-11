@@ -1,0 +1,215 @@
+In an email, Asa suggested we could cache the toolbar notification icons so they can be displayed immediately at startup rather than waiting for the provider to provide them.  IIUC, the main issue with the current state is one of perception - that the current implementation made startup seem slow.  This bug is to track that idea and either implement it, or reject it!
+
+This should be feasible - the biggest issue is probably that the data will be stale at startup.  eg:
+
+1) the icons may indicate (say) unread messages, but they are no longer unread - so the state of the buttons will not immediately match the state of the content in the panel.
+
+2) the panel URL may be specific to the "current state".  Eg, imagine the provider specifies a URL like ".../show_messages.html?msg_ids=5,12,18", but these messages have been deleted - the panel may end up showing an error state, be blank or otherwise not be what the user expects.
+
+Note that for at least one of our providers, (2) isn't a problem in practice - the URL they send for the content panels is the same regardless of the state of the icons (ie, the same URL is specified whether there are unread messages or not).  Also, in both cases, we can expect the "correct" state to be reflected fairly quickly - ie, the incorrect state will only persist for as long as there are *no* icons currently.
+
+In an email, Asa suggested we could cache the toolbar notification icons so they can be displayed immediately at startup rather than waiting for the provider to provide them.  IIUC, the main issue with the current state is one of perception - that the current implementation made startup seem slow.  This bug is to track that idea and either implement it, or reject it!
+
+This should be feasible - the biggest issue is probably that the data will be stale at startup.  eg:
+
+1) the icons may indicate (say) unread messages, but they are no longer unread - so the state of the buttons will not immediately match the state of the content in the panel.
+
+2) the panel URL may be specific to the "current state".  Eg, imagine the provider specifies a URL like ".../show_messages.html?msg_ids=5,12,18", but these messages have been deleted - the panel may end up showing an error state, be blank or otherwise not be what the user expects.
+
+Note that for at least one of our providers, (2) isn't a problem in practice - the URL they send for the content panels is the same regardless of the state of the icons (ie, the same URL is specified whether there are unread messages or not).  Also, in both cases, we can expect the "correct" state to be reflected fairly quickly - ie, the incorrect state will only persist for as long as there are *no* icons currently.
+We don't need to do anything fancy for the provider icon, since it can be a data URI in the manifest.
+
+The other icons could also be added to the manifest, requiring a spec change, but one that would help us on first-run experience.
+
+This makes the Social feature less flexible, but the current flexibility may be too much.
+
+I wouldn't mind us changing our manifest to specify the number of ambient-notification buttons as well as their icons. This would allow data URIs to be used in all of those places, and takes care of the caching inherently.
+
+WRT #2, we shouldn't cache the panel contents. They're loaded in the background and unless a user clicks the button while the browser is starting up they won't notice any slowness.
+(In reply to Jared Wein [:jaws] from comment #1)
+> We don't need to do anything fancy for the provider icon, since it can be a
+> data URI in the manifest.
+
+Yeah, and is very likely to be "http cached" anyway.  That icon does indeed appear immediately in my testing.
+
+> The other icons could also be added to the manifest, requiring a spec
+> change, but one that would help us on first-run experience.
+
+I'm not sure that is necessary.  I think all we need to do is capture the exact JSON data sent by a provider, store it (in a pref?) and eagerly use it at startup.  Non 'data:' image URLs are still likely to be cached and data: urls will obviously serialize fine.
+
+> WRT #2, we shouldn't cache the panel contents.
+
+Agreed.  I'm suggesting we just "pref cache" the URL location and let the "http cache" do its thing - that URL might be "stale", but as you say, the user probably won't click on it until we've got fresh data from the provider.
+Created attachment 660700
+Cache providers notifications
+
+This is a simple localized patch that caches the most recent set of notifications into preferences.  It has no tests and could be optimized, but it does have the effect of showing all toolbar notification icons as soon as the provider's icon is drawn.
+Comment on attachment 660700
+Cache providers notifications
+
+Review of attachment 660700:
+-----------------------------------------------------------------
+
+I don't think we should be caching the ambient notification icons like this. With our current API, there is no way for a provider to use different icons when these are cached (bug 791615).
+
+Mark, let's change the API to require notification icons to be specified in the manifest and remove the ability to add/remove toolbar icons dynamically. That seems the simplest way to fix this perf bug while also being explicit about the stability of the toolbar buttons.
+(In reply to Jared Wein [:jaws] from comment #4)
+> I don't think we should be caching the ambient notification icons like this.
+> With our current API, there is no way for a provider to use different icons
+> when these are cached (bug 791615).
+
+I don't see why that is the case.  New icons will be picked up as soon as they initialize.
+
+Further, adding them to the manifest will actually make things worse until we implement polling for changes to the manifest (which we currently don't have IIUC).
+
+> Mark, let's change the API to require notification icons to be specified in
+> the manifest and remove the ability to add/remove toolbar icons dynamically.
+> That seems the simplest way to fix this perf bug while also being explicit
+> about the stability of the toolbar buttons.
+
+My concern with this approach is that the icons will appear on the toolbar, but there is no content we have to show when they are clicked (and adding the content URLs to the manifest would be too inflexible and prevent providers using dynamic URLs).  The approach in this bug will mean we have *both* icons *and* content we can load into the panel before the provider has finished initialization, and totally fresh icons and content once initialization is complete.
+
+Personally, I think adding them to the manifest is too big of a stick with minimal gains.
+Comment on attachment 660700
+Cache providers notifications
+
+After talking about this more over IRC I'm fine with this change (http://pastebin.mozilla.org/1828260). 
+
+Felipe, can you take a look at this patch and provide any input you have?
+Comment on attachment 660700
+Cache providers notifications
+
+Talked to Asa about the correctness issue related to displaying the icons on startup before the worker can authenticate the user. The conclusion is that for now we should cache the icons but not include the counters. If there is feedback that this causes the experience to be worse than no caching we can undo this bug. 
+
+I'll also file a separate bug to include an api for the provider to explicitly tell if a user is gonna be be authenticated across sessions, but this will not be targeted for Fx17.
+The problem we have with this approach is the logged out state:  ie:
+
+* User closes browser while logged in, so icons are cached.
+* User restarts browser, we restore icons from the cache.
+* User session has expired, so provider never responds with profile information, so we never adjust icons.
+
+There is no point at which we know the user is not logged in, so we never remove the cached icons.  The provider tells us when the user *is* logged in, but doesn't tell is when they are not - so it is impossible for us to tell the difference between "provider is still initializing and will notify us of the profile soon" vs "provider has finished initializing but the user is not logged in"
+
+One option here would be to insist the provider always callback with the profile notification, but they supply null when logged out.
+Created attachment 668363
+updated
+
+An updated version that tries to be more robust.  Note this also fixes the unreported bug that the toolbar notifications are not removed on logout.  Main changes:
+
+* The default for provider.profile is now 'undefined' - this is so we can differentiate "provider gave null for profile" vs "provider hasn't told us anything yet".
+
+* If we have no icons from the provider and provider.profile is undefined, we use any cached values.
+
+* If we are not logged in, we nuke both the icons and the cache.
+
+* Otherwise we are in the "normal" case so we draw the icons and save them to the cache.
+
+I'm not that happy with the code that deletes the icons - it needs to skip over the first as that is the provider icon itself.
+
+Seems to work fine in my late-friday-night testing - it is now beer o'clock for me :)
+Comment on attachment 668363
+updated
+
+Needs more love
+Created attachment 668728
+updated
+
+I managed to confused myself in the last patch :)  Icons are being removed on logout - the first version of the patch broke that.
+
+Note that no current providers send a null profile at startup when the user is logged out, so icons are never removed if you exit when logged in but are logged out by the time things restart - but when the providers do get around to notifying of not being logged in at startup things should all work correctly
+Comment on attachment 668728
+updated
+
+Review of attachment 668728:
+-----------------------------------------------------------------
+
+Awesome!  Let's just explain in the comments a bit more the null/undefined difference. It's the perfect distinction of null/undef but it's tricky to figure out just by looking at the code
+
+::: browser/base/content/browser-social.js
+@@ +608,5 @@
+>  
+>      let command = document.getElementById("Social:ToggleNotifications");
+>      command.setAttribute("checked", Services.prefs.getBoolPref("social.toast-notifications.enabled"));
+>  
+> +    const CACHE_PREF_NAME = "social.cached.notificationIcons";
+
+let's add a comment here explaining the difference of null/undefined
+
+@@ +625,5 @@
+> +      try {
+> +        cached = JSON.parse(Services.prefs.getCharPref(CACHE_PREF_NAME));
+> +      } catch (ex) {
+> +        ;
+> +      }
+
+the style is usually just  "} catch (ex) {}"
+
+::: toolkit/components/social/SocialService.jsm
+@@ +206,5 @@
+>    // Properties:
+>    //   iconURL, portrait, userName, displayName, profileURL
+> +  // A value of null or an empty object means 'user not logged in'.
+> +  // A value of undefined means the service has not told us the status of the
+> +  // profile, but is expected to soon (ie, the service is still loading/initing)
+
+Let's also explain here why this distinction exists (where it's used).
+
+@@ +211,1 @@
+>    // See https://github.com/mozilla/socialapi-dev/blob/develop/docs/socialAPI.md
+
+should probably keep this docs url above the added comment block
+Comment on attachment 668728
+updated
+
+Review of attachment 668728:
+-----------------------------------------------------------------
+
+::: toolkit/components/social/SocialService.jsm
+@@ +211,1 @@
+>    // See https://github.com/mozilla/socialapi-dev/blob/develop/docs/socialAPI.md
+
+This doc URL should be updated to https://developer.mozilla.org/en-US/docs/Social_API
+https://hg.mozilla.org/integration/mozilla-inbound/rev/3cf86586da0d
+Comment on attachment 668728
+updated
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): n/a
+User impact if declined: The social feature will appear sluggish on browser restart.
+Risk to taking this patch (and alternatives if risky): Risks are limited to the social api functionality.
+String or UUID changes made by this patch: None
+Comment on attachment 668728
+updated
+
+>diff --git a/toolkit/components/social/SocialService.jsm b/toolkit/components/social/SocialService.jsm
+
+>   // workerAPI via updateUserProfile. Null if the provider has no FrameWorker.
+
+^ this comment is now wrong
+
+>   // Properties:
+>   //   iconURL, portrait, userName, displayName, profileURL
+>+  // A value of null or an empty object means 'user not logged in'.
+>+  // A value of undefined means the service has not told us the status of the
+>+  // profile, but is expected to soon (ie, the service is still loading/initing)
+>   // See https://github.com/mozilla/socialapi-dev/blob/develop/docs/socialAPI.md
+>-  profile: null,
+>+  profile: undefined,
+https://hg.mozilla.org/mozilla-central/rev/3cf86586da0d
+Adjusted the comment:
+https://hg.mozilla.org/integration/mozilla-inbound/rev/a4bc614f4092
+Created attachment 669062
+aurora patch
+
+(includes the comment fix)
+https://hg.mozilla.org/releases/mozilla-aurora/rev/c7c6f2aa37b6
+https://hg.mozilla.org/mozilla-central/rev/a4bc614f4092
+
+
+cache toolbar notification icons for faster rendering at startup?
+
+
+
+Bug 790545 - cache provider's toolbar notification icons.  r=felipe 
+
+Adjust comment from bug 790545's patch 

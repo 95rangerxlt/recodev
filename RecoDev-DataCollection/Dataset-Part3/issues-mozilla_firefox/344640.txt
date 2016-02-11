@@ -1,0 +1,248 @@
+Session managing extensions can't really take advantage of SessionStore if there's no way for them to get the collected session data (all-in-one and per-window) and restore it. The code is mostly there, so this is rather a question of refining and exposing it.
+
+Session managing extensions can't really take advantage of SessionStore if there's no way for them to get the collected session data (all-in-one and per-window) and restore it. The code is mostly there, so this is rather a question of refining and exposing it.
+As for the problem how to pass the session data around (since I haven't seen yet a way of passing pure JS objects through XPCOM):
+
+What about specifying the passed value to be an nsISupports which has the object set as wrappedJSObject? Passing the object would then be as "simple" as writing { wrappedJSObject: obj } instead of obj, resp obj.wrappedJSObject instead of obj on the receiver end.
+That would make usage simpler, though using .wrappedJSObject seems kludgey. Before we do this for an API that is expressly targeted at extension authors, I'd like to get comment on whether we should set this precedent for passing JS objects through XPCOM. When we did this for getClosedTabData (bug 342700), mconnor said that there might be cleaner way of doing this. Mr. Connor, did you have thoughts on this?
+Drivers: Without a patch to this, the new SessionStore service won't be of much use for session managing extensions (they'd have to disable it and still ship their own).
+Created attachment 230545
+restore apis
+
+For the most part this exposes the APIs that were already in the code. I changed the state properties to methods so that it's a tad clearer to the caller that immediate action will occur. If there's a better way to move the JS objects to and fro through XPCOM than wrappedJSObject, holler.
+You seem to have gotten some tabs and mixed line endings into your code/patch. And the IDL comments still refer to strings where they should refer to wrapped JS objects.
+
+Then it might be worth considering a third parameter for setWindowState which allows to append tabs to a window (or alternatively add another method to this end). This would allows extensions to very cheaply implement tab duplication, window merging, moving tabs between windows, storing tab state in bookmarks, etc.
+Created attachment 230637
+issues fixed, added param for overwrite
+
+(In reply to comment #5)
+> You seem to have gotten some tabs and mixed line endings into your code/patch.
+> And the IDL comments still refer to strings where they should refer to wrapped
+> JS objects.
+
+fixed, fixed
+
+> Then it might be worth considering a third parameter for setWindowState which
+> allows to append tabs to a window (or alternatively add another method to this
+> end). This would allows extensions to very cheaply implement tab duplication,
+> window merging, moving tabs between windows, storing tab state in bookmarks,
+> etc.
+
+Sounds good, added.
+So, is this API really supposed to be used only from javascript context?
+(In reply to comment #7)
+> So, is this API really supposed to be used only from javascript context?
+
+AFAICT the alternatives are to either pass the JavaScript objects as source strings and call them "JSON strings" (which can easily be (un)eval'd from JS and Python) or to get a whole bunch of APIs which mirror basic JavaScript object manipulation. Considering that at least a basic API should go into Firefox 2, it's probably already too late for the latter though.
+Please do file a bug on the latter (cc me please), the proposed solution here is sub-optimal, I realize it's already way too late for the 2.0...
+Comment on attachment 230637
+issues fixed, added param for overwrite
+
+r=me, need to rev the GUID
+Comment on attachment 230637
+issues fixed, added param for overwrite
+
+Shaver, if you're satisfied that this gives extension authors what they need, please just SR this. Thanks!
+Standardizing on JSON as a string here would be better and clearer than the .wrappedJSObject indirection, I think, especially if someone writes a nice little utility to go from a property bag to a JSON string and back the other way.
+
+Have to look some more at this, but it doesn't seem like there's a way for an extension (or other part of the chrome, for that matter) to participate in the session restore process usefully.
+
+For example, there doesn't seem to be a way that Firebug could store some per-tab state (as simple as "am I open here?" and going up to fully serialized watchpoint/etc. state) and interrogate it on session restore, nor a way for Firebug to even find out that such a restore would happen.  Even if we restrict it to string keys and values, it would be pretty desirable that such extensions not need to get, mutate, and re-set the full JS object state -- especially from C++, or, heaven help them, Java.
+
+Are there any rules about which threads the restore service can be called from, or on which it would notify observers that a session restore had been completed (or cancelled, in the crash-dialog case)?  If so, we should at least document them here, so that we can make sure they make sense.
+Comment on attachment 230637
+issues fixed, added param for overwrite
+
+Oh yeah, have I mentioned how hot the test case being  here makes me?  Rawr!
+(In reply to comment #12)
+> For example, there doesn't seem to be a way that Firebug could store some
+> per-tab state (as simple as "am I open here?" and going up to fully serialized
+> watchpoint/etc. state) and interrogate it on session restore, nor a way for
+> Firebug to even find out that such a restore would happen.
+
+There is: the per tab/window value part of the API was already checked in in bug 332774; and session restore notifications ("SSTabRestoring" before content is loaded and "SSTabRestored" afterwards) were included in the original check in.
+
+If you think that this is enough, I'll attach a patch using JSON strings later this week.
+Yeah, that sounds like a fine approach.  Not sure if "later this week" is going to work for a patch, but that's more mconnor's department.
+Created attachment 231511
+the same API with (w)strings
+
+There you go: everything returned and accepted is a string as returned by any JS object's toSource. I've additionally for consistency converted getClosedTabData to also use the same format and furthermore changed all strings to wstrings (otherwise we might get unexpected results when passing unicode data).
+
+As for JSON - we're currently close, but not completely there, because our toSource implementation doesn't really adhere to that standard. For JS callers this isn't needed, so I'd prefer leaving that bit to another bug for after beta 2 (it should mostly be a case of s/([\s\{])(\w+):/$1"$2":/g to ensure that all keys are enclosed in quotes - but I'd prefer to have somebody else verify that this indeed is enough first).
+Comment on attachment 231511
+the same API with (w)strings
+
+We should use AString instead of wstring here, and ACString instead of string.  Can you also file a follow-up on the proper JSONification, so that we can get that done before final as well?  Calling "eval" makes me a little nervous, given our history of imperfect storage cleanliness.  Can we just use one of Crockford's JSON functions here and breathe a little easier?
+Created attachment 231832
+API with AStrings
+
+I'd prefer to see how to best protect us from eval in bug 347078 (Crockford applies a RegExp I don't feel like deciphering right now).
+Created attachment 232034
+JSON-ified API
+
+This patch already fixes bug 347078 as well: SessionStore now returns and accepts correct JSON strings (technically it even accepts a super-set of JSON, leading to the nice result that JavaScript code can use toSource instead of having to implement toJSONString). I'd stick with using plain eval for code directly returned from SessionStore since I don't see why we shouldn't trust our own implementation. OTOH SessionStore uses a sandbox for evaluating JSON input anyway.
+(In reply to comment #19)
+> I'd stick with using plain eval for code
+> directly returned from SessionStore since I don't see why we shouldn't trust
+> our own implementation. OTOH SessionStore uses a sandbox for evaluating JSON
+> input anyway.
+
+We should prefer using a well-tested and known-robust JSON routine in order to protect against bugs in our implementation, or other sources of possibly-malign data corruption.  We've had bugs in the past about sites being able to trick us into storing improper data in things like localstore.rdf, which in this case could permit a minor bug like "site can screw up scroll-bar position via XBL4 override" to escalate into "site can run code as chrome if they can crash the browser".  Defense in depth, please, especially where we can achieve it by reusing existing, solid code.
+(In reply to comment #20)
+> We should prefer using a well-tested and known-robust JSON routine in order to
+> protect against bugs in our implementation, or other sources of possibly-malign
+> data corruption.
+
+Would you be satisfied with adding the following sanitation test used by Crockford's parseJSON method directly to our own _toJSONString?
+
+/[^,:{}\[\]0-9.\-+Eaeflnr-u \n\r\t]/.test(
+  JSONString.replace(/"(\\.|[^"\\])*"/g, "")
+)
+
+This would guarantee that we indeed emit correct JSON and would make it unnecessary for our consumers to verify that code themselves (unless they don't eval it right after calling the API). The only thing that could happen then would be that the strings is garbled through XPCOM but if that happens, we've probably got worse problem than an eval gone wild.
+
+As for the other way around, using the above sanitation would make things much harder for API consumers since they couldn't use the toSource/safeEval pattern anymore. Do we really distrust our own JS-Sandbox implementation that much (if we do, we'd have to change SessionStore's file format again)?
+(In reply to comment #21)
+> (In reply to comment #20)
+> As for the other way around, using the above sanitation would make things much
+> harder for API consumers since they couldn't use the toSource/safeEval pattern
+> anymore.
+
+I agree with Simon here. These APIs should allow extension authors to easily and intuitively interact with core features. Requiring extension authors to fetch and use external JSON routines increases the burden on those authors, and muddies the extension ecosystem (We use JSON internally but don't provide tools for extension authors to do so?!). We should move to true JSON APIs when the core has true JSON support, and use the existing solution until then.
+
+(In reply to comment #22)
+> I agree with Simon here. These APIs should allow extension authors to easily
+> and intuitively interact with core features. Requiring extension authors to
+> fetch and use external JSON routines increases the burden on those authors, and
+> muddies the extension ecosystem (We use JSON internally but don't provide tools
+> for extension authors to do so?!). We should move to true JSON APIs when the
+> core has true JSON support, and use the existing solution until then.
+
+Why can't extension authors use the same JSON stuff?  Put it in a utils include if you want, but using a standard format means that it can be consumed and produced by, f.e., the usual mechanisms in other languages (there exist libraries for C++ and Python, in addition to everything else), and it means that we don't need to document the format except by reference to the existing docs and libraries.
+
+Copying in a known snippet of JS from crockford.com is the _least_ of an extension author's worries when it comes to easily interacting with our system, I'm sure, and we don't have to maintain it independently. :)
+Why force extension authors to use more code than really necessary (or to rewrite Crockford's code independently because it doesn't look like anything a half-way confident author would copy&paste willingly)?
+
+The patch I propose emits pure JSON and accepts pure JSON, so API consumers can use as much JSON code as they wish. But it happens to accept also toSource'd JS objects which can make an extension author's life simply simpler.
+
+Now you insist that there are security issues when eval'ing JS code. That happens at two places:
+
+(1) Right after a JS API consumer gets the JSON string. I've already proposed to even do the sanity check for them. So in the end they'll simply have to trust XPCOM that it correctly transfers the string. However if we can't ensure this we have worse issues.
+
+(2) When we get a string back (JSON or otherwise) we eval it in a sandbox which has been created specifically for this purpose. If we can't trust that one, we better rip it out so that extension authors don't feel overconfident (think Greasemonkey) - and we'll have to use JSON or a different format internally as well.
+
+Of course, insisting on using Crockford's JSON methods is simpler (although how well proven are they really?) - but why do it the hard way?
+
+Consider the following JS:
+
+// duplicate any tab into this window's tabbrowser
+gBrowser.duplicateTab = function(aTab) {
+  var ss = Cc["@mozilla.org/browser/sessionstartup;1"].
+           getService(Ci.nsISessionStartup);
+  // get the state of the tab's window
+  var state = ss.getWindowState(aTab.ownerDocument.defaultView);
+  state = eval("(" + state + ")");
+  // purge all but the given tab from the state object
+  state.tabs = state.tabs.splice(aTab._tPos, 1);
+  // append that tab's state to the current window
+  ss.setWindowState(window, state.toSource(), false);
+  // do some magic to return the newly created tab
+  return document.getAnonymousElementByAttribute(this,
+    "linkedpanel", this.mPanelContainer.lastChild.id);
+};
+
+Code that simple could be added as a custom button or a keyconfig macro. That quite surely won't happen when JSON becomes an absolute requirement...
+
+Anyway, your mozilla.org and I'm not - so if you still don't agree, feel free to reassign this bug to Dietrich.
+BTW: The above JS doesn't work with the current proposal. Use state.windows[0].tabs instead of state.tabs. The question is:
+* do we want getWindowState to return a complete state object (as we get one from getBrowserState) which would allow to directly restore it as single window session at a later point
+* should we rather return only the window state object itself which makes tab handling slightly more obvious (cf. the example above) but will require "{ windows: [" + JSON_state + "] }" whenever we need a complete session state (e.g. for setBrowserState and for the internal restoreWindow method called from setWindowState )?
+
+Which might confuse API consumers less?
+Comment on attachment 232034
+JSON-ified API
+
+r=me, but shaver's going to be the best at covering the security implications here.
+Comment on attachment 232034
+JSON-ified API
+
+The analogy with Greasemonkey is flawed, because the choice of evalInSandbox principal here grants file: rights to the code that's run in in the sandbox.  It has nothing to do with me "being mozilla.org", I'm just the guy who was asked to review this, and I happen to be the original author of evalInSandbox, so I'm quite sensitive to its limitations (oft-lamented, especially by mrbkap).
+
+As I said above, though, I don't see why the parseJSON/toJSONString methods -- what are they going to be called in JS2, again? -- can't be easily made available to extension authors via an easily-accessible "include".  (Crockford's code is quite well-analyzed and tested, FWIW.)
+
+I'll sr= here, conditional on a test that shows that deserialized session values can't take advantage of their file: blessing.
+
+I believe that we should look forward rather than back with these APIs, and anticipate the coming parseJSON/toJSONString natives, so thank you for your indulgence in the generated format.
+Created attachment 233744
+JSON-ified API (security update)
+
+(In reply to comment #27)
+> The analogy with Greasemonkey is flawed, because the choice of evalInSandbox
+> principal here grants file: rights to the code that's run in in the sandbox. 
+
+True. OTOH we don't need file: rights at all, so changing the Sandbox' principal to about:blank should help here (which I've done, please notify me in case there's a cleaner way for having a sealed off sandbox).
+
+> I'll sr= here, conditional on a test that shows that deserialized session
+> values can't take advantage of their file: blessing.
+
+With that blessing taken away, this test is no longer necessary.
+mozilla/browser/components/sessionstore/nsISessionStore.idl 	1.7
+mozilla/browser/components/sessionstore/nsISessionStartup.idl 	1.2
+mozilla/browser/base/content/browser.js 	1.694
+mozilla/browser/components/sessionstore/src/nsSessionStore.js 	1.42
+Created attachment 235776
+fixes History RCT menu regression
+
+This fixes a regression from the API patch, which broke population of the History Recently-closed-tabs menu.
+(In reply to comment #30)
+> This fixes a regression from the API patch, which broke population of the
+> History Recently-closed-tabs menu.
+
+What kind of regression is this. STR?
+
+>+    for (var i in undoItems) {
+
+Please never treat arrays as hashes without a very good reason: What makes sure that (1) you iterate the keys in the correct numerical order and (2) that no extension extends the Array prototype?
+Comment on attachment 235776
+fixes History RCT menu regression
+
+Ugh, never mind. This was actually a problem caused by a different patch in my tree.
+Comment on attachment 233744
+JSON-ified API (security update)
+
+a=mconnor on behalf of drivers for checkin to 1.8 branch
+Sorry for the mixed messages on this, but the regression I mentioned earlier is not just in my local tree. The problem is that the History RCT menu is never populating, instead dumping this error to the console:
+
+Warning: reference to undefined property undoItems.length
+Source File: chrome://browser/content/browser.js
+Line: 6943
+
+Simon, have you seen this error before?
+
+I'm batting -1000 today, so it'd be great someone else could verify this. STR:
+
+1. start Minefield
+2. open a tab, then close it
+3. open Tools/Recently Closed Tabs, note that there are no entries
+
+I could reproduce this on the trunk cvs, trunk nightly, and on branch cvs (after applying this patch). Attachment 235776 fixes the problem, but as Simon noted, it needs some work still.
+Created attachment 235883
+wallpaper patch for bug 350558
+
+(In reply to comment #34)
+To reproduce you'll need one further step:
+0. Set Minefield to resume the previous session at startup.
+
+The issue seems to be that saveEval'd arrays aren't instanceof Array which makes the toJSONString code wrongly return it as an object (see bug 350558). AFAICT this only has an effect in the case of copying the list of recently closed tabs over (all other results of saveEval are either used internally without instanceof checking or are pure string values). This wallpaper patch fixes that issue without doing anything dangerous - we just create a copy of the array through slicing it.
+
+A more complete patch might consist in uneval&eval'ing the object returned by evalInSandbox (which would guarantee all arrays to be instanceof Array), but we should be able to do without - especially since one of the points of safeEval is that we don't have to call |eval| itself.
+Comment on attachment 235883
+wallpaper patch for bug 350558
+
+Drivers: This low risk patch fixes a regression introduced by this bug which broke the Recently Closed Tabs list after resuming a session. While not fixing the underlying issue (which is bug 350558), this patch ensures that the list of closed tabs is in all places correctly recognized as a JS array.
+Comment on attachment 235883
+wallpaper patch for bug 350558
+
+a=beltzner on behalf of 181drivers

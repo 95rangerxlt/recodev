@@ -1,0 +1,298 @@
+Created attachment 8602417
+move social error listener to content script
+
+SocialErrorListener uses webnav.  moving into a content script makes this work better, also simplifies usage.
+
+Created attachment 8602417
+move social error listener to content script
+
+SocialErrorListener uses webnav.  moving into a content script makes this work better, also simplifies usage.
+Created attachment 8602421
+move social error listener to content script
+
+get the right patch
+Comment on attachment 8602421
+move social error listener to content script
+
+Review of attachment 8602421:
+-----------------------------------------------------------------
+
+This looks like a nice improvement, but I'd like to see how this grow to handle the different modes current used (and I doubt we want to unify or change them). Also I'm a little confused how all the tests pass?
+
+::: browser/base/content/browser-social.js
+@@ -927,5 @@
+>        if (sbrowser.getAttribute("src") != this.provider.sidebarURL) {
+>          // we check readyState right after setting src, we need a new content
+>          // viewer to ensure we are checking against the correct document.
+>          sbrowser.docShell.createAboutBlankContentViewer(null);
+> -        Social.setErrorListener(sbrowser, this.setSidebarErrorMessage.bind(this));
+
+I wonder if setSidebarErrorMessage should change to post a message to the new framescript rather than still setting things directly?
+
+::: browser/base/content/social-content.js
+@@ +5,5 @@
+> +
+> +/* This content script should work in any browser or iframe and should not
+> + * depend on the frame being contained in tabbrowser. */
+> +
+> +let {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+
+const?
+
+@@ +10,5 @@
+> +
+> +Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> +Cu.import("resource://gre/modules/Services.jsm");
+> +
+> +// always apptab
+
+A more explicit "social frames are always treated as app tabs" would be better (and a comment indicating why if you can still remember ;)
+
+@@ +20,5 @@
+> +  QueryInterface: XPCOMUtils.generateQI([Ci.nsIWebProgressListener,
+> +                                         Ci.nsISupportsWeakReference,
+> +                                         Ci.nsISupports]),
+> +
+> +  setErrorMessage() {
+
+The function had this name before the patch, but I wonder if setErrorPage() is a better name?
+
+@@ +21,5 @@
+> +                                         Ci.nsISupportsWeakReference,
+> +                                         Ci.nsISupports]),
+> +
+> +  setErrorMessage() {
+> +    try {
+
+I guess the try/catch is just for debugging and will be removed
+
+@@ +27,5 @@
+> +
+> +    let origin = frame.getAttribute("origin");
+> +    let src = frame.getAttribute("src");
+> +    let webNav = docShell.QueryInterface(Ci.nsIWebNavigation);
+> +    let url = "about:socialerror?mode=tryAgainOnly&url=" +
+
+I don't see how we intent to handle all the different variations of about:socialerror we currently do - eg, flyout uses mode=compactInfo, the chat uses "mode=tryAgainOnly&directory=1&url=...", the sidebar uses either mode=workerFailure or mode=TryAgain?
+
+@@ +31,5 @@
+> +    let url = "about:socialerror?mode=tryAgainOnly&url=" +
+> +                   encodeURIComponent(src) + "&origin=" +
+> +                   encodeURIComponent(origin);
+> +    webNav.loadURI(url, null, null, null, null);
+> +    // XXX not sure we need this yet...
+
+I wouldn't have thought so as we've just changed the URI so there's not going to be a listener?
+
+@@ +41,5 @@
+> +      console.log(e);
+> +    }
+> +  },
+> +
+> +  onStateChange: function SPL_onStateChange(aWebProgress, aRequest, aState, aStatus) {
+
+I think you might as well use the new onStateChange() { ... form you used above for all functions here.
+
+::: browser/base/content/socialmarks.xml
+@@ +49,5 @@
+>            let provider = Social._getProviderFromOrigin(this.getAttribute("origin"));
+>            let size = provider.getPageSize("marks");
+>            let {width, height} = size ? size : {width: 330, height: 100};
+>  
+> +          let iframe = this._frame = document.createElement("browser");
+
+why this change?
+
+@@ -108,5 @@
+>            this._dynamicResizer.stop();
+>            this._dynamicResizer = null;
+>          }
+>          this.content.setAttribute("src", "about:blank");
+> -        // called during onhidden, make sure the docshell is updated
+
+why this change? I can't see it anywhere else in the patch (but maybe I just missed it)
+
+::: browser/base/content/test/social/browser_social_errorPage.js
+@@ +131,5 @@
+>          function() { // the panel api callback
+>            panelCallbackCount++;
+>          },
+>          function() { // the "load" callback.
+> +          is(panelCallbackCount, 0, "Bug 833207 - should be no callback when error page loads.");
+
+so bug 833207 is fixed by this patch? That surprises me.
+
+::: browser/base/content/test/social/browser_social_marks.js
+@@ +245,5 @@
+>                goOnline().then(next);
+>              });
+>            });
+>          });
+> +        btn.markCurrentPage(true);
+
+This means the panel is automatically opened, right? Why does this need to change as part of this?
+Created attachment 8605938
+move social error listener to content script
+
+address previous comments
+
+try at https://treeherder.mozilla.org/#/jobs?repo=try&revision=16b28c0a1dc0
+Created attachment 8606035
+move social error listener to content script
+
+fixes problems that appeared in try
+Comment on attachment 8606035
+move social error listener to content script
+
+Review of attachment 8606035:
+-----------------------------------------------------------------
+
+Let me know if I'm wrong in any of these assumptions :)
+
+::: browser/base/content/browser-social.js
+@@ +156,5 @@
+>          SocialStatus.updateButton(data);
+>          break;
+>        case "social:frameworker-error":
+>          if (this.enabled && SocialSidebar.provider && SocialSidebar.provider.origin == data) {
+> +          SocialSidebar.setErrorURL();
+
+If I'm reading the patch correctly, this seems wrong - setSidebarErrorMessage() immediately changes the browser's url to about:socialerror, whereas setErrorURL() just sets the template but relies on the progress listener to see an error before that url is actually loaded.
+
+So ISTM we should be able to send the Social:SetErrorURL message for the browser exactly once (see below), but then need another message, say Social:ShowErrorURL to force the previously set URL to be used (or possibly better, Social:ShowErrorURL should also take a template which overrides the previously sent template - that would avoid you needing to continuously send messages to update the template just in-case the worker is in an error state.
+
+And if I'm correct above, it sounds like we are missing a test that would have picked this up.
+
+@@ +383,5 @@
+>      iframe.docShell.isAppTab = true;
+>      if (iframe.contentDocument.readyState == "complete") {
+>        this._dynamicResizer.start(panel, iframe);
+>        this.dispatchPanelEvent("socialFrameShow");
+> +      iframe.messageManager.sendAsyncMessage("Social:SetErrorURL", null,
+
+I was a bit worried about (a) these duplicate calls and (b) the timing, and it reminded me of bug 1101074. So I changed browser_social_errorPage so that testFlyout did:
+
+>          ok(href.indexOf("about:socialerror?mode=compactInfo")==0, href);
+
+instead of just "about:socialerror?" - and sure enough it failed (the message comes *after* social-content.js sees the error page, so the default template is used).
+
+So taking a cue from bug 1101074, I removed these 2 sendAsyncMessage calls and changed the end of _createFrame to read:
+
+>    panel.appendChild(iframe);
+>    // the xbl bindings for the iframe probably don't exist yet, so we can't
+>    // access iframe.messageManager directly - but can get at it with this dance.
+>    let mm = iframe.QueryInterface(Components.interfaces.nsIFrameLoaderOwner).frameLoader.messageManager;
+>    mm.sendAsyncMessage("Social:SetErrorURL", null,
+>                        { template: "about:socialerror?mode=compactInfo&origin=%{origin}" });
+
+and sure enough it worked.
+
+So I think we should do both of those things (ie, move the message send to when the frame is created - both here and everywhere else in this file - and change *every* reference to "about:socialerror?" in the tests to to include the expected mode - it looks like browser_social_errorPage, browser_social_marks, browser_social_status and browser_social_workercrash all reference this)
+
+@@ +920,5 @@
+>          document.getElementById("social-sidebar-button").setAttribute("loading", "true");
+>          sbrowser.addEventListener("load", SocialSidebar._loadListener, true);
+>        } else {
+>          this.setSidebarVisibilityState(true);
+> +        this.setErrorURL();
+
+I don't understand why these additional calls are needed here. Maybe my comments above about a new message for force an error will remove the need for them?
+
+@@ +962,4 @@
+>      let sbrowser = document.getElementById("social-sidebar-browser");
+> +    let template = null;
+> +    if (this.provider.errorState == "frameworker-error") {
+> +      template = "about:socialerror?mode=workerFailure&origin=%{origin}";
+
+See above, but I'm also not sure we want the template to be null when we aren't in a frameworker-error state - doesn't that mean the template will be wrong when there's an error in the sidebar itself?
+
+Oh - maybe you are relying on defaultTemplate in social-content? If so, and this is the only thing using the default, maybe we should drop the default?
+(In reply to Mark Hammond [:markh] from comment #5)
+> Comment on attachment 8606035
+> move social error listener to content script
+> 
+> Review of attachment 8606035:
+> -----------------------------------------------------------------
+
+> @@ +920,5 @@
+> >          document.getElementById("social-sidebar-button").setAttribute("loading", "true");
+> >          sbrowser.addEventListener("load", SocialSidebar._loadListener, true);
+> >        } else {
+> >          this.setSidebarVisibilityState(true);
+> > +        this.setErrorURL();
+> 
+> I don't understand why these additional calls are needed here. Maybe my
+> comments above about a new message for force an error will remove the need
+> for them?
+
+Your comments above deal with this issue.
+
+> @@ +962,4 @@
+> >      let sbrowser = document.getElementById("social-sidebar-browser");
+> > +    let template = null;
+> > +    if (this.provider.errorState == "frameworker-error") {
+> > +      template = "about:socialerror?mode=workerFailure&origin=%{origin}";
+> 
+> See above, but I'm also not sure we want the template to be null when we
+> aren't in a frameworker-error state - doesn't that mean the template will be
+> wrong when there's an error in the sidebar itself?
+
+null sets it to the default.
+
+> Oh - maybe you are relying on defaultTemplate in social-content? If so, and
+> this is the only thing using the default, maybe we should drop the default?
+
+several elements are using the default template, chat, marks, sidebar.  I actually think we could remove the distinction altogether and use the same error page all the time.
+Created attachment 8606563
+move social error listener to content script
+
+I realized that the frameworker error has to actually be loaded normally, so there is some more change around that issue.
+
+running a few things through try here;
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=10fb2dc29c52
+Comment on attachment 8606563
+move social error listener to content script
+
+Review of attachment 8606563:
+-----------------------------------------------------------------
+
+Looks fine to me, although your try has an e10s bc1 failure due to leaking a docShell that will need to be fixed (although if we are super lucky we may find removing _receiveMessage might fix it.)  Also please check on #e10s about using setAttribute("src") on a browser element in the parent process.
+
+::: browser/base/content/browser-social.js
+@@ +958,5 @@
+> +  loadFrameworkerFailure: function() {
+> +    if (this.provider && this.provider.errorState == "frameworker-error") {
+> +      // we have to explicitly load this error page since it is not being
+> +      // handled via the normal error page paths.
+> +      let sbrowser = document.getElementById("social-sidebar-browser");
+
+I think we probably want browser.loadURI here instead of setting src (but I'm not 100% sure about that - might be worth checking on #e10s)
+
+@@ +1304,5 @@
+> +  },
+> +  onWidgetBeforeDOMChange: function(aNode, aNextNode, aContainer, isRemoval) {
+> +    if (!isRemoval || !aNode || !aNode.classList.contains("social-mark-button"))
+> +      return;
+> +    messageManager.removeMessageListener("Social:ErrorPageNotify", aNode._receiveMessage);
+
+looks like it might be worth deleting aNode._receiveMessage here?
+setting src is ok under e10s (verified on #e10s)
+
+running try with only this patch to make sure the issues are not from other patches.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=9d0c4e438f54
+The e10s failure is from re-enabling a test in one of the patches included in the previous try.
+https://hg.mozilla.org/integration/fx-team/rev/13116475bbd5
+Created attachment 8609519
+move social error listener to content script
+
+https://hg.mozilla.org/integration/fx-team/rev/13116475bbd5
+https://hg.mozilla.org/mozilla-central/rev/13116475bbd5
+
+
+Move error listener into content script
+
+
+
+Bug 1162322 change social error handling to use messagemanager, r=markh 

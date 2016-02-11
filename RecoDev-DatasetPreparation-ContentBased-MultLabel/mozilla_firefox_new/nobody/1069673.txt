@@ -1,0 +1,277 @@
+For checking which actors, actor methods exist on a target. Either via queries:
+
+`target.supportsActor("timeline")`
+`target.supportsMethod("webaudioeditor", "methodName")`
+`target.getTraits("stylesheet")`
+
+Or maybe just a return of the protocol description and subsequently parsed. Probably just returning actor existence for support, and individual actors can handle feature detection (traits, for values, but also a method for returning which methods exist).
+
+For checking which actors, actor methods exist on a target. Either via queries:
+
+`target.supportsActor("timeline")`
+`target.supportsMethod("webaudioeditor", "methodName")`
+`target.getTraits("stylesheet")`
+
+Or maybe just a return of the protocol description and subsequently parsed. Probably just returning actor existence for support, and individual actors can handle feature detection (traits, for values, but also a method for returning which methods exist).
+Created attachment 8494819
+1069673-tabtarget-featuredetect.patch
+
+Also, looking for feedback. Exposes methods on TabTarget for helping in feature detection:
+
+target.hasActor("actorName") -> bool
+target.getTrait("traitName") -> value
+target.getActorDescription("webaudio") -> promise
+target.actorHasMethod("webaudio", "setup") -> promise
+
+The synchronous methods are pretty straight forward and can be used immediately, while the promise methods require fetching a protocol description, and requires the actor to have been lazily-loaded, so best to be used within a tool itself. To get an actor definition immediately, which would be in the case of `isToolSupported`, this wouldn't work, but for use within a tool to see what features can be exposed. For seeing if a tool should be supported at all, I think traits on the root are still the way to go.
+
+Thoughts?
+https://tbpl.mozilla.org/?tree=Try&rev=0fd975daa351
+Comment on attachment 8494819
+1069673-tabtarget-featuredetect.patch
+
+Review of attachment 8494819:
+-----------------------------------------------------------------
+
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #1)
+> Created attachment 8494819
+> 1069673-tabtarget-featuredetect.patch
+
+This is quite interesting work!  I think it's good to see more automated, self-describing ways to use feature detection.
+
+> Also, looking for feedback. Exposes methods on TabTarget for helping in
+> feature detection:
+
+I think it generally looks good, but I've added more details comments on several below.
+
+Once this lands, you should update the Backward Compat wiki page[1] to describe these new tools.
+
+Also, be sure to test other uses of the toolbox, like the Browser Toolbox and WebIDE, to be sure nothing has broken.
+
+[1]: https://wiki.mozilla.org/DevTools/Backwards_Compatibility
+
+::: browser/devtools/framework/target.js
+@@ -121,5 @@
+> - * A better way to support feature detection, but we're not yet at a place
+> - * where we have the features well enough defined for this to make lots of
+> - * sense.
+> - */
+> -function supports(feature) {
+
+Removing this seems fine to me.  But DeveloperToolbar.jsm checks for it existing on the target, so you should remove those checks too.
+
+@@ +217,5 @@
+> +   *   }],
+> +   *  "events": {}
+> +   * }
+> +   */
+> +  getActorDescription: function (actorName) {
+
+Do you have use cases planned where we really want to test and inspect this metadata directly from a tool?  I think it would be best to keep this as a private implementation detail of the higher-level feature checking methods for now.
+
+@@ +218,5 @@
+> +   *  "events": {}
+> +   * }
+> +   */
+> +  getActorDescription: function (actorName) {
+> +    if (this.isLocalTab) {
+
+This is not the check you want here.  It's possible to use this on local tab targets, as long as someone has already called |makeRemote()| on it.  So, you should test for |this.client| instead.  Your other methods should be changed similarly.
+
+Speaking of... it may be time to "makeRemote ALL the targets!".  As I said on IRC before, we can't throw away the ability to access a local tab for now, but it should always be safe to |makeRemote|.  We do this for nearly everything now, so I don't really see much overhead if we did it by default.  I filed bug 1072764 about this work.
+
+@@ +224,5 @@
+> +    }
+> +
+> +    let deferred = promise.defer();
+> +
+> +    if (this._protocolDescription && this._protocolDescription.types[actorName]) {
+
+I think we should also cache negative answers for an actor.
+
+So, if someone asks for "blob" and we know nothing, we first ask for a protocol description update, in case it has just been loaded.  But if it's still not there we get the description back, we should save this info, and never request again for "blob".  So, we request the protocol description at most once for each actor type.
+
+It may also be convenient to add a server-side method to dump just one actor's data, instead of the whole thing every time.
+
+@@ +248,5 @@
+> +    if (this.isLocalTab) {
+> +      throw new Error("TabTarget#hasActor() can only be called on remote tabs.");
+> +    }
+> +    if (this.form) {
+> +      return !!this.form[actorName + "Actor"];
+
+I don't think this is quite what we want...  By only inspecting the form, you can check the "main" actors on a tab, but there's no way to test for the existence of child actor types.
+
+To test all the types, this would also need to look at the protocol description data.
+
+However, I can also see a desire to examine these "top-level" actors in |isTargetSupported| methods, just as you've done in this patch.  Can we make it clear that this only checks these top-level actors?  (Is there a better name for them...?)
+
+It's also confusing when you compare it to |actorHasMethod| below, since that actually can explore all the actor types, unlike this one.
+
+@@ +282,5 @@
+> +   * @param {String} traitName
+> +   * @return {Mixed}
+> +   */
+> +  getTrait: function (traitName) {
+> +    return this.client.traits[traitName];
+
+You'll need to test and throw if client is missing here as well.
+
+@@ +697,5 @@
+>    this._setupListeners();
+>  }
+>  
+>  WindowTarget.prototype = {
+> +  supports: () => false,
+
+I don't think anyone uses this, right?  Let's just remove it.
+
+::: browser/devtools/main.js
+@@ +285,5 @@
+>    panelLabel: l10n("timeline.panelLabel", timelineStrings),
+>    tooltip: l10n("timeline.tooltip", timelineStrings),
+>  
+>    isTargetSupported: function(target) {
+> +    return !target.isAddon && target.hasActor("timeline");
+
+Unfortunately, this breaks the local tab toolbox at the moment, but should work once you change |target.js| to check |client|.
+
+::: toolkit/devtools/client/dbg-client.jsm
+@@ +267,5 @@
+>    this._eventsEnabled = true;
+>  
+>    this.compat = new ProtocolCompatibility(this, []);
+>    this.traits = {};
+> +  this.actors = [];
+
+Is this used?
+Comment on attachment 8494819
+1069673-tabtarget-featuredetect.patch
+
+Review of attachment 8494819:
+-----------------------------------------------------------------
+
+::: browser/devtools/framework/target.js
+@@ +217,5 @@
+> +   *   }],
+> +   *  "events": {}
+> +   * }
+> +   */
+> +  getActorDescription: function (actorName) {
+
+This is useful for feature detection, like when a method changes signature or what it does, and if an event is supported
+
+@@ +218,5 @@
+> +   *  "events": {}
+> +   * }
+> +   */
+> +  getActorDescription: function (actorName) {
+> +    if (this.isLocalTab) {
+
+Noted, and sounds good, will change isLocalTab checks to check for client instead
+
+@@ +224,5 @@
+> +    }
+> +
+> +    let deferred = promise.defer();
+> +
+> +    if (this._protocolDescription && this._protocolDescription.types[actorName]) {
+
+This is due to actor descriptions being lazily loaded -- it's possible to get a protocol description not containing the actor one is looking for, but it will be there at a later point. Not ideal, but at certain stages (like inside of a tool), the actor will have been loaded
+
+@@ +248,5 @@
+> +    if (this.isLocalTab) {
+> +      throw new Error("TabTarget#hasActor() can only be called on remote tabs.");
+> +    }
+> +    if (this.form) {
+> +      return !!this.form[actorName + "Actor"];
+
+maybe `hasRootActor`? Also the benefit of this is we have this information immediately, rather than needing a tool to be loaded, so yes, it's for high level detection of whether a tool should be supported or not
+
+@@ +282,5 @@
+> +   * @param {String} traitName
+> +   * @return {Mixed}
+> +   */
+> +  getTrait: function (traitName) {
+> +    return this.client.traits[traitName];
+
++1
+
+@@ +697,5 @@
+>    this._setupListeners();
+>  }
+>  
+>  WindowTarget.prototype = {
+> +  supports: () => false,
+
++1
+
+::: browser/devtools/main.js
+@@ +285,5 @@
+>    panelLabel: l10n("timeline.panelLabel", timelineStrings),
+>    tooltip: l10n("timeline.tooltip", timelineStrings),
+>  
+>    isTargetSupported: function(target) {
+> +    return !target.isAddon && target.hasActor("timeline");
+
++1
+
+::: toolkit/devtools/client/dbg-client.jsm
+@@ +267,5 @@
+>    this._eventsEnabled = true;
+>  
+>    this.compat = new ProtocolCompatibility(this, []);
+>    this.traits = {};
+> +  this.actors = [];
+
+Removed
+Created attachment 8509036
+1069673-tabtarget-featuredetect.patch
+
+Addressed comments:
+* Tested browser toolbox, webide (1.3/2.0), local tools
+* Changed name of the method and use cases mentioned in previous review
+* Changed to check for client rather than isLocalTab
+* Renamed method `hasActor` to `rootHasActor` to specify the difference
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=d1e2c4e8f833
+Comment on attachment 8509036
+1069673-tabtarget-featuredetect.patch
+
+Review of attachment 8509036:
+-----------------------------------------------------------------
+
+::: browser/devtools/framework/target.js
+@@ +237,5 @@
+> +   *
+> +   * @param {String} actorName
+> +   * @return {Boolean}
+> +   */
+> +  rootHasActor: function (actorName) {
+
+Actually |rootHasActor| seems more confusing to me, because there is a concept of a "root actor", but it's not the same as the main actor for a tab (instead it is its parent that lists all the tabs), so |this.form| is technically not a "root" actor, even though it's the top-level of this target.
+
+Let's go back to just |hasActor| I guess.  Names are hard. :/
+Created attachment 8509773
+1069673-tabtarget-featuredetect.patch
+https://hg.mozilla.org/integration/fx-team/rev/fa3aec4c2aae
+https://hg.mozilla.org/mozilla-central/rev/fa3aec4c2aae
+jsantell, we need this uplifted to Aurora because bug 1088247 depends on it and we need it for dev edition. I don't know how much of a pain that will be, but I'll follow-up on IRC.
+Comment on attachment 8509773
+1069673-tabtarget-featuredetect.patch
+
+Approval Request Comment
+[Feature/regressing bug #]: NA
+[User impact if declined]: We need this bug so that we can uplift bug 1088247, which has already been approved for aurora (didn't realize it depended on this one). The same user impact there applies here.
+[Describe test coverage new/current, TBPL]: This has already landed on m-c with tests passing
+[Risks and why]: Not much risk, there's not much changes just additions
+[String/UUID change made/needed]:
+https://hg.mozilla.org/releases/mozilla-aurora/rev/fc90e0c671c2
+https://hg.mozilla.org/releases/mozilla-aurora/rev/cfc1be82cd6d
+
+
+Add feature detection to devtools framework
+
+
+
+Bug 1069673 - Add support methods on devtool's Target, r=jryans 

@@ -1,0 +1,125 @@
+Session restore does not preserve the HttpOnly cookie attribute. When restored cookies become visible to web-page scripts.
+
+If it were just post-crash recovery it wouldn't be a big deal (assuming a stable browser), but for folks who's start page is "use tabs from last time" (and especially if their default cookie lifetime is "session" -- I'm describing myself) this equates to not having httpOnly cookies most of the time.
+
+[This would be mostly mitigated if "use tabs from last time" didn't restore session cookies at all as discussed in bug 345345 and other places. ignore the first comments that don't get what "session" restore is about, but in a non-crash situation a lot of people don't want, need, or expect any actual session continuance. But that's not this bug.]
+
+Session restore does not preserve the HttpOnly cookie attribute. When restored cookies become visible to web-page scripts.
+
+If it were just post-crash recovery it wouldn't be a big deal (assuming a stable browser), but for folks who's start page is "use tabs from last time" (and especially if their default cookie lifetime is "session" -- I'm describing myself) this equates to not having httpOnly cookies most of the time.
+
+[This would be mostly mitigated if "use tabs from last time" didn't restore session cookies at all as discussed in bug 345345 and other places. ignore the first comments that don't get what "session" restore is about, but in a non-crash situation a lot of people don't want, need, or expect any actual session continuance. But that's not this bug.]
+Created attachment 268800
+simple fix
+i'm curious, is there a reason you use nsICookieService::SetCookieString() to set cookies, and not nsICookieManager2::Add()? the latter avoids parsing (and for you, constructing) a cookie string, and lets you set the cookie attributes directly.
+HttpOnly should probably not land on branch without the one line really required to fix this one issue as well.
+
+(In reply to comment #0)
+> in a non-crash situation a lot of people don't want, need, or expect
+> any actual session continuance.
+
+Except that they might not get that much of the tabs from last time if we don't resume the whole session (and you'd also want to make an exception to the exception for the restart case)... but as you said: different bug. :)
+
+(In reply to comment #2)
+> is there a reason you use nsICookieService::SetCookieString() to set cookies
+
+That prevents me from having to invent yet another serialization format for cookies when a perfectly acceptable one already exists - besides it's more compact and requires less code.
+(In reply to comment #3)
+> That prevents me from having to invent yet another serialization format for
+> cookies when a perfectly acceptable one already exists - besides it's more
+> compact and requires less code.
+
+hmm, there are differences between what SetCookieString and Add do - in particular the former might prompt the user for each cookie, if they have the "ask me" pref set. it'll also do permissionmanager lookups for each host, etc.
+The latter might even be wanted and we haven't had any complaints about the first one yet. Still: If you want to offer a patch to move to nsICookieManager2::Add, we'd probably take it, although that might mean losing all stored cookies during the upgrade. Please just file a new bug about it.
+Comment on attachment 268800
+simple fix
+
+>Index: browser/components/sessionstore/src/nsSessionStore.js
+
+>               if (_this._checkPrivacyLevel(cookie.isSecure)) {
+>                 value = (cookie.name || "name") + "=" + (cookie.value || "") + ";";
+>+                value += cookie.isDomain ? "; domain=" + cookie.rawHost : "";
+
+Looks like this could result in a double semi-colon (the one before "domain" and the one after the value), is that a problem? dwitte could probably review this more usefully than I can :)
+Created attachment 268852
+simple fix (another semi-colon down)
+
+(In reply to comment #6)
+> Looks like this could result in a double semi-colon
+
+Oops, that one should have been removed in the Great Semi-Colon Reordering.
+
+There really isn't much to this patch - just adding the HttpOnly bit to the cookie string if required (and not adding a superfluous semi-colon to the very end of the saved string).
+
+See bug 384944 for the resolution of the discussion from comment #2 through #5.
+Comment on attachment 268852
+simple fix (another semi-colon down)
+
+per gavin i'll step in and r+ this. ;)
+
+>+                value = (cookie.name || "name") + "=" + (cookie.value || "");
+
+howcome you set "name" if cookie.name is blank? cookies with blank names exist in the wild, see:
+http://mxr.mozilla.org/mozilla/source/netwerk/cookie/src/nsCookieService.cpp#1709
+
+anyway, that's bug 384944 material, although if we ever want this patch on 1.8 branch (which dveditz may) we won't have httponly in nsICookieManager2::Add(), so we might have to come back to fix this one.
+
+>+                value += cookie.isHttpOnly ? "; HttpOnly" : "";
+
+i'd prefer lowercase "httponly" to be consistent. r=dwitte with that fixed and an explanation of "name"
+Comment on attachment 268852
+simple fix (another semi-colon down)
+
+>-        cookieService.setCookieString(ioService.newURI(aCookies["domain" + i], null, null), null, aCookies["value" + i] + "expires=0;", null);
+>+        cookieService.setCookieString(ioService.newURI(aCookies["domain" + i], null, null), null, aCookies["value" + i] + "; expires=0", null);
+
+You should switch this to setCookieStringFromHttp(), bug 383181 is going to make setCookieString() ignore the httponly attribute.
+
+This will work until then, switching will work regardless.
+Created attachment 268925
+fix
+
+(In reply to comment #8)
+> howcome you set "name" if cookie.name is blank?
+
+Hmm, an artifact from pre-historic times. Fixed.
+
+> i'd prefer lowercase "httponly" to be consistent.
+
+Changed.
+
+(In reply to comment #9)
+> You should switch this to setCookieStringFromHttp()
+
+Done.
+Created attachment 268935
+minimal branch patch
+
+For Trunk this issue will be fixed in bug 384944 during a slightly more extended cookie related clean-up.
+Comment on attachment 268935
+minimal branch patch
+
+Carrying over r+ from dwitte (attachment #268925).
+
+Drivers: Minimal two-line patch with low regression risk.
+For Trunk, this issue was fixed in bug 384944.
+This restores saved httponly values, but how do they get saved in the first place, or where? (dveditz)
+juanb, it gets saved in the JSON output in the sessionstore.js file. So a good test would be:
+
+1. Make sure the "Show my windows and tabs from last time" is chosen in Options > General.
+2. Go to a page that sets an HTTPOnly session cookie (still looking for one).
+3. Close Firefox.
+4. Open up the sessionstore.js file in your profile and make sure there is a "httponly" property for the website URL that set the cookie.
+(In reply to comment #15)
+> 2. Go to a page that sets an HTTPOnly session cookie (still looking for one).
+
+You should be able to simulate this by changing your cookie lifetime to "session only". Then any HTTPonly-using site should work for this, facebook.com etc.
+
+
+qawanted: Please verify on the trunk (see comments 15 and 16). The http-only cookie should be saved in sessionstore.js, and on restart should still be http-only (not visible to document.cookie, but still sent to the site). The LiveHttpHeaders addon would be good for testing this one.
+This will have to wait for 1.8.1.6
+Comment on attachment 268935
+minimal branch patch
+
+approved for 1.8.1.7, a=dveditz for release-drivers
+browser/components/sessionstore/src/nsSessionStore.js 1.5.2.46

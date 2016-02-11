@@ -1,0 +1,398 @@
+Vladan asked me to add a telemetry probe for activeTicks (currently probed for FHR).
+
+I experimented a bit with activeTicks and noticed the following:
+
+1. It's considered active as long as the mouse pointer hovers the browser (even if the user is away from the computer).
+
+2. It's considered inactive as long as the mouse pointer is not over the Firefox window.
+
+The combination of the above could result in highly biased and misleading values IMO.
+
+As for what value should be probed, I'm also not sure. Could be:
+
+1. Identical number to activeTicks which FHR collects.
+2. Percentage of activity at shutdown (probably 100 * 5 * activeTicks /  totalTime)
+3. More than one value, possibly including 1 or 2 above, or other values.
+
+As for the magic constant 5 at #2, I think it's defined at http://dxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#101 , and I'm pretty sure it's not accessible from outside this file and isn't meant to be exposed.
+
+We could either try to expose it (lots of hassle), or duplicate it at session.jsm and add appropriate comments on both places, or accumulate the [in]activity durations independently at onActivity (observer for active and inactive notifications) at session.jsm. I implemented the last approach locally and it seems to collect the values well.
+
+Vladan, thoughts on how you want to proceed here?
+
+Vladan asked me to add a telemetry probe for activeTicks (currently probed for FHR).
+
+I experimented a bit with activeTicks and noticed the following:
+
+1. It's considered active as long as the mouse pointer hovers the browser (even if the user is away from the computer).
+
+2. It's considered inactive as long as the mouse pointer is not over the Firefox window.
+
+The combination of the above could result in highly biased and misleading values IMO.
+
+As for what value should be probed, I'm also not sure. Could be:
+
+1. Identical number to activeTicks which FHR collects.
+2. Percentage of activity at shutdown (probably 100 * 5 * activeTicks /  totalTime)
+3. More than one value, possibly including 1 or 2 above, or other values.
+
+As for the magic constant 5 at #2, I think it's defined at http://dxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#101 , and I'm pretty sure it's not accessible from outside this file and isn't meant to be exposed.
+
+We could either try to expose it (lots of hassle), or duplicate it at session.jsm and add appropriate comments on both places, or accumulate the [in]activity durations independently at onActivity (observer for active and inactive notifications) at session.jsm. I implemented the last approach locally and it seems to collect the values well.
+
+Vladan, thoughts on how you want to proceed here?
+1) With regards to the user-active metric:
+
+13:09 <&vladan> avih: yeah that sounds pretty good
+13:09 <&vladan> system-active + firefox is foreground
+
+2) Send the "amount of time active" in Telemetry.. you can send the calculated % as well if you think it will be useful. If it's just so the user can take a look at the "% of time active" value in the browser, you could also just compute it in aboutTelemetry.js
+
+3) Your call on how you want to deal with the magic constant
+Created attachment 8537789
+bug1106122.patch
+
+I decided to take the KISS approach.
+
+Just accumulate the same count value as FHR does, and if its semantics ever changes, they'll change together.
+Comment on attachment 8537789
+bug1106122.patch
+
+Review of attachment 8537789:
+-----------------------------------------------------------------
+
+- Add an "expires_in_version" field to your histogram with a value of "never"
+- Add an "alert_emails" field to your histogram pointed to "perf-telemetry-alerts@mozilla.com"
+- Are you sure the FHR onActivity code is correct? It looks like it assumes it's not possible to get 2 "user-notification-active" notifications in a row. Is that the case?
+- I don't like how we're storing the same value in two different places in that one "onActivity" function
+- "count" histograms aren't well supported right now in the Telemetry dashboard and afaik in the regression detector. I'd prefer to have the ticks count stored in simpleMeasurements
+* Correction: it looks like the FHR onActivity code actually doesn't accumulate a tick if a "user-notification-active" was preceded by a "user-notification-inactive"
+(In reply to Vladan Djeric (:vladan) from comment #3)
+> - Add an "expires_in_version" field to your histogram with a value of "never"
+> - Add an "alert_emails" field to your histogram pointed to
+> "perf-telemetry-alerts@mozilla.com"
+
+OK.
+
+> - Are you sure the FHR onActivity code is correct? It looks like it assumes
+> it's not possible to get 2 "user-notification-active" notifications in a
+> row. Is that the case?
+
+It seems to be working as expected at this file (not including issues of incorrect number of events sent), but regardless, the goal was to have an identical number (whatever this number might be) at FHR and telemetry, and this is the only place where the value is modified for FHR.
+
+> - I don't like how we're storing the same value in two different places in
+> that one "onActivity" function
+
+This bug is about duplicating the activeTicks FHR value into telemetry as a stop gap until they merge, because it's hard to associate an FHR value with telemetry sessions. Duplication is going to happen someplace. And it's duplicated at the safest place: Whenever FHR's value is incremented, so is the Telemetry one.
+
+Other implementations (which I considered) where the number is inserted as a single value whenever the FHR value is "collected" will be more sensitive (code wise) since it would depend on timing relation between FHR and telemetry collection/submission (e.g. if FHR values are collected after the telemetry values are "finalized" then it might not go into the correct telemetry session).
+
+> - "count" histograms aren't well supported right now in the Telemetry
+> dashboard and afaik in the regression detector. I'd prefer to have the ticks
+> count stored in simpleMeasurements
+
+Simple measurements is a hack for anything except startup times. All the other kinds of values at simple measurements are individually implemented hacks, and adding a single value at simple measurements is more lines of code than the current patch has (and uglier too), and in more files.
+
+"count" histograms, OTOH, were designed exactly for this kind of values (even if "histogram" is a misleading term here).
+
+Since this is a stop gap solution which will get redundant once FHR and telemetry merge, and because less LOC in less files is less sensitive - code wise, and because this patch works as expected and as defined, I prefer it over other approaches which I considered.
+
+If you still prefer your approach, then let's please discuss this before I update the patch.
+In the interest of getting this project moving, let's land your patch as-is with the additional 2 fields in histogram definition.
+Created attachment 8543213
+bug1106122.v2.patch
+
+Use simple measurements value 'activeTicks'.
+
+If FHR is enabled - Telemetry's activeTicks get FHR's activeTicks value.
+
+If FHR is disabled or we can't read the prefs correctly - use value of -1.
+Comment on attachment 8543213
+bug1106122.v2.patch
+
+Review of attachment 8543213:
+-----------------------------------------------------------------
+
+Georg, is it ok to get FHR values via prefs instead of calling into data-reporting?
+Comment on attachment 8543213
+bug1106122.v2.patch
+
+Lets please not side-step the FHR API for this.
+
+Side note: While this seems straight-forward now, we will have to duplicate or move the activeTicks collection code at some point anyway.
+(In reply to Georg Fritzsche [:gfritzsche] from comment #9)
+> Lets please not side-step the FHR API for this.
+
+Please ping me on IRC, I'd appreciate some help in understanding how it should be done correctly.
+Two new data points:
+
+1. gfritzsche says there isn't currently such API. In order to not sidestep it, we'll first have to implement and expose such API, and then use it instead of reading the pref value.
+
+2. <rvitillo> a count histogram with a single bucket which is the count value should provide us with the most accurate data [compared to a simple measurement -avih]
+
+<rvitillo> I don’t see how a simple measurement in your case is better for regression detection.
+(In reply to Avi Halachmi (:avih) from comment #11)
+> 1. gfritzsche says there isn't currently such API. In order to not sidestep
+> it, we'll first have to implement and expose such API, and then use it
+> instead of reading the pref value.
+
+I mentioned that the SessionRecorder doess't seem to be exposed yet on the DataReportingService, which wouldn't be much effort to change.
+
+We could also presumably go through the HealthReporter and query the values from
+* its payload, but that would mean we wouldn't get live values
+* query it via the SessionProvider and CurrentSessionMeasurement.getValues()... but that carries some overhead
+
+Can we just expose the SessionRecorder and query directly from it?
+When moving the other measurements over we may end up just making the SessionRecorder accessible without FHR running anyway.
+
+Another point: In this case we can control the submission of this probe using the FHR service.enabled pref instead of the uploadEnabled pref - see the preferences documentation here:
+https://ci.mozilla.org/job/mozilla-central-docs/Tree_Documentation/services/healthreport/healthreport/architecture.html
+Created attachment 8544624
+bug1106122.v3.patch
+
+- Exposes sessionRecorder via the data reporting service and uses it as a simple measurement value.
+
+- Works when the FHR service is enabled (even if [upload] is disabled at the configuration panel). bsmedberg confirmed this is OK.
+Comment on attachment 8544624
+bug1106122.v3.patch
+
+Review of attachment 8544624:
+-----------------------------------------------------------------
+
+Can we get basic test-coverage for this here or in a follow-up?
+I.e. the Telemetry activeTicks should not be -1 after "profile-after-change".
+
+::: services/datareporting/DataReportingService.js
+@@ +392,5 @@
+>    }),
+>  
+> +  /**
+> +   * returns the SessionRecorder instance associated with the data reporting service.
+> +   * May return undefined if FHR is not enabled.
+
+If FHR upload is not enabled and before profile-after-change. Or just leave it unspecified, just as a heads-up?
+Created attachment 8545192
+bug1106122.v4.patch
+
+1. Simplified the patch - there's no need to check a preference that FHR is enabled because if it isn't then the data reporting service doesn't return a SessionRecorder object. This also reduces redundancy at the code (the pref name).
+
+Also updated the comment about when getSessionRecorder() returns a valid object.
+
+
+2. I wasn't sure how to interpret "basic test-coverage", so I interpreted it as follows and added a test:
+
+- getSessionRecorder() doesn't throw before the data reporting service is initialized.
+
+- getSessionRecorder() returns an actual object after the DRS is initialized, which implicitly also tests that FHR is enabled by default (since otherwise we won't get activeTicks by default - so we want a failure to make sure it gets noticed).
+
+- That activeTicks is a non negative number.
+
+
+Georg, if this interpretation is what you had in mind, then please review the patch. Else - let me know what you want tested and I'll implement it. Thanks.
+Comment on attachment 8545192
+bug1106122.v4.patch
+
+Review of attachment 8545192:
+-----------------------------------------------------------------
+
+This is fine aside from the test (discussed this on IRC).
+Created attachment 8545302
+bug1106122.v5.patch
+
+Compared to v4 - v5 moves the test into test_TelemetryPing.js, and it tests the following cases:
+
+1. That getSessionRecorder() can be called and returns undefined before DRS is initialized.
+
+2. That the telemetry ping payload's activeTicks ends up as -1 if the FHR service is disabled.
+
+3. That when the FHR service is enabled, the ping payload's activeTicks ends up as 0 or higher.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/63f90f467985
+
+Thanks for your patience, Georg :)
+Backed out for xpcshell orange.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/9b49d075575f
+
+https://treeherder.mozilla.org/logviewer.html#?job_id=5165158&repo=mozilla-inbound
+Looks like the failures were only on android x86 (v4.2).
+<RyanVM|sheriffduty> avih: https://treeherder.mozilla.org/logviewer.html#?job_id=5172824&repo=mozilla-inbound
+<RyanVM|sheriffduty> and of course, then that shows up
+
+That's probably on every platform where the data reporting service doesn't exist. I see where it comes from, and I'll make the patch behave better.
+Created attachment 8545676
+bug1106122.v6.patch
+
+Compared to v5: also account for the case where DRS is unavailable:
+- Make all the modification happen only when DRS is enabled.
+- activeTicks test results take DRS availability into account.
+
+Slight improvement:
+- Restore FHR service enabled pref to its original state instead of always "restoring" it to true.
+
+try push has xpcshell tests pass on all platforms:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=dd0fcf5ee18d
+Comment on attachment 8545676
+bug1106122.v6.patch
+
+Review of attachment 8545676:
+-----------------------------------------------------------------
+
+Ah, i should have caught this.
+r+ with comments addressed.
+
+::: toolkit/components/telemetry/tests/unit/test_TelemetryPing.js
+@@ +58,5 @@
+>    () => Cc["@mozilla.org/datareporting/service;1"]
+>            .getService(Ci.nsISupports)
+>            .wrappedJSObject);
+>  
+> +let has_DRS = "@mozilla.org/datareporting/service;1" in Cc;
+
+This should have camel-case. But you can just make it a |const HAS_DRS| or (better) HAS_DATAREPORTINGSERVICE.
+
+@@ +427,5 @@
+>    let contents = "" + FAILED_PROFILE_LOCK_ATTEMPTS;
+>    writeStringToFile(file, contents);
+>  }
+>  
+> +let orig_fhr_service_enabled = true;
+
+We use camel-casing for variables here.
+If you need a global, please put it on top and prefix with a 'g'.
+
+@@ +442,5 @@
+> +  // make sure getSessionRecorder() can be called before the DRS init.
+> +  // It's not a requirement that it returns undefined, but that's how it behaves
+> +  // now - so just let this test fail if this behavior changes.
+> +  if (has_DRS)
+> +    do_check_true(gDatareportingService.getSessionRecorder() === undefined);
+
+Nit: {} bracing?
+
+@@ +453,5 @@
+>    Services.prefs.setBoolPref(PREF_FHR_UPLOAD_ENABLED, true);
+>  
+>    // Send the needed startup notifications to the datareporting service
+>    // to ensure that it has been initialized.
+>    if ("@mozilla.org/datareporting/service;1" in Cc) {
+
+if (HAS_DATAREPORTINGSERVICE)
+
+@@ +518,1 @@
+>    if ("@mozilla.org/datareporting/service;1" in Cc) {
+
+if (HAS_DATAREPORTINGSERVICE)
+Created attachment 8545936
+bug1106122.v7.patch
+
+Addressed comments, carrying r+
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/5e0872c8c3d5
+https://hg.mozilla.org/mozilla-central/rev/5e0872c8c3d5
+According to bug 1119959, this fails for Thunderbird:
+
+(also, running a single Thunderbird xpcshell-test which resides at the mozilla-central repository subdirectory was undocumented - I added docs for this at https://developer.mozilla.org/en-US/docs/MailNews_xpcshell-tests )
+
+1. exception because the pref doesn't exist: datareporting.healthreport.service.enabled
+
+2. If I want to account for #1 and check that the pref doesn't exist, I can't assume that sessionReporter will not be available - since the DRS assumes the pref value is true if the pref doesn't exist, so I need to duplicate the same assumption at the test, which is delicate and quite ugly.
+
+I'm still working on it and it will end up working. But this is turning ugly.
+Created attachment 8547042
+Thunderbird xpcshell-test fix
+
+I'll r? it after it passes all xpcshell-tests (doesn't include comm-central, but I tested it locally).
+
+https://tbpl.mozilla.org/?tree=Try&rev=825d904e2bd1
+Comment on attachment 8547042
+Thunderbird xpcshell-test fix
+
+Try push is all green.
+Created attachment 8547148
+Thunderbird xpcshell-test fix v2
+
+I couldn't live with the ugliness of the original patch and of the first Thunderbird fix patch.
+
+This patch fixes the Thunderbird errors (tested locally since I don't know how to try-push Thunderbird), and greatly simplify the test as follows:
+
+1. No more 2x init of the datareporting service. Instead I added a function to suppress its getSessionRecorder() method and then to restore it to normal. This is much less intrusive than 2x init, and also get rids of setting and restoring the pref.
+
+2. Simpler logic for "should we expect sessionRecorder" - same read-pref with fallback to true as the DRS has.
+
+3. Removed the initial test which was really useless anyway.
+
+Ended up with much less LOC and much less logic. Finally I'm mostly happy with it.
+
+And try tests are green on all platforms: https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=1d128bc3c2c9
+(In reply to Avi Halachmi (:avih) from comment #29)
+> This patch fixes the Thunderbird errors (tested locally since I don't know
+> how to try-push Thunderbird)
+
+You can find the info here: https://wiki.mozilla.org/ReleaseEngineering/ThunderbirdTryServer
+Comment on attachment 8547148
+Thunderbird xpcshell-test fix v2
+
+Review of attachment 8547148:
+-----------------------------------------------------------------
+
+I think we need to start introducing some mock or policy objects to TelemetryPing etc. at some point to ease testing (instead of going to make test changes to components Telemetry depends on all around the tree).
+However, for this task right now that would be overkill.
+
+::: services/datareporting/DataReportingService.js
+@@ +70,5 @@
+>    this._saveClientIdTask = null;
+>  
+>    this._stateDir = null;
+>    this._stateFilePath = null;
+> +  this._simulateNoSessionRecorder = false;
+
+Please add a comment on what the pref does.
+
+@@ +130,5 @@
+>            // living in its own XPCOM service.
+>            if (this._prefs.get("service.enabled", true)) {
+> +            // Note: the logic where SessionRecorder is instanciated even if the
+> +            // pref doesn't exist is duplicated and relied upon at test_TelemetryPing.js
+> +            // If this logic changes, please modify it also at the test.
+
+If we change the behavior tests will start failing, which we run on try pushes and checkins to integration repos etc.
+So i don't think we need to explicitly document this here?
+
+@@ +405,5 @@
+> +  },
+> +
+> +  // These two simulate* methods below are only used at test_TelemetryPing.js
+> +  // to check that the telemetry ping payload has an activeTicks value of -1
+> +  // when getSessionRecorder() returns undefined.
+
+This is very specific and likely to get out of date. Its sufficient to talk about what the method simulates, mention "tests" and let people do code-search for the method.
+
+::: toolkit/components/telemetry/tests/unit/test_TelemetryPing.js
+@@ +506,5 @@
+> +  if (HAS_DATAREPORTINGSERVICE) {
+> +    // force getSessionRecorder()==undefined to check the payload's activeTicks
+> +    gDatareportingService.simulateNoSessionRecorder();
+> +  }
+> +  // When no DRS or no DRS.getSessionRecorder(), activeTicks should be -1.
+
+Nit: newline before this one.
+
+@@ +511,1 @@
+>    do_check_true(TelemetryPing.getPayload().simpleMeasurements.activeTicks == -1);
+
+While we're here, |do_check_eq(a,b)| instead of |do_check_true(a==b)|.
+This bug was RESOLVED_FIXED, lets please move checkin etc. to bug 1119959. Otherwise this is painful to handle & track later with our tooling and process.
+If people are missing context on bug 1119959 they can always follow the links to the blocked bug.
+Thanks. The final patch posted at bug 1119959 comment 76 and landed.
+
+As for at which bug to handle it, I thought it was a direct continuation at the discussion here and the previous comments would provide better context to the patch. The patch obviously lands via bug 1119959.
+
+
+Add telemetry probe for activeTicks
+
+
+
+bug 1106122: Telemetry: Add FHR activeTicks value as simple measurement. r=vladan, r=gfritzsche 
+
+Backed out changeset 63f90f467985 (bug 1106122) for xpcshell orange.
+
+bug 1106122: Telemetry: Add FHR activeTicks value as simple measurement. r=vladan, r=gfritzsche 

@@ -1,0 +1,210 @@
+Sometimes on my Linux box I see a black frame being rendered just after switching tabs, and just before the spinner is drawn. This is on a local build of m-c from 2015-02-10 (optimised, profiling). I actually have a profile of it too as I was profiling at the time: http://people.mozilla.org/~gwright/WUqSl3IG.bin
+
+Adapter Description	Intel Open Source Technology Center -- Mesa DRI Intel(R) Haswell
+Device ID	Mesa DRI Intel(R) Haswell
+Driver Version	3.0 Mesa 10.4.2
+GPU Accelerated Windows	0/3 Basic (OMTC)
+Vendor ID	Intel Open Source Technology Center
+WebGL Renderer	Intel Open Source Technology Center -- Mesa DRI Intel(R) Haswell
+windowLayerManagerRemote	true
+AzureCanvasBackend	cairo
+AzureContentBackend	cairo
+AzureFallbackCanvasBackend	none
+AzureSkiaAccelerated	0
+
+Sometimes on my Linux box I see a black frame being rendered just after switching tabs, and just before the spinner is drawn. This is on a local build of m-c from 2015-02-10 (optimised, profiling). I actually have a profile of it too as I was profiling at the time: http://people.mozilla.org/~gwright/WUqSl3IG.bin
+
+Adapter Description	Intel Open Source Technology Center -- Mesa DRI Intel(R) Haswell
+Device ID	Mesa DRI Intel(R) Haswell
+Driver Version	3.0 Mesa 10.4.2
+GPU Accelerated Windows	0/3 Basic (OMTC)
+Vendor ID	Intel Open Source Technology Center
+WebGL Renderer	Intel Open Source Technology Center -- Mesa DRI Intel(R) Haswell
+windowLayerManagerRemote	true
+AzureCanvasBackend	cairo
+AzureContentBackend	cairo
+AzureFallbackCanvasBackend	none
+AzureSkiaAccelerated	0
+Created attachment 8563454
+tab-switch-refactor
+
+This is the patch I've been working on.
+*** Bug 1135624 has been marked as a duplicate of this bug. ***
+Created attachment 8573454
+Tab switch refactoring
+
+Here's the latest version of the patch. There's still one intermittent I need to track down, but it's basically done.
+Comment on attachment 8573454
+Tab switch refactoring
+
+Review of attachment 8573454:
+-----------------------------------------------------------------
+
+I think I understand what you're doing here, and I'm glad you're centralizing all of the async tab switching stuff into a single object.
+
+So one major problem I seem to have with this patch is that I restored a session with multiple tabs, and my first tab was stuck with the spinner forever. This means that I never called finish, which means that I was hitting onUnloadTimeout forever. This kills the battery. So there's a bug there.
+
+I also have some minor nits / questions. See below.
+
+::: browser/base/content/tabbrowser.xml
+@@ +2872,5 @@
+> +        The tab switcher is a state machine. For each tab, it
+> +        maintains state about whether the layer tree for the tab is
+> +        available, being loaded, being unloaded, or unavailable. It
+> +        also keeps track of the tab currently being displayed, the tab
+> +        it's trying to load, and the tab the user has asked to switch
+
+Might be worth mentioning the lifetime of the tab switcher too - I thought it existed for the lifetime of a tabbrowser, and was initted and memoized after the first tab switch. That's actually not the case.
+
+@@ +2932,5 @@
+> +
+> +          let switcher = {
+> +            // How long to wait for a tab's layers to load. After this
+> +            // time elapses, we're free to put up the spinner and start
+> +            //trying to load a different tab.
+
+Nit - space before trying
+
+@@ +2971,5 @@
+> +            // visible. All tabs but the most recently shown tab are
+> +            // removed from the set upon MozAfterPaint.
+> +            maybeVisibleTabs: new Set([this.selectedTab]),
+> +
+> +            STATE_UNLOADED: 0,
+
+Some inconsistency here - we've got the kPrefix for the timeout lengths, but ALL_CAPS for the states. Let's pick one and stick with it.
+
+@@ +2976,5 @@
+> +            STATE_LOADING: 1,
+> +            STATE_LOADED: 2,
+> +            STATE_UNLOADING: 3,
+> +
+> +            // Enable logging?
+
+Nit - I don't think this comment adds much, tbh.
+
+@@ +3008,5 @@
+> +              if (state == this.STATE_LOADING) {
+> +                // Ask for a MozLayerTreeReady event. If the tab is in
+> +                // the process of initializing, requestNotifyLayerTreeReady
+> +                // will throw, so we retry until it works.
+> +                tryUntilSuccess(fl.requestNotifyLayerTreeReady, 10);
+
+If the content process crashes before we can get the layer tree ready notification, I think this will run forever. Am I right on that? It might be worth having some kind of fallback termination policy here...
+
+Alternatively, is there no way of getting an event on initialization that we can listen for?
+
+The 10 ms magic number should probably get thrown into the constants at the top of the switcher.
+
+@@ +3101,5 @@
+> +                let tabPanel = this.tabbrowser.mPanelContainer;
+> +                let showPanel = tabs.getRelatedElement(showTab);
+> +                let index = Array.indexOf(tabPanel.childNodes, showPanel);
+> +                if (index != -1) {
+> +                  this.log("Switch to tab " + index + " " + this.tinfo(showTab));
+
+You might like the new backtick powers that ES6 gives us:
+
+this.log(`Switch to tab ${index} ${this.tinfo(showTab)}`);
+
+@@ +3154,5 @@
+> +                this.loadTimer = null;
+> +              }
+> +            },
+> +
+> +            // This code runs after we've responded to an event and updated all
+
+"responded to an event", or had a new tab requested.
+
+@@ +3158,5 @@
+> +            // This code runs after we've responded to an event and updated all
+> +            // the principal state variables. It takes care of updating any
+> +            // auxilliary state.
+> +            postActions: function() {
+> +              this.assert(!this.loadingTab ||
+
+Can you document why these assertions are necessary?
+
+@@ +5825,5 @@
+>            let toTab = this.getRelatedElement(this.childNodes[val]);
+>            let fromTab = this._selectedPanel ? this.getRelatedElement(this._selectedPanel)
+>                                              : null;
+>  
+> +          let switcher = gBrowser._getSwitcher();
+
+Might as well just do:
+
+gBrowser._getSwitcher().requestTab(toTab);
+*** Bug 1123898 has been marked as a duplicate of this bug. ***
+Created attachment 8575622
+Tab switch refactoring (r=mconley?)
+
+I decided to move the failure handling for requestNotifyLayerTreeReady to the platform side, which cleans things up a bit.
+
+I also turned off the unload timer if we don't have anything to unload. That should mitigate the battery issue, althoug obviously we want to avoid the spinner anyway.
+Created attachment 8575623
+Handle RequestNotifyLayerTreeReady when RenderFrameParent not ready
+
+David, this patch adds on a patch in bug 129223. The problem is in how we handle the case where the frontend asks for a notification that a tab's layer tree is ready before the PRenderFrame has been constructed. I think the easiest way to handle this is to set a flag that we check when the PRenderFrame eventually arrives.
+Hey billm - was attachment 8575622 ready for review? Or were you holding off on r? for something?
+Comment on attachment 8575622
+Tab switch refactoring (r=mconley?)
+
+I've started using a git tool to post my patches. I must have messed up.
+Comment on attachment 8575623
+Handle RequestNotifyLayerTreeReady when RenderFrameParent not ready
+
+See comment 7.
+Comment on attachment 8575622
+Tab switch refactoring (r=mconley?)
+
+Review of attachment 8575622:
+-----------------------------------------------------------------
+
+I think we should go for this. I like how it's encapsulating all of the complexity of our tab switching behaviour into a single place. I also think this greatly reduces the weird conditions we could get into before with the Promises.
+
+Assuming a green try run, r=me. Thanks billm!
+Bill, I'm seeing a test timeout failure with your patch on browser/base/content/test/general/browser_tabfocus.js
+
+See https://treeherder.mozilla.org/#/jobs?repo=try&revision=7be6c40dee88 - any of the bc1-e10s are showing timeouts. The other failures were due to my patch, but it appears the timeout at the end of the test is from this one.
+Yeah, I'll fix it soon. I've been trying to finish some reviews first.
+No problem, just wanted to make sure you were aware of it.
+Created attachment 8579676
+patch
+
+This fixes the test issue for me. The problem is that the tab switcher sometimes switches to the new tab immediately if we've already been waiting a long time for the current tab to load and it still hasn't loaded. After the switcher runs, we call updateCurrentBrowser, which then unfocuses the current tab (which is actually the new tab), thinking that we'll focus it when we switch to it. But that never happens.
+
+The fix is to avoid the blurring behavior if we've already switched. We don't need to call _adjustFocusAfterTabSwitch because the switcher already did that when it switched.
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/38c35f7b2b7d
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/fca0ab2e718d
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/531892b480db
+I had to back these out in 
+https://hg.mozilla.org/integration/mozilla-inbound/rev/9d5cf44338f9
+https://hg.mozilla.org/integration/mozilla-inbound/rev/a27defc5a71d
+https://hg.mozilla.org/integration/mozilla-inbound/rev/84bbf01b30ba
+
+for apparently causing near-permafailures in e10s-browser-chrome-3:
+https://treeherder.mozilla.org/logviewer.html#?job_id=7881250&repo=mozilla-inbound
+*** Bug 1147437 has been marked as a duplicate of this bug. ***
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/27d2e35e5832
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/564a9e11d9ec
+*** Bug 1087007 has been marked as a duplicate of this bug. ***
+https://hg.mozilla.org/mozilla-central/rev/27d2e35e5832
+https://hg.mozilla.org/mozilla-central/rev/564a9e11d9ec
+
+
+[e10s] black frame sometimes seen when switching tabs
+
+
+
+Bug 1132072 - Handle RequestNotifyLayerTreeReady when RenderFrameParent not ready (r=dvander) 
+
+Bug 1132072 - Tab switch refactoring (r=mconley) 
+
+Backed out changeset 531892b480db (bug 1132072) for frequent bc3 failures 
+
+Backed out changeset 38c35f7b2b7d (bug 1132072) for frequent bc3 failures CLOSED TREE 
+
+Bug 1132072 - Handle RequestNotifyLayerTreeReady when RenderFrameParent not ready (r=dvander) 
+
+Bug 1132072 - Tab switch refactoring (r=mconley) 

@@ -1,0 +1,133 @@
+(In reply to Jim Blandy :jimb from bug 1024774 comment #164)
+> Comment on attachment 8584033
+> Part 9: Deserialize heap snapshots
+> 
+> Review of attachment 8584033:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/devtools/server/HeapSnapshot.h
+> @@ +77,5 @@
+> > +  NodeId rootId;
+> > +
+> > +  // The set of nodes in this deserialized heap graph, keyed by id.
+> > +  using NodeMap = js::HashMap<NodeId, UniquePtr<DeserializedNode>>;
+> > +  NodeMap nodes;
+> 
+> Oh, one thought here, if you have time:
+> 
+> Since DeserializedNode itself has an 'id' field, this HashMap actually ends
+> up storing the id twice in each hash entry: once as the key, and then again
+> in the DeserializedNode pointed to by the value.
+> 
+> The hack to avoid this is to make this a HashSet, use Id for the Lookup type
+> in the hash policy, and make the policy's match method look inside its first
+> argument to get the Id.
+
+(In reply to Jim Blandy :jimb from bug 1024774 comment #164)
+> Comment on attachment 8584033
+> Part 9: Deserialize heap snapshots
+> 
+> Review of attachment 8584033:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/devtools/server/HeapSnapshot.h
+> @@ +77,5 @@
+> > +  NodeId rootId;
+> > +
+> > +  // The set of nodes in this deserialized heap graph, keyed by id.
+> > +  using NodeMap = js::HashMap<NodeId, UniquePtr<DeserializedNode>>;
+> > +  NodeMap nodes;
+> 
+> Oh, one thought here, if you have time:
+> 
+> Since DeserializedNode itself has an 'id' field, this HashMap actually ends
+> up storing the id twice in each hash entry: once as the key, and then again
+> in the DeserializedNode pointed to by the value.
+> 
+> The hack to avoid this is to make this a HashSet, use Id for the Lookup type
+> in the hash policy, and make the policy's match method look inside its first
+> argument to get the Id.
+Created attachment 8615500
+Savie some memory in HeapSnapshot instances by using a HashSet with a NodeId lookup, instead of a HashMap
+Comment on attachment 8615500
+Savie some memory in HeapSnapshot instances by using a HashSet with a NodeId lookup, instead of a HashMap
+
+Review of attachment 8615500:
+-----------------------------------------------------------------
+
+r=me with the requested changes.
+
+::: toolkit/devtools/server/DeserializedNode.cpp
+@@ +186,5 @@
+>          if (!name)
+>            return false;
+>        }
+>  
+> +      auto& referent = const_cast<DeserializedNode&>(node.getEdgeReferent(*edgep));
+
+You know, I think this is the only use of getEdgeReferent at the moment. Since we know it's okay to produce a ubi::Node pointing to a const DeserializedNode, would it make sense to have getEdgeReferent just return a ubi::Node directly and thereby localize this const_cast to that function?
+
+::: toolkit/devtools/server/DeserializedNode.h
+@@ +106,5 @@
+> +{
+> +  using Lookup = NodeId;
+> +
+> +  static js::HashNumber hash(const Lookup& lookup) {
+> +    return lookup;
+
+Let's use PointerHasher here, to smear the entropy around better. Pointer bottom bits are always zero.
+
+::: toolkit/devtools/server/HeapSnapshot.cpp
+@@ +102,5 @@
+> +  if (!dn.init(node, *this))
+> +    return false;
+> +  auto ptr = nodes.lookupForAdd(dn.id);
+> +  MOZ_ASSERT(!ptr);
+> +  return nodes.add(ptr, Move(dn));
+
+Is this the same as HashSet<T>::putNew(Move(dn))?
+Created attachment 8615721
+Save some memory in HeapSnapshot instances by using a HashSet with a NodeId lookup, instead of a HashMap
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5f2fdcefa7db
+Created attachment 8616906
+Save some memory in HeapSnapshot instances by using a HashSet with a NodeId lookup, instead of a HashMap
+Comment on attachment 8616906
+Save some memory in HeapSnapshot instances by using a HashSet with a NodeId lookup, instead of a HashMap
+
+This latest revision fixes DeserializedNode::HashPolicy::Hash to work properly on non-64bit architectures, as we discussed on IRC.
+Comment on attachment 8616906
+Save some memory in HeapSnapshot instances by using a HashSet with a NodeId lookup, instead of a HashMap
+
+Review of attachment 8616906:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/DeserializedNode.cpp
+@@ +127,5 @@
+>  {
+>    assertInitialized();
+>    auto ptr = owner->nodes.lookup(edge.referent);
+>    MOZ_ASSERT(ptr);
+> +  return JS::ubi::Node(const_cast<DeserializedNode*>(&*ptr));
+
+A comment here would be nice:
+
+HashSets only provide 'const' access to their values, because mutating a value might change its hash, rendering it unfindable in the set. Unfortunately, the ubi::Node constructor requires a non-const pointer to its referent. However, the only aspect of a DeserializedNode we hash on is its Id, which can't be changed via ubi::Node, so this cast can't cause the trouble HashSet is concerned a non-const reference would cause.
+
+Or something a little less verbose.
+
+::: toolkit/devtools/server/DeserializedNode.h
+@@ +108,5 @@
+> +
+> +  static js::HashNumber hash(const Lookup& lookup) {
+> +    // The below is equivalent to js::PointerHasher<NodeId, 3>::hash(), but
+> +    // because NodeId is always 64 bits regardless of the size of a native word,
+> +    // we can't use js::PointerHasher and must reimplement it here.
+
+I think we can be less apologetic:
+
+NodeIds are 64 bits, but they are derived from the original objects' addresses, which could have been either 32 or 64 bits long. As such, a NodeId has little entropy in its bottom three bits, and may or may not have entropy in its upper 32 bits. This hash should manage both cases well.
+Created attachment 8616940
+Save some memory in HeapSnapshot instances by using a HashSet with a NodeId lookup, instead of a HashMap
+New try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=9ee9829d3265
+https://hg.mozilla.org/integration/mozilla-inbound/rev/6c24d7e60eec
+https://hg.mozilla.org/mozilla-central/rev/6c24d7e60eec

@@ -1,0 +1,374 @@
+workers will likely need to reload periodically, in order to update, etc.  we should provide a mechanism for providers to reload.
+
+workers will likely need to reload periodically, in order to update, etc.  we should provide a mechanism for providers to reload.
+The trickiest part of this would be ensuring that no messages are lost during the reload - messages already posted aren't available to us (they are in the postMessage queue), so redelivery is probably impossible.
+
+One hacky solution may simply be for the worker to use importScripts() to load its own URL.  This will not remove old globals etc, but would probably also not have the problem of message redelivery as the onmessage handlers would not also be reloaded.  That would likely work today without anything extra for us to implement.
+(In reply to Mark Hammond (:markh) from comment #1)
+> The trickiest part of this would be ensuring that no messages are lost
+> during the reload - messages already posted aren't available to us (they are
+> in the postMessage queue), so redelivery is probably impossible.
+
+I'm not sure we need to be loss-less here.  providers can handle this on their end, eg. sending a reloaded message to the content panels, which could then update from the provider servers, or even just reload themselves.  Making sure the ports remain connected, or are recycled somehow, needs to be done.
+
+> One hacky solution may simply be for the worker to use importScripts()
+
+Which reminds me, importScripts is broken.
+
+> to
+> load its own URL.  This will not remove old globals etc, but would probably
+> also not have the problem of message redelivery as the onmessage handlers
+> would not also be reloaded.  That would likely work today without anything
+> extra for us to implement.
+
+hmm, that sounds interesting, though importScripts needs to be fixed.
+Also, the window 'location' object is exposed to the worker - so I guess it might even be possible for it to say "location = location.href" or similar.
+
+The fact 'location' is exposed is correct.  The fact it is exposed as a writable object may or may not be correct :)
+window.location.reload() ? navigator.mozSocial.reload() ?
+(In reply to imperio59 from comment #4)
+> window.location.reload() ? navigator.mozSocial.reload() ?
+
+Workers have neither |window| nor |navigator.mozSocial| objects (only the content-side of providers have that)
+I misread your comment #3 then...
+Is this still planned for FF 17?
+Sorry Florian, I misread your comment :)  The current situation is that location.reload() does exist in the worker.  The bad news is that it fails to work correctly (ie, the code isn't actually reloaded, and even if it was, existing ports would be in a strange "disconnected" state (ie, not closed, but not working either)
+
+It seems unlikely this will make 17 - is that a problem?
+Created attachment 669818
+workerreload.patch
+
+worker reload implementation for feedback.
+
+The big trick here is that ports remain alive and get reentangled after worker reload.  The other content panels can keep hold of a reference to their ports and all will be fine, however the worker should signal them in onconnect so they know a reconnect has happened.
+
+The demo at github.com/mixedpuppy/socialapi-demo (gh-pages branch) has been updated to support reload testing.
+
+- sidebar login sets cookie, which results in a message from teh worker
+- sidebar logout does the same
+
+1. login
+2. click reload worker button
+3. logout
+4. login
+5. click *request chat* button (which causes worker to initiate chat)
+
+This shows that the fundamentals are all working.
+Comment on attachment 669818
+workerreload.patch
+
+Review of attachment 669818:
+-----------------------------------------------------------------
+
+looking pretty good given we grudgingly have no real choice other than to implement it.
+
+::: toolkit/components/social/FrameWorker.jsm
+@@ +87,5 @@
+> +      } catch (e) {
+> +        Cu.reportError("FrameWorker: failed to create sandbox for " + url + ". " + e);
+> +      }
+> +    }, "document-element-inserted", false);
+> +  
+
+nit: trailing whitespace
+
+@@ +96,5 @@
+> +    // push all the ports into pending ports, they will be re-entangled
+> +    // during the call to createSandbox after the document is reloaded
+> +    for (let [portid, port] in Iterator(this.ports)) {
+> +      port._window = null;
+> +      if (port._portid)
+
+It looks like a new attribute is being added specifically for the port being closed (you named it 'closed', I'm going to suggest '_closed') - whatever it is named, you might as well use that new attribute here.
+
+However, an even better check might simply be that self._pendingMessages isn't empty to help avoid issues like bug 788368.  Eg, consider:
+
+port = getThePort()
+port.postMessage(...)
+port.close()
+
+in that scenario, the message should be delivered after the close both in the reload and normal cases.
+
+@@ +272,5 @@
+>  WorkerHandle.prototype = {
+>    get document() {
+>      return this._worker.frame.contentDocument;
+>    },
+> +  
+
+nit: trailing whitespace
+
+@@ +273,5 @@
+>    get document() {
+>      return this._worker.frame.contentDocument;
+>    },
+> +  
+> +  reload: function reload() {
+
+This object should try and stay as close to the standard worker object as possible - so maybe it should be _reload()?  (Sadly the document attribute above has snuck in, but no point making matters worse.)
+
+::: toolkit/components/social/MessagePortBase.jsm
+@@ +102,5 @@
+>      this._handler = null;
+>      this._pendingMessagesIncoming = [];
+>      this._portid = null;
+> +  },
+> +  
+
+more trailing whitespace :)
+
+@@ +103,5 @@
+>      this._pendingMessagesIncoming = [];
+>      this._portid = null;
+> +  },
+> +  
+> +  get closed() {
+
+this should be _closed as a standard port object has no closed attribute.
+
+::: toolkit/components/social/MozSocialAPI.jsm
+@@ +79,5 @@
+>    if (provider.origin != targetDocURI.prePath) {
+>      throw new Error("MozSocialAPI: cannot attach " + origin + " to " + targetDocURI.spec);
+>    }
+>  
+> +  var port;
+
+Why this change?  If reconnection on reload works correctly it probably isn't necessary for this?
+
+@@ +193,5 @@
+>    targetWindow.addEventListener("unload", function () {
+>      // We want to close the port, but also want the target window to be
+>      // able to use the port during an unload event they setup - so we
+>      // set a timer which will fire after the unload events have all fired.
+> +    schedule(function () {
+
+ditto here - I can't see where port can become undefined/null, and multiple closing of ports is explicitly allowed by the worker spec.
+
+::: toolkit/components/social/WorkerAPI.jsm
+@@ +25,5 @@
+>  
+>  WorkerAPI.prototype = {
+> +  initialize: function initialize() {
+> +    if (this._port)
+> +      this._port.close();
+
+TBH, I think I'd rather have the reload function inline the reinitialize code, rather than allowing initialize to be called multiple times.
+
+Also, is it really necessary to resend the social.initialize message?  The worker itself has requested the reload, so I'm not sure what the advantage of that is (but I might be missing a good reason, and I guess there isn't really a good reason to *not* resend it...)
+Oh - I also think we should avoid committing to this API over the longer term, so there should be comments to that effect, and similarly any doc changes should warn it might go away.
+
+I really hope I can get to work on real workers sometime soon and help move this social api to real workers - at that point I seriously doubt we can re-implement this api, and I sure as hell don't want this API to block us moving to real workers :)
+(In reply to Mark Hammond (:markh) from comment #11)
+> Oh - I also think we should avoid committing to this API over the longer
+> term, so there should be comments to that effect, and similarly any doc
+> changes should warn it might go away.
+> 
+> I really hope I can get to work on real workers sometime soon and help move
+> this social api to real workers - at that point I seriously doubt we can
+> re-implement this api, and I sure as hell don't want this API to block us
+> moving to real workers
+
+afaik, the only change here that would not be in the worker api is the port.closed attribute, which can be changed, since it is only really used in chrome.  
+
+WorkerHandle is not a worker api, it isn't exposed anywhere that i can find, it is used in chrome code.
+
+The reload is done via a port message, which should be compatible.
+
+We should work towards APIs that are long term, so if I am wrong about something above that's fine, lets fix it.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #12)
+
+> afaik, the only change here that would not be in the worker api is the
+> port.closed attribute, which can be changed, since it is only really used in
+> chrome.  
+
+Right - but that is exposed to content, so probably should be changed (ie, after this patch, content could use port.closed and it would appear to be a real supported api.  port._closed would at least signal they are digging under the covers.
+
+> WorkerHandle is not a worker api, it isn't exposed anywhere that i can find,
+> it is used in chrome code.
+
+Yeah, my mistake there - although the general intent is that that object exposes the SharedWorker API (ie, hence it has a terminate() method).  I guess I'm fine with moving away from that if necessary, but OTOH I don't think it is actually necessary ;)
+
+> The reload is done via a port message, which should be compatible.
+> 
+> We should work towards APIs that are long term, so if I am wrong about
+> something above that's fine, lets fix it.
+
+Let's say the WorkerAPI had a real worker and a real message port rather than our mockups of them.  In that scenario, I can't see how reload would actually be implemented (the message could obviously be received just fine - it is just that it could actually implement the reload functionality as SharedWorkers don't expose a way to do that).
+oops - ... it is just that it could *not* actually implement ...
+Comment on attachment 669818
+workerreload.patch
+
+>diff --git a/toolkit/components/social/FrameWorker.jsm b/toolkit/components/social/FrameWorker.jsm
+
+>+  reload: function reloadWorker() {
+
+>+    this.frame.setAttribute("src", "data:;charset=utf-8,");
+>+    this.load();
+
+Don't you need to wait for the data: load to complete? AFAIK that doesn't happen synchronously.
+
+>diff --git a/toolkit/components/social/MozSocialAPI.jsm b/toolkit/components/social/MozSocialAPI.jsm
+
+>+  Object.defineProperty(workerWrapper,
+>+                        "port", {
+>+                          get : function(){
+>+                            if (!port || port.closed)
+>+                              port = provider.getWorkerPort(targetWindow);
+>+                            return port;
+
+>-          port: port,
+>-          __exposedProps__: {
+>-            port: "r"
+>-          }
+
+Can you really lose these properties without re-introducing warnings? createObjectIn isn't a sufficient replacement. I've been meaning to look into having this code use ObjectWrapper.jsm, actually.
+
+>diff --git a/toolkit/components/social/WorkerAPI.jsm b/toolkit/components/social/WorkerAPI.jsm
+
+> function WorkerAPI(provider, port) {
+>   if (!port)
+>     throw new Error("Can't initialize WorkerAPI with a null port");
+> 
+>   this._provider = provider;
+>+  this.initialize();
+> }
+
+Looks like the "port" parameter is now unused... Which seems like it could mess up SocialProvider._activate (see comment there about port creation ordering - not sure if that's still relevant). At the very least we should get rid of the parameter, if it isn't necessary.
+Created attachment 670047
+workerreload.patch
+
+reduces the patch to the necessary changes, removes non sharedworker apis from workerhandle.  the loading of a blank document isn't necessary, setting src is reloading my provider without that.
+this is a blocker for the socailapi even in fx17, we're going to need to uplift.
+Comment on attachment 670047
+workerreload.patch
+
+Looks good to me, but I'm afraid I can't give r+ without tests (and tests should be fairly easy, right?)
+Comment on attachment 670047
+workerreload.patch
+
+Review of attachment 670047:
+-----------------------------------------------------------------
+
+I agree with Mark that there should be tests. Thanks for getting this together Shane, it looks pretty good.
+
+::: toolkit/components/social/WorkerAPI.jsm
+@@ +63,5 @@
+>        this._provider.setAmbientNotification(data);
+>      },
+>      "social.cookies-get": function(data) {
+> +      let document = getFrameWorkerHandle(this._provider.workerURL, null).
+> +                        _worker.frame.contentDocument
+
+nit: add a semicolon at the end of this line.
+Created attachment 670605
+workerreload.patch
+
+now with tests
+https://tbpl.mozilla.org/?tree=Try&rev=9cdbca888b91
+Comment on attachment 670605
+workerreload.patch
+
+Review of attachment 670605:
+-----------------------------------------------------------------
+
+::: toolkit/components/social/FrameWorker.jsm
+@@ +75,4 @@
+>  }
+>  
+>  FrameWorker.prototype = {
+> +  load: function loadWorker() {
+
+load: function FrameWorker_load() {
+
+@@ +91,5 @@
+> +
+> +    this.frame.setAttribute("src", this.url);
+> +  },
+> +
+> +  reload: function reloadWorker() {
+
+reload: function FrameWorker_reload() {
+
+::: toolkit/components/social/test/browser/browser_workerAPI.js
+@@ +102,5 @@
+>      Services.cookies.add('.example.com', '/', 'cheez', 'burger', false, false, true, MAX_EXPIRY);
+>      port.postMessage({topic: "test-initialization"});
+>      port.postMessage({topic: "test.cookies-get"});
+> +  },
+> +  
+
+nit: trailing whitespace
+FrameWorker's createSandbox seems to add offline/online event listeners to the sandbox, but doesn't remove them. Won't that result in multiple listeners attached after a reload? Or does the inner window destruction get rid of them?
+
+It would be nice if we could actually go through the same path for firing "social.initialize" in both cases (initial load and reload). I'm not sure the best way to do that offhand, perhaps that can be moved to a followup bug.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #23)
+> FrameWorker's createSandbox seems to add offline/online event listeners to
+> the sandbox, but doesn't remove them. Won't that result in multiple
+> listeners attached after a reload? Or does the inner window destruction get
+> rid of them?
+
+I did a quick test on that, we are indeed leaking those listeners, I'll rework the patch to remove them.
+Created attachment 670965
+workerreload.patch
+
+fixed nits from Jared in previous review, asking for review just on the change for onoffline and ononline event listeners.
+Comment on attachment 670965
+workerreload.patch
+
+Can you fix this by just setting the listeners on workerWindow instead, so that it gets cleared automatically when the window is reloaded?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #26)
+> Comment on attachment 670965
+> workerreload.patch
+> 
+> Can you fix this by just setting the listeners on workerWindow instead, so
+> that it gets cleared automatically when the window is reloaded?
+
+yes, I'll change that.
+Created attachment 670991
+workerreload.patch
+
+updated to simpler fix for listener leak
+Comment on attachment 670991
+workerreload.patch
+
+We need to re-work the getFrameWorkerHandle at some point, having WorkerAPI refer to it's ._worker property doesn't really make sense (if we need to expose the actual FrameWorker object, we might as well just do that, and then WorkerAPI can just hold on to that rather than the port). But that's something for another bug, I guess.
+
+I also don't like firing social.initialize from the reload-worker handler, but that's also something that we can re-work later, I guess. I'll file bugs.
+Checked in to mozilla-inbound:
+  https://hg.mozilla.org/integration/mozilla-inbound/rev/7a75ede979bf
+Don't forget to set in-testsuite :)
+ah yes, thanks!
+https://hg.mozilla.org/mozilla-central/rev/7a75ede979bf
+Comment on attachment 670991
+workerreload.patch
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): 
+User impact if declined: 
+Testing completed (on m-c, etc.): 
+Risk to taking this patch (and alternatives if risky): 
+String or UUID changes made by this patch:
+[Approval Request Comment]
+User impact if declined: security regressions in provider, this is a blocker on shipping.
+
+Testing completed (on m-c, etc.): unit tests via try and on m-c
+
+Risk to taking this patch (and alternatives if risky): risk is in content side, providers must coordinate their content to update based on the reload of the worker, with only one provider at the time, risk is low.  
+
+String or UUID changes made by this patch: none
+Comment on attachment 670991
+workerreload.patch
+
+Approving and trusting that someone will be doing outreach/documentation for the content providers on this change.
+added bug 801936 for documentation.
+https://hg.mozilla.org/releases/mozilla-beta/rev/60977deb1a10
+https://hg.mozilla.org/releases/mozilla-aurora/rev/2f92bb1104eb
+[qa-] for verification since this has in-testsuite coverage.
+
+
+reload for workers
+
+
+
+Bug 785920 - reload for workers. r=gavin.sharp 

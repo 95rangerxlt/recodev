@@ -1,0 +1,115 @@
+There's no real reason we need to iterate the child scripts at all on `onNewScript`. In fact it's misleading because `script.getChildScripts` does not recursively return all the nested scripts, it only returns the immediate children.
+
+Our breakpoint architecture has evolved over time and I think there used to be a reason we do it, but I talked with ejpbruel on IRC and he agreed that we should do this simple approach now:
+
+* `setBreakpoint` in the SourceActor takes a line/col and has the responsibility to set a breakpoint on ALL scripts at that location. It will appropriately check if a script already has a breakpoint. When it's done we know that all nested scripts have an activated breakpoint.
+
+* `onNewScripts` and `_restoreBreakpoints` only need to call `_addScript` with a top-level script. This approach is faster because we don't need to go through all the sourcemapping machinery (when resolving a script to a SourceActor and a location in that) for each individual script. I'm not entirely sure what's slow in that code path, but from my experiments it's not the fastest.
+
+It's very fast to just give `_addScript` only top-level scripts, and let `setBreakpoint` take care of the nested child scripts.
+
+One question is do we need to do the start/end line filtering in `_addScript` that we do now? Theoretically if we always pass it top-level scripts, we don't need to, we are basically activating all breakpoints for the entire source.
+
+If we do need to do the filtering, we can't do this until we fix an issue with the Debugger.Script `lineCount` property not always being correct. This blocks on bug 979094 if so.
+
+Note that in the case where the debugger is opened on an existing page, top-level scripts may be GCed. The `setBreakpoint` function in the SourceActor will still have to handled possibly "pending" breakpoints and not assume the top-level script is available.
+
+The end result of this bug, though, should be a *lot* faster debugger loading when a large, complex page is refreshed. I've seen rough results going from ~150ms to ~30ms, but we'll need to do more benchmarking here.
+
+There's no real reason we need to iterate the child scripts at all on `onNewScript`. In fact it's misleading because `script.getChildScripts` does not recursively return all the nested scripts, it only returns the immediate children.
+
+Our breakpoint architecture has evolved over time and I think there used to be a reason we do it, but I talked with ejpbruel on IRC and he agreed that we should do this simple approach now:
+
+* `setBreakpoint` in the SourceActor takes a line/col and has the responsibility to set a breakpoint on ALL scripts at that location. It will appropriately check if a script already has a breakpoint. When it's done we know that all nested scripts have an activated breakpoint.
+
+* `onNewScripts` and `_restoreBreakpoints` only need to call `_addScript` with a top-level script. This approach is faster because we don't need to go through all the sourcemapping machinery (when resolving a script to a SourceActor and a location in that) for each individual script. I'm not entirely sure what's slow in that code path, but from my experiments it's not the fastest.
+
+It's very fast to just give `_addScript` only top-level scripts, and let `setBreakpoint` take care of the nested child scripts.
+
+One question is do we need to do the start/end line filtering in `_addScript` that we do now? Theoretically if we always pass it top-level scripts, we don't need to, we are basically activating all breakpoints for the entire source.
+
+If we do need to do the filtering, we can't do this until we fix an issue with the Debugger.Script `lineCount` property not always being correct. This blocks on bug 979094 if so.
+
+Note that in the case where the debugger is opened on an existing page, top-level scripts may be GCed. The `setBreakpoint` function in the SourceActor will still have to handled possibly "pending" breakpoints and not assume the top-level script is available.
+
+The end result of this bug, though, should be a *lot* faster debugger loading when a large, complex page is refreshed. I've seen rough results going from ~150ms to ~30ms, but we'll need to do more benchmarking here.
+Created attachment 8552626
+1124258.patch
+
+This gives us the ability to give a top-level script to `_addScript` and set all the breakpoints within it, even though the `lineCount` is buggy (see bug 979094). Basically if the staticLevel of the script passed to `_addScript` is 0, don't do the range checking, as its the whole source.
+
+This should significantly speed up page refreshes on large sites, I think. It's also just simpler. All tests are passing locally, will do some benchmarking and more testing later.
+(this patch depends on bug 1122064)
+Comment on attachment 8552626
+1124258.patch
+
+Review of attachment 8552626:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/script.js
+@@ +2036,5 @@
+>      let source = this.sources.createNonSourceMappedActor(aScript.source);
+>      for (let bpActor of this.breakpointActorMap.findActors({ sourceActor: source })) {
+> +      // Limit the search to the line numbers contained in the new
+> +      // script if it's not the whole top-level script
+> +      if (aScript.staticLevel === 0 ||
+
+We only call _addScript for top level scripts now, don't we? So we should be able to remove this check completely.
+(In reply to Eddy Bruel [:ejpbruel] from comment #3)
+> 
+> We only call _addScript for top level scripts now, don't we? So we should be
+> able to remove this check completely.
+
+I took a conservative approach, but we probably should just make sure `_addScript` is called from the top-level. It is also called from `_restoreBreakpoints`, where it can be called from any script I think. But we should change that behavior (and add an assert at the top of `_addScript`).
+
+I'm also not entirely sure when `_restoreBreakpoints` is called. It's called from `onAttach` but as far as I know breakpoints don't survive across detach/attach.
+Created attachment 8598160
+1124258.patch
+
+Tests pass locally; I'll do a try run
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=fc95d065b2fa
+Comment on attachment 8598160
+1124258.patch
+
+Review of attachment 8598160:
+-----------------------------------------------------------------
+
+Great stuff. Glad to see this is getting cleaned up. r+ with comments addressed.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +2015,5 @@
+>      }
+>    },
+>  
+>    /**
+>     * Add the provided script to the server cache.
+
+This comment needs updating. We're not dealing with scripts anymore, we're dealing with sources.
+
+@@ -2050,5 @@
+>        } else {
+>          promises.push(this.sources.getGeneratedLocation(actor.originalLocation)
+>                                    .then((generatedLocation) => {
+> -          // Limit the search to the line numbers contained in the new script.
+> -          if (generatedLocation.generatedSourceActor.actorID === sourceActor.actorID &&
+
+If I understand this correctly, the range check can now be omitted because addSource is now only called for top-level scripts, correct?
+(In reply to Eddy Bruel [:ejpbruel] from comment #7)
+> 
+> If I understand this correctly, the range check can now be omitted because
+> addSource is now only called for top-level scripts, correct?
+
+Yes. I think the previous behavior was leftover from some old vision of the architecture. Either we (#1) thought that we would call _addScript for every single script (including all nested ones), and we would *only* set the breakpoint for that script if there is one (but not for any nested scripts). Since _addScript would be called for all nested scripts, breakpoints would be set on each script at line N.
+
+Or (#2) there was something about the debugger API that drove us to do the line range checking, I don't know.
+
+The previous code was kind of weird. `getChildScripts` is *not* recursive, it only returns the immediate children. There are some comments in there that we recurse on children 1-level deep because sometimes the line count of the top-level script is wrong. However, it we use the top-level script, we don't need to check line ranges! Or maybe we *thought* that `getChildScripts` was recursive and was attempting to do #1.
+
+Either way, this is a lot clearer and potentially faster. It also paves the way to handle sources introduced multiple times with the same URL, and somehow handling that in the frontend. I'm think in _addSource we could still notify TabSources to send a `newSource` packet even if one already exists.
+Created attachment 8598787
+1124258.patch
+
+tweaked comments
+The try links looks pretty good, are we having problems with the asan builds though? https://treeherder.mozilla.org/#/jobs?repo=try&revision=fc95d065b2fa
+https://hg.mozilla.org/integration/fx-team/rev/9463c48c807d
+https://hg.mozilla.org/mozilla-central/rev/9463c48c807d

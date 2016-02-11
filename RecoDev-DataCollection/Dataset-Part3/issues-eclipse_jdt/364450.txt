@@ -1,0 +1,131 @@
+The following test case should show two fatal errors regarding unresolved w.I. If we do some change e.g. change the type of w.W#i from w.I to I, and then undo this change, we will get two build path errors:
+
+1. "The project was not built since its build path is incomplete. Cannot find the class file for w.I. Fix the build path then try building this project"
+
+2. "The type w.I cannot be resolved. It is indirectly referenced from required .class files"
+
+We can observe the same problem, if we change the order of imports in a.A instead of changing the type of w.W#i. After the clean correct errors are shows again.
+
+----------%<-----------
+package a;
+
+import w.I;
+import w.W;
+
+public class A {
+}
+
+package w;
+
+public class W {
+	private w.I i;
+}
+----------%<-----------
+
+The following test case should show two fatal errors regarding unresolved w.I. If we do some change e.g. change the type of w.W#i from w.I to I, and then undo this change, we will get two build path errors:
+
+1. "The project was not built since its build path is incomplete. Cannot find the class file for w.I. Fix the build path then try building this project"
+
+2. "The type w.I cannot be resolved. It is indirectly referenced from required .class files"
+
+We can observe the same problem, if we change the order of imports in a.A instead of changing the type of w.W#i. After the clean correct errors are shows again.
+
+----------%<-----------
+package a;
+
+import w.I;
+import w.W;
+
+public class A {
+}
+
+package w;
+
+public class W {
+	private w.I i;
+}
+----------%<-----------
+This looks like a case of there being some instability in the error messages
+reported in the full build case vs incremental build case.
+
+Not clear, at least not patently clear, that either set of messages is 
+misleading/incorrect.
+
+I'll study this in more detail.
+An easier way to reproduce - in A.java, press space and save -> error appears, again press space and save -> error disappears.
+First impressions - this seems to happen because of a race condition between reconciler and the compiler.
+The second "indirectly referenced from required .class files" error occurs when compiler finishes after reconciler. While when the reconciler finishes last, there is only 1 error. This is because the compiler tries to build the binary type binding for W, that was found in W.class, and finds an unresolved reference to w.I in the class file. On the other hand, the reconciler just gets the source type W.
+Digging deeper it looks like reconciler behaves consistently. The problem is in fact in the resource deltas. In one case, the deltas correspond to both W.java and A.java. In this case W.java is resolved first and hence is available when A.java begins to resolve. In the other case, the deltas correspons to only A.java, and W is picked up from classfile. Don't know why the resource deltas behave differently every alternate time.
+This is why behaviour differs every alternate time:
+1. When we do a clean build all source files are build and thus there is no "indirect reference from .class file" error
+2. The next time we modify and save A, only A is built (incremental build), and W is picked up from its class file. This causes the "indirect reference from .class file" error which is a build path error.
+3. Once again when we modify and save A, the incremental java builder figures out there's a buildpath error since the last build, and goes back to building ALL sources, taking us back to 1.
+
+So, I think we should avoid reporting the "indirectly referenced from .class files" error somehow.
+I would like to describe the impact of the issue that users are experiencing.
+This improper build path error makes the Java builder runs as full build whenever there is a change in any sources that belong to the project. Therefore it results in build performance degradation.
+Ayush, please follow up just as soon as M4 is cooked and shipped.
+Thanks for marking me for review.
+(In reply to comment #5)
+> I would like to describe the impact of the issue that users are experiencing.
+> This improper build path error makes the Java builder runs as full build
+> whenever there is a change in any sources that belong to the project. Therefore
+> it results in build performance degradation.
+
+I understand the problem. We've been focusing on shipping M4 this week so I couldn't get much time on this. I will follow up on my analysis soon.
+Created attachment 208136
+proposed fix v1.0 + regression tests
+
+This is what happens in A.java after typing a space and saving (after a full build):
+1. Import w.I is found to be bogus and I is put in the cache as a not found type.
+2. Import w.W is found and compiler starts to resolve W from the already compiled W.class file.
+3. The compiler finds a missing w.I again in W.class and goes to org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment.getTypeFromCompoundName(char[][], boolean, boolean). Here, it looks into the cache and finds a not found type, thereby eliciting a classpath error.
+However, this is not needed because if the type was already in the cache as a not found type, we've already complained against it. This is where the patch helps.
+The following strategies were considered and rejected, in consultation with Satyam:
+1. To not generate a .class file for W since it has an unresolved type error. However, this will make the incremental builds really slow since there will be more CU's to process.
+2. To have the compiler's NameEnvironment always use sources when sources are available instead of using .class files, just like the reconciler's SearchableEnvironment. However => again performance hit since resolving binary classes is faster.
+
+The current patch seems like the best solution and passes all tests.
+Srikanth, please review, its a one line change. Thanks!
+Brought about by https://bugs.eclipse.org/bugs/show_bug.cgi?id=196200.
+Fix and tests look good. Basically, a class path error is indicated
+when we are unable to locate some type now, which we could locate 
+properly earlier while building some other piece (a binary class file).
+That is not the case here.
+
+Thanks for the quick resolution, Ayush.
+
+Dani, this is reported against 3.4.2, what streams should we release it
+in ourselves and for what streams a source patch is enough ? 
+
+(It is a one-line fix btw)
+Released in master via commit b78c9eb519121b68605325fd214ba23170967998.
+
+Released in maintenance via commit 626c55af72d40b07c0ba5d8332f9d48da304abca.
+(In reply to comment #11)
+> Fix and tests look good. Basically, a class path error is indicated
+> when we are unable to locate some type now, which we could locate 
+> properly earlier while building some other piece (a binary class file).
+> That is not the case here.
+> 
+> Thanks for the quick resolution, Ayush.
+> 
+> Dani, this is reported against 3.4.2, what streams should we release it
+> in ourselves and for what streams a source patch is enough ? 
+
+All branches >= R3_4_maintenance including R3_6_maintenance_Java7.
+Released in R3_6_maintenance_Java7 branch via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=R3_6_maintenance_Java7&id=8aff1e27a0c9b4c7936da57c5f115401c96583e6
+Released in R3_6_maintenance branch via commit c251eb3f1fc1878627fdc704bb1636e70f3db615
+Released in R3_5_maintenance branch via commit b00a5c1a34864630f0714dfada5ae77cda61169d
+(In reply to comment #16)
+> Released in R3_5_maintenance branch via commit
+> b00a5c1a34864630f0714dfada5ae77cda61169d
+
+Released into R3_5_maintenance CVS branch.
+Released in R3_4_maintenance(CVS).
+Phew!
+Verified for 3.7.2RC2 using build M20120118-0800
+Verified for 3.8M5 using build I20120122-2000
+New Gerrit change created: https://git.eclipse.org/r/58301
+Gerrit change https://git.eclipse.org/r/58301 was merged to [master].
+Commit: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=4b18dd4316dc00236ed6c747f8c1a28dbbc77894

@@ -1,0 +1,143 @@
+The remote protocol specification describes the messages that a Function grip actor must respond to:
+
+https://wiki.mozilla.org/Remote_Debugging_Protocol#Functions
+
+We can implement "nameAndParameters" and "scope" now, but "decompile" will have to wait for bug 690377.
+
+The remote protocol specification describes the messages that a Function grip actor must respond to:
+
+https://wiki.mozilla.org/Remote_Debugging_Protocol#Functions
+
+We can implement "nameAndParameters" and "scope" now, but "decompile" will have to wait for bug 690377.
+"scope" depends on bug 690558, but I'll stub out the relevant parts for now.
+Since I'm adding support for Debugger.Environment as part of this patch, handling the "assign" request will need bug 692984 to be resolved first.
+Created attachment 568429
+WIP
+
+Still WIP, lots of TODOs.
+Created attachment 568662
+WIP 2
+
+Finished the server part. I've added checks for the missing platform bits, since the relevant patches may not land for some time and we might want to land this sooner. Also did some moving around in the breakpoint actor code for consistency with the rest of the code.
+
+In the next iteration, I'll expose these protocol operations in the client API.
+Created attachment 569140
+WIP 3
+
+The variables pane now displays the "this" and "arguments" objects.
+Created attachment 569696
+Working patch
+
+This is a working version that gets the debugger to display "this", "arguments" and function call parameters in the property view. Further inspection of the parameter objects will be implemented in bug 694538.
+
+The tests do not exercise many new code paths, like the various EnvironmentActor-related ones, since that functionality depends on the bugs blocking this one. I'd like to get this in since the existing functionality is very useful and file a followup bug to write tests (and fixes if necessary) for the parts that depend on the other bugs. Otherwise we could shelve this patch for now and get back to finish it after the blocking ones land.
+Comment on attachment 569696
+Working patch
+
+Review of attachment 569696:
+-----------------------------------------------------------------
+
+r- because I don't understand the environmentPool stuff.  Might just need an explanation to switch that to r+.
+
+::: toolkit/devtools/debugger/server/dbg-script-actors.js
+@@ +515,5 @@
+> +    this._environmentPool = environmentPool;
+> +    this._environmentPool.addActor(actor);
+> +    this.conn.addActorPool(environmentPool);
+> +    environment.actor = actor;
+> +
+
+I don't understand this.  What happens to an existing this._environmentPool when this method is called a second time?
+
+Do we need a separate pool for environments?  Do they not make sense as breakpoint-lifetime actors?
+
+@@ -639,0 +672,37 @@
+> > +  /**
+> > +   * Handle a protocol request to provide the source code of a function.
+> > +   */
+> > +  onDecompile: function OA_onDecompile(aRequest) {
+NaN more ...
+
+actor ? actor.grip() : actor is a pretty common pattern, I wonder if we should add a simple grip(actor) function to do that.
+Created attachment 569984
+Working patch v2
+
+(In reply to Dave Camp (:dcamp) from comment #7)
+> Comment on attachment 569696 [diff] [details] [review]
+> Working patch
+> 
+> Review of attachment 569696 [diff] [details] [review]:
+> -----------------------------------------------------------------
+> 
+> r- because I don't understand the environmentPool stuff.  Might just need an
+> explanation to switch that to r+.
+> 
+> ::: toolkit/devtools/debugger/server/dbg-script-actors.js
+> @@ +515,5 @@
+> > +    this._environmentPool = environmentPool;
+> > +    this._environmentPool.addActor(actor);
+> > +    this.conn.addActorPool(environmentPool);
+> > +    environment.actor = actor;
+> > +
+> 
+> I don't understand this.  What happens to an existing this._environmentPool
+> when this method is called a second time?
+> 
+> Do we need a separate pool for environments?  Do they not make sense as
+> breakpoint-lifetime actors?
+
+Doh, you're right, this is not good. I tried to copy the frame pool approach, but I botched it.
+
+The environment actors lifetime should be similar to the lifetime of the breakpoint actors, but I didn't reuse that pool because of the different handling. The breakpoint pool is manually managed with explicit "delete" requests that remove objects, while the environment actors should be automatically managed, like the _pausePool or the threadLifetime pool. Come to think of it, the lifetime of environment actors should probably span across pauses, since the Debugger API mentions that the engine will return the same Debugger.Environment instance for the same scope. Breakpoints on the other hand could span contexts, since reloading a page should probably maintain the breakpoints both in the client and server.
+
+In this patch I put all EnvironmentActors to the threadlifetimePool, so they should be properly taken care of by the existing pool handling code. There may be more stupid mistakes in this part of the patch, since it can't be tested yet.
+
+> @@ -639,0 +672,37 @@
+> > > +  /**
+> > > +   * Handle a protocol request to provide the source code of a function.
+> > > +   */
+> > > +  onDecompile: function OA_onDecompile(aRequest) {
+> NaN more ...
+> 
+> actor ? actor.grip() : actor is a pretty common pattern, I wonder if we
+> should add a simple grip(actor) function to do that.
+
+It seems prone to confusion to have both foo.grip() and grip(foo), but I gave it a shot. Unfortunately, some code paths didn't have grip(foo) in scope, like the event-triggered onDebuggerStatement. Fixing that would require to define grip(foo) as an inherited method, leading to even more confusion between foo.grip() and bar.grip(foo) or this.grip(foo).
+(In reply to Panos Astithas [:past] from comment #8)
+
+(sorry, I meant pause lifetime, not breakpoint lifetime).
+
+> In this patch I put all EnvironmentActors to the threadlifetimePool, so they
+> should be properly taken care of by the existing pool handling code. There
+> may be more stupid mistakes in this part of the patch, since it can't be
+> tested yet.
+
+Just talked this over with jimb: When requesting a frame's |environment|, that environment should be parented by the frame - when the frame is dropped, the environment should be dropped too.  So I guess FrameActors should each have a pool, to which we'll add frame-lifetime objects like the environment.
+When requesting a function grip's |scope|, the environment should have the same parent as the function grip.  So you can just added it to the same pool that the function grip belongs to.
+
+That can lead to multiple grips for the same environment, but there's some precedent for that when promoting grips to different lifetimes.
+Created attachment 570747
+Working patch v3
+
+Changed environmentActor to accept a pool object and store the newly-created actor in there. Call sites provide the proper pool, since FrameActor now hosts a _frameLifetimePool. In the case of a "scope" request to a function, the function's registeredPool is used, as you suggested. This will not be the _frameLifetimePool though, since object actors are put into the _pausePool or _threadLifetimePool. Shouldn't object actors get stored in the same frame pool? Why are they treated differently?
+Created attachment 570970
+Working patch v4
+
+Fixed a broken function grips unit test that I noticed while working on object grips.
+https://hg.mozilla.org/users/dcamp_campd.org/remote-debug/rev/2a652fe9b4bd
+(In reply to Panos Astithas [:past] from comment #1)
+> "scope" depends on bug 690558, but I'll stub out the relevant parts for now.
+
+Bug 690558 is now fixed, so we need to merge from fx-team in order to work on this.
+(In reply to Panos Astithas [:past] from comment #13)
+> (In reply to Panos Astithas [:past] from comment #1)
+> > "scope" depends on bug 690558, but I'll stub out the relevant parts for now.
+> 
+> Bug 690558 is now fixed, so we need to merge from fx-team in order to work
+> on this.
+
+This work was done in bug 715543.
+
+
+Implement Function grip actor message handling
+

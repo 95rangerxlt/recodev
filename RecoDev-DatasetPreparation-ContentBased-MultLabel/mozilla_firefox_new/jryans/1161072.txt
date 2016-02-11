@@ -1,0 +1,1024 @@
+Anyone contributing seriously to our codebase hit issues in tests or while using tools intensively where the toolbox gets into a broken state or you end up with various random exception in browsre console.
+Many of these exception are due to races in the way we are handling connection shutdown on actor side and/or target/toolbox/panels cleanups on client side.
+
+One rule we should try to respect to avoid these exception and broken state is:
+Do not attempt to use actors once the toolbox starts closing or the client/connection closes.
+
+Today, we end up calling actors method during toolbox cleanup to reset the state of the actors/tab, but instead, the actor itself should clean things up when its `disconnect` method is called.
+
+Anyone contributing seriously to our codebase hit issues in tests or while using tools intensively where the toolbox gets into a broken state or you end up with various random exception in browsre console.
+Many of these exception are due to races in the way we are handling connection shutdown on actor side and/or target/toolbox/panels cleanups on client side.
+
+One rule we should try to respect to avoid these exception and broken state is:
+Do not attempt to use actors once the toolbox starts closing or the client/connection closes.
+
+Today, we end up calling actors method during toolbox cleanup to reset the state of the actors/tab, but instead, the actor itself should clean things up when its `disconnect` method is called.
+Created attachment 8601001
+cleanup reconfigure - v1
+
+First one, first mess, we call reconfigure in various place, with various patterns,
+sometime we wait for the request, or we don't...
+Sometime the request reach the actor but the docshell is already gone.
+
+Just move all the reconfigure reset from client code to the actor.
+I also tried to reorder/cleanup code in webbrowser.js.
+
+This patch also improve the overall behavior of this actor,
+as it will reenable cache even if the network monitor (or any other code) fails to/doesn't restore it.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=a27155808007
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=49d75647d26e
+Comment on attachment 8601001
+cleanup reconfigure - v1
+
+Review of attachment 8601001:
+-----------------------------------------------------------------
+
+This seems like a good improvement, in general.
+
+However, I don't think it works for servers before the change.  They will still wait to be reconfigured.  So, it seems like a trait is needed.  My guess is this could be true of many of the changes you make here.
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #2)
+> Comment on attachment 8601001
+>
+> However, I don't think it works for servers before the change.  They will
+> still wait to be reconfigured.  So, it seems like a trait is needed.  My
+> guess is this could be true of many of the changes you make here.
+
+Yes it doesn't clean state for old servers, I did that on purpose to clean that code.
+It isn't as important to reset state as in firefox as you reuse the tab easily after a debugging session.
+But I reintroduced these calls in my new patch. I would happily remove them if you think that a good breaking compromise ;)
+In my next patch you will see a new trait that I'm using for that and all other similar usecases.
+I'll land the trait once I cleaned eveything in order to prevent having to introduce one trait for each single cleanup.
+Created attachment 8601555
+cleanup reconfigure - v2
+Created attachment 8601558
+trait
+
+The trait, to tell that actors do cleanup on disconnect.
+Created attachment 8601560
+Destroy inspector actor on disconnect
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=bd403ab20d79
+Created attachment 8601562
+Destroy highlighter actor on disconnect
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=e4bbb5570f33
+Created attachment 8601564
+Call hideBoxModel from actor
+
+not from client during shutdown!
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=aad4a873edcc
+Created attachment 8601565
+Destroy the walker actor on disconnect
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=7b7f6d7ece38
+Comment on attachment 8601564
+Call hideBoxModel from actor
+
+Here is the right try for this patch:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=2477ea077fa2
+Arf, here is the "No such actor for ID: server1.conn2.pagestyle27" exception again, starting from the very first patch related to inspector, attachment 8601560 "destroy inspector actor on disconnect". I split my cleanup in many patches as I thought it would have only start to fail in one step, but not the very first one :x
+In this first step, I'm just adding a disconnect method on InspectorActor with an empty destroy method that only call Actor's one.
+
+That's the same exception that prevents me from landing bug 1145049. I opened this bug as I thought toolbox shutdown was related to it and I would be able to fix/prevent it if I made the toolbox/target cleanup codepath simplier by moving code to the actors.
+Something I've seen in many tests is that we close the tab we opened for the test and call `finish()` right after.
+That ends up calling toolbox.destroy and its async mess without waiting.
+That is a source of overlap between tests, but at the end it shouldn't break the next tests as the next tests are going to open a new tab, new toolbox, new client. It ends up breaking because of warning messages being thrown in the console.
+The real issue is that some test ends up throwing and dispatching these warning in the console.
+
+There is a common pattern over multiple files, to pass a promiseWarn method to all promises to log errors.
+But I'm wondering if we can get rid of all those as promises now automatically do that?
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/protocol.js#18
+  http://mxr.mozilla.org/mozilla-central/source/browser/devtools/styleinspector/rule-view.js#48
+As well as the various
+  .then(null, console.error | Cu.reportError)
+?
+
+The only difference is that the error is going to be displayed immediately and always no matter if there is a following promise handler.
+Also in the second case (console.error/reportError), if there is a next promise, it will return a resolving (i.e. not rejecting) promise and always log the message.
+(In reply to Alexandre Poirot [:ochameau] from comment #3)
+> (In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #2)
+> > Comment on attachment 8601001
+> >
+> > However, I don't think it works for servers before the change.  They will
+> > still wait to be reconfigured.  So, it seems like a trait is needed.  My
+> > guess is this could be true of many of the changes you make here.
+> 
+> Yes it doesn't clean state for old servers, I did that on purpose to clean
+> that code.
+> It isn't as important to reset state as in firefox as you reuse the tab
+> easily after a debugging session.
+> But I reintroduced these calls in my new patch. I would happily remove them
+> if you think that a good breaking compromise ;)
+> In my next patch you will see a new trait that I'm using for that and all
+> other similar usecases.
+> I'll land the trait once I cleaned eveything in order to prevent having to
+> introduce one trait for each single cleanup.
+
+I think it's actually quite important to ensure the tab is correctly reset:  If the toolbox disabled caching and then you close the toolbox but we fail to reset it, it could lead to a confusing performance experience that is hard to explain, since there's no user-visible indication that caching is off.
+
+So, at least for this particular change, I think a proper trait is important.
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #13)
+> I think it's actually quite important to ensure the tab is correctly reset:
+
+Note that for tab, we don't need trait as client and server are in sync and support actor cleanup, only remote usecase would go wrong.
+(In reply to Alexandre Poirot [:ochameau] from comment #14)
+> (In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #13)
+> > I think it's actually quite important to ensure the tab is correctly reset:
+> 
+> Note that for tab, we don't need trait as client and server are in sync and
+> support actor cleanup, only remote usecase would go wrong.
+
+Hmm, that's true.  Still, it does feel like a bad idea to me, even for the remote case.
+I created a wiki page to offer guidance on the right way to design actors:
+
+https://wiki.mozilla.org/DevTools/Actor_Best_Practices
+
+I've only added the main flaw you've been running into for now, but please edit and add to it!  An example might be good to have.
+Huh, I didn't know that. How can actors register to the connection being destroyed? Can we have a bug that ensures this is the case everywhere? (Cc me if so!)
+Created attachment 8604544
+cleanup reconfigure - v3
+
+It looks like the docshell leaks reported last week are gone,
+at least locally, it vanished when rebasing against last tip.
+
+Try without the trait:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=cb32becabfd1
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=57e200b90813
+With it:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=a830b7bed58d
+Created attachment 8604775
+cleanup reconfigure - v4
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=bdd2881a1247
+A cache test was still failing on linux32,
+a race that should be happening also without this patch...
+Can't explain why it is highlighted by this small modification.
+We shouldn't do a reload of the document when we reset javascript state from toolbox-options:destroy.
+
+I plan to land this patch before the trait addition, and do the same for most patches.
+So that we can use just one trait for all these cleanups fixes.
+I'm ensuring that tests are green with/without the trait before landing.
+Comment on attachment 8604775
+cleanup reconfigure - v4
+
+Review of attachment 8604775:
+-----------------------------------------------------------------
+
+Patch seems fine, but I really think you need a specific trait.  Let's discuss further if you disagree.
+
+::: browser/devtools/framework/toolbox.js
+@@ +1748,5 @@
+>  
+>      // Now that we are closing the toolbox we can re-enable the cache settings
+>      // and disable the service workers testing settings for the current tab.
+> +    // FF40+ automatically cleans up state in actor on disconnect.
+> +    if (this.target.activeTab && !this.target.activeTab.traits.actorsCleanup) {
+
+I think it feels strange to have a trait that says "things are better".  It's too vague.  Next time someone cleans up something, what happens?  |actorsCleanup2|?
+
+Look at the list of existing traits[1].  Each trait's name summarizes its purpose.
+
+The traits are used beyond Gecko as well, like in Valence.  With a name like "actorsCleanup", it's not at all clear if Valence should say true or false.
+
+Also, by grouping a bunch of unrelated things in one trait, you force all servers (like Valence) to either do *everything* you did or *nothing*, since there is no in-between.
+
+So, for this specific fix, use something like:
+
+noTabReconfigureOnClose
+
+[1]: https://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/root.js#109
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #20)
+> Comment on attachment 8604775
+>
+> I think it feels strange to have a trait that says "things are better". 
+> It's too vague.  Next time someone cleans up something, what happens? 
+> |actorsCleanup2|?
+
+I know but I was scared to introduce tons of traits in this cleanup quest.
+But that would be ok, if I can, at least shared a cleanup trait for the inspector which will need various tweaks.
+(hideBoxModel, highlighter, walker)
+(In reply to Alexandre Poirot [:ochameau] from comment #21)
+> (In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #20)
+> > Comment on attachment 8604775
+> >
+> > I think it feels strange to have a trait that says "things are better". 
+> > It's too vague.  Next time someone cleans up something, what happens? 
+> > |actorsCleanup2|?
+> 
+> I know but I was scared to introduce tons of traits in this cleanup quest.
+> But that would be ok, if I can, at least shared a cleanup trait for the
+> inspector which will need various tweaks.
+> (hideBoxModel, highlighter, walker)
+
+Sharing just for the inspector sounds potentially reasonable assuming the set of changes are related as group.  It's kind of hard to say for sure without looking at the changes, though.
+
+You could potentially make use of traits on the actor instead of the root, if that seems helpful, as in webbrowser[1].  But, you added those, so I guess you already know. :)
+
+[1]: https://hg.mozilla.org/mozilla-central/annotate/617dbce26726/toolkit/devtools/server/actors/webbrowser.js#l2074
+Created attachment 8605183
+Destroy inspector actor on disconnect
+
+Just rebased.
+
+It looks like I should be able to land this patch.
+Try is now green (If I ignore the always failing dt1/dt2 on linux32).
+But I also need another fix (next patch).
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=b781bbad521f
+
+This patch doesn't introduce incompatibilities with old/new client/server,
+it just improves the actor.
+Created attachment 8605185
+Prevent "no such actor" exception from style inspector during toolbox shutdown
+
+As I sligthly change the destruction order, the rule-view code starts throwing
+in some really rare race where the rule-view dispatches a getApplied request
+whereas the targeted actor is already destroyed.
+`polulate` here, is called by a setTimeout from inspector-panel:scheduleLayoutChange().
+The race happens when the timeout fires *just before* we call toolbox.destroy, really just before.
+At the time we call front.getApplied, the front and the actor are still alive,
+but by the time the request reach the server side code, the actor is gone.
+Created attachment 8605207
+cleanup reconfigure - v5
+
+With specific trait.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=4031bb91ee40
+As the trait is now specific I'm landing it combined.
+Comment on attachment 8605207
+cleanup reconfigure - v5
+
+Review of attachment 8605207:
+-----------------------------------------------------------------
+
+Thanks for using a specific trait, it feels much better to me now.
+
+::: browser/devtools/framework/toolbox-options.js
+@@ +375,5 @@
+>      this._removeListeners();
+>  
+>      if (this.target.activeTab) {
+> +      this.disableJSNode.removeEventListener("click", this._disableJSClicked);
+> +      // FF40+ automatically cleans up state in actor on disconnect
+
+Nit: It's 41 now... (Unless you plan to uplift)
+
+::: browser/devtools/framework/toolbox.js
+@@ +1747,5 @@
+>      }
+>  
+>      // Now that we are closing the toolbox we can re-enable the cache settings
+>      // and disable the service workers testing settings for the current tab.
+> +    // FF40+ automatically cleans up state in actor on disconnect.
+
+Nit: It's 41 now... (Unless you plan to uplift)
+
+::: toolkit/devtools/server/actors/webbrowser.js
+@@ +1374,5 @@
+>  
+>    /**
+>     * Handle logic to enable/disable JS/cache/Service Worker testing.
+>     */
+>    _toggleDevtoolsSettings: function(options) {
+
+Super Nit: If you could change Devtools to DevTools, that would be great!
+Created attachment 8605315
+cleanup reconfigure - v6
+Created attachment 8607132
+cleanup reconfigure - v7
+
+Rebased against recent tip, with new try:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=dbd815bd6a64
+Created attachment 8607134
+Destroy inspector actor on disconnect
+Created attachment 8607136
+Prevent "no such actor" exception from style inspector during toolbox shutdown
+https://hg.mozilla.org/integration/fx-team/rev/613ea0ac6707
+https://hg.mozilla.org/integration/fx-team/rev/bd930602d606
+https://hg.mozilla.org/integration/fx-team/rev/c9d7db3555f7
+https://hg.mozilla.org/mozilla-central/rev/613ea0ac6707
+https://hg.mozilla.org/mozilla-central/rev/bd930602d606
+https://hg.mozilla.org/mozilla-central/rev/c9d7db3555f7
+Hum... it looks like the other patches now applies without making try look like a chrystmas tree?!
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=a7c769b811ef
+
+Let's see if that's also somewhat green on linux32:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=ce56177cdf8b
+Created attachment 8607602
+Prevent racing hideBoxModel during connection shutdown. r=pbrosset
+
+Just realized these two patches were disabled as I renamed the trait name...
+New patches with traits on related actors and not on the root actor.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=2689d0e035de
+Created attachment 8607603
+Destroy the walker actor on disconnect
+https://hg.mozilla.org/integration/fx-team/rev/caaf9d16a00d
+(In reply to Alexandre Poirot [:ochameau] from comment #34)
+> Created attachment 8607602
+> Prevent racing hideBoxModel during connection shutdown. r=pbrosset
+> 
+> Just realized these two patches were disabled as I renamed the trait name...
+> New patches with traits on related actors and not on the root actor.
+> 
+> https://treeherder.mozilla.org/#/jobs?repo=try&revision=2689d0e035de
+
+Ok... Better, that actually fails as expected!
+https://hg.mozilla.org/mozilla-central/rev/caaf9d16a00d
+Created attachment 8608764
+cleanup webconsole tests
+
+This patch ensures that webconsole tests do not have pending requests on test end.
+They used to have various highlighter requests pending like showBoxModel.
+
+The issue in console-output.js is that we ended up registering more than one mousover listener
+and dispatched multiple showBoxModel requests.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=7c411dba02be
+All the patches and deps on try:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=0ad3b868ee6e
+Comment on attachment 8608764
+cleanup webconsole tests
+
+Review of attachment 8608764:
+-----------------------------------------------------------------
+
+LGTM, but Patrick knows this code better.
+Comment on attachment 8608764
+cleanup webconsole tests
+
+Review of attachment 8608764:
+-----------------------------------------------------------------
+
+::: browser/devtools/webconsole/test/browser_webconsole_output_dom_elements_03.js
+@@ +58,5 @@
+>  function* hoverOverWidget(widget, toolbox) {
+>    info("Hovering over the output to highlight the node");
+>  
+>    let onHighlight = toolbox.once("node-highlight");
+> +  let onHighlighterShown = toolbox.once("highlighter-ready");
+
+I don't understand why you have to wait for this event too. It's sent as a result of "ready" being sent at the end of BoxModelHighlighter._show, which is called by the HighlighterActor's showBoxModel protocol method, which is called in toolbox-highlighter-utils's highlightNodeFront function.
+tl;dr; "node-highlight" is emitted after "highlighter-ready", so it doesn't seem required to wait for it.
+(In reply to Patrick Brosset [:pbrosset] [:patrick] [:pbro] from comment #42)
+> Comment on attachment 8608764
+> cleanup webconsole tests
+> 
+> Review of attachment 8608764:
+> -----------------------------------------------------------------
+> 
+> :::
+> browser/devtools/webconsole/test/browser_webconsole_output_dom_elements_03.js
+> @@ +58,5 @@
+> >  function* hoverOverWidget(widget, toolbox) {
+> >    info("Hovering over the output to highlight the node");
+> >  
+> >    let onHighlight = toolbox.once("node-highlight");
+> > +  let onHighlighterShown = toolbox.once("highlighter-ready");
+> 
+> I don't understand why you have to wait for this event too. It's sent as a
+> result of "ready" being sent at the end of BoxModelHighlighter._show, which
+> is called by the HighlighterActor's showBoxModel protocol method, which is
+> called in toolbox-highlighter-utils's highlightNodeFront function.
+> tl;dr; "node-highlight" is emitted after "highlighter-ready", so it doesn't
+> seem required to wait for it.
+
+I do not remember why I added this with all the tweaks I made to so many tests :/
+You are right, I must have been confused with bug 1167174, or some other patch in my queue did a subtle change to this codepath. But the fact is that I no longer need to wait for highlighter-ready here.
+The real issue shifted to browser_webconsole_output_dom_elements_02.js, which makes browser_webconsole_output_dom_elements_04.js to fail (with the two other patches to land in this patch).
+I'll post an updated patch shortly.
+Created attachment 8611187
+cleanup webconsole tests v2
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=8facf3a4766e
+Comment on attachment 8611187
+cleanup webconsole tests v2
+
+Review of attachment 8611187:
+-----------------------------------------------------------------
+
+Looks good to me now.
+Created attachment 8613515
+Fix pending requests in markup view
+
+The issue here is that markup view dispatch some WalkerActor.insertBefore request
+on some mouse up event, but we do not track progress of this request
+and the request may still be pending on destroy.
+The mouse listener is here:
+  http://mxr.mozilla.org/mozilla-central/source/browser/devtools/markupview/markup-view.js#1931
+
+Here is a quite hacky way to address this...
+Handling all requests nicely on shutdown in hard.
+I'have been chasing them down for quite a while now and just on the inspector.
+Such practice (flushPendingRequests) may solve the overall issue.
+
+Ryan, I still think the exception/error thrown when there is still a request in queue
+cost us a lot and shouldn't exists. Things should just work.
+But I have to agree it also help discovering issues. I've recently highlighted
+an anormal number of requests in rule-view.
+And also, we shouldn't ever have pending requests/code overlapping between tests.
+This patch may address that, but I'm also scared to put such setTimeout within destruction
+codepath. It may slowdown toolbox shutdown or worse, prevent it from shutting down!
+
+...Feedback welcomed on this particular markup view scenario and on the overall issue...
+https://hg.mozilla.org/integration/fx-team/rev/c32e6f44cc4d
+https://hg.mozilla.org/mozilla-central/rev/c32e6f44cc4d
+Comment on attachment 8613515
+Fix pending requests in markup view
+
+Review of attachment 8613515:
+-----------------------------------------------------------------
+
+I still feel like the pending request during shutdown error is helpful.  As you admit, it's pointing out problems.  To me it's evidence of race conditions that need to be fixed at some point, even if things may "usually" work.
+
+Let me take a look at this part and see what I can think of.  Do the tests fail every time without this patch, or do I need a special setup to cause the errors?
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #49)
+> Let me take a look at this part and see what I can think of.  Do the tests
+> fail every time without this patch, or do I need a special setup to cause
+> the errors?
+
+You need to apply attachment 8607602 and attachment 8607603.
+You can see the related test (for ex: markupview_dragdrop_autoscroll.js) fail in comment 34's try.
+Note that you may have to run all the tests to get it to fail...
+Created attachment 8615078
+Record stacks for pending requests
+
+It can be tricky to debug these pending requests as-is.
+
+This adds the stack from the time the request was made, which is more useful to find where it came from.
+Created attachment 8615080
+Fix pending requests in markup view (v2)
+
+I spent some time on markup view tests, and I still feel like the pending request error should remain.
+
+Many times they are demonstrating clear race conditions in the product or test, and could be related to other intermittents.  So, I think fixing them is a better idea than turning off the error.
+
+When you have something like these cases of waiting on the result of an event handler, a good solution is for the tool to emit some event once the RDP request completes, which the test can then wait for.  This is what I've seen done very heavily in the net monitor and web audio tools, and it really helps make the tests more correct.
+
+I've fixed up the markup view tests with this approach.
+Created attachment 8615082
+Fix pending requests in rule view
+
+I kept going and did the rule view tests too, for more evidence that the approach works.
+
+That's all for now. :)
+Try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=e258c9c9ab3f
+Comment on attachment 8615078
+Record stacks for pending requests
+
+Review of attachment 8615078:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/protocol.js
+@@ +1168,5 @@
+>      this._requests.push({
+>        deferred,
+>        to: to || this.actorID,
+> +      type,
+> +      stack: new Error().stack
+
+Could you do that conditionally, as I imagine it will use additional memory whereas we care about that only while debugging.
+Comment on attachment 8615082
+Fix pending requests in rule view
+
+Review of attachment 8615082:
+-----------------------------------------------------------------
+
+I'm already fixing the ruleview-changed in bug 1166774, attachment 8612357.
+Comment on attachment 8615080
+Fix pending requests in markup view (v2)
+
+Review of attachment 8615080:
+-----------------------------------------------------------------
+
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #52)
+> Created attachment 8615080
+> Fix pending requests in markup view (v2)
+> Many times they are demonstrating clear race conditions in the product or
+> test, and could be related to other intermittents.  So, I think fixing them
+> is a better idea than turning off the error.
+> 
+> When you have something like these cases of waiting on the result of an
+> event handler, a good solution is for the tool to emit some event once the
+> RDP request completes, which the test can then wait for.  This is what I've
+> seen done very heavily in the net monitor and web audio tools, and it really
+> helps make the tests more correct.
+
+That's what I've been doing so far, but my concern was that we only fix those possible races in tests.
+We are waiting for these events only from the test script.
+
+ruleview-changed is something used in tests, but also in production code
+that made sense to me to listen and use this existing event in tests.
+But I was reluctant to introduce such event, like "drop-completed", just for tests,
+with no usage in production code.
+This is why I did fix the ruleview-changed and took some time to ask your feedback on that one.
+
+I think it is more up to inspector maintainer to make the call for this precise case/patch.
+
+::: browser/devtools/markupview/markup-view.js
+@@ +1950,5 @@
+>  
+> +    yield this.markup.walker.insertBefore(this.node, dropTargetNodes.parent,
+> +                                          dropTargetNodes.nextSibling);
+> +    this.markup.emit("drop-completed");
+> +  }),
+
+May be we could avoid Task by just returning insertBefore promise, as in the two tests you are fixing are calling this method directly.
+(In reply to Alexandre Poirot [:ochameau] from comment #55)
+> Comment on attachment 8615078
+> Record stacks for pending requests
+> 
+> Review of attachment 8615078:
+> -----------------------------------------------------------------
+> 
+> ::: toolkit/devtools/server/protocol.js
+> @@ +1168,5 @@
+> >      this._requests.push({
+> >        deferred,
+> >        to: to || this.actorID,
+> > +      type,
+> > +      stack: new Error().stack
+> 
+> Could you do that conditionally, as I imagine it will use additional memory
+> whereas we care about that only while debugging.
+
+Okay, like as a some "debug" boolean in the file?  Mostly I just want to land something even if it's commented out, as I've written this same debugging aid about 5 times now...
+(In reply to Alexandre Poirot [:ochameau] from comment #56)
+> Comment on attachment 8615082
+> Fix pending requests in rule view
+> 
+> Review of attachment 8615082:
+> -----------------------------------------------------------------
+> 
+> I'm already fixing the ruleview-changed in bug 1166774, attachment 8612357
+> [details] [diff] [review].
+
+Haha, I should have known... :)
+
+For me, this set of tests convinced me more strongly that the error is helpful.  It illuminated several places where the tests were waiting incorrectly, or were out of sync with what actually triggers changes to be sent to the server.
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #58)
+> Okay, like as a some "debug" boolean in the file?  Mostly I just want to
+> land something even if it's commented out, as I've written this same
+> debugging aid about 5 times now...
+
+Yes, or gDevtools.testing as you prefer. I used the exact same trick ;)
+(In reply to Alexandre Poirot [:ochameau] from comment #57)
+> Comment on attachment 8615080
+> Fix pending requests in markup view (v2)
+> 
+> Review of attachment 8615080:
+> -----------------------------------------------------------------
+> 
+> (In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #52)
+> > Created attachment 8615080
+> > Fix pending requests in markup view (v2)
+> > Many times they are demonstrating clear race conditions in the product or
+> > test, and could be related to other intermittents.  So, I think fixing them
+> > is a better idea than turning off the error.
+> > 
+> > When you have something like these cases of waiting on the result of an
+> > event handler, a good solution is for the tool to emit some event once the
+> > RDP request completes, which the test can then wait for.  This is what I've
+> > seen done very heavily in the net monitor and web audio tools, and it really
+> > helps make the tests more correct.
+> 
+> That's what I've been doing so far, but my concern was that we only fix
+> those possible races in tests.
+> We are waiting for these events only from the test script.
+> 
+> ruleview-changed is something used in tests, but also in production code
+> that made sense to me to listen and use this existing event in tests.
+> But I was reluctant to introduce such event, like "drop-completed", just for
+> tests,
+> with no usage in production code.
+> This is why I did fix the ruleview-changed and took some time to ask your
+> feedback on that one.
+
+In other tools like net monitor, debugger, and web audio, there are many events used in this way (only from the test script) so it does not worry me very much.
+
+Overall, I think we should be able to find a better solution for these cases than the timeout idea you proposed.  Waiting on events that result from the requests completing handles many cases nicely and improves correctness of the test scripts.
+
+> I think it is more up to inspector maintainer to make the call for this
+> precise case/patch.
+
+Of course, I agree, it's up to each tool maintainer, as it should be.  However, I would be interested to hear if people think this event approach is bad, so I can discuss it further.
+(In reply to Alexandre Poirot [:ochameau] from comment #46)
+> Ryan, I still think the exception/error thrown when there is still a request
+> in queue
+> cost us a lot and shouldn't exists. Things should just work.
+> But I have to agree it also help discovering issues. I've recently
+> highlighted
+> an anormal number of requests in rule-view.
+> And also, we shouldn't ever have pending requests/code overlapping between
+> tests.
+
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #49)
+> I still feel like the pending request during shutdown error is helpful.  As
+> you admit, it's pointing out problems.  To me it's evidence of race
+> conditions that need to be fixed at some point, even if things may "usually"
+> work.
+
+My opinion on the request-pending-at-shutdown error is that it's useful to tell you something is wrong and helps discover problems that need to be fixed. We've already fixed quite a bunch of inspector related problems in the past that happened when the toolbox was closed.
+It's also hard to understand sometimes, especially for newcomers to the project, so attaching the stack-trace in debug is a great idea.
+The way I've usually gone so far about fixing these in tests was what Alex has used in the rule-view and what Ryan proposed to add in the markup-view: listening for the right type of event, even if that means adding an event that's not used in the product code.
+At least we make sure tests run to completion and are as independent of each other as possible.
+Isn't there something we can do at the debugger server level, protocol level, test harness level to make sure there's no test overlapping? I've always been so surprised that one test could influence the next one, this feels wrong to me. I'd say let's make sure all tests are properly sandboxed.
+(In reply to Alexandre Poirot [:ochameau] from comment #57)
+> ruleview-changed is something used in tests, but also in production code
+> that made sense to me to listen and use this existing event in tests.
+> But I was reluctant to introduce such event, like "drop-completed", just for
+> tests,
+> with no usage in production code.
+> This is why I did fix the ruleview-changed and took some time to ask your
+> feedback on that one.
+> 
+> I think it is more up to inspector maintainer to make the call for this
+> precise case/patch.
+I like the idea of making the tests self-contained and if that means waiting for the proper event, even if that event is only here for tests, I think we should do it.
+Created attachment 8615311
+Record stacks for pending requests (v2)
+
+Try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=a69c7fcb8998
+Comment on attachment 8615311
+Record stacks for pending requests (v2)
+
+Moving this to bug 1171654.
+Patrick, Could you proceed with attachment 8615080, better fix the tests than doing nothing!
+
+Ryan, could you submit a try with just this patch to see if we can land it?
+What do you want me to do?  Maybe you should submit it since I am not sure... :P
+I had to pull this patch in my queue to see where we are with destruction these days...
+Here is what I meant, just a try push to try to push your patch.
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=57a6291d8e18
+(In reply to Alexandre Poirot [:ochameau] from comment #68)
+> I had to pull this patch in my queue to see where we are with destruction
+> these days...
+> Here is what I meant, just a try push to try to push your patch.
+>   https://treeherder.mozilla.org/#/jobs?repo=try&revision=57a6291d8e18
+
+Oh wow, I'm sorry, I forgot I had even written a patch in this set, so then I was really confused about what you meant I should do here. :/
+
+Thanks for pushing the updated try!
+Comment on attachment 8615080
+Fix pending requests in markup view (v2)
+
+Since Patrick is out for a bit, perhaps Brian can review.
+Comment on attachment 8615080
+Fix pending requests in markup view (v2)
+
+Review of attachment 8615080:
+-----------------------------------------------------------------
+
+::: browser/devtools/markupview/markup-view.js
+@@ +1950,5 @@
+>  
+> +    yield this.markup.walker.insertBefore(this.node, dropTargetNodes.parent,
+> +                                          dropTargetNodes.nextSibling);
+> +    this.markup.emit("drop-completed");
+> +  }),
+
+We could, but I'm happy with being more explicit by adding the event.  It's easier to follow what's going on from inside the test.
+
+Also, we have lots of cases where events are only used in tests (like reselectedonremoved / canceledreselectonremoved / text-expand in this file).  It's a pretty common pattern for this tool.
+https://hg.mozilla.org/integration/fx-team/rev/d2203c78c12d
+New try with various additional fixes:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=e1fb8b2943df
+Comment on attachment 8615082
+Fix pending requests in rule view
+
+Already done in bug 1166774.
+Created attachment 8631564
+Fix pending showBoxModel request when running browser_markupview_keybindings_04.js
+Created attachment 8631565
+Prevent unnecessary hideBoxModel request
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=e5f66d1bf589
+https://hg.mozilla.org/mozilla-central/rev/d2203c78c12d
+New try, with another set of patches.
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=f5fa56763526
+Still cleaning inspector/markup-view tests that overlap...
+Except one intermittent in an animation inspector test, the previous try was finally looking good!!
+Here is a new, rebased try:
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=71fe77bea237
+Comment on attachment 8607602
+Prevent racing hideBoxModel during connection shutdown. r=pbrosset
+
+I'll move this one to bug 1136931.
+Created attachment 8639749
+Destroy the walker actor on disconnect - v2
+
+Rebased.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=c2f8fab83fb8
+The overall goal is also to make it possible to land the inspector tests refactoring...
+Let's see if that's still somewhat green (I may need to rebase/tweak the refactoring for new/updated tests):
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=e22078f41ad6
+Comment on attachment 8639749
+Destroy the walker actor on disconnect - v2
+
+Review of attachment 8639749:
+-----------------------------------------------------------------
+
+Brian, Do you mind keeping reviewing all my inspector patches until Patrick get back?
+This patch looks simple, but is pretty significant, especially regarding tests!
+I had to fix them all (see all deps and other patches).
+With this patch, we finally start releasing the walker actor on server side.
+Before all these patches we kept reusing the same actors when closing/reopening the toolbox.
+This is just a start as we are still leaking many things (bug 1186937 is going to help and is the next thing to review ;)),
+and also we are still not freeing NodeActor's.
+(In reply to Alexandre Poirot [:ochameau] from comment #82)
+> The overall goal is also to make it possible to land the inspector tests
+> refactoring...
+> Let's see if that's still somewhat green (I may need to rebase/tweak the
+> refactoring for new/updated tests):
+>   https://treeherder.mozilla.org/#/jobs?repo=try&revision=e22078f41ad6
+
+I do need to rebase... and there is a suspicious leak, but it is still worth landing attachment 8639749 as it keep try green without all the refactoring patches.
+(In reply to Alexandre Poirot [:ochameau] from comment #83)
+> Comment on attachment 8639749
+> Destroy the walker actor on disconnect - v2
+> 
+> Review of attachment 8639749:
+> -----------------------------------------------------------------
+> 
+> Brian, Do you mind keeping reviewing all my inspector patches until Patrick
+> get back?
+> This patch looks simple, but is pretty significant, especially regarding
+> tests!
+> I had to fix them all (see all deps and other patches).
+> With this patch, we finally start releasing the walker actor on server side.
+> Before all these patches we kept reusing the same actors when
+> closing/reopening the toolbox.
+> This is just a start as we are still leaking many things (bug 1186937 is
+> going to help and is the next thing to review ;)),
+> and also we are still not freeing NodeActor's.
+
+I'm not sure I understand what you mean by 'Before all these patches we kept reusing the same actors when closing/reopening the toolbox'.  Wasn't the call to .release() in fact destroying the WalkerActor (assuming that the toolbox close didn't have some error that prevented that function from being called).
+Comment on attachment 8639749
+Destroy the walker actor on disconnect - v2
+
+Review of attachment 8639749:
+-----------------------------------------------------------------
+
+I don't see any reason why the WalkerActor shouldn't be managed by the InspectorActor.   Even though it doesn't strictly need the inspector, it's only ever constructed from the inspector (even in tests).  But clearing the review until I understand the answer to Comment 85.
+Comment on attachment 8639749
+Destroy the walker actor on disconnect - v2
+
+Sorry, yes I'm fuzzy. I'm kind of lost in this pile of patches against the inspector...
+I had so hard time getting green try that I had to split this somewhat simple and obvious fix.
+
+You are right, we are already explicitely releasing the walker actor in current tip.
+But we aren't releasing it in case of disconnect (if you pull the phone cable for ex).
+Having to explicitely call release when the toolbox is closing on client disconnection is just wrong. The actors should clean themself, we shouldn't have the client to say to cleanup stuff.
+This is the big picture over most my inspector patches.
+
+Only tab actors can handle disconnection correctly. Only them can get their `disconnect` method being called when the connection closes. For the inspector panel, only the inspector actor can handle this. So in the already landed attachment 8607134, I fixed the InspectorActor behavior by adding a `disconnect` method on it. It finally starts to clean something on disconnect or toolbox close (as disconnect is called on toolbox close as we shut down the related client). Before that we didn't even tried to release it manually in toolbox.destroyInspector as this._inspector.destroy() only call front's destroy.
+
+So the overall codepath for cleanup is now Inspector.disconnect gets called in most useful cases of cleanup, then it call its destroy method which call protocol.js one which handle all the inspector actor hierarchy. And the followup patches are to improve all these actor destroy method to ensure not leaking various stuff like MutationObserver, or NodeActors.
+
+To summarize:
+ - the overall goal of all these patches in to cleanup inspector actors (inspector, walker, highlighter, node, stylesheet, ...) correctly both when we close the toolbox or shutdown the connection.
+ - this particular patch only fix the precise case where we shutdown the connection and the walker isn't destroyed
+
+Note that I wasn't able to land this particular patch due to failure on try, so it highlighted cases where we weren't correctly cleaning up the walker actor during tests. We may have some tests where we aren't closing the toolbox and instead just shutdown the server/client/connection.
+Also note that most tests failures I'm hitting are cases where we are trying to use an already released actor, this means that we weren't correctly destroying some actors. It also highlighted many tests that weren't waiting correctly for actor responses and were still running after the test clean itself up and/or call SimpleTest.finish and runs another tests.
+Comment on attachment 8639749
+Destroy the walker actor on disconnect - v2
+
+Review of attachment 8639749:
+-----------------------------------------------------------------
+
+As I said in Comment 86, this makes sense
+
+::: browser/devtools/framework/toolbox.js
+@@ +1784,5 @@
+>  
+>      // Releasing the walker (if it has been created)
+>      // This can fail, but in any case, we want to continue destroying the
+>      // inspector/highlighter/selection
+> +    // FF41+: Inspector actor starts managing Walker actor and auto destroy it.
+
+Looks like this should already be FF42+ in the comment for now, and then the number will need to be bumped if this doesn't land before the merge date
+
+@@ +1785,5 @@
+>      // Releasing the walker (if it has been created)
+>      // This can fail, but in any case, we want to continue destroying the
+>      // inspector/highlighter/selection
+> +    // FF41+: Inspector actor starts managing Walker actor and auto destroy it.
+> +    let walker = this._walker && !this.walker.traits.autoReleased ?
+
+Seems like this should assign to 'this._destroyingInspector' instead of 'let walker'.  Since the value is always a promise, the old variable name never really made sense.  Then we could just return this._destroyingInspector in the next statement.
+
+::: toolkit/devtools/server/actors/inspector.js
+@@ +1305,5 @@
+>      return {
+>        actor: this.actorID,
+> +      root: this.rootNode.form(),
+> +      traits: {
+> +        // FF41+ Inspector starts managing the Walker, while the inspector also
+
+FF42+
+
+@@ +3140,5 @@
+>    form: function(json) {
+>      this.actorID = json.actor;
+>      this.rootNode = types.getType("domnode").read(json.root, this);
+>      this._rootNodeDeferred.resolve(this.rootNode);
+> +    // FF41+ the actor starts exposing traits
+
+FF42+
+(In reply to Brian Grinstead [:bgrins] from comment #88)
+> @@ +1785,5 @@
+> >      // Releasing the walker (if it has been created)
+> >      // This can fail, but in any case, we want to continue destroying the
+> >      // inspector/highlighter/selection
+> > +    // FF41+: Inspector actor starts managing Walker actor and auto destroy it.
+> > +    let walker = this._walker && !this.walker.traits.autoReleased ?
+> 
+> Seems like this should assign to 'this._destroyingInspector' instead of 'let
+> walker'.  Since the value is always a promise, the old variable name never
+> really made sense.  Then we could just return this._destroyingInspector in
+> the next statement.
+
+That would prevent waiting for `outstanding` resolution.
+But I can refactor this code within outstanding and use Task to make that clearer...
+(In reply to Alexandre Poirot [:ochameau] from comment #89)
+> (In reply to Brian Grinstead [:bgrins] from comment #88)
+> > @@ +1785,5 @@
+> > >      // Releasing the walker (if it has been created)
+> > >      // This can fail, but in any case, we want to continue destroying the
+> > >      // inspector/highlighter/selection
+> > > +    // FF41+: Inspector actor starts managing Walker actor and auto destroy it.
+> > > +    let walker = this._walker && !this.walker.traits.autoReleased ?
+> > 
+> > Seems like this should assign to 'this._destroyingInspector' instead of 'let
+> > walker'.  Since the value is always a promise, the old variable name never
+> > really made sense.  Then we could just return this._destroyingInspector in
+> > the next statement.
+> 
+> That would prevent waiting for `outstanding` resolution.
+> But I can refactor this code within outstanding and use Task to make that
+> clearer...
+
+Or maybe just rename the 'walker' variable to something like 'walkerReleased'.  I wouldn't argue against refactoring it though :)
+Created attachment 8642529
+Destroy the walker actor on disconnect - v3
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=8386d6a7fc0c
+Here is the refactoring. It is much clearer!
+Comment on attachment 8642529
+Destroy the walker actor on disconnect - v3
+
+Review of attachment 8642529:
+-----------------------------------------------------------------
+
+Definitely clearer!  Think there are a couple of issues still that we need to work out to make sure it's doing the same thing as it used to with regards to multiple calls to this function and failures in walker.release()
+
+::: browser/devtools/framework/toolbox.js
+@@ +1742,5 @@
+>     * Destroy the inspector/walker/selection fronts
+>     * Returns a promise that resolves when the fronts are destroyed
+>     */
+> +  destroyInspector: Task.async(function*() {
+> +    if (this._destroyingInspector) {
+
+this._destroyingInspector is no longer set anywhere so this will just run twice when called twice
+
+@@ +1755,5 @@
+>      // This can fail, but in any case, we want to continue destroying the
+>      // inspector/highlighter/selection
+> +    // FF42+: Inspector actor starts managing Walker actor and auto destroy it.
+> +    if (this._walker && !this.walker.traits.autoReleased) {
+> +      yield this._walker.release();
+
+Don't we need to catch a failure here to be consistent with what used to happen?
+Created attachment 8642633
+Destroy the walker actor on disconnect - v4
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=23aa51742b4d
+Comment on attachment 8642633
+Destroy the walker actor on disconnect - v4
+
+Review of attachment 8642633:
+-----------------------------------------------------------------
+
+::: browser/devtools/framework/toolbox.js
+@@ +1863,5 @@
+>      }
+>  
+>      // Now that we are closing the toolbox we can re-enable the cache settings
+>      // and disable the service workers testing settings for the current tab.
+> +    // FF42+ automatically cleans up state in actor on disconnect.
+
+Was this comment update intentional?
+https://hg.mozilla.org/integration/fx-team/rev/2672589e571e
+(In reply to Brian Grinstead [:bgrins] from comment #94)
+> Comment on attachment 8642633
+> Destroy the walker actor on disconnect - v4
+> 
+> Review of attachment 8642633:
+> -----------------------------------------------------------------
+> 
+> ::: browser/devtools/framework/toolbox.js
+> @@ +1863,5 @@
+> >      }
+> >  
+> >      // Now that we are closing the toolbox we can re-enable the cache settings
+> >      // and disable the service workers testing settings for the current tab.
+> > +    // FF42+ automatically cleans up state in actor on disconnect.
+> 
+> Was this comment update intentional?
+
+No! I think I'm doing too many dumb refactoring these days... Fixed and landed.
+sorry had to back this out for test failures like :
+
+https://treeherder.mozilla.org/logviewer.html#?job_id=4078307&repo=fx-team
+Backout:
+https://hg.mozilla.org/integration/fx-team/rev/0afaff7ed957
+Created attachment 8643987
+Fix browser_animation_target_highlight_select.js - v1
+
+Sorry brian to spam you with reviews,
+I really wish Patrick was around...
+Please do not hesitate to nominate someone else to review any of my requests!
+
+As other tests fixes, I had to add some explicit wait for various events,
+that, to prevent sending or replying to requests after the test is finished,
+and the toolbox is destroyed (now that actors are correctly destroyed,
+we get new "Connection closed, pending request" exceptions).
+
+First, there is something unexpected with `mouseover`.
+If we don't do the `mouseout` we get random new mouseover
+when calling selectNode(). (And that dispatches unexpected new RDP requests)
+
+Then, we weren't waiting for *all* AnimationTargetNode.render() calls
+to finish their getNodeFromActor request.
+Nor were we correctly waiting for animation panel to fully proceed
+the newly selected node and create the related AnimationTargetNode instances.
+Created attachment 8643992
+Fix browser_tilt_picking_inspector.js - v1
+
+This one is a bit simplier. We weren't correctly waiting for the inspector
+and its various panels to finish updating (and processing related RDP requests like showBoxModel).
+Comment on attachment 8643987
+Fix browser_animation_target_highlight_select.js - v1
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=7a7e8c7c8e32
+Comment on attachment 8643987
+Fix browser_animation_target_highlight_select.js - v1
+
+Review of attachment 8643987:
+-----------------------------------------------------------------
+
+Fly-by review. This looks good to me.
+
+::: browser/devtools/animationinspector/test/browser_animation_target_highlight_select.js
+@@ +13,5 @@
+>    let ui = yield openAnimationInspector();
+>    yield testTargetNode(ui);
+>  
+>    ui = yield closeAnimationInspectorAndRestartWithNewUI();
+> +
+
+nit: no need for a new line here.
+Comment on attachment 8643992
+Fix browser_tilt_picking_inspector.js - v1
+
+Review of attachment 8643992:
+-----------------------------------------------------------------
+
+seems fine
+https://hg.mozilla.org/integration/fx-team/rev/2c22db41143d
+https://hg.mozilla.org/integration/fx-team/rev/660a4b33140c
+https://hg.mozilla.org/integration/fx-team/rev/a0610620d6d1
+https://hg.mozilla.org/mozilla-central/rev/2c22db41143d
+https://hg.mozilla.org/mozilla-central/rev/660a4b33140c
+https://hg.mozilla.org/mozilla-central/rev/a0610620d6d1
+\o/ This was a pretty crazy effort, I am glad to see it finally say FIXED!
+
+
+Toolbox/connection shutdown code is broken in many different ways
+
+
+
+Bug 1161072 - Reset docshell state (disabled js/cache, service workers) from actor instead of client. r=jryans 
+
+Bug 1161072 - Destroy inspector actor on disconnect. r=pbrosset 
+
+Bug 1161072 - Prevent "no such actor" exception from style inspector during toolbox shutdown. r=pbrosset 
+
+Bug 1161072 - Destroy highlighter actor on disconnect. r=pbrosset 
+
+Bug 1161072 - Ensure webconsole test do have pending request on test end. r=pbrosset 
+
+Bug 1161072 - Fix pending requests in markup view tests. r=pbrosset 
+
+Bug 1161072 - Destroy the walker actor on disconnect. r=bgrins 
+
+Backed out changeset 2672589e571e (bug 1161072) for test failures in browser_tilt_picking_inspector.js 
+
+Bug 1161072 - Destroy the walker actor on disconnect. r=bgrins 
+
+Bug 1161072 - Wait correctly for events in browser_animation_target_highlight_select.js. r=pbrosset 
+
+Bug 1161072 - Wait for all async operations to finish before proceeding in browser_tilt_picking_inspector.js. r=bgrins 

@@ -1,0 +1,407 @@
+It is currently a bit hard to start using Console.jsm for SDK addons while keeping the existing behavior of SDK console API, like:
+ - addon name is displayed in stdout between console.log and the actual message,
+ - we only print when some special global and/or addon specific preferences are set,
+ - we do not print console API frames in case of stackframes output.
+
+I think that the easiest way to go if to expose a console object contructor from Console.jsm in order to pass necessary tweaks, but I can easily convinced to do differently if you have better ideas. My goal here is to integrate SDK console to the browser console.
+
+It is currently a bit hard to start using Console.jsm for SDK addons while keeping the existing behavior of SDK console API, like:
+ - addon name is displayed in stdout between console.log and the actual message,
+ - we only print when some special global and/or addon specific preferences are set,
+ - we do not print console API frames in case of stackframes output.
+
+I think that the easiest way to go if to expose a console object contructor from Console.jsm in order to pass necessary tweaks, but I can easily convinced to do differently if you have better ideas. My goal here is to integrate SDK console to the browser console.
+Created attachment 757915
+[browserconsole] tune console.jsm to ease Addon SDK integration
+Thank you for this work. When the patch is ready for review, please ask for review.
+Created attachment 758594
+[browserconsole] tune console.jsm to ease Addon SDK integration
+Comment on attachment 758594
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+So after discussing with Irakli about the SDK side of the story, we decided to  avoid having to wrap console by pushing necessary SDK features to Console.jsm. I hope that will work for you.
+
+The story of this patch is: We expose a Console API contructor, which accepts an objects with various parameter that allows us to tune console behavior.
+* prefix: allows to inject addon name before the console message, like:
+    "console.log: adblock: hello"
+* logLevel: allows us to dynamically change which console method actually do something (print to stdout and send messages to browser console). In SDK we have a global and per-addon preferences in order to completely disable or enable console methods, so that addon won't pollute stdout or consoles if not explicitely wanted. Note that this attribute can be modified at anytime, so that you can change console API behavior at anytime.
+* dump: offers a way to unit test Console.jsm final stdout output. I haven't seen any test against its stdout output. We were used to have some in SDK, so I'd really like to keep them.
+
+This patch doesn't come with unit tests, as we are going to test these new features extensively in the SDK:
+  https://github.com/ochameau/addon-sdk/blob/56ce98a550241f44a28d1dbdd7a2dd8244d6a054/test/test-plain-text-console.js
+
+While adapting SDK unit test I've identified some potential followups, like:
+* supports of custom toString method on objects:
+con.log("testing", { toString: function() "obj.toString()" });
+-  test.assertEqual(lastPrint(), "info: " + name + ": testing obj.toString()\n",
+-                   "PlainTextConsole.log() must stringify custom toString.");
++  test.assertEqual(lastPrint(), "console.log: " + name + ": testing, {}\n",
++                   "PlainTextConsole.log() doesn't printify custom toString."); 
+
+* improve stack printing. We used to have a non width-limited output, that was clearer. Here most file names are truncated. Also, we used to have various files with the exact same name. The only way to make the difference is to print their file path.
+Comment on attachment 758594
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+Review of attachment 758594:
+-----------------------------------------------------------------
+
+Thanks for the patch. This is looking good.
+
+I expected an actual object with a constructor instead of a createConsole() wrapper function. We could do new ConsoleAPI(options), and that object would have a prototype with all of the related methods. Currently you pass |options| around to various functions. What do you think? Would it be cleaner to do that?
+
+Another concern would be related to adding too many features here. Console.jsm should be something lightweight. For now this patch is fine, but if we want more features we need to think of how much they are really needed.
+
+More comments below.
+
+::: toolkit/devtools/Console.jsm
+@@ +299,5 @@
+> + * @return {boolean}
+> + *        Should this message be logged or not?
+> + */
+> +function shouldLog(aLevel, aConsoleOptions) {
+> +  return LOG_LEVELS[aConsoleOptions.logLevel] <= LOG_LEVELS[aLevel];
+
+Do you need to pass the entire |aConsoleOptions| object to this function?
+
+@@ +423,5 @@
+> + * Dump a new message header to stdout by taking care of adding an eventual
+> + * prefix.
+> + *
+> + * @param {string} aLevel
+> + *        The string identifier for the message log level
+
+nit: please be consistent about descriptions ending with a period or not.
+
+@@ +457,2 @@
+>    return function() {
+> +    if (!shouldLog(aLevel, aConsoleOptions))
+
+Why not return a void function in createDumper() if !shouldLog?
+
+@@ +486,2 @@
+>    return function() {
+> +    if (!shouldLog(aLevel, aConsoleOptions))
+
+Same as above.
+
+Coding style nit: we always put curly braces around single-line code blocks. For example:
+
+if (foo) {
+  bar();
+}
+Seems like we're kind of veering into "full fledged logging API" territory, and I wonder how much this conflicts with e.g. bug 451283.
+Created attachment 760964
+[browserconsole] tune console.jsm to ease Addon SDK integration
+Created attachment 760967
+[browserconsole] tune console.jsm to ease Addon SDK integration
+Comment on attachment 760967
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+(In reply to Mihai Sucan [:msucan] from comment #5)
+> Comment on attachment 758594
+> [browserconsole] tune console.jsm to ease Addon SDK integration
+> 
+> Review of attachment 758594:
+> -----------------------------------------------------------------
+> 
+> Thanks for the patch. This is looking good.
+> 
+> I expected an actual object with a constructor instead of a createConsole()
+> wrapper function. We could do new ConsoleAPI(options), and that object would
+> have a prototype with all of the related methods. Currently you pass
+> |options| around to various functions. What do you think? Would it be
+> cleaner to do that?
+
+I does make sense, I've updated the patch to use a prototype pattern.
+But it also comes with a price, we can introduce issues with `this` being wrong.
+When doing something like this:
+  function (callback) {
+    callback("hey");
+  }
+  aFunction(console.error);
+
+> 
+> Another concern would be related to adding too many features here.
+> Console.jsm should be something lightweight. For now this patch is fine, but
+> if we want more features we need to think of how much they are really needed.
+
+In the very first patch attached to this bug, I choosed to wrap console object but it was quite frustrating to wraper every console method and doesn't look very efficient.
+
+> @@ +423,5 @@
+> > + * Dump a new message header to stdout by taking care of adding an eventual
+> > + * prefix.
+> > + *
+> > + * @param {string} aLevel
+> > + *        The string identifier for the message log level
+> 
+> nit: please be consistent about descriptions ending with a period or not.
+
+I ended up not using period, but the file uses both.
+
+> 
+> @@ +457,2 @@
+> >    return function() {
+> > +    if (!shouldLog(aLevel, aConsoleOptions))
+> 
+> Why not return a void function in createDumper() if !shouldLog?
+> 
+
+I'm not doing that as we expect to modify the console max log level at any time,
+so that we need to check this at anytime to enable/disable call on demand.
+(In reply to Alexandre Poirot (:ochameau) from comment #9)
+> Comment on attachment 760967
+> [browserconsole] tune console.jsm to ease Addon SDK integration
+> 
+> (In reply to Mihai Sucan [:msucan] from comment #5)
+> > Comment on attachment 758594
+> > [browserconsole] tune console.jsm to ease Addon SDK integration
+> > 
+> > Review of attachment 758594:
+> > -----------------------------------------------------------------
+> > 
+> > Thanks for the patch. This is looking good.
+> > 
+> > I expected an actual object with a constructor instead of a createConsole()
+> > wrapper function. We could do new ConsoleAPI(options), and that object would
+> > have a prototype with all of the related methods. Currently you pass
+> > |options| around to various functions. What do you think? Would it be
+> > cleaner to do that?
+> 
+> I does make sense, I've updated the patch to use a prototype pattern.
+
+Thanks!
+
+> But it also comes with a price, we can introduce issues with `this` being
+> wrong.
+> When doing something like this:
+>   function (callback) {
+>     callback("hey");
+>   }
+>   aFunction(console.error);
+
+This is normal and expected. If someone wants to do that, bind() is their friend.
+Comment on attachment 760967
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+Review of attachment 760967:
+-----------------------------------------------------------------
+
+This is looking good. Thank you! r+ with the comments below addressed and a green try push.
+
+You also need a patch rebase, because of bug 861338.
+
+::: toolkit/devtools/Console.jsm
+@@ +430,5 @@
+> + *        ConsoleAPI instance
+> + * @param {string} aMessage
+> + *        The string message to print to stdout
+> + */
+> +function dumpMessage(aLevel, aConsole, aMessage) {
+
+Seeing how dumpMessage() is used it's awkward to see |this| being the second argument. I suggest:
+
+  dumpMessage(this, "trace", msg);
+
+looks better than:
+
+  dumpMessage("trace", this, msg);
+
+If you agree, please move the |aConsole| argument to be the first one.
+
+@@ +462,5 @@
+>      sendConsoleAPIMessage(aLevel, frame, args);
+>      let data = args.map(function(arg) {
+>        return stringify(arg);
+>      });
+> +    dumpMessage(aLevel, this,
+
+This |this| here is odd. Shouldn't it be |aConsole|?
+
+@@ +485,5 @@
+>    return function() {
+> +    if (!shouldLog(aLevel, this.maxLogLevel)) {
+> +      return;
+> +    }
+> +    dumpMessage(aLevel, this, "\n");
+
+Same as above.
+
+Also, why the "\n"? I know that dump() needs an "\n" at the end, but it feels like our dumpMessage() should be smart enough to always append it.
+
+@@ +491,5 @@
+>      let frame = getStack(Components.stack.caller, 1)[0];
+>      sendConsoleAPIMessage(aLevel, frame, args);
+>      args.forEach(function(arg) {
+> +      this.dump(log(arg));
+> +    }, this);
+
+|this| or |aConsole|?
+
+@@ +585,5 @@
+> +  get maxLogLevel() {
+> +    return this._maxLogLevel;
+> +  },
+> +  set maxLogLevel(v) {
+> +    this._maxLogLevel = v;
+
+Are the getter and setter functions needed for maxLogLevel?
+
+@@ +603,5 @@
+>      let trace = getStack(Components.stack.caller);
+>      sendConsoleAPIMessage("trace", trace[0], args,
+>                            { stacktrace: trace });
+> +    dumpMessage("trace", this,
+> +                "\n" + formatTrace(trace) + "\n");
+
+Do you need the first "\n"? Shouldn't dumpMessage add it when needed?
+Created attachment 763544
+[browserconsole] tune console.jsm to ease Addon SDK integration
+Created attachment 763550
+[browserconsole] tune console.jsm to ease Addon SDK integration
+(In reply to Mihai Sucan [:msucan] from comment #11)
+> Comment on attachment 760967
+> [browserconsole] tune console.jsm to ease Addon SDK integration
+> 
+> Review of attachment 760967:
+> -----------------------------------------------------------------
+> 
+> This is looking good. Thank you! r+ with the comments below addressed and a
+> green try push.
+> 
+> You also need a patch rebase, because of bug 861338.
+> 
+> ::: toolkit/devtools/Console.jsm
+> @@ +430,5 @@
+> > + *        ConsoleAPI instance
+> > + * @param {string} aMessage
+> > + *        The string message to print to stdout
+> > + */
+> > +function dumpMessage(aLevel, aConsole, aMessage) {
+> 
+> Seeing how dumpMessage() is used it's awkward to see |this| being the second
+> argument. I suggest:
+> 
+>   dumpMessage(this, "trace", msg);
+> 
+> looks better than:
+> 
+>   dumpMessage("trace", this, msg);
+> 
+> If you agree, please move the |aConsole| argument to be the first one.
+
+Agreed!
+
+> 
+> @@ +462,5 @@
+> >      sendConsoleAPIMessage(aLevel, frame, args);
+> >      let data = args.map(function(arg) {
+> >        return stringify(arg);
+> >      });
+> > +    dumpMessage(aLevel, this,
+> 
+> This |this| here is odd. Shouldn't it be |aConsole|?
+
+I forgot to remove this |aConsole| argument, we have to use |this| here and after.
+
+> 
+> @@ +485,5 @@
+> >    return function() {
+> > +    if (!shouldLog(aLevel, this.maxLogLevel)) {
+> > +      return;
+> > +    }
+> > +    dumpMessage(aLevel, this, "\n");
+> 
+> Also, why the "\n"? I know that dump() needs an "\n" at the end, but it
+> feels like our dumpMessage() should be smart enough to always append it.
+
+Yes, it appears that we always append "\n" on each call.
+
+> 
+> @@ +585,5 @@
+> > +  get maxLogLevel() {
+> > +    return this._maxLogLevel;
+> > +  },
+> > +  set maxLogLevel(v) {
+> > +    this._maxLogLevel = v;
+> 
+> Are the getter and setter functions needed for maxLogLevel?
+
+Actually no, I faced some issues because of object freezing in SDK, but that doesn't really help at the end. I switched to a simple property.
+
+> 
+> @@ +603,5 @@
+> >      let trace = getStack(Components.stack.caller);
+> >      sendConsoleAPIMessage("trace", trace[0], args,
+> >                            { stacktrace: trace });
+> > +    dumpMessage("trace", this,
+> > +                "\n" + formatTrace(trace) + "\n");
+> 
+> Do you need the first "\n"? Shouldn't dumpMessage add it when needed?
+
+I removed the "\n" at the end, but I don't see how dumpMessage would guess that it needs to prepend a new line? In most cases we do not want such new line.
+Comment on attachment 763550
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+Carry over the review after last fixes.
+Try push: https://tbpl.mozilla.org/?tree=Try&rev=b82197e6689c
+The try run looks green.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/e086e888bd8d
+This appears to have broken a mochitest on B2G, e.g. 
+
+The failure looks like this:
+{
+21:34:01  WARNING -  E/GeckoConsole(  776): [JavaScript Error: "console is undefined" {file: "resource://gre/modules/ContactDB.jsm" line: 894}]
+21:34:01     INFO -  I/GeckoDump(  813): 37981 ERROR TEST-UNEXPECTED-FAIL | /tests/dom/contacts/tests/test_contacts_basics.html | 1 Entry.
+21:34:01     INFO -  I/GeckoDump(  813): 37982 ERROR TEST-UNEXPECTED-FAIL | /tests/dom/contacts/tests/test_contacts_basics.html | uncaught exception - TypeError: contact1 is undefined at http://mochi.test:8888/tests/dom/contacts/tests/test_contacts_basics.html:198
+21:34:01  WARNING -  E/GeckoConsole(  813): [JavaScript Error: "TypeError: contact1 is undefined" {file: "http://mochi.test:8888/tests/dom/contacts/tests/test_contacts_basics.html" line: 198}]
+}
+https://tbpl.mozilla.org/php/getParsedLog.php?id=24315422&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/?tree=Mozilla-Inbound&rev=80cf4c214910
+
+Note the mention of "console" being undefined there, for some reason. The code in ContactDB that that warning is pointing to is:
+> 894           console.warn("ContactDB: 'contains' only works for 'tel'. " +
+> 895                        "Falling back to 'startsWith'.");
+http://mxr.mozilla.org/mozilla-central/source/dom/contacts/fallback/ContactDB.jsm#894
+
+gwagner said we probably shouldn't be importing console in that library; he suggested that we should remove (or maybe re-write) that console.warn() line, since console behaves differently on b2g, or something like that. Probably worth spinning up a helper-patch to remove the console.warn (though I'm not clear on whether removal vs. replacing is what we want), and giving that a Try run with that the original patch here to see if that fixes the issue.
+That issue is due to the very specific behavior of JSM on b2g, where we share global between all of them on this platform.
+This try push confirms that:
+  https://tbpl.mozilla.org/?tree=Try&rev=7a2778e1954e
+
+In order to work on b2g, JSM's EXPORTED_SYMBOLS variable should be set on `this`, being a global variable isn't enough:
+-const console = new ConsoleAPI();
++this.console = new ConsoleAPI();
++this.ConsoleAPI = ConsoleAPI;
+
+Otherwise, it would be cool to ensure that Console.jsm works also on b2g.
+I'm currently working hard in bug 817580 to start plugging various devtools to b2g, so in near future we will be able to see all console.* calls from your desktop, without having to read te over-verbose output of adb logcat!
+Created attachment 764709
+[browserconsole] tune console.jsm to ease Addon SDK integration
+Comment on attachment 764709
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+As I'm not sure what are the review rules for devtools,
+I prefer to ask, but may be I can automatically r+ unit test fixes?
+
+Compared to previous patch, I just modified the last two lines:
++this.console = new ConsoleAPI();
++this.ConsoleAPI = ConsoleAPI;
+Comment on attachment 764709
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+Thanks for the updated patch.
+
+You can r+ your own test fixes. I usually ask for review only when I change tests from a component that I don't know well enough. Often tests check subtle behavior that is easy to miss.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/b1252db21280
+https://hg.mozilla.org/mozilla-central/rev/b1252db21280
+
+
+[browserconsole] tune console.jsm to ease Addon SDK integration
+
+
+
+Bug 879228 - [browserconsole] tune console.jsm to ease Addon SDK integration. r=msucan 
+
+Backed out changeset e086e888bd8d (bug 879228), on the suspicion of causing a b2g mochitest-3 failure, since the failure mentions 'console is undefined' and this patch touched Console.jsm.
+
+Bug 879228 - [browserconsole] Tune console.jsm to ease Addon SDK integration. r=msucan 

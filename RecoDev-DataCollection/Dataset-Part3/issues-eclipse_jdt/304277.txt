@@ -1,0 +1,223 @@
+Build Identifier: 
+
+With a testcase that suspends with 200 frames in the stack, only the first stack frame lable is visible for up to 40 seconds, and during that time,
+the rest of the stack frames are blank.  This is on a 64bit machine with 8GB RAM. Stepping can take 30-40 seconds, sometimes it varies between 1-5.
+With several, large projects (with about 600 classes and 2 dozen dependent jars) in the workspace,  CPU before test is at 2%. It goes up to 20% during test (the UI took 18%, target JVM 1 or 2 %). UI remains at 18% even after that the debug view has been displayed for 30 more seconds and then go back down to 2% CPU. 
+In a fresh workspace even with just one project with 200 classes, the first time the application suspends, it takes 25 seconds for the view to be populated, and each subsequent resume/suspend takes 1-2 seconds. Then suddenly one update will take 30 seconds, and then back to 1-2 seconds per resume/step. On another machine, 32bit, 4ghz, it takes about half that - 16 seconds for the first update. This problem seems to be independent of workspace, and seems to be worse depending on depth of stack frames. 
+
+This has also been tested on a product running 3.5.2 and the same performance issues are present.
+
+
+Attached a screenshot of the debug view during update and some thread dumps taken of the UI. Seems to be busy in the content/label providers. Generated debug trace will be attached tomorrow. 
+
+Reproducible: Always
+
+Build Identifier: 
+
+With a testcase that suspends with 200 frames in the stack, only the first stack frame lable is visible for up to 40 seconds, and during that time,
+the rest of the stack frames are blank.  This is on a 64bit machine with 8GB RAM. Stepping can take 30-40 seconds, sometimes it varies between 1-5.
+With several, large projects (with about 600 classes and 2 dozen dependent jars) in the workspace,  CPU before test is at 2%. It goes up to 20% during test (the UI took 18%, target JVM 1 or 2 %). UI remains at 18% even after that the debug view has been displayed for 30 more seconds and then go back down to 2% CPU. 
+In a fresh workspace even with just one project with 200 classes, the first time the application suspends, it takes 25 seconds for the view to be populated, and each subsequent resume/suspend takes 1-2 seconds. Then suddenly one update will take 30 seconds, and then back to 1-2 seconds per resume/step. On another machine, 32bit, 4ghz, it takes about half that - 16 seconds for the first update. This problem seems to be independent of workspace, and seems to be worse depending on depth of stack frames. 
+
+This has also been tested on a product running 3.5.2 and the same performance issues are present.
+
+
+Attached a screenshot of the debug view during update and some thread dumps taken of the UI. Seems to be busy in the content/label providers. Generated debug trace will be attached tomorrow. 
+
+Reproducible: Always
+Created attachment 160549
+screenshot
+Darin, though no StackOverflow involved, the underlying problem that causes the UI "hang" looks the same as the one causing bug 258416.
+(In reply to comment #2)
+> Darin, though no StackOverflow involved, the underlying problem that causes the
+> UI "hang" looks the same as the one causing bug 258416.
+
+I think the stack overflow is different. During a stack overflow, the VM is having trouble responding to the Debug client (it's in a bad state), where as in this situation, the communication is still active (and respsonsive), but the UI is not updating.
+
+I've played around with a few different scenarios and discovered that a deep stack (say 200 frames), has problems updating frame labels when transient threads are starting/exiting frequently. There is logic in the viewers that puts update requests (labels, has children, etc.), in a queue while updates on parent elements are pending. When a thread starts/stops, its parent (target) ends up with a pending update (to update it's children at the location a thread started/stopped), which puts frame updates on hold. If thread updates continue to come in, the frame updates starve, even though they are on a disjoint path in the tree.
+Created attachment 160699
+patch
+
+This patch does not fix the update scheduling issue, but does provide better batching of "has children" updates. Rather than updating each item in a separate UI job, batched requests are all updated in one UI job.
+Created attachment 160837
+example project
+
+Import example as an existing project to see the performance issue.
+
+To test, place a breakpoint in MyClass200, on the "sysout" line. Debug "Test" in the com.some.thing.main package.
+
+The viewer is asked to repeatedly update the child count of the debug target. Each time the viewer is asked to update the child count of an element, its filtered children are re-filtered (system threads). This creates a "children update request" for the filtered children (threads). Since all "has children" and "children count" update requests are scheduled on their parent, those requests are queued until all parent updates are complete. Since transient threads keep coming/going, this never happens.
+
+I've found that commenting out the call to "refilterChildren" alleviates the problem. Simialarly, having all requests scheduled on their element (rather than parent element), alleviates the problem (but breaks a test).
+Created attachment 160846
+patch
+
+This patch adds additional debug tracing for request scheduling and changes the scheduling paths for 'has children' and 'children count' updates requests. It breaks the platform tests, but I don't know why...
+Created attachment 160863
+Patch with fix for the state tests.
+
+This patch fixes the tests, but it exposes a problem in how coalesced updates are tracked.
+(In reply to comment #3)
+> I've played around with a few different scenarios and discovered that a deep
+> stack (say 200 frames), has problems updating frame labels when transient
+> threads are starting/exiting frequently. There is logic in the viewers that
+> puts update requests (labels, has children, etc.), in a queue while updates on
+> parent elements are pending. When a thread starts/stops, its parent (target)
+> ends up with a pending update (to update it's children at the location a thread
+> started/stopped), which puts frame updates on hold. If thread updates continue
+> to come in, the frame updates starve, even though they are on a disjoint path
+> in the tree.
+
+In fact do we even need the following loop in ModelContentProvider.schedule():
+
+                TreePath parentPath = schedulingPath;
+                Object inProgress = fRequestsInProgress.get(parentPath);
+                while (inProgress == null) {
+                    parentPath = parentPath.getParentPath();
+                    if (parentPath == null) {
+                        // no running requests: start request
+                        update.start();
+                        return;
+                    }
+                    inProgress = fRequestsInProgress.get(parentPath);
+                }
+
+Since this loop goes up in the hierarchy all the way to root.  Shouldn't we be able to schedule the updates for children even if the parent update is pending.  The side effect ts that this may result in redundant updates and view flicker, but the view may actually appear more responsive to the user.
+>> Darin, though no StackOverflow involved, the underlying problem that causes the
+>> UI "hang" looks the same as the one causing bug 258416.
+>
+>I think the stack overflow is different.
+OK. I was only looking at what "blocks" the main thread and it looked like it's the tree updating in both cases.
+Created attachment 160997
+Simpler fix.
+
+This patch makes the simpler change from comment #8 and adjusts the state restore logic to compensate... so the state tests pass.
+(In reply to comment #10)
+> Created an attachment (id=160997) [details]
+> Simpler fix.
+> This patch makes the simpler change from comment #8 and adjusts the state
+> restore logic to compensate... so the state tests pass.
+
+I had come to a similar conclusion. Except some tests fail on Windows.
+(In reply to comment #11)
+> I had come to a similar conclusion. Except some tests fail on Windows.
+
+That's too bad, I may have time to look at them tomorrow could you attach the full failure traces?
+Created attachment 161059
+traces of failures
+(In reply to comment #11)
+> I had come to a similar conclusion. Except some tests fail on Windows.
+
+I tried the test on windows and I see what the problem is: the state restore logic currently depends on the prioritization of updates in order to work.  So for example in test case testPreserveExpandedOnMultLevelContent we have this state:
+
+1
+ 1.1
+  1.1.1
+2
+3
+ 3.1
+  3.1.1
+4
+5
+ 5.1
+  5.1.1
+6
+
+Then element 1 is removed, so the tree thinks that 3 (which moves into position of 2) is now collapsed and 5 is also.  The restore logic for elements 3 and 5 triggered by the has-children update completing.  But he has-children updates can complete on elements 3 and 5 before the viewer completes the children update on root so the expand happens too soon.  
+
+So to compensate for this change, the state logic needs to start tracking whether updates on parents have completed.  This isn't trivial, but should be entirely doable.
+Created attachment 161408
+Work in progress.
+
+(In reply to comment #14)
+> So to compensate for this change, the state logic needs to start tracking
+> whether updates on parents have completed.  This isn't trivial, but should be
+> entirely doable.
+
+I did some experiments for this on Friday, but I didn't get very far.  I probably won't be able to work on this till end of the week so this patch is just so I won't loose the changes.
+Created attachment 161687
+3.4.x based patch
+Created attachment 161688
+3.6 based patch
+
+These patches change the request scheduling to a simple queue. Requests remain in the queue for 50ms before being started to allow for coalescing of requests. This ways requests are executed pretty much in the order they are requested and they do not wait for other requests in different parts of the tree to execute first.
+
+As well, a maximum is imposed on request coalescing - for example, a max of 20 children are retrieved per request. This also improves performance where a large number of children are requested since the update no longer hogs the UI thread as it sets children back into the tree.
+
+Currenty the implementation results in an update sequence notification with several {begin/end} pairs where we used to get one {begin/end} notification. However, I think I can clean that up.
+
+It does seem to improve performance.
+After some more investigation, I found that even after scheduling updates to allow deeper elements in the tree to update before higher elements (or when just processing requests in the order they were received), there is still a peroformance issue for deep stacks. The problem appears to be that the JFace viewer frame work forces each stack frame to be retrived when we call:
+
+TreeViewer#setExpanded(TreePath, 1)
+
+The code path eventally creates all children, creating a request to retrive all frames, which are then set back to the viewer. Since we colaesce requests, we call back to the viewer replace(parent, index, child) 400 times in one update (which is slow).
+
+When I manually expand an element in the tree, the frames are updated lazily (i.e. just the exposed frames are retrieved).
+
+I experimented with two fixes:
+
+(1) Added a method to the tree viewer to replace multiple children in one pass - so we only call back once to replace 400 children (and only preserve selection once).
+(2) Modified the #setExpanded(...) code path to clear items in the tree rather than force their children to be retrieved. This means only the visible children are retrieved.
+
+Solution (2) feels like the correct fix, which should be fixed in JFace.
+Created attachment 161934
+patch
+
+This patch has the feature to replace multiple children in the tree at once, as well as the 'lazy expand'.
+Created attachment 161936
+3.4.x patch for lazy expand
+
+This is a 3.4.x patch (as it the previous patch), that only modifies the expand code (and fixes a bug in the debug content provider to remove filtered elements from the tree).
+
+This is a smaller/less risky fix. However, it needs review/comments from the JFace viewer team.
+I filed bug 305739 against JFace to get their opinion on the matter.
+(In reply to comment #18)
+> After some more investigation, I found that even after scheduling updates to
+> allow deeper elements in the tree to update before higher elements (or when
+> just processing requests in the order they were received), there is still a
+> peroformance issue for deep stacks. The problem appears to be that the JFace
+> viewer frame work forces each stack frame to be retrived when we call:
+> 
+> TreeViewer#setExpanded(TreePath, 1)
+> 
+> The code path eventally creates all children, creating a request to retrive all
+> frames, which are then set back to the viewer. Since we colaesce requests, we
+> call back to the viewer replace(parent, index, child) 400 times in one update
+> (which is slow).
+
+I this this the same issue as bug 266189.  I implemented the workaround for this in the flex. viewer a couple of months ago (in 3.6).
+With the fix to bug 305739 (JFace tree viewer) performance is improved. The fix to bug 274358 is also required to make the viewer more stable (i.e. prevent collapsing/stale threads in the view).
+Created attachment 164622
+patch
+
+Patch needed in addition to JFace patch to avoid materializing children.
+Released fix to 3.4.x
+Created attachment 164784
+debug patch for 3.6
+Released fix to 3.6 stream as well. Pawel, please verify.
+
+The debug fix is a "hack" to avoid materializing items in the JFace virtual view when we handle a "select" delta. The approach is to quietly clear the seleciton in the viewer, and then replace and select elements in the viewer. By quietly clearing the selection we avoid a transient change in the active debug context.
+Marking fixed, noting dependency on bug 305739.
+Created attachment 168317
+Patch to remove workaround for 305739.
+
+(In reply to comment #27)
+> Released fix to 3.6 stream as well. Pawel, please verify.
+
+Sorry this took me so long but I wanted to write some tests to verify the intended lazy behavior.  
+
+First of all, there's a workaround in InternalTreeModelViewer for 305739, this patch removes that.
+
+> The debug fix is a "hack" to avoid materializing items in the JFace virtual
+> view when we handle a "select" delta. The approach is to quietly clear the
+> seleciton in the viewer, and then replace and select elements in the viewer. By
+> quietly clearing the selection we avoid a transient change in the active debug
+> context.
+I wasn't able to reproduce this failure in a test, so I'm very curious about how it happens.  The failure requires that the item for the selected element be gone after the replace... hmm, that gives me an idea so I'll try again tomorrow.
+Created attachment 168318
+First try at tests for the lazy behavior on expand and select.
+Created attachment 168319
+Tests for fix.
+
+After I wrote it in a comment it became obvious :-)  Attached are two tests that reproduce the bug and verify the fix.

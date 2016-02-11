@@ -1,0 +1,134 @@
+Created attachment 8432481
+debugger-flicker.gif
+
+There is a weird glitch with the UI of the pause button the first time the debugger panel is opened.  It toggles between the pause and resume states quickly before landing on the pause (see gif).
+
+Created attachment 8432481
+debugger-flicker.gif
+
+There is a weird glitch with the UI of the pause button the first time the debugger panel is opened.  It toggles between the pause and resume states quickly before landing on the pause (see gif).
+Also, the stepping arrows become active at the same time
+Some thoughts from #devtools:
+
+> Has anyone else noticed the flicker between pause and resume states when the debugger first loads?
+
+> The execution is paused while the debugger frontend attaches.
+
+> A number of things need to be stable while the debugger server creates actors for things, sets breakpoints, etc.
+
+> Also we need to get the list of sources once and then rely on onNewScript callbacks, but we need to make sure that no more scripts will appear until we're ready to handle them
+
+> Would it be possible/practical to special case that initial pause and not have the button state change for it?  Like, not have the buttons listening for these events until after debugger is attached?
+
+> yeah, might be.
+Also discussed initializing the debugger UI to the paused state to prevent the view from transitioning from running->paused->running and instead just going to paused->running.
+How about just preventing changes to the button until after the initial resume?
+How about just not changing the state of the buttons when the packet type is interrupt.
+
+jlongster, fitzgen and I discussed this some time back on irc [0]. This will also remove the flicker in other cases like setting a breakpoint, etc.
+
+
+[0] http://irclog.gr/#show/irc.mozilla.org/devtools/320538
+(In reply to Girish Sharma [:Optimizer] from comment #5)
+> How about just not changing the state of the buttons when the packet type is
+> interrupt.
+> 
+> jlongster, fitzgen and I discussed this some time back on irc [0]. This will
+> also remove the flicker in other cases like setting a breakpoint, etc.
+> 
+> 
+> [0] http://irclog.gr/#show/irc.mozilla.org/devtools/320538
+
+Is the initial pause considered an interrupt or do we need to handle these two things separately?
+The interrupt packets are not related to the initial attachment flickering.
+(In reply to Girish Sharma [:Optimizer] from comment #5)
+> How about just not changing the state of the buttons when the packet type is
+> interrupt.
+> 
+> jlongster, fitzgen and I discussed this some time back on irc [0]. This will
+> also remove the flicker in other cases like setting a breakpoint, etc.
+> 
+> 
+> [0] http://irclog.gr/#show/irc.mozilla.org/devtools/320538
+
+There is some code indicating this already: http://dxr.mozilla.org/mozilla-central/source/browser/devtools/debugger/debugger-controller.js#477, but the flicker still happens (that function seems to still be called with "paused" and "resumed" events when setting a breakpoint).
+We could check for pausePacket.why.type == "attached" and not go into the paused state, which I believe we already do for "interrupted" as mentioned above.
+
+https://wiki.mozilla.org/Remote_Debugging_Protocol#Attaching_To_a_Thread
+(In reply to Nick Fitzgerald [:fitzgen] from comment #9)
+> We could check for pausePacket.why.type == "attached" and not go into the
+> paused state, which I believe we already do for "interrupted" as mentioned
+> above.
+> 
+> https://wiki.mozilla.org/Remote_Debugging_Protocol#Attaching_To_a_Thread
+
+OK so in _update there is a comment indicating it is ignoring 'interrupted' events, but there will never be a case where aEvent === "interrupted".  When a breakpoint for instance, aPacket.why.type is "interrupted" but aEvent is "paused".
+
+If I change the code to look for why.type == "interrupted" in the code, then the flicker goes away.  BUT it also stops updating the button when pressing the 'pause' button in the UI (this also comes through as event == "paused" why.type == "interrupted").
+
+I'm still trying to figure out when why.type === "attached" (I don't see that come through when opening the debugger.  There is a call directly to this._update() in handleTabNavigation which seems to cause the flicker on page load, but it may also be needed for cleaning if it was paused on navigation.  I'll do a bit more investigation.
+Created attachment 8435249
+debugger-flicker-load.patch
+
+This fixes the flicker on the initial page load.  Basically, on connect it is calling handleTabNavigation() which only calls _update().  We don't *want* the UI to be updated during connect.  Pushed to try: https://tbpl.mozilla.org/?tree=Try&rev=fa1370e0addf.
+Created attachment 8435273
+debugger-flicker-breakpoint.patch
+
+Was thinking something like this for preventing the flicker on setting breakpoints, which still allowing interrupts for the resume button
+Comment on attachment 8435273
+debugger-flicker-breakpoint.patch
+
+Review of attachment 8435273:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +488,1 @@
+>      if (gTarget && (aEvent == "paused" || aEvent == "resumed")) {
+
+One specific question is: do we want to lie to the gTarget and not emit the event in this case like it was (trying) to do before?  Or should we stick with the approach in this patch in which it just doesn't update the toolbar buttons.
+Comment on attachment 8435273
+debugger-flicker-breakpoint.patch
+
+Review of attachment 8435273:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +473,5 @@
+>     * Update the UI after a thread state change.
+>     */
+> +  _update: function(aEvent, aPacket) {
+> +    // Ignore "interrupted" events, to avoid UI flicker. These are generated
+> +    // by the slow script dialog and internal events  such as setting
+
+Nit: "events            such"
+
+@@ +478,5 @@
+> +    // breakpoints. Pressing the resume button does need to be shown, though.
+> +    let ignoreToolbarUpdate = aEvent == "paused" &&
+> +                              aPacket.why.type == "interrupted" &&
+> +                              !this.interruptedByResumeButton;
+> +    this.interruptedByResumeButton = false;
+
+Nit: Can you also add `this.interruptedByResumeButton = false;` in the constructor, so we don't fragment the shape tree?
+
+@@ +488,1 @@
+>      if (gTarget && (aEvent == "paused" || aEvent == "resumed")) {
+
+I don't think we want to emit the event to the target because that would flash the debugger panel's tab green and bring focus to the devtools window. However, there might be tests that rely on these events, in which case I think we can push it off to a follow up.
+Created attachment 8435384
+debugger-flicker-load-r=fitzgen.patch
+
+Updated commit message
+https://hg.mozilla.org/integration/fx-team/rev/e110c9dfcba0
+https://hg.mozilla.org/mozilla-central/rev/e110c9dfcba0
+https://hg.mozilla.org/mozilla-central/rev/d31f7a547ab0
+That last comment should have been bug 1018955.
+
+
+Pause/resume button flickers when debugger first loads
+
+
+
+Bug 1018955 - Fix pause/resume button flicker when debugger first loads. r=fitzgen 
+
+Bug 1018955: Get rid of pause/resume button flicker when setting breakpoint;r=fitzgen 

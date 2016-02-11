@@ -1,0 +1,2056 @@
+At the moment, Session Restore does the following:
+- load sessionstore.js if possible;
+- in case of crash recovery, copy sessionstore.js to sessionstore.bak.
+
+That's not good if, for some reason, sessionstore.js is corrupt and cannot be loaded. In such cases, we should not copy sessionstore.js to sessionstore.bak.
+
+At the moment, Session Restore does the following:
+- load sessionstore.js if possible;
+- in case of crash recovery, copy sessionstore.js to sessionstore.bak.
+
+That's not good if, for some reason, sessionstore.js is corrupt and cannot be loaded. In such cases, we should not copy sessionstore.js to sessionstore.bak.
+hi i want to work in this bug can you please guide me
+Pasted from IRC.
+
+« Session Restore is the feature that lets you restart Firefox in the state in which you left it when quitting or in case of crash. The problem we have is that sometimes, for various reasons, the files it saves can be corrupted (due to hardware problems, etc.)  At the moment, when we backup, we blindly copy sessionstore.js on top of sessionstore.bak, even if sessionstore.js is corrupted. Which is not good.
+
+The code that triggers the backup copy is here: http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/_SessionFile.jsm#l289
+
+You need to prevent the backup from taking place if reading has failed: http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/_SessionFile.jsm#l238 and http://dxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/_SessionFile.jsm#l186
+»
+Created attachment 765820
+I have added a flag variable _isSessionStoreFileValid for confirming the sessionstore file is in proper condition
+Created attachment 766237
+Bug 883609 to check the correctness of the sessionstore.js file before making a backup of it
+Comment on attachment 766237
+Bug 883609 to check the correctness of the sessionstore.js file before making a backup of it
+
+Review of attachment 766237:
+-----------------------------------------------------------------
+
+Good start.
+Please see my comments below.
+Also, you have only covered one of the ways of reading sessionstore.js. There are two.
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +147,5 @@
+>     * The path to sessionstore.bak
+>     */
+>    backupPath: OS.Path.join(OS.Constants.Path.profileDir, "sessionstore.bak"),
+> +  /**
+> +   * To store the last successfull read of SessionStore.js
+
+That comment is incorrect.
+It should read something along the lines of:
+"|true| if the last read of sessionstore.js was correct, |false| otherwise"
+
+@@ +149,5 @@
+>    backupPath: OS.Path.join(OS.Constants.Path.profileDir, "sessionstore.bak"),
+> +  /**
+> +   * To store the last successfull read of SessionStore.js
+> +   */
+> +  _isSessionStoreFileValid:true,
+
+Nit: whitespace before |true|
+
+@@ +193,5 @@
+>      // First read the sessionstore.js.
+>      let text = this.readAuxSync(this.path);
+>      if (typeof text === "undefined") {
+>        // If sessionstore.js does not exist or is corrupted, read sessionstore.bak.
+> +      this._isSessionStoreFileValid=false;
+
+Nit: whitespace around "=".
+
+@@ +297,5 @@
+>      };
+>      let self = this;
+>      return TaskUtils.spawn(function task() {
+>        try {
+> +        if(self._lastSuccessfulread)
+
+It would be clearer as follows:
+if (!self._lastSuccessfulRead) {
+  return
+}
+(before the |try|).
+
+Also, please be careful with capitalization. JavaScript is case-dependent, so your code was false.
+
+Nit: Please fix the indentation.
+Nit: Whitespace after |if|.
+Oh, and you'll need unit tests, too, of course.
+Created attachment 766241
+Bug 883609 to check the correctness of the sessionstore.js file before making a backup of it
+Created attachment 766255
+Bug 883609 to check the correctness of the sessionstore.js file before making a backup of it
+Comment on attachment 766255
+Bug 883609 to check the correctness of the sessionstore.js file before making a backup of it
+
+Review of attachment 766255:
+-----------------------------------------------------------------
+
+Looks good.
+Now:
+- this only covers one of the manners of reading sessionstore.js, we need to cover both;
+- we'll want unit testing.
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +193,5 @@
+>      // First read the sessionstore.js.
+>      let text = this.readAuxSync(this.path);
+>      if (typeof text === "undefined") {
+>        // If sessionstore.js does not exist or is corrupted, read sessionstore.bak.
+> +      // And mark the lastSuccessfulread as false so as to prevent a good sessionstore.bak file
+
+Did you forget a word in that comment?
+
+@@ +297,5 @@
+>      let backupCopyOptions = {
+>        outExecutionDuration: null
+>      };
+>      let self = this;
+> +    if (!self._isSessionStoreFileValid) {
+
+Nit: Please fix the indentation.
+is there value in saving the bad copy for later analysis?
+No update in 4 months, so resetting ownership.
+Also, code is now badly bitrotten.
+
+(In reply to Wayne Mery (:wsmwk) from comment #10)
+> is there value in saving the bad copy for later analysis?
+
+I can't think of any.
+Given the recent occurrences of bug 898800, it looks like we should prioritize this.
+So, how about the following:
+- whenever we fail to load sessionstore.js, we move it to sessionstore-corrupted.js (for rescue purposes);
+- whenever we save a new sessionstore.js, we first move sessionstore.js to sessionstore.bak;
+- whenever we load, we search for sessionstore.js, then if loading fails, sessionstore.bak.
+I think that sounds great to me. As said on IRC, I don't have any insight into why we chose to only create a backup copy once at startup but that has been around since we the initial import of sessionstore code into Firefox.
+
+I don't see any drawbacks with creating a copy everytime, ideally the backup should be as recent as possible, I think.
+Created attachment 822015
+Don't overwrite backups with invalid files
+
+So, this (untested) patch does a few changes at once:
+- before any write to sessionstore.js, we move sessionstore.js to sessionstore.bak, so as to be able to use that file for recovery;
+- whenever we restore the session, if sessionstore.js is absent *or invalid* (that's new), we use sessionstore.bak;
+- whenever we restore the session, if sessionstore.js (resp sessionstore.bak) is invalid, we rename the file to ensure that it won't be used or backed up.
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #15)
+> - before any write to sessionstore.js, we move sessionstore.js to
+> sessionstore.bak, so as to be able to use that file for recovery;
+
+Is it really a good idea to do that on every write? If a user accidentally does something to their tabs/windows and tries to get to the state before starting up there currently is sessionstore.bak. With that change we'd destroy this possibility.
+
+I don't even know whether I have a real opinion about this, I'm just trying to figure out which of those strategies would be best to implement. With atomic writes, we shouldn't really have to care about incomplete writes to disk, should we?
+
+Also, for deferred sessions we would not be respecting the privacy level set by the user. We by default do not save encrypted sites when shutting down properly without automatic restore enabled. While browsing we save this data to disk to recover from crashes properly. With the new approach we would now "leak" this data to sessionstore.bak.
+Comment on attachment 822015
+Don't overwrite backups with invalid files
+
+Review of attachment 822015:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +98,5 @@
+> +   * Mark a source file (typically sessionstore.js) as invalid,
+> +   * so that it is never backed up on top of a (presumably) valid
+> +   * file.
+> +   */
+> +  markAsInvalid: function(path) {
+
+Instead of exposing new functionality via SessionFile, could we implement all this in SessionWorker.read()? It would be great if SessionStore wouldn't have to care about all the logic involved in finding and checking files.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +115,5 @@
+> +        // Initialization is complete, nothing else to do
+> +        return;
+> +      }
+> +      for (let source of _SessionFile.sources) {
+> +        let string = _SessionFile.syncRead(source);
+
+Can we base this off of bug 918024? Looks like we had a little less stuff to do without supporting the sync fallbacks.
+
+@@ +165,5 @@
+> +      data = JSON.parse(aStateString);
+> +    } catch (ex) {
+> +      debug("The session file contained un-parse-able JSON: " + ex);
+> +      // This is not valid JSON, but this might still be valid JavaScript,
+> +      // as used in FF2/FF3, so we need to eval.
+
+I think we can finally get rid of this backwards compat code.
+(In reply to Tim Taubert [:ttaubert] from comment #16)
+> (In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment
+> #15)
+> > - before any write to sessionstore.js, we move sessionstore.js to
+> > sessionstore.bak, so as to be able to use that file for recovery;
+> 
+> Is it really a good idea to do that on every write? If a user accidentally
+> does something to their tabs/windows and tries to get to the state before
+> starting up there currently is sessionstore.bak. With that change we'd
+> destroy this possibility.
+
+Well, in that case, we should backup sessionstore.bak more intelligently.
+
+> I don't even know whether I have a real opinion about this, I'm just trying
+> to figure out which of those strategies would be best to implement. With
+> atomic writes, we shouldn't really have to care about incomplete writes to
+> disk, should we?
+
+They can still happen, in case of OS/hardware/battery failure.
+
+> Also, for deferred sessions we would not be respecting the privacy level set
+> by the user. We by default do not save encrypted sites when shutting down
+> properly without automatic restore enabled. While browsing we save this data
+> to disk to recover from crashes properly. With the new approach we would now
+> "leak" this data to sessionstore.bak.
+(In reply to Tim Taubert [:ttaubert] from comment #17)
+> Comment on attachment 822015
+> Don't overwrite backups with invalid files
+> 
+> Review of attachment 822015:
+> -----------------------------------------------------------------
+> 
+> ::: browser/components/sessionstore/src/SessionWorker.js
+> @@ +98,5 @@
+> > +   * Mark a source file (typically sessionstore.js) as invalid,
+> > +   * so that it is never backed up on top of a (presumably) valid
+> > +   * file.
+> > +   */
+> > +  markAsInvalid: function(path) {
+> 
+> Instead of exposing new functionality via SessionFile, could we implement
+> all this in SessionWorker.read()? It would be great if SessionStore wouldn't
+> have to care about all the logic involved in finding and checking files.
+
+So you want SessionWorker to parse the files instead of nsSessionStartup?
+
+> 
+> ::: browser/components/sessionstore/src/nsSessionStartup.js
+> @@ +115,5 @@
+> > +        // Initialization is complete, nothing else to do
+> > +        return;
+> > +      }
+> > +      for (let source of _SessionFile.sources) {
+> > +        let string = _SessionFile.syncRead(source);
+> 
+> Can we base this off of bug 918024? Looks like we had a little less stuff to
+> do without supporting the sync fallbacks.
+
+Yes, that will be nicer.
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #18)
+> > I don't even know whether I have a real opinion about this, I'm just trying
+> > to figure out which of those strategies would be best to implement. With
+> > atomic writes, we shouldn't really have to care about incomplete writes to
+> > disk, should we?
+> 
+> They can still happen, in case of OS/hardware/battery failure.
+
+Yeah... I think moving to .bak on write isn't too bad. Especially to not destroy the whole session if something breaks. For people that want extra security we have a few add-ons out there and I think those should be sufficient.
+
+We could also think about making the number of "upgrade backups" to keep configurable. That would be handy especially for nightly users if they could keep a few more backups. But let's not scope-creep too much, that's something for a follow-up.
+
+(In reply to David Rajchenbach Teller [:Yoric] <needinfo? me> from comment #19)
+> > Instead of exposing new functionality via SessionFile, could we implement
+> > all this in SessionWorker.read()? It would be great if SessionStore wouldn't
+> > have to care about all the logic involved in finding and checking files.
+> 
+> So you want SessionWorker to parse the files instead of nsSessionStartup?
+
+I understand what you're saying. I actually don't want to parse, all I want is to verify. The problem is that with JSON those two things are basically the same. Is it worth having the overhead of parsing twice (once off the main thread) to keep the code simple?
+
+How efficient is sending objects via messages? Could we use Transferables like for postMessage()?
+Comment on attachment 822015
+Don't overwrite backups with invalid files
+
+Review of attachment 822015:
+-----------------------------------------------------------------
+
+(In reply to Tim Taubert [:ttaubert] from comment #20) 
+> Yeah... I think moving to .bak on write isn't too bad. Especially to not
+> destroy the whole session if something breaks. For people that want extra
+> security we have a few add-ons out there and I think those should be
+> sufficient.
+
+I concur.
+
+> I understand what you're saying. I actually don't want to parse, all I want
+> is to verify. The problem is that with JSON those two things are basically
+> the same. Is it worth having the overhead of parsing twice (once off the
+> main thread) to keep the code simple?
+> 
+> How efficient is sending objects via messages? Could we use Transferables
+> like for postMessage()?
+
+I agree it seems much cleaner if we can encapsulate all of this in the worker. Has anyone measured the cost of parsing various session files?
+this also happened (.bak got bad data) when I encountered my bug 961752
+This should become quite simple once bug 965196 has landed:
+1. don't create sessionstore.bak manually;
+2. during startup, if sessionstore.js is corrupted, move it to sessionstore.corrupted;
+3. whenever we use OS.File.writeAtomic to write sessionstore.js, use option backupTo to backup sessionstore.js to sessionstore.bak.
+Created attachment 8377856
+Overhauling backup and recovery
+
+This is a draft of a complete overhaul of the session restore backup. The idea is to make backups more useful.
+
+1/ Instead of sessionstore.js and sessionstore.bak, we now have sessionstore.js, sessionstore-previous.js (backup of the previous write of sessionstore.js, typically 15 seconds old), sessionstore-startup.js (backup of whichever file, sessionstore.js or other, we used during startup), in addition of the upgrade backup.
+
+2/ During startup, we check not only if the file exists but also if it is correct JSON. Also, we try sessionstore.js, sessionstore-previous.js, sessionstore-startup.js and the upgrade backup.
+
+3/ We don't overwrite any of the backups with invalid sessionstore.js.
+Created attachment 8378209
+Don't overwrite backups with invalid files, v2
+
+Here's an updated version. It's a little better tested, a little better documented, and now the whole write/backup/recover logic is in SessionFile.jsm/SessionWorker.js, which should make it more understandable.
+Created attachment 8379008
+Overhauling backup and recovery, v2
+
+Added tests, made them pass, the patch is now up for review.
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #24)
+> This is a draft of a complete overhaul of the session restore backup. The
+> idea is to make backups more useful.
+
+Much appreciated, thanks for tackling this.
+
+> sessionstore-previous.js (backup of the previous write of
+> sessionstore.js, typically 15 seconds old)
+
+This doesn't seem like a good idea. We have the deferred privacy level that is active on a clean shutdown and contains less data (by default) than the previous writes. The idea behind that is that we restore all data after crashing but only less privacy-sensitive data after a clean shutdown.
+Comment on attachment 8379008
+Overhauling backup and recovery, v2
+
+Cancelling review until the comment about the deferred privacy level is addressed.
+(In reply to Tim Taubert [:ttaubert] from comment #27)
+> > sessionstore-previous.js (backup of the previous write of
+> > sessionstore.js, typically 15 seconds old)
+> 
+> This doesn't seem like a good idea. We have the deferred privacy level that
+> is active on a clean shutdown and contains less data (by default) than the
+> previous writes. The idea behind that is that we restore all data after
+> crashing but only less privacy-sensitive data after a clean shutdown.
+
+I wonder against what we're protecting, exactly. Do you recall the bug#?
+
+So, for restoration, this shouldn't change anything:
+- in case of crash, we restore sessionstore.js if possible, sessionstore-previous.js otherwise;
+- in case of clean shutdown, we restore sessionstore.js, unless some issue (e.g. very badly-timed power failure) has caused the corruption of that file.
+
+If we are worried about file snooping/forensics evidence (is that in our scope?), of course, it's more tricky. I suppose that we could just remove session-previous.js once we are relatively satisfied that the file has been written correctly. Perhaps with a shutdown-time flush.
+Created attachment 8382102
+Overhauling backup and recovery, v3
+
+So, I have changed strategy slightly.
+We now have:
+- sessionstore.js contains data written during the latest clean shutdown, without sensitive data;
+- sessionstore.bak and its backup sessionstore.bak2 contain the data written during runtime and serve only for recovery – they are also removed during a clean shutdown;
+- sessionstore.bak-$buildid is a backup of sessionstore.js (not sessionstore.bak*) performed during the first startup from a valid sessionstore.js after an upgrade.
+
+During startup we try to load in the following order:
+- sessionstore.{bak, bak2} (if either is present, latest shutdown was not clean, so sessiontore.js is not up to date);
+- sessionstore.js;
+- sessionstore.bak-$buildid.
+Created attachment 8382105
+Overhauling backup and recovery, v4
+
+Forgot a qref
+Comment on attachment 8382105
+Overhauling backup and recovery, v4
+
+Review of attachment 8382105:
+-----------------------------------------------------------------
+
+Overall approach looks good to me. Thanks for talking it through again. Below, a few questions and suggestions for cleanup.
+
+::: browser/components/sessionstore/src/SessionFile.jsm
+@@ +99,2 @@
+>  let SessionFileInternal = {
+> +  Paths: Object.freeze({
+
+I wonder... do we need those paths at all in SessionFile.jsm? Can we move the whole SessionFile.read() procedure to the worker, that would save us communication overhead and passing paths around.
+
+@@ +176,5 @@
+> +      // Attempt to load by order of priority from the various backups
+> +      for (let key of ["recovery",
+> +                       "recoveryBackup",
+> +                       "clean",
+> +                       "upgradeBackup"]) {
+
+Could we put this in SessionFile.Paths and name it .restorePaths or something? Or .restorationOrder? That would then return an array of paths possibly including |upgradeBackup|.
+
+@@ +201,2 @@
+>          }
+> +        Services.telemetry.getHistogramById("FX_SESSION_RESTORE_CORRUPT_FILE").add(corrupted);
+
+We don't need |corrupted|, do we? We can just call .add() in the catch clause.
+
+@@ +295,3 @@
+>        } catch (ex) {
+>          TelemetryStopwatch.cancel("FX_SESSION_RESTORE_WRITE_FILE_LONGEST_OP_MS", refObj);
+> +        console.error("Could not write session state file ", this.latestPath, ex);
+
+Where is |this.latestPath| defined?
+
+::: browser/components/sessionstore/src/SessionSaver.jsm
+@@ +267,5 @@
+>      stopWatchStart("SEND_SERIALIZED_STATE_LONGEST_OP_MS");
+>      let promise = SessionFile.write(data);
+>      stopWatchFinish("WRITE_STATE_LONGEST_OP_MS",
+>                      "SEND_SERIALIZED_STATE_LONGEST_OP_MS");
+> +    promise = promise.then((x) => {
+
+x? What is x?
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +112,5 @@
+> +            backupTo: this.Paths.recoveryBackup
+> +          });
+> +          break;
+> +
+> +        case "clean":
+
+"clean" and "PERMANENT" are the same except for the backupTo option. I feel like we should combine that and just set the property in case of "PERMANENT".
+
+@@ +119,5 @@
+> +            tmpPath: this.Paths.recovery + ".tmp"
+> +          });
+> +          break;
+> +
+> +        case "recovery":
+
+That's the same behavior as for "PERMANENT", no need to duplicate.
+
+@@ +131,5 @@
+> +            backupTo: this.Paths.recoveryBackup
+> +          });
+> +          break;
+> +
+> +      case "recoveryBackup":
+
+That's the same behavior as for "clean".
+
+@@ +153,5 @@
+> +            tmpPath: this.Paths.recovery + ".tmp"
+> +          });
+> +          File.writeAtomic(this.Paths.clean, stateString, {
+> +            tmpPath: this.Paths.clean + ".tmp"
+> +          });
+
+Couldn't we just copy $upgradeBackup to $clean. Would that be cheaper? Also in theory |stateString| could contain new sensitive information (if the user is really fast ;) that could be leaked to the upgrade backup below.
+
+@@ +156,5 @@
+> +            tmpPath: this.Paths.clean + ".tmp"
+> +          });
+> +          break;
+> +
+> +        case "EMPTY":
+
+Same as "clean".
+
+@@ +161,5 @@
+> +          // First save since we started with no state at all.
+> +          // Nothing to backup.
+> +          File.writeAtomic(this.Paths.recovery, stateString, {
+> +            tmpPath: this.Paths.recovery + ".tmp"
+> +          });
+
+I understand that we don't want to override .bak2 when restoring from it but couldn't we just specify .backupTo here anyway and let OS.File deal with that if the target file doesn't exist? Or is that a failure? I just feel like it would remove some complexity.
+
+@@ +164,5 @@
+> +            tmpPath: this.Paths.recovery + ".tmp"
+> +          });
+> +          break;
+> +
+> +        default:
+
+It looks like we could summarize this all as:
+
+let options = {tmpPath: this.Paths.recovery + ".tmp"};
+
+if (PERMANENT || recovery) {
+  options.backupTo = this.Paths.recoveryBackup;
+}
+
+File.writeAtomic(this.Paths.recovery, stateString, options);
+
+if (upgradeBackup) {
+  File.writeAtomic(this.Paths.clean, stateString, {
+    tmpPath: this.Paths.clean + ".tmp"
+  });
+}
+
+@@ +174,5 @@
+>      }
+>  
+> +    // If necessary, perform an upgrade backup
+> +    let upgradeBackupComplete = false;
+> +    if (this.upgradeBackupNeeded && this.state == "clean") {
+
+What if Firefox crashes after updating. Wouldn't we want to create an upgrade backup for the state we managed to restore?
+
+@@ +189,5 @@
+> +    if (isFinal && !exn) {
+> +      // During shutdown, remove possibly sensitive data that has been
+> +      // stored purely for crash recovery. Note that this slightly
+> +      // decreases our ability to recover from OS-level/hardare-level
+> +      // issue.
+
+So actually, looking at PrivacyLevel.jsm, we can keep the files if we resume automatically:
+
+function willResumeAutomatically() {
+  return Services.prefs.getIntPref("browser.startup.page") == 3 ||
+         Services.prefs.getBoolPref("browser.sessionstore.resume_session_once");
+}
+
+With |willResumeAutomatically() == true| the $clean file will not differ from $recovery file.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +121,5 @@
+>        this._sessionType = Ci.nsISessionStartup.NO_SESSION;
+>        Services.obs.notifyObservers(null, "sessionstore-state-finalized", "");
+>        gOnceInitializedDeferred.resolve();
+>        return;
+> +    } else if (stateString == source) {
+
+No |else if| after a |return| please.
+
+@@ +123,5 @@
+>        gOnceInitializedDeferred.resolve();
+>        return;
+> +    } else if (stateString == source) {
+> +      // No need to parse twice
+> +      this._initialState = parsed;
+
+Good idea. Can we just set _initialState unconditionally and overwrite it |if (stateString != source)|? I feel like that would be easier to read.
+Created attachment 8389824
+Overhauling backup and recovery, v5
+
+Applied feedback.
+Comment on attachment 8389824
+Overhauling backup and recovery, v5
+
+Review of attachment 8389824:
+-----------------------------------------------------------------
+
+Cancelling review, there is a lot to fix. Sorry for the delay! Some of my feedback hasn't been addressed or disputed so I just repeated that :) I didn't take a too close look at the tests.
+
+(BTW, can't wait to have this!)
+
+::: browser/components/sessionstore/src/PrivacyLevel.jsm
+@@ +85,1 @@
+>    }
+
+This doesn't feel like something that should be provided by "PrivacyLevel". How about using
+
+Cc["@mozilla.org/browser/sessionstartup;1"].getService(Ci.nsISessionStartup).isAutomaticRestoreEnabled()
+
+? Would be great to update PrivacyLevel.jsm as well.
+
+::: browser/components/sessionstore/src/SessionFile.jsm
+@@ +188,5 @@
+>     */
+>    _isClosed: false,
+>  
+>    read: function () {
+> +    return Task.spawn(function* () {
+
+How about using:
+
+read: Task.async(function* () {
+  ...
+}),
+
+@@ +197,5 @@
+> +          let path = this.Paths[key];
+> +          let source = yield this._readSessionFile(path);
+> +          let parsed = JSON.parse(source);
+> +          result = {
+> +            origin: key,
+
+Do we still need "origin"?
+
+@@ +207,3 @@
+>            break;
+> +        } catch (ex if ex instanceof Ci.nsIXPCException &&
+> +                 ex.result == Cr.NS_ERROR_FILE_NOT_FOUND) {
+
+That should need to change with OS.File now.
+
+@@ +210,5 @@
+> +          // Ignore non-existent files.
+> +        } catch (ex if ex instanceof SyntaxError) {
+> +          // File is corrupted, try next file
+> +          Services.telemetry.getHistogramById("FX_SESSION_RESTORE_CORRUPT_FILE").
+> +            add(true);
+
+Sorry, I totally forgot that we also record a value if corrupted=false. In that case I think a variable would be nicer, like it was before. You can protest feedback if it doesn't make sense ;)
+
+@@ +217,5 @@
+>  
+> +      if (!result) {
+> +        // If everything fails, start with an empty session.
+> +        result = {
+> +          origin: "EMPTY",
+
+Do we still need "origin"? SessionFile.read() doesn't use it anymore.
+
+@@ +245,5 @@
+>    _readSessionFile: function (path) {
+>      let deferred = Promise.defer();
+>      let file = FileUtils.File(path);
+>      let durationMs = Date.now();
+> +    let stack = (new Error()).stack;
+
+I don't know but it feels quite expensive getting .stack only for a potential error. We know where _readSessionFile() is called from so do we really need to do that?
+
+@@ +264,5 @@
+>  
+> +        Telemetry.getHistogramById("FX_SESSION_RESTORE_READ_FILE_MS").add(durationMs);
+> +        Telemetry.getHistogramById("FX_SESSION_RESTORE_FILE_SIZE_BYTES").add(byteLength);
+> +      } catch (ex if ex instanceof Ci.nsIXPCException
+> +                 && ex.result == Cr.NS_BASE_STREAM_CLOSED) {
+
+That's all somewhat obsolete now that we use OS.File again.
+
+@@ +301,4 @@
+>        TelemetryStopwatch.start("FX_SESSION_RESTORE_WRITE_FILE_LONGEST_OP_MS", refObj);
+>  
+>        try {
+> +        let performShutdownCleanup = isFinalWrite && PrivacyLevel.willResumeAutomatically;
+
+This needs to be !willResumeAutomatically. We want to do cleanup iff we have a deferred session at next startup because we don't restore sessions automatically.
+
+@@ +318,3 @@
+>        } catch (ex) {
+>          TelemetryStopwatch.cancel("FX_SESSION_RESTORE_WRITE_FILE_LONGEST_OP_MS", refObj);
+> +        console.error("Could not write session state file ", this.latestPath, ex);
+
+Where is |this.latestPath| defined?
+
+::: browser/components/sessionstore/src/SessionSaver.jsm
+@@ +267,5 @@
+>      stopWatchStart("SEND_SERIALIZED_STATE_LONGEST_OP_MS");
+>      let promise = SessionFile.write(data);
+>      stopWatchFinish("WRITE_STATE_LONGEST_OP_MS",
+>                      "SEND_SERIALIZED_STATE_LONGEST_OP_MS");
+> +    promise = promise.then((x) => {
+
+Please give "x" a more meaningful name. OTOH, what exactly is returned by SessionFile.write()?
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +56,5 @@
+> +// The various possible states
+> +const PERMANENT = "PERMANENT";
+> +const EMPTY = "EMPTY";
+> +const clean = "clean";
+> +const recovery = "recovery";
+
+Why the mix of uppercase/lowercase?
+
+@@ +59,5 @@
+> +const clean = "clean";
+> +const recovery = "recovery";
+> +const recoveryBackup = "recoveryBackup";
+> +const upgradeBackup = "upgradeBackup";
+> +const STATES = [PERMANENT, EMPTY, clean, recovery, recoveryBackup, upgradeBackup];
+
+const STATES = new Set([PERMANENT, EMPTY, clean, recovery, recoveryBackup, upgradeBackup]);
+
+Do we really need EMPTY, clean and recoveryBackup? I feel like they can be folded into the other states as they're not handled themselves.
+
+@@ +89,5 @@
+> +   * @param {string} origin Which of sessionstore.js or its backups
+> +   *   was used. One of "EMPTY", "clean", "recovery",
+> +   *   "recoveryBackup", "upgradeBackup".
+> +   */
+> +  init: function ({origin, paths}) {
+
+It seems weird to pass an object here when we could just pass multiple arguments.
+
+@@ +111,3 @@
+>  
+> +    try {
+> +      if (OS.Constants.Sys.DEBUG && STATES.indexOf(this.state) == -1) {
+
+STATES.has(this.state)
+
+@@ +116,5 @@
+> +      if (this.state != PERMANENT) {
+> +        File.makeDir(this.Paths.backups);
+> +      }
+> +      if (this.state == PERMANENT
+> +       || this.state == recovery) {
+
+Nit: this could be on one line?
+
+@@ +131,5 @@
+> +        // In other cases, either $Path.recovery doesn't exist or has
+> +        // been corrupted. Regardless, don't backup $Path.recovery.
+> +        File.writeAtomic(this.Paths.recovery, stateString, {
+> +          tmpPath: this.Paths.recovery + ".tmp"
+> +        });
+
+I think it would be better to have:
+
+let opts = {tmpPath: this.Paths.recovery + ".tmp"};
+
+// Add some nice comment.
+if (this.state == PERMANENT || this.state == recovery) {
+  opts.backupTo = this.Paths.recoveryBackup;
+}
+
+File.writeAtomic(this.Paths.recovery, stateString, opts);
+
+That makes it more obvious that we definitely write to "recovery" every time.
+
+OTOH, do we really need handling that here? Does OS.File throw an exception when "backupTo" doesn't exist? If not we can simplify code here.
+
+@@ +142,5 @@
+> +        // sessionstore.js
+> +        File.copy(this.Paths.upgradeBackup, this.Paths.clean);
+> +      }
+> +    } catch (ex) {
+> +      // Don't throw immediately
+
+I really feel like the exception handling around here is quite awful to be honest. Maybe this wouldn't look as bad if we would only wrap stuff that can file, i.e. any OS.File calls.
+
+@@ +143,5 @@
+> +        File.copy(this.Paths.upgradeBackup, this.Paths.clean);
+> +      }
+> +    } catch (ex) {
+> +      // Don't throw immediately
+> +      exn = exn || ex;
+
+exn = ex;
+
+@@ +152,5 @@
+> +    if (this.upgradeBackupNeeded
+> +      && (this.state == clean
+> +       || this.state == upgradeBackup)) {
+> +      try {
+> +        File.copy(this.Paths.clean, this.Paths.nextUpgradeBackup);
+
+In the case of |state == upgradeBackup| couldn't we also just skip the copying the file? Seems like we already have one usable upgrade backup even if that has an "old" build ID. We could just set |this.upgradeBackupNeeded=false| and |upgradeBackupComplete=true|.
+
+Also, assuming we restored from $upgradeBackup and somehow failed in writeAtomic() above, there will be no $clean file to copy.
+
+@@ +164,5 @@
+> +
+> +    if (performShutdownCleanup && !exn) {
+> +      // During shutdown, remove possibly sensitive data that has been
+> +      // stored purely for crash recovery. Note that this slightly
+> +      // decreases our ability to recover from OS-level/hardare-level
+
+*hardware-level
+
+@@ +201,3 @@
+>     * Wipes all files holding session data from disk.
+>     */
+>    wipe: function () {
+
+Can you please split wipe() into multiple methods that are called by wipe()? Add one for wiping upgrade backups and one for wiping legacy upgrade backups? That could probably be a single method that we just pass different directory names.
+
+@@ +216,5 @@
+> +    // Erase the contents of the sessionstore directory
+> +    let iterator = new File.DirectoryIterator(this.Paths.backups);
+> +    try {
+> +      if (iterator.exists()) {
+> +        for (let entry in iterator) {
+
+Should that be "let entry of iterator"?
+
+@@ +222,5 @@
+> +            try {
+> +              File.remove(entry.path);
+> +            } catch (ex) {
+> +            // Don't stop immediately.
+> +            exn = exn || ex;
+
+We need to ignore non-existent files as well here, right? How about having a method like this._removeFile() that returns null or an exception if any?
+
+@@ +236,5 @@
+> +    iterator = new File.DirectoryIterator(OS.Constants.Path.profileDir);
+> +    try {
+> +      if (iterator.exists()) {
+> +        for (let entry in iterator) {
+> +        if (!entry.isDir && entry.path.startsWith(this.Paths.upgradeBackupPrefix)) {
+
+The indentation is a little off here.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +110,2 @@
+>     */
+> +  _onSessionFileRead: function ({origin, source, parsed}) {
+
+Does |origin| still exist? It's definitely not used here anymore.
+
+@@ +121,5 @@
+>        this._sessionType = Ci.nsISessionStartup.NO_SESSION;
+>        Services.obs.notifyObservers(null, "sessionstore-state-finalized", "");
+>        gOnceInitializedDeferred.resolve();
+>        return;
+> +    } else if (stateString == source) {
+
+No "else if" after the return above, please.
+
+::: browser/components/sessionstore/test/unit/test_backup_once.js
+@@ +8,5 @@
+>    let profd = do_get_profile();
+>    Cu.import("resource:///modules/sessionstore/SessionFile.jsm", toplevel);
+>    decoder = new TextDecoder();
+>    pathStore = OS.Path.join(OS.Constants.Path.profileDir, "sessionstore.js");
+> +  pathBackup = OS.Path.join(OS.Constants.Path.profileDir, "sessionstore-startup.js");
+
+sessionstore-startup.js? As the backup path?
+(In reply to Tim Taubert [:ttaubert] from comment #34)
+> How about using:
+> 
+> read: Task.async(function* () {
+>   ...
+> }),
+
+You're cheating, this didn't exist at the time :)
+
+> 
+> @@ +197,5 @@
+> > +          let path = this.Paths[key];
+> > +          let source = yield this._readSessionFile(path);
+> > +          let parsed = JSON.parse(source);
+> > +          result = {
+> > +            origin: key,
+> 
+> Do we still need "origin"?
+
+We need it in the worker, but we may not need it in the caller anymore. I suspect we'll need it in the future, but we can remove it for now.
+
+> @@ +245,5 @@
+> >    _readSessionFile: function (path) {
+> >      let deferred = Promise.defer();
+> >      let file = FileUtils.File(path);
+> >      let durationMs = Date.now();
+> > +    let stack = (new Error()).stack;
+> 
+> I don't know but it feels quite expensive getting .stack only for a
+> potential error. We know where _readSessionFile() is called from so do we
+> really need to do that?
+
+Come to think about it, it might be useful to have a function that returns the stack only in DEBUG mode. Need to think about it.
+
+> Do we really need EMPTY, clean and recoveryBackup? I feel like they can be
+> folded into the other states as they're not handled themselves.
+
+I believe that they can be useful for debugging and, a later stage, for giving feedback to the user.
+
+> OTOH, do we really need handling that here? Does OS.File throw an exception
+> when "backupTo" doesn't exist? If not we can simplify code here.
+
+I don't understand that comment. It's about not erasing a good file with a bad file.
+
+> 
+> @@ +142,5 @@
+> > +        // sessionstore.js
+> > +        File.copy(this.Paths.upgradeBackup, this.Paths.clean);
+> > +      }
+> > +    } catch (ex) {
+> > +      // Don't throw immediately
+> 
+> I really feel like the exception handling around here is quite awful to be
+> honest. Maybe this wouldn't look as bad if we would only wrap stuff that can
+> file, i.e. any OS.File calls.
+
+Did you mean "stuff that can fail"? Otherwise, I don't understand your sentence.
+
+> @@ +143,5 @@
+> > +        File.copy(this.Paths.upgradeBackup, this.Paths.clean);
+> > +      }
+> > +    } catch (ex) {
+> > +      // Don't throw immediately
+> > +      exn = exn || ex;
+> 
+> exn = ex;
+
+Well, I wrote exn || ex to be on the safe side in case you wanted more refactorings :)
+
+> 
+> @@ +152,5 @@
+> > +    if (this.upgradeBackupNeeded
+> > +      && (this.state == clean
+> > +       || this.state == upgradeBackup)) {
+> > +      try {
+> > +        File.copy(this.Paths.clean, this.Paths.nextUpgradeBackup);
+> 
+> In the case of |state == upgradeBackup| couldn't we also just skip the
+> copying the file? Seems like we already have one usable upgrade backup even
+> if that has an "old" build ID. We could just set
+> |this.upgradeBackupNeeded=false| and |upgradeBackupComplete=true|.
+>
+> Also, assuming we restored from $upgradeBackup and somehow failed in
+> writeAtomic() above, there will be no $clean file to copy.
+
+Right. In this case, we should probably move the file instead of copying it.
+
+> @@ +222,5 @@
+> > +            try {
+> > +              File.remove(entry.path);
+> > +            } catch (ex) {
+> > +            // Don't stop immediately.
+> > +            exn = exn || ex;
+> 
+> We need to ignore non-existent files as well here, right? How about having a
+> method like this._removeFile() that returns null or an exception if any?
+
+By default, remove() ignores non-existent files. 
+
+
+> ::: browser/components/sessionstore/test/unit/test_backup_once.js
+> @@ +8,5 @@
+> >    let profd = do_get_profile();
+> >    Cu.import("resource:///modules/sessionstore/SessionFile.jsm", toplevel);
+> >    decoder = new TextDecoder();
+> >    pathStore = OS.Path.join(OS.Constants.Path.profileDir, "sessionstore.js");
+> > +  pathBackup = OS.Path.join(OS.Constants.Path.profileDir, "sessionstore-startup.js");
+> 
+> sessionstore-startup.js? As the backup path?
+
+Ah, well, anyway, I should use SessionFile.Paths.
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #35)
+> (In reply to Tim Taubert [:ttaubert] from comment #34)
+> > How about using:
+> > 
+> > read: Task.async(function* () {
+> >   ...
+> > }),
+> 
+> You're cheating, this didn't exist at the time :)
+
+It's quite new to be fair :)
+
+> > Do we really need EMPTY, clean and recoveryBackup? I feel like they can be
+> > folded into the other states as they're not handled themselves.
+> 
+> I believe that they can be useful for debugging and, a later stage, for
+> giving feedback to the user.
+
+Ok, fair enough.
+
+> > OTOH, do we really need handling that here? Does OS.File throw an exception
+> > when "backupTo" doesn't exist? If not we can simplify code here.
+> 
+> I don't understand that comment. It's about not erasing a good file with a
+> bad file.
+
+Right, that makes sense. Sorry for the confusion.
+
+> > > +    } catch (ex) {
+> > > +      // Don't throw immediately
+> > 
+> > I really feel like the exception handling around here is quite awful to be
+> > honest. Maybe this wouldn't look as bad if we would only wrap stuff that can
+> > file, i.e. any OS.File calls.
+> 
+> Did you mean "stuff that can fail"? Otherwise, I don't understand your
+> sentence.
+
+Yes, only wrap stuff that can fail. If you mumble a little it sounds almost the same :)
+
+> > We need to ignore non-existent files as well here, right? How about having a
+> > method like this._removeFile() that returns null or an exception if any?
+> 
+> By default, remove() ignores non-existent files. 
+
+Sweet.
+(In reply to Tim Taubert [:ttaubert] from comment #34)
+> @@ +131,5 @@
+> > +        // In other cases, either $Path.recovery doesn't exist or has
+> > +        // been corrupted. Regardless, don't backup $Path.recovery.
+> > +        File.writeAtomic(this.Paths.recovery, stateString, {
+> > +          tmpPath: this.Paths.recovery + ".tmp"
+> > +        });
+> 
+> I think it would be better to have:
+> 
+> let opts = {tmpPath: this.Paths.recovery + ".tmp"};
+> 
+> // Add some nice comment.
+> if (this.state == PERMANENT || this.state == recovery) {
+>   opts.backupTo = this.Paths.recoveryBackup;
+> }
+> 
+> File.writeAtomic(this.Paths.recovery, stateString, opts);
+> 
+> That makes it more obvious that we definitely write to "recovery" every time.
+
+I'm not a big fan, as I feel that it obfuscates the code. Unless you insist, I'm going to ignore this comment.
+
+> OTOH, do we really need handling that here? Does OS.File throw an exception
+> when "backupTo" doesn't exist? If not we can simplify code here.
+> 
+> @@ +142,5 @@
+> > +        // sessionstore.js
+> > +        File.copy(this.Paths.upgradeBackup, this.Paths.clean);
+> > +      }
+> > +    } catch (ex) {
+> > +      // Don't throw immediately
+> 
+> I really feel like the exception handling around here is quite awful to be
+> honest. Maybe this wouldn't look as bad if we would only wrap stuff that can
+> file, i.e. any OS.File calls.
+
+Well, I want upgradeBackupNeeded and upgradeBackupComplete to be updated only if the upgrade backup is complete. I don't see a cleaner way to express that.
+
+> @@ +143,5 @@
+> > +        File.copy(this.Paths.upgradeBackup, this.Paths.clean);
+> > +      }
+> > +    } catch (ex) {
+> > +      // Don't throw immediately
+> > +      exn = exn || ex;
+> 
+> exn = ex;
+
+I kept it as this because that's less likely to break in subtle ways during the next refactoring of the code.
+
+> 
+> @@ +152,5 @@
+> > +    if (this.upgradeBackupNeeded
+> > +      && (this.state == clean
+> > +       || this.state == upgradeBackup)) {
+> > +      try {
+> > +        File.copy(this.Paths.clean, this.Paths.nextUpgradeBackup);
+> 
+> In the case of |state == upgradeBackup| couldn't we also just skip the
+> copying the file? Seems like we already have one usable upgrade backup even
+> if that has an "old" build ID. We could just set
+> |this.upgradeBackupNeeded=false| and |upgradeBackupComplete=true|.
+> 
+> Also, assuming we restored from $upgradeBackup and somehow failed in
+> writeAtomic() above, there will be no $clean file to copy.
+
+I reworked this a little and remove the first File.copy.
+Created attachment 8406189
+Overhauling backup and recovery, v6
+Created attachment 8406481
+1. Making OS.File.removeDir work without options
+
+Looks like this didn't work.
+Created attachment 8406482
+2. Overhauling backup and recovery, v7
+Created attachment 8406820
+2. Overhauling backup and recovery, v8
+
+I had forgotten to fix some tests. Here we go.
+Tim, review ping? :)
+I just saw that the second patch doesn't apply anymore, which is of course my fault. I've had the feedback draft sitting in here for a while so I'll just submit that for now and will do a full review when the new patch(es) is/are up. Sorry for blocking you.
+Comment on attachment 8406820
+2. Overhauling backup and recovery, v8
+
+Review of attachment 8406820:
+-----------------------------------------------------------------
+
+It would be great to have all test changes in their own patch. browser_backup_recovery.js and browser_upgrade_backup.js fail for me locally.
+
+::: browser/components/sessionstore/src/PrivacyLevel.jsm
+@@ +81,1 @@
+>    }
+
+This can be removed.
+
+::: browser/components/sessionstore/src/SessionFile.jsm
+@@ +39,5 @@
+>  
+>  XPCOMUtils.defineLazyModuleGetter(this, "console",
+>    "resource://gre/modules/devtools/Console.jsm");
+> +XPCOMUtils.defineLazyModuleGetter(this, "PrivacyLevel",
+> +  "resource:///modules/sessionstore/PrivacyLevel.jsm");
+
+This is unused and can be removed.
+
+@@ +203,5 @@
+> +        let startMs = Date.now();
+> +        let source = yield OS.File.read(path, { encoding: "utf-8" });
+> +        let parsed = JSON.parse(source);
+> +        result = {
+> +          origin: key,
+
+|origin| isn't used anywhere, please remove.
+
+@@ +227,5 @@
+> +    }
+> +    if (!result) {
+> +      // If everything fails, start with an empty session.
+> +      result = {
+> +        origin: "empty",
+
+|origin| isn't used anywhere, please remove.
+
+::: browser/components/sessionstore/src/SessionSaver.jsm
+@@ +268,3 @@
+>        this.updateLastSaveTime();
+>        notify(null, "sessionstore-state-write-complete");
+> +      return result;
+
+SessionFile.write() doesn't return anything afaict. This change seems pointless?
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +53,5 @@
+>    });
+>  };
+>  
+> +// The various possible states
+> +const STATES = Object.freeze({
+
+Freezing doesn't make sense if we don't expose the object anywhere.
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +112,2 @@
+>     */
+> +  _onSessionFileRead: function ({origin, source, parsed}) {
+
+Please remove |origin| as it's unused.
+
+@@ +124,5 @@
+>        Services.obs.notifyObservers(null, "sessionstore-state-finalized", "");
+>        gOnceInitializedDeferred.resolve();
+>        return;
+>      }
+> +    if (stateString == source) {
+
+Nit: empty line above please.
+
+@@ +130,5 @@
+> +      this._initialState = parsed;
+> +    } else {
+> +      // The session has been intercepted by an add-on, reparse.
+> +      try {
+> +        this._initialState = JSON.stringify(stateString);
+
+This should be JSON.parse()...
+
+@@ +133,5 @@
+> +      try {
+> +        this._initialState = JSON.stringify(stateString);
+> +      } catch (ex) {
+> +        // That's not very good, an add-on has rewritten the initial
+> +        // state to something that won't parse.
+
+Can you please report an error here to let add-on authors know?
+
+@@ +135,5 @@
+> +      } catch (ex) {
+> +        // That's not very good, an add-on has rewritten the initial
+> +        // state to something that won't parse.
+> +        this._initialState = null;
+> +	origin = "broken-by-observer: " + ex;
+
+|origin| is set here but never used, please remove.
+
+::: browser/components/sessionstore/test/browser_upgrade_backup.js
+@@ +20,5 @@
+> +  let contents = JSON.stringify({"browser_upgrade_backup.js": Math.random()});
+> +  yield OS.File.writeAtomic(Paths.clean, contents);
+> +  yield SessionFile.read(); // First call to read() initializes the SessionWorker
+> +  yield SessionFile.write(""); // First call to write() triggers the backup
+> +  Services.prefs.savePrefFile(null); // Flush preferences
+
+Why is flushing the pref file needed? We don't read from it again.
+
+::: browser/components/sessionstore/test/head.js
+@@ +286,5 @@
+> +    } catch (ex if ex instanceof OS.File.Error
+> +	     && ex.becauseNoSuchFile) {
+> +      // Ignore missing files
+> +    }
+> +    yield cb(data, key);
+
+Wouldn't calling the callback be sufficient here? Do we really need to yield? The only use I see doesn't return a promise.
+
+::: browser/components/sessionstore/test/unit/test_backup_once.js
+@@ +6,5 @@
+>  
+>  function run_test() {
+>    let profd = do_get_profile();
+> +  let SessionFile = Cu.import("resource:///modules/sessionstore/SessionFile.jsm", {});
+> +  Paths = SessionFile.Paths;
+
+Can't you do this at the top as well? Feels rather strange doing this in the test, esp. if it's global.
+
+@@ +11,4 @@
+>    let source = do_get_file("data/sessionstore_valid.js");
+>    source.copyTo(profd, "sessionstore.js");
+> +
+> +  yield SessionFile.read();
+
+Does yielding here even work? run_test() isn't a task afaict. How about
+
+SessionFile.read().then(run_next_test);
+
+@@ +34,5 @@
+>  
+>  // Write to the store again, and check that the backup is not updated
+>  add_task(function test_second_write_no_backup() {
+>    let content = "test_2";
+> +  let initial_content = yield OS.File.read(Paths.clean, { encoding: "utf-8" });
+
+|initial_content| is unused.
+(In reply to Tim Taubert [:ttaubert] from comment #44)
+> @@ +203,5 @@
+> > +        let startMs = Date.now();
+> > +        let source = yield OS.File.read(path, { encoding: "utf-8" });
+> > +        let parsed = JSON.parse(source);
+> > +        result = {
+> > +          origin: key,
+> 
+> |origin| isn't used anywhere, please remove.
+
+Well, we agreed to keep it (comment 35 and comment 36).
+
+> ::: browser/components/sessionstore/src/SessionSaver.jsm
+> @@ +268,3 @@
+> >        this.updateLastSaveTime();
+> >        notify(null, "sessionstore-state-write-complete");
+> > +      return result;
+> 
+> SessionFile.write() doesn't return anything afaict. This change seems
+> pointless?
+
+Ah, right.
+
+> ::: browser/components/sessionstore/src/SessionWorker.js
+> @@ +53,5 @@
+> >    });
+> >  };
+> >  
+> > +// The various possible states
+> > +const STATES = Object.freeze({
+> 
+> Freezing doesn't make sense if we don't expose the object anywhere.
+
+Well, if we're sure that we don't want to modify it, why should we not freeze it?
+
+> ::: browser/components/sessionstore/test/unit/test_backup_once.js
+> @@ +6,5 @@
+> >  
+> >  function run_test() {
+> >    let profd = do_get_profile();
+> > +  let SessionFile = Cu.import("resource:///modules/sessionstore/SessionFile.jsm", {});
+> > +  Paths = SessionFile.Paths;
+> 
+> Can't you do this at the top as well? Feels rather strange doing this in the
+> test, esp. if it's global.
+
+Well,
+1. do_get_profile() should be called from within run_test(), iirc;
+2. SessionFile depends on having a profile
+Created attachment 8438349
+2. Overhauling backup and recovery, v9
+
+Applied feedback, moved the tests to their own patch.
+Created attachment 8438352
+3. Tests
+
+Just the tests, with your feedback applied.
+Oh, and an intermittent failure in browser_backup_recovery removed, I believe.
+Comment on attachment 8438349
+2. Overhauling backup and recovery, v9
+
+Review of attachment 8438349:
+-----------------------------------------------------------------
+
+Need to take a closer look at SessionFile and SessionWorker still but here's some early feedback :)
+
+::: browser/components/sessionstore/src/PrivacyLevel.jsm
+@@ +11,5 @@
+>  Cu.import("resource://gre/modules/Services.jsm");
+> +Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> +
+> +XPCOMUtils.defineLazyServiceGetter(this, "sessionStartup",
+> +  "@mozilla.org/browser/sessionstartup;1", "nsISessionStartup");
+
+Please name it gSessionStartup. It feels like a variable more than a global when reading the code below.
+
+@@ +73,5 @@
+>        return false;
+>      }
+>  
+>      return true;
+> +  },
+
+Please revert.
+
+::: browser/components/sessionstore/src/SessionFile.jsm
+@@ +103,5 @@
+>  let SessionFileInternal = {
+> +  Paths: Object.freeze({
+> +    // The path to the latest version of sessionstore written during a clean
+> +    // shutdown. This file is removed at the end of startup (and moved to
+> +    // latestStart if it was valid) and written during clean shutdown.
+
+Need to update the comment here as we're actually keeping sessionstore.js around.
+
+@@ +211,5 @@
+> +        Telemetry.getHistogramById("FX_SESSION_RESTORE_READ_FILE_MS").
+> +          add(Date.now() - startMs);
+> +        break;
+> +      } catch (ex if ex instanceof OS.File.Error && ex.becauseNoSuchFile) {
+> +	exists = false;
+
+This seems weirdly indented with tabs when looking at the file directly.
+
+@@ +217,5 @@
+> +        // File is corrupted, try next file
+> +	corrupted = true;
+> +      } finally {
+> +	if (exists) {
+> +	  Telemetry.getHistogramById("FX_SESSION_RESTORE_CORRUPT_FILE").
+
+Same here.
+
+@@ +234,4 @@
+>  
+> +    // Initialize the worker to let it handle backups and also
+> +    // as a workaround for bug 964531.
+> +    SessionWorker.post("init", [
+
+Please see the comment for part 3.
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +293,5 @@
+>  
+> +  /**
+> +   * Wipe out the main sessionstore file and the sessionstore directory.
+> +   */
+> +  _wipeCurrent: function () {
+
+This seems unused?
+
+@@ +331,5 @@
+> +
+> +  /**
+> +   * Wipe out leftovers from previous versions.
+> +   */
+> +  _wipeLegacy: function() {
+
+This seems unused as well?
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +117,2 @@
+>     */
+> +  _onSessionFileRead: function ({origin, source, parsed}) {
+
+Please remove |origin| here as long as we don't use it.
+
+@@ +125,3 @@
+>  
+> +    if (stateString != source) {
+> +      // The session has been intercepted by an add-on, reparse.
+
+s/intercepted/modified
+
+@@ +130,5 @@
+> +      } catch (ex) {
+> +        // That's not very good, an add-on has rewritten the initial
+> +        // state to something that won't parse.
+> +        warning("Observer rewrote the state to something that won't parse", ex);
+> +        this._initialState = null;
+
+Nulling _initialState is rather superfluous here. If we catch an error the value won't have changed.
+
+@@ +131,5 @@
+> +        // That's not very good, an add-on has rewritten the initial
+> +        // state to something that won't parse.
+> +        warning("Observer rewrote the state to something that won't parse", ex);
+> +        this._initialState = null;
+> +	origin = "broken-by-observer: " + ex;
+
+Same here, setting |origin| makes me assume we use that value anywhere. Please remove.
+Comment on attachment 8438352
+3. Tests
+
+Review of attachment 8438352:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_394759_perwindowpb.js
+@@ +83,5 @@
+>        executeSoon(aCallback);
+>      });
+>  
+>      // Remove the sessionstore.js file before setting the interval to 0
+> +    SessionFile.wipe();
+
+Should we make SessionFile.wipe() return a promise and yield that here? Probably ok to not do that as write() will finish after wiping.
+
+::: browser/components/sessionstore/test/browser_454908.js
+@@ +42,5 @@
+>    // Write to disk and read our file.
+> +  yield forceSaveState();
+> +  yield promiseForEachSessionRestoreFile((state, key) =>
+> +    // Ensure that we have not saved our password.
+> +    is(state.indexOf(PASS), -1, "password has not been written to file " + key)
+
+ok(!state.contains(PASS), "...");
+
+::: browser/components/sessionstore/test/browser_backup_recovery.js
+@@ +32,4 @@
+>  });
+>  
+> +add_task(function* test_creation() {
+> +  yield SessionFile.wipe();
+
+This doesn't really return a promise yet. See my part 2 review comments.
+
+@@ +32,5 @@
+>  });
+>  
+> +add_task(function* test_creation() {
+> +  yield SessionFile.wipe();
+> +  yield SessionFile.read(); // Reinitializes SessionFile
+
+Using read() to re-initialize is kind of weird. I think we should have a SessionFile.init() method that calls SessionWorker.init() and we ensure that this is only called once. It should be called by nsSessionStartup.js, probably in _onSessionFileRead().
+
+@@ +40,5 @@
+>  
+> +  let URL_BASE = "http://example.com/?atomic_backup_test_creation=" + Math.random();
+> +  let URL = URL_BASE + "?first_write";
+> +  let tab = gBrowser.addTab(URL);
+> +  try {
+
+Please don't wrap this all in a try/finally, we don't do this anywhere else in tests.
+
+@@ +81,5 @@
+>  
+> +let promiseSource = Task.async(function*(name) {
+> +  let URL = "http://example.com/?atomic_backup_test_recovery=" + Math.random() + "&name=" + name;
+> +  let tab = gBrowser.addTab(URL);
+> +  try {
+
+Remove try/finally, please.
+
+::: browser/components/sessionstore/test/browser_privatetabs.js
+@@ +35,5 @@
+>  
+>      info("Checking out state");
+>      yield SessionSaver.run();
+> +    let state = yield OS.File.read(SessionFile.Paths.recovery,
+> +		  { encoding: "utf-8" });
+
+Shouldn't we use promiseSaveFileContents() here?
+
+::: browser/components/sessionstore/test/unit/head.js
+@@ +5,5 @@
+>  Components.utils.import("resource://gre/modules/Services.jsm");
+>  
+>  // Call a function once initialization of SessionStartup is complete
+> +function afterSessionStartupInitialization(cb) {
+> +  do_print("Waiting for session startup initialization");
+
+Those kinds of changes make it really hard to review big patches :( Let's keep it - it is worthwhile to fix but still out of scope.
+
+::: browser/components/sessionstore/test/unit/test_startup_nosession_async.js
+@@ +18,5 @@
+>    afterSessionStartupInitialization(function cb() {
+>      do_check_eq(startup.sessionType, Ci.nsISessionStartup.NO_SESSION);
+>      do_test_finished();
+>    });
+> +}
+
+Please revert, nothing changed here.
+(In reply to Tim Taubert [:ttaubert] from comment #49)
+> @@ +32,5 @@
+> >  });
+> >  
+> > +add_task(function* test_creation() {
+> > +  yield SessionFile.wipe();
+> > +  yield SessionFile.read(); // Reinitializes SessionFile
+> 
+> Using read() to re-initialize is kind of weird. I think we should have a
+> SessionFile.init() method that calls SessionWorker.init() and we ensure that
+> this is only called once. It should be called by nsSessionStartup.js,
+> probably in _onSessionFileRead().
+
+Well, initialization of the worker requires having read the file, and only really makes sense immediately after having read the file. Now, I can rename `read` to `init`. It's not ideal, though, as:
+- `init` will actually read and return the contents of the file;
+- we want to be able to call `init` several times during the tests.
+
+> >  // Call a function once initialization of SessionStartup is complete
+> > +function afterSessionStartupInitialization(cb) {
+> > +  do_print("Waiting for session startup initialization");
+> 
+> Those kinds of changes make it really hard to review big patches :( Let's
+> keep it - it is worthwhile to fix but still out of scope.
+
+Sorry about that.
+Created attachment 8441423
+3. Tests, v2
+
+Applied feedback.
+Created attachment 8441425
+2. Overhauling backup and recovery, v10
+
+Applied feedback.
+
+On second thought, I also reintroduced the renaming of `clean` into `cleanBackup` during startup, as I realized that there were a few issues with the current algorithm:
+1. Depending on Privacy level, both `clean` and `recovery` may co-exist, in which case we end up loading the largest file instead of the smaller one, which is bad for performance;
+2. If we crash after `clean` has been written and before `recovery` and `recoveryBackup` have been removed, we end up loading a file that is not the latest version, despite the fact that we have the latest version on disk;
+3. If, during shutdown, `clean` is corrupted while both `recovery` and `recoveryBackup` are removed, it is good to be able to fallback to the previous startup state, instead of falling back to the latest upgrade backup.
+Comment on attachment 8441425
+2. Overhauling backup and recovery, v10
+
+Review of attachment 8441425:
+-----------------------------------------------------------------
+
+Looks great, the $cleanBackup is a good idea, I think. f+ because the tests are failing and that could either be the tests or the code here.
+
+::: browser/components/sessionstore/src/SessionFile.jsm
+@@ +91,5 @@
+> +   * the state of the file.
+> +   */
+> +  get Paths() {
+> +    return SessionFileInternal.Paths;
+> +   }
+
+Nit: indentation.
+
+@@ +249,5 @@
+> +    // as a workaround for bug 964531.
+> +    SessionWorker.post("init", [
+> +      result.origin,
+> +      this.Paths,
+> +    ]);
+
+I wish all the I/O was in the worker, that would make some of this code much nicer :'(
+
+@@ +280,5 @@
+>        TelemetryStopwatch.start("FX_SESSION_RESTORE_WRITE_FILE_LONGEST_OP_MS", refObj);
+>  
+>        try {
+> +        let performShutdownCleanup = isFinalWrite &&
+> +        !sessionStartup.isAutomaticRestoreEnabled();
+
+Nit: indentation.
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +55,5 @@
+>  
+> +// The various possible states
+> +const STATES = Object.freeze({
+> +  permanent: "permanent",
+> +  empty: "empty",
+
+To stick with current conventions and make it a little more readable I would like to change that to:
+
+const STATE_PERMANENT = "permanent";
+const STATE_EMPTY = "empty";
+
+// ... etc.
+
+@@ +58,5 @@
+> +  permanent: "permanent",
+> +  empty: "empty",
+> +  clean: "clean",
+> +  recovery: "recovery",
+> +  recoveryBackup: "recoveryBackup",
+
+We can get rid of $recoveryBackup here with the constants.
+
+@@ +75,5 @@
+>  
+>    /**
+> +   * The current state of the worker, as one of the following strings:
+> +   * - "PERMANENT", once the first write has been completed;
+> +   * - "EMPTY", before the first write has been completed,
+
+Nit: The states aren't uppercase anymore.
+
+@@ +94,5 @@
+> +   */
+> +  init: function (origin, paths) {
+> +    if (!(origin in STATES)) {
+> +      throw new TypeError("Invalid origin: " + origin);
+> +    }
+
+Could be changed to |origin in paths| with the STATE_* constants above.
+
+@@ +130,5 @@
+>        }
+>  
+> +      startWriteMs = Date.now();
+> +
+> +      if (this.state == STATES.permanent || this.state == STATES.recovery) {
+
+The "permanent" state is confusing. Please remove it and use "recovery" instead to denote that we're writing to $recovery by default.
+
+@@ +225,5 @@
+> +    try {
+> +      File.remove(this.Paths.clean);
+> +    } catch (ex) {
+> +      // Don't stop immediately.
+> +      exn = exn || ex;
+
+I wish we had a nice wrapper for this pattern but I have no idea how we could implement this :/
+
+@@ +278,5 @@
+> +      return;
+> +    }
+> +    for (let entry in iterator) {
+> +      if (entry.isDir) {
+> +	continue;
+
+Nit: indentation.
+
+@@ +285,2 @@
+>          try {
+> +	  File.remove(entry.path);
+
+Nit: indentation.
+Comment on attachment 8441423
+3. Tests, v2
+
+Review of attachment 8441423:
+-----------------------------------------------------------------
+
+When running tests locally I get the following:
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_394759_perwindowpb.js | Test timed out
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_454908.js |  - Got false, expected password has not been written to file clean
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_454908.js |  - Got false, expected password has not been written to file recovery
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_454908.js |  - Got false, expected password has not been written to file recoveryBackup
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_454908.js |  - Got false, expected password has not been written to file cleanBackup
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_backup_recovery.js | Uncaught exception at :0 - Unix error 2 during operation open on file /var/folders/89/3mqt0ggs7kg0v_5f4_2s_y040000gn/T/tmpHrww9V/sessionstore.js (No such file or directory)
+
+Just running browser_backup_recovery.js on its own I get:
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_backup_recovery.js | After wipe recovery sessionstore file doesn't exist
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_backup_recovery.js | After write, recoveryBackup sessionstore doesn't exist
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_backup_recovery.js | Uncaught exception at :0 - Unix error 2 during operation open on file /var/folders/89/3mqt0ggs7kg0v_5f4_2s_y040000gn/T/tmp0RErhh/sessionstore.js (No such file or directory)
+
+::: browser/components/sessionstore/test/browser_backup_recovery.js
+@@ +20,5 @@
+> +function promiseRead(path) {
+> +  return Task.spawn(function*() {
+> +    let data = yield OS.File.read(path);
+> +    return gDecoder.decode(data);
+> +  });
+
+return OS.File.read(path).then(contents => gDecoder.decode(contents));
+Sorry about that, the errors were entirely in the tests.
+(In reply to Tim Taubert [:ttaubert] from comment #53)
+> @@ +249,5 @@
+> > +    // as a workaround for bug 964531.
+> > +    SessionWorker.post("init", [
+> > +      result.origin,
+> > +      this.Paths,
+> > +    ]);
+> 
+> I wish all the I/O was in the worker, that would make some of this code much
+> nicer :'(
+
+Unfortunately, that doesn't sound likely :/
+
+> 
+> @@ +58,5 @@
+> > +  permanent: "permanent",
+> > +  empty: "empty",
+> > +  clean: "clean",
+> > +  recovery: "recovery",
+> > +  recoveryBackup: "recoveryBackup",
+> 
+> We can get rid of $recoveryBackup here with the constants.
+
+I don't understand that comment.
+
+> @@ +130,5 @@
+> >        }
+> >  
+> > +      startWriteMs = Date.now();
+> > +
+> > +      if (this.state == STATES.permanent || this.state == STATES.recovery) {
+> 
+> The "permanent" state is confusing. Please remove it and use "recovery"
+> instead to denote that we're writing to $recovery by default.
+
+I don't understand this either.
+
+> 
+> @@ +225,5 @@
+> > +    try {
+> > +      File.remove(this.Paths.clean);
+> > +    } catch (ex) {
+> > +      // Don't stop immediately.
+> > +      exn = exn || ex;
+> 
+> I wish we had a nice wrapper for this pattern but I have no idea how we
+> could implement this :/
+
+I have an idea involving generators, but it seems a bit overkill.
+
+failLater(function*() {
+  yield File.remove(this.Paths.clean);
+  // ...
+});
+Created attachment 8443707
+Cumulative patch
+
+Applied feedback, fixed offending tests. This patch applies on top of the previous ones.
+(In reply to David Rajchenbach Teller [:Yoric] from comment #56)
+> > @@ +58,5 @@
+> > > +  permanent: "permanent",
+> > > +  empty: "empty",
+> > > +  clean: "clean",
+> > > +  recovery: "recovery",
+> > > +  recoveryBackup: "recoveryBackup",
+> > 
+> > We can get rid of $recoveryBackup here with the constants.
+> 
+> I don't understand that comment.
+
+|STATE.recoveryBackup| isn't used anywhere, we can remove it when checking |origin in paths|.
+
+> > @@ +130,5 @@
+> > >        }
+> > >  
+> > > +      startWriteMs = Date.now();
+> > > +
+> > > +      if (this.state == STATES.permanent || this.state == STATES.recovery) {
+> > 
+> > The "permanent" state is confusing. Please remove it and use "recovery"
+> > instead to denote that we're writing to $recovery by default.
+> 
+> I don't understand this either.
+
+"permanent" is not an origin, so rather an "artificial state". I find this very confusing, we should just use $recovery after the first write to denote that we're writing to the $recovery file.
+Comment on attachment 8443707
+Cumulative patch
+
+Review of attachment 8443707:
+-----------------------------------------------------------------
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_394759_perwindowpb.js | Uncaught exception at resource:///modules/sessionstore/SessionWorker.js:240 - Error: TypeError: this.Paths is null
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +69,5 @@
+> + * use.)
+> + */
+> +const STATE_CLEAN = "clean";
+> +const STATE_RECOVERY = "recovery";
+> +const STATE_UPGRADE_BACKUP = "upgradeBackup";
+
+Ok, I see you already got rid of STATE_RECOVERY_BACKUP.
+
+@@ +199,5 @@
+>        File.remove(this.Paths.recoveryBackup);
+>        File.remove(this.Paths.recovery);
+>      }
+>  
+> +    this.state = STATE_PERMANENT;
+
+If we would just set STATE_RECOVERY here we could get rid of the confusing STATE_PERMANENT. That makes it clearer to which file we're writing to.
+
+::: browser/components/sessionstore/test/browser_394759_perwindowpb.js
+@@ +20,5 @@
+> +
+> +registerCleanupFunction(function() {
+> +  Services.prefs.clearUserPref("browser.sessionstore.interval");
+> +  windowsToClose.forEach(function(win) {
+> +    win.close();
+
+Should use promiseWindowClosed(). registerCleanupFunction() supports functions that return a promise, we could do |registerCleanupFunction(Task.async(function* () { ...| here.
+
+@@ +25,2 @@
+>    });
+> +  Services.prefs.clearUserPref("browser.sessionstore.interval");
+
+Clearing the pref once should be enough ;)
+
+@@ +31,5 @@
+> +  return Task.spawn(function*() {
+> +    let win = yield promiseNewWindowLoaded({ "private": aIsPrivate });
+> +    win.gBrowser.selectedBrowser.loadURI(aTest.url);
+> +    yield promiseBrowserLoaded(win.gBrowser.selectedBrowser);
+> +    yield Promise.resolve();
+
+This extra tick shouldn't be needed. If so this would point to a different problem.
+
+@@ +35,5 @@
+> +    yield Promise.resolve();
+> +    // Mark the window with some unique data to be restored later on.
+> +    ss.setWindowValue(win, aTest.key, aTest.value);
+> +    // Close.
+> +    win.close();
+
+yield promiseWindowClosed(win);
+
+@@ +43,5 @@
+> +function promiseTestOnWindow(aIsPrivate, aValue) {
+> +  return Task.spawn(function*() {
+> +    let win = yield promiseNewWindowLoaded({ "private": aIsPrivate });
+> +    windowsToClose.push(win);
+> +    yield Promise.resolve();
+
+The extra tick shouldn't be needed here either.
+
+@@ +83,5 @@
+> +    yield forceSaveState();
+> +    closedWindowCount = ss.getClosedWindowCount();
+> +    is(closedWindowCount, 0, "Correctly set window count");
+> +
+> +    yield Promise.resolve();
+
+Extra tick...
+(In reply to Tim Taubert [:ttaubert] from comment #58)
+> > > The "permanent" state is confusing. Please remove it and use "recovery"
+> > > instead to denote that we're writing to $recovery by default.
+> > 
+> > I don't understand this either.
+> 
+> "permanent" is not an origin, so rather an "artificial state". I find this
+> very confusing, we should just use $recovery after the first write to denote
+> that we're writing to the $recovery file.
+
+Well, it's very much a state. It means that we have reached a state at which we don't care about the origin anymore. Would you prefer if I called it "memory"?
+
+(In reply to Tim Taubert [:ttaubert] from comment #59)
+> Comment on attachment 8443707
+> Cumulative patch
+> 
+> Review of attachment 8443707:
+> -----------------------------------------------------------------
+> 
+> TEST-UNEXPECTED-FAIL |
+> chrome://mochitests/content/browser/browser/components/sessionstore/test/
+> browser_394759_perwindowpb.js | Uncaught exception at
+> resource:///modules/sessionstore/SessionWorker.js:240 - Error: TypeError:
+> this.Paths is null
+
+Sorry about that, I forgot to qref after fixing the typo.
+
+> @@ +199,5 @@
+> >        File.remove(this.Paths.recoveryBackup);
+> >        File.remove(this.Paths.recovery);
+> >      }
+> >  
+> > +    this.state = STATE_PERMANENT;
+> 
+> If we would just set STATE_RECOVERY here we could get rid of the confusing
+> STATE_PERMANENT. That makes it clearer to which file we're writing to.
+
+Well, the state tells us where we're reading from, not where we're writing to, so I would find this more confusing.
+
+> @@ +31,5 @@
+> > +  return Task.spawn(function*() {
+> > +    let win = yield promiseNewWindowLoaded({ "private": aIsPrivate });
+> > +    win.gBrowser.selectedBrowser.loadURI(aTest.url);
+> > +    yield promiseBrowserLoaded(win.gBrowser.selectedBrowser);
+> > +    yield Promise.resolve();
+> 
+> This extra tick shouldn't be needed. If so this would point to a different
+> problem.
+
+I don't know, I ported the extra ticks straight from the old version. I didn't want to change that, too.
+(In reply to David Rajchenbach Teller [:Yoric] from comment #60)
+> Well, it's very much a state. It means that we have reached a state at which
+> we don't care about the origin anymore. Would you prefer if I called it
+> "memory"?
+
+I would actually prefer if we got rid of it.
+
+> Well, the state tells us where we're reading from, not where we're writing
+> to, so I would find this more confusing.
+
+It actually does both which is what is confusing.
+
+> > This extra tick shouldn't be needed. If so this would point to a different
+> > problem.
+> 
+> I don't know, I ported the extra ticks straight from the old version. I
+> didn't want to change that, too.
+
+Let's get rid of them anyway.
+Created attachment 8444381
+Cumulative patch 2
+
+I realized that with paths.cleanBackup, we were not writing to Paths.clean anymore.
+
+Summary of changes:
+- removed STATE_PERMANENT, as requested;
+- now writing to Paths.clean again;
+- testing that we write to Paths.clean;
+- SessionWorker can now be accessed from outside of SessionFile (this will be necessary for Differential updates, too);
+- more doc;
+- fixes in browser_394759_perwindowpb.js.
+Comment on attachment 8444381
+Cumulative patch 2
+
+Review of attachment 8444381:
+-----------------------------------------------------------------
+
+I didn't succeed trying to apply the patch on top of everything else but I just assume you ran the tests and you'll push to try before landing anyway :)
+
+r=me with the comments addressed. Thanks!
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +165,5 @@
+> +        // We are shutting down. At this stage, we know that
+> +        // $Paths.clean is either absent or corrupted. If it was
+> +        // originally present and valid, it has been moved to
+> +        // $Paths.cleanBackup a long time ago. We can therefore write
+> +        // with guarantess that we erase nothing.
+
+*with the guarantee that we erase no important data.
+
+@@ +174,5 @@
+> +	// At this stage, either $Paths.recovery was written >= 15
+> +        // seconds ago during this session or we have just started
+> +        // from $Paths.recovery left from the previous session. Either
+> +        // way, $Paths.recovery is good. We can move $Path.backup to
+> +        // $Path.recoveryBacup without erasing a good file with a bad
+
+*$Path.recoveryBackup
+
+@@ +212,5 @@
+>          exn = exn || ex;
+>        }
+>      }
+>  
+> +    if (options.performShutdownCleanup && !exn) {
+
+Nit: Can you please note here that the shutdown cleanup is only performed for deferred sessions? We're better off with automatic restore luckily. Although that unfortunately isn't the default.
+
+::: browser/components/sessionstore/test/browser_394759_perwindowpb.js
+@@ +46,5 @@
+>         "Check the closed window data was stored correctly");
+>    });
+>  }
+>  
+>  function promiseBlankState() {
+
+This whole function seems weird, I think it's only there to to clear closed windows. Can we please do that as usual in a setup task, call forgetClosedWindow() a couple of times and remove this function? Thanks :)
+
+@@ +78,5 @@
+>      yield SessionFile.wipe();
+>  
+>      // Make sure that sessionstore.js can be forced to be created by setting
+>      // the interval pref to 0.
+> +    yield SessionSaver.run();
+
+Nit: yield forceSaveState();
+Another remark (for later), before continuing to use the SessionWorker in other places we should probably tack a minimal UI onto it that directly maps to message names. That would make it nicer to use.
+(In reply to Tim Taubert [:ttaubert] from comment #64)
+> Another remark (for later), before continuing to use the SessionWorker in
+> other places we should probably tack a minimal UI onto it that directly maps
+> to message names. That would make it nicer to use.
+
+What kind of UI? I don't follow.
+Created attachment 8444790
+2. Overhauling backup and recovery, v13
+Created attachment 8444792
+3. Tests, v3
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=ccbba90f43b6
+(In reply to David Rajchenbach Teller [:Yoric] from comment #65)
+> (In reply to Tim Taubert [:ttaubert] from comment #64)
+> > Another remark (for later), before continuing to use the SessionWorker in
+> > other places we should probably tack a minimal UI onto it that directly maps
+> > to message names. That would make it nicer to use.
+> 
+> What kind of UI? I don't follow.
+
+Argh, API. Not UI. Sorry.
+Sorry, wrong try link: https://tbpl.mozilla.org/?tree=Try&rev=4931b99305ca
+(previous try link also had bug 1016387)
+Applying the third patch fails for browser/components/sessionstore/test/browser.ini. Is this based off of fx-team/m-c tip?
+Comment on attachment 8444790
+2. Overhauling backup and recovery, v13
+
+Review of attachment 8444790:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +312,5 @@
+>      }
+>  
+> +    let exn = null;
+> +
+> +    let iterator = new File.DirectoryIterator(this.Paths.backups);
+
+Did some smoke testing and this doesn't remove old sessionstore.bak-2014... files. This should pass the |path| argument, right? Can you please fix that? :)
+
+@@ +320,5 @@
+> +    for (let entry in iterator) {
+> +      if (entry.isDir) {
+> +        continue;
+> +      }
+> +      if (!prefix || entry.path.startsWith(prefix)) {
+
+This should be |entry.name.startsWith(prefix)|.
+The removal of the r+ was more reflexive than a conscious choice. Please don't request review again. Please.
+Created attachment 8445089
+2. Overhauling backup and recovery, v14
+
+Fixed typo. Thanks, Tim.
+Created attachment 8445091
+3. Tests, v4
+
+Unbitrotten.
+I also took the opportunity to add a test that we do remove sessionstore.bak-*
+Try: https://tbpl.mozilla.org/?tree=Try&rev=63c297456f2b
+Comment on attachment 8445089
+2. Overhauling backup and recovery, v14
+
+Review of attachment 8445089:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionWorker.js
+@@ +283,5 @@
+> +    }
+> +
+> +    // Wipe legacy Ression Restore files from the profile directory
+> +    try {
+> +      this._wipeFromDir(OS.Constants.Path.profileDir, OS.Path.join(OS.Constants.Path.profileDir, "sessionstore.bak"));
+
+Why did you decide to pass the full path instead of using |entry.name| below? We only get files from the path given as the first argument so that feels superfluous?
+
+@@ +312,5 @@
+>      }
+>  
+> +    let exn = null;
+> +
+> +    let iterator = new File.DirectoryIterator(this.Paths.backups);
+
+This should be |new File.DirectoryIterator(path)|, no?
+(In reply to Tim Taubert [:ttaubert] from comment #76)
+> Why did you decide to pass the full path instead of using |entry.name|
+> below? We only get files from the path given as the first argument so that
+> feels superfluous?
+
+Because it seemed like a good idea at the time. But yes, you're right.
+
+> @@ +312,5 @@
+ld be |new File.DirectoryIterator(path)|, no?
+
+I wonder how this passed tests.
+(double-check)
+Oh, gosh, it's embarrassing. I switched the order of arguments in writeAtomic(), so of course the file didn't exist.
+Created attachment 8445108
+2. Overhauling backup and recovery, v15
+Created attachment 8445109
+3. Tests, v5
+
+Try: https://tbpl.mozilla.org/?tree=Try&rev=be034c77b538
+https://hg.mozilla.org/integration/fx-team/rev/da27f716ead0
+https://hg.mozilla.org/integration/fx-team/rev/969be473c07d
+https://hg.mozilla.org/integration/fx-team/rev/281eb562486e
+https://hg.mozilla.org/mozilla-central/rev/da27f716ead0
+https://hg.mozilla.org/mozilla-central/rev/969be473c07d
+https://hg.mozilla.org/mozilla-central/rev/281eb562486e
+Thank you for fixing this! I've known many people over the years who have lost sessions, and it has a corrosive effect on their view of Firefox. (That in turn has been a factor when some of them have heard other people praising other browsers which they have then been more inclined to switch to.) I think by making the UX better in this regard you've made a real positive contribution to reducing one of the more painful encounters users can have with Firefox.
+
+I also think many core Firefox contributors would be interested to know about this change, so maybe summarize it in a blog post?
+Blogged: https://dutherenverseauborddelatable.wordpress.com/2014/06/26/firefox-the-browser-that-has-your-backup/
+relnote? - See blog post link ^.
+*** Bug 558425 has been marked as a duplicate of this bug. ***
+*** Bug 686553 has been marked as a duplicate of this bug. ***
+Added the release note with the wording:
+"Improved reliability of the session restoration (learn more)"
+"Learn more" pointing to https://dutherenverseauborddelatable.wordpress.com/2014/06/26/firefox-the-browser-that-has-your-backup/
+Is there any chance to push this fixes to ESR?
+dindog, Unfortunately, this is very unlikely. Patches are too big and it would introduce too much risks in the ESR release.
+*** Bug 1070921 has been marked as a duplicate of this bug. ***
+*** Bug 939872 has been marked as a duplicate of this bug. ***

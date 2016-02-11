@@ -1,0 +1,197 @@
+STR:
+
+1. Open Firefox with a fresh new profile
+2. Open toolbox
+3. Tick chrome/remote debugging in the options panel
+4. Close toolbox
+5. Open Scratchpad
+6. Switch to the Browser environment and don't dismiss the context warning notification
+7. Paste something
+
+Confusion and general sadness ensues.
+
+STR:
+
+1. Open Firefox with a fresh new profile
+2. Open toolbox
+3. Tick chrome/remote debugging in the options panel
+4. Close toolbox
+5. Open Scratchpad
+6. Switch to the Browser environment and don't dismiss the context warning notification
+7. Paste something
+
+Confusion and general sadness ensues.
+I'm wondering if we need self-xss protection in browser scratchpads at all. There is no key sequence to flip from page context to browser context (is this right?) so the self-xss script would look like this:
+
+* Press Shift+F4
+* From the Environment menu select "Browser"
+* Press Ctrl+V
+* Press Ctrl+R
+
+I think flipping from the keyboard to the mouse is going to go well past the complexity barrier than is Win+R.
+
+Also this assumes that devtools.chrome.enabled is already enabled.
+Actually we should just add 'devtools.chrome.enabled' to the list of things that prevent this warning. I think that's a fairly clear indication that you can take responsibility for your actions.
+Manish - what do you think about adding a check for devtools.chrome.enabled, and if set, we don't do self-xss protection?
+
+devtools.chrome.enabled is the flag to say "I trust myself to mess with chrome level JS".
+I agree with this.
+
+IIRC there's a warning associated with the chrome debugger, too, and if not, the general complexity of "go to this random corner in the devtools and click 'enable browser debugging' " is quite decent.
+
+I'll put up a patch in a moment.
+Created attachment 8432138
+Patch
+Comment on attachment 8432138
+Patch
+
+Review of attachment 8432138:
+-----------------------------------------------------------------
+
+Still r+, but I had a couple of thoughts.
+
+::: toolkit/devtools/webconsole/utils.js
+@@ +543,5 @@
+>      if (WebConsoleUtils._usageCount < CONSOLE_ENTRY_THRESHOLD) {
+>        WebConsoleUtils._usageCount = Services.prefs.getIntPref("devtools.selfxss.count")
+> +      if (Services.prefs.getBoolPref("devtools.chrome.enabled")) {
+> +        WebConsoleUtils.usageCount = CONSOLE_ENTRY_THRESHOLD;
+> +      }
+
+Could we do:
+
+    if (devtools.chrome.enabled) {
+      usageCount = THRESHOLD
+      devtools.selfxss.count = THRESHOLD
+    }
+
+That way we're remembering that the pref was set.
+
+@@ +551,5 @@
+>    set usageCount(newUC) {
+>      if (newUC <= CONSOLE_ENTRY_THRESHOLD) {
+>        WebConsoleUtils._usageCount = newUC;
+>        Services.prefs.setIntPref("devtools.selfxss.count", newUC);
+>      }
+
+I have a feeling that this might be the cause of bug 1018112. We only set the pref if it's less than (or equal to) the threshold, not if it's greater. More checking needed.
+(In reply to Joe Walker [:jwalker] from comment #6)
+> @@ +551,5 @@
+> >    set usageCount(newUC) {
+> >      if (newUC <= CONSOLE_ENTRY_THRESHOLD) {
+> >        WebConsoleUtils._usageCount = newUC;
+> >        Services.prefs.setIntPref("devtools.selfxss.count", newUC);
+> >      }
+> 
+> I have a feeling that this might be the cause of bug 1018112. We only set
+> the pref if it's less than (or equal to) the threshold, not if it's greater.
+> More checking needed.
+
+We're only doing ++ so this should work.
+
+I am concerned that "WebConsoleUtils.usageCount = 1000;" wouldn't do what we expected it to none the less. I think we should do:
+
+  let oldUsageCount = Services.prefs.getIntPref("devtools.selfxss.count");
+  if (newUsageCount > CONSOLE_ENTRY_THRESHOLD) {
+    newUsageCount = CONSOLE_ENTRY_THRESHOLD;
+  }
+  if (oldUsageCount !== newUsageCount) {
+    WebConsoleUtils._usageCount = newUC;
+    Services.prefs.setIntPref("devtools.selfxss.count", newUC);
+  }
+
+Or perhaps rename the method so it's not longer a setter, but instead a function called incrementUsageCount().
+
+While we're here, with the hood up, please could you add a blank line between the functions.
+(In reply to Joe Walker [:jwalker] from comment #6)
+> 
+> Could we do:
+> 
+>     if (devtools.chrome.enabled) {
+>       usageCount = THRESHOLD
+>       devtools.selfxss.count = THRESHOLD
+>     }
+> 
+> That way we're remembering that the pref was set.
+> 
+
+I'm using the setter there, not the bare _usageCount, so it does both :)
+
+> @@ +551,5 @@
+> >    set usageCount(newUC) {
+> >      if (newUC <= CONSOLE_ENTRY_THRESHOLD) {
+> >        WebConsoleUtils._usageCount = newUC;
+> >        Services.prefs.setIntPref("devtools.selfxss.count", newUC);
+> >      }
+> 
+> I have a feeling that this might be the cause of bug 1018112. We only set
+> the pref if it's less than (or equal to) the threshold, not if it's greater.
+> More checking needed.
+
+The reason this was there was to minimize interaction with the prefs (for performance). I didn't want to hit the prefs every time someone tries to execute something in the console. We can switch to your solution if you feel that this isn't an issue.
+(In reply to Manish Goregaokar [:manishearth] from comment #8)
+> (In reply to Joe Walker [:jwalker] from comment #6)
+> > 
+> > Could we do:
+> > 
+> >     if (devtools.chrome.enabled) {
+> >       usageCount = THRESHOLD
+> >       devtools.selfxss.count = THRESHOLD
+> >     }
+> > 
+> > That way we're remembering that the pref was set.
+> > 
+> 
+> I'm using the setter there, not the bare _usageCount, so it does both :)
+
+Ah, yes.
+
+> > @@ +551,5 @@
+> > >    set usageCount(newUC) {
+> > >      if (newUC <= CONSOLE_ENTRY_THRESHOLD) {
+> > >        WebConsoleUtils._usageCount = newUC;
+> > >        Services.prefs.setIntPref("devtools.selfxss.count", newUC);
+> > >      }
+> > 
+> > I have a feeling that this might be the cause of bug 1018112. We only set
+> > the pref if it's less than (or equal to) the threshold, not if it's greater.
+> > More checking needed.
+> 
+> The reason this was there was to minimize interaction with the prefs (for
+> performance). I didn't want to hit the prefs every time someone tries to
+> execute something in the console. We can switch to your solution if you feel
+> that this isn't an issue.
+
+OK, so could we rename this to incrementUsageCount() then?
+Which would mean we'd need to 
+
+    WebConsoleUtils._usageCount = CONSOLE_ENTRY_THRESHOLD;
+    Services.prefs.setIntPref("devtools.selfxss.count", CONSOLE_ENTRY_THRESHOLD);
+
+In the code that we're adding. It does seem unexpected to me that "WebConsoleUtils.usageCount = 1000;" doesn't do anything.
+We would still need to have a setter for the tests to work, but this makes sense otherwise. The incrementor will increment if the cached value is less than the threshhold and stop otherwise. The setter will always work, regardless of the pref.
+(In reply to Manish Goregaokar [:manishearth] from comment #10)
+> We would still need to have a setter for the tests to work, but this makes
+> sense otherwise. The incrementor will increment if the cached value is less
+> than the threshhold and stop otherwise. The setter will always work,
+> regardless of the pref.
+
+So how about we just add
+
+    else {
+      throw new Error("Max usageCount is " + CONSOLE_ENTRY_THRESHOLD);
+    }
+
+To the setter then.
+(after discussion in IRC we determined that the above changes would complicate things even more, markign as checkin-needed)
+Hi Manish, do you happen to have a Try link handy? :)
+(In reply to Ryan VanderMeulen [:RyanVM UTC-4] from comment #13)
+> Hi Manish, do you happen to have a Try link handy? :)
+
+I do now :) 
+
+https://tbpl.mozilla.org/?tree=Try&rev=e8de4763e548 -- seems to pass, though the OS X tests haven't finished yet.
+
+(forgot to do so before, sorry about that)
+https://hg.mozilla.org/integration/fx-team/rev/8e18f2d48069
+https://hg.mozilla.org/mozilla-central/rev/8e18f2d48069

@@ -1,0 +1,187 @@
+The custom actor examples in https://github.com/firebug/devtools-extension-examples/ use following method to register the actor and construct a front for it:
+> ActorRegistry.registerActor().then(actor => {
+>   target.client.listTabs(tabs => {
+>     // use the tab form to create a front
+>   });
+> });
+
+However, with e10s the call to registerActor resolves before the actor has been created in the child process (it calls setupInChild and returns). This causes a race condition with the registration of the custom actor and the call to listTabs to get the form for a tab with the new actor.
+
+If the actor is registered before the listTabs packet arrives to the child, everything is fine. The new actor will be part of the tab form and the front can be initialized.
+
+However, if the listTabs packet arrives to the child before the actor has been setup in the child process, the tab form will not contain the new actor and the front cannot be created.
+
+This is rare but I've hit it a couple of times while playing with the actor registration API. The easiest way to reproduce this is to add a small timeout before the actor is registered in the child process (e.g. to [1]). This ensures the registration always loses the race with the listTabs call. Then any actor from the devtools-extensions-examples that registers custom actors triggers the bug.
+
+[1] https://dxr.mozilla.org/mozilla-central/source/devtools/server/actors/utils/actor-registry-utils.js#48-52
+
+The custom actor examples in https://github.com/firebug/devtools-extension-examples/ use following method to register the actor and construct a front for it:
+> ActorRegistry.registerActor().then(actor => {
+>   target.client.listTabs(tabs => {
+>     // use the tab form to create a front
+>   });
+> });
+
+However, with e10s the call to registerActor resolves before the actor has been created in the child process (it calls setupInChild and returns). This causes a race condition with the registration of the custom actor and the call to listTabs to get the form for a tab with the new actor.
+
+If the actor is registered before the listTabs packet arrives to the child, everything is fine. The new actor will be part of the tab form and the front can be initialized.
+
+However, if the listTabs packet arrives to the child before the actor has been setup in the child process, the tab form will not contain the new actor and the front cannot be created.
+
+This is rare but I've hit it a couple of times while playing with the actor registration API. The easiest way to reproduce this is to add a small timeout before the actor is registered in the child process (e.g. to [1]). This ensures the registration always loses the race with the listTabs call. Then any actor from the devtools-extensions-examples that registers custom actors triggers the bug.
+
+[1] https://dxr.mozilla.org/mozilla-central/source/devtools/server/actors/utils/actor-registry-utils.js#48-52
+Makes sense, thanks a lot for all the details.
+We can surely fix that, but I also feel like we should expose helpers to ease working with dynamically registered actors.
+The examples are too complex, there is too much internal machinery to do for simple things.
+I hope we can simplify some things via bug 1222047.
+Reproduced. We were not covering that with a test. All register actor tests are either xpcshell or mochitest-chrome, which don't runs with e10s turned on...
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=3e281059cd97
+Created attachment 8685509
+patch v1
+
+- tweak DebuggerServer.setupInChild in order to optionaly resolves only once all the childs got called.
+I'm not proud of using CPOW, but it should be ok in this way: Child => Parent.
+It looks much better than registering one shot listeners?!
+
+- then tweak registerActor to wait on setupInChild completion
+
+- Fix "this._connections[connID].rootActor is undefined" exception.
+Exception that pollutes the console but doesn't fail the tests.
+Relates to the fact that connections in childs don't have root actor.
+
+- Fix "this._actorPool is undefined". Broke the new mochitest-browser test.
+This is actually a reentrance issue. DebuggerServerConnection.onClosed
+was somehow recalled by itself with this patch applied / new test.
+
+- Converted the existing mochitest-chrome to mochitest-browser in order
+to test Actor Registry against non-e10s and e10s codepaths (covers setupInChild with waitForEval:True|False).
+Comment on attachment 8685509
+patch v1
+
+Review of attachment 8685509:
+-----------------------------------------------------------------
+
+::: devtools/server/actors/actor-registry.js
+@@ +54,5 @@
+>      protocol.Actor.prototype.initialize.call(this, conn);
+>    },
+>  
+>    registerActor: method(function (sourceText, fileName, options) {
+> +    return registerActor(sourceText, fileName, options).then(()=> {
+
+Nit: `() =>`
+
+::: devtools/server/main.js
+@@ +930,5 @@
+> +    if (typeof(waitForEval) != "boolean") {
+> +      waitForEval = false;
+> +    }
+> +    let count = this._childMessageManagers.size;
+> +    // Pass a CPOW callback to be notified of each child execution
+
+Can't you listen for some kind of "done" message, to avoid the CPOW?
+
+@@ +941,5 @@
+>        mm.sendAsyncMessage("debug:setup-in-child", {
+>          module: module,
+>          setupChild: setupChild,
+>          args: args,
+> +      }, waitForEval ? {callback:callback} : null);
+
+Nit: use `{ callback }` (spaces inside braces, and don't need to repeat the name in ES2015)
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #5)
+> ::: devtools/server/main.js
+> @@ +930,5 @@
+> > +    if (typeof(waitForEval) != "boolean") {
+> > +      waitForEval = false;
+> > +    }
+> > +    let count = this._childMessageManagers.size;
+> > +    // Pass a CPOW callback to be notified of each child execution
+> 
+> Can't you listen for some kind of "done" message, to avoid the CPOW?
+> 
+
+I surely can, but I was wondering if it was worth the mess it introduces?
+As all such messages, we have to ensure not mixing up responses with id or something; ensure registering and unregistering the message, coming up with an abitrary unique name for the msg, ...
+I wouldn't do that for Parent => Child calls, but I think it is fine using CPOW in this way? Isn't it?
+(In reply to Alexandre Poirot [:ochameau] from comment #6)
+> (In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #5)
+> > ::: devtools/server/main.js
+> > @@ +930,5 @@
+> > > +    if (typeof(waitForEval) != "boolean") {
+> > > +      waitForEval = false;
+> > > +    }
+> > > +    let count = this._childMessageManagers.size;
+> > > +    // Pass a CPOW callback to be notified of each child execution
+> > 
+> > Can't you listen for some kind of "done" message, to avoid the CPOW?
+> > 
+> 
+> I surely can, but I was wondering if it was worth the mess it introduces?
+> As all such messages, we have to ensure not mixing up responses with id or
+> something; ensure registering and unregistering the message, coming up with
+> an abitrary unique name for the msg, ...
+> I wouldn't do that for Parent => Child calls, but I think it is fine using
+> CPOW in this way? Isn't it?
+
+My only reasoning is that browser team seems to go to great lengths to avoid CPOWs where it's feasible to do so, and this is pretty self-contained situation that messages seem like a natural fit for.
+For example the page[1] about CPOWs says:
+
+"However, although CPOWs are convenient, they have serious limitations and can cause responsiveness problems, so should only be used when necessary and only as a migration aid."
+
+[1]: https://developer.mozilla.org/en-US/Firefox/Multiprocess_Firefox/Cross_Process_Object_Wrappers
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=68d4ccd98b73
+Created attachment 8688445
+patch v2
+
+Ok, here is the same with nit addressed and using message instead of CPOW.
+One thing about Message manager API that isn't handy is that,
+in the message listeners, msg.target isn't necessarely the message manager
+but the xul:browser/html:iframe...
+(That doesn't help having a single message callback)
+
+I passed a unique ID to prevent message mixup between two servers.
+As setupInChild is on DebuggerServer, there isn't any particular id to reuse.
+(DebuggerServerConnection has some, but not DebuggerServer)
+Comment on attachment 8688445
+patch v2
+
+Review of attachment 8688445:
+-----------------------------------------------------------------
+
+::: devtools/server/main.js
+@@ +926,2 @@
+>      }
+> +    let deferred = Promise.defer();
+
+Why does only this file `Promise = require("promise")` with capital P?  I thought we were saving `Promise` for DOM promises.  Anyway, not your problem...
+Thanks for moving away from the CPOW even though it was a bit more work!
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #11)
+> Comment on attachment 8688445
+> patch v2
+> 
+> Review of attachment 8688445:
+> -----------------------------------------------------------------
+> 
+> ::: devtools/server/main.js
+> @@ +926,2 @@
+> >      }
+> > +    let deferred = Promise.defer();
+> 
+> Why does only this file `Promise = require("promise")` with capital P?  I
+> thought we were saving `Promise` for DOM promises.  Anyway, not your
+> problem...
+
+Yep... It was introduced by bug 1168853.
+I didn't new Promise.jsm was also supporting the DOM constructor mode...
+https://hg.mozilla.org/integration/fx-team/rev/88fb2a3ae0241d14688d3a3083c47272458333c9
+Bug 1220458 - Resolves ActorRegistry.registerActor only once actor is registered in the child processes. r=jryans
+https://hg.mozilla.org/mozilla-central/rev/88fb2a3ae024
+
+
+[e10s] ActorRegistry.registerActor() might resolve before the actor has been registered in the child process
+
+
+
+Bug 1220458 - Resolves ActorRegistry.registerActor only once actor is registered in the child processes. r=jryans 

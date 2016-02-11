@@ -1,0 +1,708 @@
+Web console throws an exception when using top.location.href, instead of returning the location of the topmost window
+
+STR:
+1. Open the web console
+2. Type top.location.href and hit Enter
+
+Actual result:
+Exception is displayed in the console:
+[Exception... "Illegal operation on WrappedNative prototype object"  nsresult: "0x8057000c (NS_ERROR_XPC_BAD_OP_ON_WN_PROTO)"  location: "JS frame :: Web Console :: <TOP_LEVEL> :: line 1"  data: no]
+
+Expected result:
+top.location.href should return the location of the topmost window in the window hierarchy
+
+Web console throws an exception when using top.location.href, instead of returning the location of the topmost window
+
+STR:
+1. Open the web console
+2. Type top.location.href and hit Enter
+
+Actual result:
+Exception is displayed in the console:
+[Exception... "Illegal operation on WrappedNative prototype object"  nsresult: "0x8057000c (NS_ERROR_XPC_BAD_OP_ON_WN_PROTO)"  location: "JS frame :: Web Console :: <TOP_LEVEL> :: line 1"  data: no]
+
+Expected result:
+top.location.href should return the location of the topmost window in the window hierarchy
+The STR work in Firefox 10, so this is a regression.
+WFM:
+Mozilla/5.0 (X11; Linux x86_64; rv:10.0.1) Gecko/20100101 Firefox/10.0.1
+Mozilla/5.0 (X11; Linux x86_64; rv:11.0) Gecko/20100101 Firefox/11.0
+Mozilla/5.0 (X11; Linux x86_64; rv:12.0a2) Gecko/20120213 Firefox/12.0a2
+
+Reproduced:
+Mozilla/5.0 (X11; Linux x86_64; rv:13.0a1) Gecko/20120214 Firefox/13.0a1
+
+
+Last good nightly: 2012-02-08
+First bad nightly: 2012-02-09
+
+Pushlog:
+http://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=4b9608fd670c&tochange=7c0ba1c98ff7
+The first bad revision is:
+changeset:   86393:9dde014a4b3f
+user:        Bobby Holley <bobbyholley@gmail.com>
+date:        Tue Feb 07 18:06:34 2012 -0800
+summary:     Bug 622301 - Don't use XPCWrappedNative::GetWrappedNativeOfJSObject in quickstub unwrapping. r=mrbkap
+
+https://hg.mozilla.org/mozilla-central/rev/9dde014a4b3f
+Interesting. So |window.top| works fine, but |top| throws. This would imply that the web console is using some other sort of global object that uses the real window as its prototype. Can someone who knows the web console code confirm this?
+
+If this is the case, it'll probably have to change. As the title of bug 622301 suggests, this is something we're dropping support for on the dom side, so we'll need some other approach here. Thoughts?
+Indeed, from the web console, |this === window| is false, but |this.__proto__ === window| is true.
+This is where the console sandbox is created:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/devtools/webconsole/HUDService.jsm#4886
+
+I believe this ties into the discussion we've been having in bug 690529 and bug 665834.
+> This would imply that the web console is using some other sort of global object that uses
+> the real window as its prototype.
+
+Yes.
+
+Actually, other sandboxes have a tendency to do this as well, with Window objects.
+
+I wonder whether it makes sense to specifically support this for Window objects only... and possibly when the object that has the Window on its proto chain is a system object.
+
+Or if we can just come up with something sandbox-specific (e.g. returning bound methods or whatnot) that would work too...
+(In reply to Boris Zbarsky (:bz) from comment #7)
+> Or if we can just come up with something sandbox-specific (e.g. returning
+> bound methods or whatnot) that would work too...
+
+This sounds like the right way to go. The sandboxPrototype option was too-specifically named but the idea was to give us the ability do something clever in SandboxClass if setting the window on the prototype became impossible or stopped working for whatever reason.
+Is anyone driving this? This regression is about to go to aurora...
+(In reply to Bobby Holley (:bholley) from comment #9)
+> Is anyone driving this? This regression is about to go to aurora...
+
+I think it's safe to assume that this train was lost. bz / mrbkap, do you think it's feasible to get something like what you propose in time for aurora's migration to beta?
+Possibly, but it might make more sense to back out bug 622301 on aurora instead, if it's not too difficult....
+
+This bug really needs an owner.
+(In reply to Boris Zbarsky (:bz) from comment #11)
+> Possibly, but it might make more sense to back out bug 622301 on aurora
+> instead, if it's not too difficult....
+> 
+> This bug really needs an owner.
+
+agreed. This affects the Scratchpad as well (and any other places we use evalInSandbox like this).
+
+We talked about a work-around for this in our Console code. We could wrap the JS we send to the sandbox in a "with(window) { " + codeToEval + "}" to get around this, but... kind of ugly.
+
+What do you think?
+*** Bug 735443 has been marked as a duplicate of this bug. ***
+I'm probably the best person to take this bug if we go the 'modify sandboxes' route. I'm pretty busy at the moment, though. :\
+
+What we'd probably do is modify the resolve hook on the sandbox class to try resolving the same property on the prototype. If it finds a native method, it creates a pre-bound function to wrap the call, and sticks the result on the sandbox global.
+
+This kind of gets messy when script wants to shadow the native properties with other stuff, though. Especially if the script shadows the property _after_ the sandbox has resolved it. In that case, the sandbox is stuck with a stale view of the world.
+
+To be honest, I kind of like robcee's solution. What do other people think?
+(In reply to Bobby Holley (:bholley) from comment #14)
+> I'm probably the best person to take this bug if we go the 'modify
+> sandboxes' route. I'm pretty busy at the moment, though. :\
+> 
+> What we'd probably do is modify the resolve hook on the sandbox class to try
+> resolving the same property on the prototype. If it finds a native method,
+> it creates a pre-bound function to wrap the call, and sticks the result on
+> the sandbox global.
+> 
+> This kind of gets messy when script wants to shadow the native properties
+> with other stuff, though. Especially if the script shadows the property
+> _after_ the sandbox has resolved it. In that case, the sandbox is stuck with
+> a stale view of the world.
+
+This doesn't sound like something that would have a chance of landing in Aurora, though it might be the proper fix for future releases.
+
+> To be honest, I kind of like robcee's solution. What do other people think?
+
+It's kind of hacky and uses with(). On the plus side, it's a two second patch and could probably land on aurora.
+(In reply to Rob Campbell [:rc] (robcee) from comment #15)
+> It's kind of hacky and uses with(). On the plus side, it's a two second
+> patch and could probably land on aurora.
+
+Sort of. But it also gets the semantics of here exactly right - better than any kind of c++ hackery we could come up with.
+
+What's the status of bug 690529? That would obviate the need for all of this in the long run.
+ok, I just verified that with(window) doesn't actually fix this problem.
+
+back to the whiteboard! Suggestions?
+(In reply to Bobby Holley (:bholley) from comment #16)
+> (In reply to Rob Campbell [:rc] (robcee) from comment #15)
+> > It's kind of hacky and uses with(). On the plus side, it's a two second
+> > patch and could probably land on aurora.
+> 
+> Sort of. But it also gets the semantics of here exactly right - better than
+> any kind of c++ hackery we could come up with.
+> 
+> What's the status of bug 690529? That would obviate the need for all of this
+> in the long run.
+
+Status of bug 690529 is that it's on hold. I don't think we have a good sense of how to fix it properly. It does seem like a proper fix for that would fix this bug though so maybe we should dig into it.
+(In reply to Rob Campbell [:rc] (robcee) from comment #17)
+> ok, I just verified that with(window) doesn't actually fix this problem.
+> 
+> back to the whiteboard! Suggestions?
+
+Rob and I just discussed this on IRC. It turns out that doing |with(window) { top }| in the web console does in fact work, but somehow the string munging doesn't. This would indicate that this is a viable option, and we just need to figure out this apparent paradox in the web console code.
+
+
+(In reply to Rob Campbell [:rc] (robcee) from comment #18)
+> Status of bug 690529 is that it's on hold. I don't think we have a good
+> sense of how to fix it properly. It does seem like a proper fix for that
+> would fix this bug though so maybe we should dig into it.
+
+Sounds like a good idea. Though this would probably be too big for aurora. So hopefully the |with| strategy will save us there.
+We should probably be tracking this.
+(In reply to Bobby Holley (:bholley) from comment #20)
+> We should probably be tracking this.
+
+Sure thing, and assigning to you since you landed the regressing bug. Can we just back out bug 622301 while we come to a final resolution for 14?
+(In reply to Alex Keybl [:akeybl] from comment #21)
+> (In reply to Bobby Holley (:bholley) from comment #20)
+> > We should probably be tracking this.
+> 
+> Sure thing, and assigning to you since you landed the regressing bug. Can we
+> just back out bug 622301 while we come to a final resolution for 14?
+
+We could, but the idea was to have bug 622301 go out one release ahead of the new DOM bindings (which depend on it). We'd do this so that if this was a problem, we'd have one release's worth of wiggle room to do the easy backout and buy us time before the bigger change came down the pipe.
+
+So we've got one freebie, and backing out now would be spending it. As such, it would be smarter to just do the |with| solution. Last we talked, Rob said he was going to investigate what was going on there. Rob, can you comment?
+Ugh, it sounds like other people are using sandboxPrototype stuff too. We probably need some way to keep supporting it, then. I don't really have any good ideas of how, though. :-(
+Code search shows over 500 add-ons referencing sandboxPrototype, partly because we use it in the page-mods API for Jetpack
+Boris and I talked on IRC about a potential XPConnect fix for sandboxPrototype involving proxy prototypes and bound methods. He's going to try it tomorrow. The current plan is to back the regressing changeset out on aurora and land the fix on nightly.
+(In reply to Dave Townsend (:Mossop) from comment #24)
+> Code search shows over 500 add-ons referencing sandboxPrototype, partly
+> because we use it in the page-mods API for Jetpack
+
+We shouldn't hit this issue, thanks to our proxies. sandboxPrototype isn't set to the window object but to the proxy made of it. This proxy ensure calling methods on the original xraywrapper object.
+So that  when you do window.location.href, the proxy trap each property access, and at the end, `location` is fetched on the original xraywrapper, not on the sandbox global object.
+
+The precise location where we fetch location attribute is here:
+https://github.com/mozilla/addon-sdk/blob/master/packages/api-utils/data/content-proxy.js#L760
+(`obj` is the `window` xraywrapper, and `name` is "location")
+But I suggest you to have faith in my words, as this whole proxy implementation is scary ;)
+
+Some unit tests cover this case:
+https://github.com/mozilla/addon-sdk/blob/master/packages/addon-kit/tests/test-page-worker.js#L10-24
+
+But, we will have to take care of these kind of issues when we are going to get rid of these proxies!
+Does that work for open(), where just getting it off the right object is not enough; it must also be invoked with the right this-binding?
+(In reply to Boris Zbarsky (:bz) from comment #27)
+> Does that work for open(), where just getting it off the right object is not
+> enough; it must also be invoked with the right this-binding?
+
+Yes, it should work. We have some issues with postMessage where this-binding isn't enough because it checks for global object too. And we can't fake the global object.
+see bug 733035. We have a special workaround for that in the proxy code that traps all `postMessage` calls :s
+https://github.com/mozilla/addon-sdk/blob/master/packages/api-utils/data/content-proxy.js#L98-101
+Note that |with (window) { eval(str); }| -- what I assume has been implied as a possible workaround -- puts |window| onto the scope chain, which observably changes behavior.  In particular, function calls like |valueOf()| suddenly now occur passing |this === window|, where they should be passing |this === undefined|.  This manifests as different behaviors when calling built-in functions that don't work if |this| isn't an object, when calling strict mode functions that expect precise |this| values, and so on.  A testcase for this is typing |valueOf()| in the console -- it should throw a TypeError: can't convert undefined to object, but a with-based strategy probably will have it return [object Window].
+A slight side note, but you can see this problem -- without having to modify any web console code -- in Jesse's JavaScript shell if you type |valueOf()| in it, because it uses |with| to provide builtin functions:
+
+http://www.squarefree.com/shell/shell.html
+(In reply to Jeff Walden (:Waldo) (remove +bmo to email) from comment #29)
+> Note that |with (window) { eval(str); }| -- what I assume has been implied
+> as a possible workaround -- puts |window| onto the scope chain, which
+> observably changes behavior.  In particular, function calls like |valueOf()|
+> suddenly now occur passing |this === window|, where they should be passing
+> |this === undefined|.
+
+I don't think we're going to use that workaround here, but I'd like to understand this a bit better. A few questions:
+
+* Why does adding window to the scope chain cause it to be used as an implicit |this| parameter? The global is already at the top of the scope chain, so I would have thought that the global would be the |this| parameter, but it appears not to be the case. Is there something special about globals in this regard? As in, things parented directly to the global get |this===undefined|, but everyone else gets |this===parent|?
+
+* |this| in the web console (with the current prototype-based setup) resolves to 'window'. How does all of that work?
+A call like f() passes the ImplicitThisBinding() of the current environment record as |this|.  Directly inside a |with|, and not nested in a function, the implicit this is the object associated with the |with| -- |window| in this case.  That's because the environment record has |provideThis === true| from 10.2.1.2 and 12.10 step 5.  Not inside a |with|, the global environment rules, and it has |provideThis === false|, so per 10.2.1.2.6 ImplicitThisBinding() evaluates to |undefined|.
+
+|this| doesn't resolve to |window|, but it is true that |Object.getPrototypeOf(this) === window|.  When the console stringifies it, however, it appears as though it were |window|.  |this| evaluates per 11.1.1 to ThisBinding -- quite different from how the |thisValue| passed to a function call is calculated as ImplicitThisBinding() in 11.2.3.
+
+(Head hurting yet?)
+(In reply to Bobby Holley (:bholley) from comment #22)
+> So we've got one freebie, and backing out now would be spending it. As such,
+> it would be smarter to just do the |with| solution. Last we talked, Rob said
+> he was going to investigate what was going on there. Rob, can you comment?
+
+Late reply now, but I didn't have any luck using the |with| work-around. For whatever reason, the string munging in the Web Console's input line seemed to cause this to fail. Also, Waldo's good points about changing call scope are good ones. That introduces additional unexpected behavior we may not want to have.
+
+Given that this is liable to break addons in unexpected ways, as well as our own developer tools, I'd say we have little choice but to back it out until we can figure out how to fix this properly.
+
+I'd also like to get a unittest in place so we can catch this regression if it occurs in the future.
+Backed out bug 622301 on aurora:
+
+http://hg.mozilla.org/releases/mozilla-aurora/rev/1f489405617a
+http://hg.mozilla.org/releases/mozilla-aurora/rev/98c38622905f
+*** Bug 740216 has been marked as a duplicate of this bug. ***
+Boris was working on this last we talked.
+
+bz, let me know if you need me to take it over.
+This is fixed on Aurora 13, by the backout mentioned in comment 34.
+Bobby, I'll try to get this done early next week, but once you finish your CPG stuff we should talk, if I haven't gotten this done by then...
+Created attachment 614919
+Proposed patch
+
+This is really scary stuff, but I _think_ I got the security bits right.  I hope.  The testcase fails without this patch, and passes with the patch.  The boilerplate in the proxy was mostly cribbed from transparent Xrays, but a little bit from the nodelist bindings.
+Comment on attachment 614919
+Proposed patch
+
+Reviews that would leave me with headroom before the 24th to address comments would be much appreciated.  ;)
+
+One caveat:  we _may_ want to only set up the proxy if the proto is an XPConnect object or a wrapper around one.  If we do want that, I'd love to know how I can check that sanely and securely.
+Comment on attachment 614919
+Proposed patch
+
+>+static int SandboxProxyFamily;
+>+class SandboxProxyHandler : public js::ProxyHandler {
+
+Can we inherit js::Wrapper instead? As far as I can tell, that would obviate the need to implement everything but getPropertyDescriptor and getOwnPropertyDescriptor (s we could kill fix, enumerate, delete_, getOwnPropertyNames, defineProperty). Or am I missing something?
+
+>+bool
+>+SandboxProxyHandler::getPropertyDescriptor(JSContext *cx, JSObject *proxy,
+>+                                           jsid id, bool set,
+>+                                           PropertyDescriptor *desc)
+>+{
+>+    JSObject *obj = getRealProto(proxy);
+>+    JS_ASSERT(js::GetObjectCompartment(obj) == js::GetObjectCompartment(proxy));
+>+    // XXXbz Not sure about the JSRESOLVE_QUALIFIED here, but we have
+>+    // no way to tell for sure whether to use it.
+>+    if (!JS_GetPropertyDescriptorById(cx, obj, id,
+>+                                      (set ? JSRESOLVE_ASSIGNING : 0) | JSRESOLVE_QUALIFIED,
+>+                                      desc))
+>+        return false;
+>+
+>+    if (desc->obj) {
+
+Can we invert the check here and turn it into an early return? There's already quite a lot of indentation in this function.
+
+>+            JSObject* getterObj;
+>+            if (desc->attrs & JSPROP_GETTER) {
+>+                getterObj = JS_FUNC_TO_DATA_PTR(JSObject *, desc->getter);
+>+            } else {
+>+                // We have a JSPropertyOp; have to make a JSObject
+>+                getterObj =
+>+                    GeneratePropertyOp(cx, desc->obj, id, 0, desc->getter);
+>+                if (!getterObj)
+>+                    return false;
+>+            }
+>+            getterObj = JS_BindCallable(cx, getterObj, obj);
+>+            if (!getterObj)
+>+                return false;
+
+Can we turn this chunk into a helper with a bool set param? It's almost entirely repeated.
+
+
+>+bool
+>+SandboxProxyHandler::getOwnPropertyDescriptor(JSContext *cx, JSObject *proxy,
+>+                                              jsid id, bool set,
+>+                                              PropertyDescriptor *desc)
+>+{
+>+    if (!getPropertyDescriptor(cx, proxy, id, set, desc))
+>+        return false;
+>+
+>+    if (desc->obj != getRealProto(proxy))
+>+        desc->obj = nsnull;
+
+I'm this won't do the right thing for layered wrappers (ie, windows). See bug 745392. Can we add some Object.getOwnPropertyDescriptor stuff to the attached test?
+
+
+>@@ -3028,16 +3179,23 @@ xpc_CreateSandboxObject(JSContext * cx, 
+> 
+>             if (xpc::WrapperFactory::IsXrayWrapper(proto) && !wantXrays) {
+>                 jsval v = OBJECT_TO_JSVAL(proto);
+>                 if (!xpc::WrapperFactory::WaiveXrayAndWrap(cx, &v))
+>                     return NS_ERROR_FAILURE;
+>                 proto = JSVAL_TO_OBJECT(v);
+>             }
+> 
+>+            // Now wrap it up in a proxy that will do the right thing in terms
+>+            // of this-binding for methods.
+>+            proto = js::NewProxyObject(cx, &sandboxProxyHandler,
+>+                                       ObjectValue(*proto), nsnull, sandbox);
+
+Do we really want the proxy to have a null prototype? It seems like that would confuse people walking up the prototype chain. Though maybe they'll already be confused.
+> Can we inherit js::Wrapper instead?
+
+Do we want code that unwraps in various places to unwrap through this object?  Because inheriting js::Wrapper would stick us in that proxy family, afaict.
+
+> Can we invert the check here and turn it into an early return? 
+
+Yes.
+
+> Can we turn this chunk into a helper with a bool set param?
+
+No, because desc->getter and desc->setter are different types.  We could make it into a template, though, with an argument for the flag to check (JSPROP_GETTER vs JSPROP_SETTER).  Do we want that?
+
+> Can we add some Object.getOwnPropertyDescriptor stuff to the attached test?
+
+So this posits that someone explicitly calls Object.getOwnPropertyDescriptor on the proto of the sandbox, right?  I can add a test for that, I guess, though I'm not sure anyone ever will.  Any ideas on how to do this check correctly?  Do I just need to check that unwrapping desc->obj and getRealProto(proxy) gives the same thing?
+
+> Do we really want the proxy to have a null prototype?
+
+The other option is to give it Object.prototype as the proto.  But yeah, this only matters to people manually walking the proto chain of the sandbox global.  And giving them the Object.prototype might confuse them even more, since it's not like any property access will ever hit the proto, right?
+
+Thoughts on comment 40?
+(In reply to Boris Zbarsky (:bz) from comment #42)
+> > Can we inherit js::Wrapper instead?
+> 
+> Do we want code that unwraps in various places to unwrap through this
+> object?  Because inheriting js::Wrapper would stick us in that proxy family,
+> afaict.
+
+I think it's probably ok. We already use this stuff for same-compartment security wrappers. Do you have any specific examples in mind?
+
+Alternatively, we could use the same behavior as outer windows wrappers. The current 'stopAtOuter' mechanism in js::UnwrapObject wasn't named in a very forward-thinking way, but could be extended pretty easily.
+
+> No, because desc->getter and desc->setter are different types.  We could
+> make it into a template, though, with an argument for the flag to check
+> (JSPROP_GETTER vs JSPROP_SETTER).  Do we want that?
+
+Assuming this would just look like a helper method with a template decorator, I think I'd prefer it. I could be convinced otherwise if there's some reason it would end up super messy, though.
+
+> 
+> > Can we add some Object.getOwnPropertyDescriptor stuff to the attached test?
+> 
+> So this posits that someone explicitly calls Object.getOwnPropertyDescriptor
+> on the proto of the sandbox, right?  I can add a test for that, I guess,
+> though I'm not sure anyone ever will.
+
+If we really didn't care, presumably we'd just not implement the function at all.
+
+> Any ideas on how to do this check
+> correctly?  Do I just need to check that unwrapping desc->obj and
+> getRealProto(proxy) gives the same thing?
+
+To get this right in the current world you'd need to js::UnwrapObject with stopAtOuter=false. But assuming we can fix this right in bug 745392, let's just make the mochitest check a todo_is for now.
+
+> 
+> > Do we really want the proxy to have a null prototype?
+> 
+> The other option is to give it Object.prototype as the proto.  But yeah,
+> this only matters to people manually walking the proto chain of the sandbox
+> global.  And giving them the Object.prototype might confuse them even more,
+> since it's not like any property access will ever hit the proto, right?
+
+Yeah, that's a good point. I'm convinced.
+
+> 
+> Thoughts on comment 40?
+>
+
+Yeah, we should probably check that the underlying object (underneath all the wrappers) is some sort of native object.
+
+The current way of doing that is to check IS_WRAPPER_CLASS on the JSClass. We'll probably also want to check ISDOMClass too.
+> Do you have any specific examples in mind?
+
+No; I have no idea what the heck our current wrapper setup is.  I'm just trying to minimize risk.  Which approach do you think is riskier?
+
+> Assuming this would just look like a helper method with a template decorator
+
+It would.  OK.
+
+> If we really didn't care, presumably we'd just not implement the function at all.
+
+Well, we have to implement it one way or another: it's pure virtual otherwise.  ;)
+
+> But assuming we can fix this right in bug 745392, let's just make the mochitest check a
+> todo_is for now.
+
+Worksforme.  Are you fixing that bug for 14?  Because if not, I need to do the UnwrapObject thing for real here; I'll bet other proxy hooks use getOwnPropertyDescriptor too, now that I think about it.
+
+Patch with comments addressed coming up.
+Except the test you asked me to write passes.  I have no idea why.
+Created attachment 614989
+Instead of using the given proto for the sandbox directly, use a proxy that forwards to the given proto but rebinds all getters/setters/methods to use the given proto, not the sandbox global, as this.   code in XPCQuickStubs.h just moved from XPCQuickStub
+
+Updated to most comments; not inheriting from js::Wrapper because it implements get() and the like.  bholley's going to fix that
+Created attachment 615387
+Instead of using the given proto for the sandbox directly, use a proxy that forwards to the given proto but rebinds all getters/setters/methods to use the given proto, not the sandbox global, as this.   code in XPCQuickStubs.h just moved from XPCQuickStub
+Created attachment 615389
+With the typo fix for jswrapper.h
+Comment on attachment 615389
+With the typo fix for jswrapper.h
+
+Gah.  bzexport ate the review request.
+Comment on attachment 615389
+With the typo fix for jswrapper.h
+
+>diff --git a/js/xpconnect/tests/chrome/test_bug726949.xul b/js/xpconnect/tests/chrome/test_bug726949.xul
+>new file mode 100644
+>--- /dev/null
+>+++ b/js/xpconnect/tests/chrome/test_bug726949.xul
+>@@ -0,0 +1,46 @@
+>+<?xml version="1.0"?>
+>+<?xml-stylesheet type="text/css" href="chrome://global/skin"?>
+>+<?xml-stylesheet type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css"?>
+>+<!--
+>+https://bugzilla.mozilla.org/show_bug.cgi?id=726949
+>+-->
+>+<window title="Mozilla Bug 726949"
+>+        xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+>+  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"/>
+>+
+>+  <!-- test results are displayed in the html:body -->
+>+  <body xmlns="http://www.w3.org/1999/xhtml">
+>+  <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=726949"
+>+     target="_blank">Mozilla Bug 726949</a>
+>+  </body>
+>+
+>+  <!-- test code goes here -->
+>+  <script type="application/javascript">
+>+  <![CDATA[
+>+  /** Test for Bug 726949 **/
+>+      var Cu = Components.utils;
+>+      function f(xrays) {
+>+          var s = new Cu.Sandbox(window, { sandboxPrototype: window,
+>+                                           wantXrays: xrays });
+>+          var t;
+>+          var desc;
+>+          try {
+>+              t = Cu.evalInSandbox('top', s);
+>+              is(t, window.top,
+>+                 "Should have gotten the right thing back with wantXrays: " +
+>+                 xrays);
+>+              desc = Cu.evalInSandbox('Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "Cu")', s);
+>+              isnot(desc, undefined,
+>+		    "Should have an own 'document' property with wantXrays: " +
+
+Do you mean "own 'Cu' property"?
+
+>+		    xrays);
+>+	      is(desc.value, Cu, "Should have the right value with wantXrays: " +
+>+		 xrays)
+
+So, it's unclear to me why this works. If wantXrays is true, then the SandboxProxy should be wrapping an Xray wrapper to the window (since wantXray forces Xray vision between same-origin compartments). So I don't understand why we can resolve |Cu| here, given that the Xray wrapper should be filtering that out.
+
+Am I missing something? I'd like to understand what's going on here before this lands. If you're busy and nothing jumps out at you, I can fire up a debugger and see what's going on.
+> Do you mean "own 'Cu' property"?
+
+Yes.  It used to be 'document', but then I realized it's weird and special and shouldn't be the thing I test.
+
+> So, it's unclear to me why this works.
+
+It's not clear to me either, to be honest.  I was pretty surprised by that part too.
+(In reply to Boris Zbarsky (:bz) from comment #51)
+> > Do you mean "own 'Cu' property"?
+> 
+> Yes.  It used to be 'document', but then I realized it's weird and special
+> and shouldn't be the thing I test.
+> 
+> > So, it's unclear to me why this works.
+> 
+> It's not clear to me either, to be honest.  I was pretty surprised by that
+> part too.
+
+As we just realized on IRC, both the principals here are chrome, so we just get a CrossCompartmentWrapper no matter what. wantXray is meaningless.
+Comment on attachment 615389
+With the typo fix for jswrapper.h
+
+r=bholley. Just fix the typo in comment 51 and remove the wantXray from the options object.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/3e24a0ebd104
+Backed out for m-oth orange:
+{
+9458 ERROR TEST-UNEXPECTED-FAIL | chrome://mochitests/content/chrome/dom/tests/mochitest/chrome/test_sandbox_image.xul | an unexpected uncaught JS exception reported through window.onerror - TypeError: Image is not a constructor at chrome://mochitests/content/chrome/dom/tests/mochitest/chrome/test_sandbox_image.xul:26
+11270 ERROR TEST-UNEXPECTED-FAIL | chrome://mochitests/content/chrome/js/xpconnect/tests/chrome/test_evalInSandbox.xul | an unexpected uncaught JS exception reported through window.onerror - NS_ERROR_XPC_BAD_CONVERT_JS: Component returned failure code: 0x80570009 (NS_ERROR_XPC_BAD_CONVERT_JS) [nsIDOMWindowUtils.getClassName] at chrome://mochitests/content/chrome/js/xpconnect/tests/chrome/test_evalInSandbox.xul:37
+}
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/d9cb12986a3a
+General notes:  the issue with Image is that we're getting a descriptor that has holder_get and holder_set _and_ a value.  We wrap up all of those, something later ignores the value and calls our getter, but holder_get seems to rely on the slot-prefilling thing, while PropertyOpForwarder doesn't know how to do that.
+OK, so general plan:
+
+1)  Skip the rebinding in the holder_get and holder_set cases.
+2)  Fix xray code to handle this.
+3)  Fix the flags snafu from bug 745422 (rather needed for #2).
+
+With those changes, the two tests from comment 55 and the test from this bug all pass.
+Created attachment 616865
+Passing tests
+
+Interdiff coming up
+Created attachment 616866
+Interdiff with previously reviewed patch
+Comment on attachment 616866
+Interdiff with previously reviewed patch
+
+>      if (from->isWrapper() &&
+> -        (Wrapper::wrapperHandler(from)->flags() & Wrapper::CROSS_COMPARTMENT)) {
+> +        (AbstractWrapper::wrapperHandler(from)->flags() &
+> +         Wrapper::CROSS_COMPARTMENT)) {
+>          to->setSlot(0, from->getSlot(0));
+>          to->setSlot(1, from->getSlot(1));
+>          n = 2;
+
+>  JS_FRIEND_API(JSObject *)
+>  js::UnwrapObjectChecked(JSContext *cx, JSObject *obj)
+>  {
+>      while (obj->isWrapper()) {
+>          JSObject *wrapper = obj;
+> -        Wrapper *handler = Wrapper::wrapperHandler(obj);
+> +        AbstractWrapper *handler = AbstractWrapper::wrapperHandler(obj);
+>          bool rvOnFailure;
+
+>  bool
+>  js::IsCrossCompartmentWrapper(const JSObject *wrapper)
+>  {
+>      return wrapper->isWrapper() &&
+> -           !!(Wrapper::wrapperHandler(wrapper)->flags() & Wrapper::CROSS_COMPARTMENT);
+> +           (AbstractWrapper::wrapperHandler(wrapper)->flags() &
+> +            Wrapper::CROSS_COMPARTMENT);
+>  }
+
+Why are these changes necessary, given the the |using| declaration in js::Wrapper?
+It'd be kinda nice to avoid the code churn.
+
+diff --git a/js/xpconnect/src/XPCComponents.cpp b/js/xpconnect/src/XPCComponents.cpp
+--- a/js/xpconnect/src/XPCComponents.cpp
++++ b/js/xpconnect/src/XPCComponents.cpp
+@@ -3061,30 +3061,17 @@ WrapForSandbox(JSContext *cx, bool wantX
+ // other. The only thing we need out of identity objects are unique addresses.
+ class Identity : public nsISupports
+ {
+     NS_DECL_ISUPPORTS
+ };
+ 
+ NS_IMPL_ISUPPORTS0(Identity)
+
+     // Now fix up the getter/setter/value as needed to be bound to desc->obj
+-    if (!BindPropertyOp(cx, obj, desc->getter, desc, id, JSPROP_GETTER))
++    // Don't mess with holder_get and holder_set, though.
+
+Can we get a more detailed comment explaining why?
+
+diff --git a/js/xpconnect/src/XPCQuickStubs.h b/js/xpconnect/src/XPCQuickStubs.h
+--- a/js/xpconnect/src/XPCQuickStubs.h
++++ b/js/xpconnect/src/XPCQuickStubs.h
+@@ -719,17 +719,17 @@ PropertyOpForwarder(JSContext *cx, unsig
+ 
+>      JSObject *ptrobj = JSVAL_TO_OBJECT(v);
+>      Op *popp = static_cast<Op *>(JS_GetPrivate(ptrobj));
+>  
+>      v = js::GetFunctionNativeReserved(callee, 1);
+>  
+>      jsval argval = (argc > 0) ? JS_ARGV(cx, vp)[0] : JSVAL_VOID;
+>      jsid id;
+> -    if (!JS_ValueToId(cx, argval, &id))
+> +    if (!JS_ValueToId(cx, v, &id))
+>          return false;
+>      JS_SET_RVAL(cx, vp, argval);
+>      return ApplyPropertyOp<Op>(cx, *popp, obj, id, vp);
+>  }
+> 
+
+So is the idea here that holder_get needs tiny ids (reserved slot indices)
+rather than name ids? That makes sense, but I'm confused as to why this change
+is necessary for this patch, given that we're not rebinding holder_get and
+holder_set anymore. If it's just a "while-we're-at-it" fix, I'd prefer for it
+to be a separate patch (and possibly reviewed by someone like who knows
+the QuickStubs code better than I do, to make sure we didn't miss it anywhere
+else).
+
+It looks like this is definitely a bug though, given that someone made |v| but
+never used it.
+
+diff --git a/js/xpconnect/wrappers/XrayWrapper.cpp b/js/xpconnect/wrappers/XrayWrapper.cpp
+--- a/js/xpconnect/wrappers/XrayWrapper.cpp
++++ b/js/xpconnect/wrappers/XrayWrapper.cpp
+@@ -58,23 +58,16 @@ using namespace mozilla::dom::bindings;
+ 
+>  static inline JSObject *
+>  FindWrapper(JSObject *wrapper)
+>  {
+>      while (!js::IsWrapper(wrapper) ||
+> -           !(Wrapper::wrapperHandler(wrapper)->flags() & WrapperFactory::IS_XRAY_WRAPPER_FLAG)) {
+> -        wrapper = js::GetObjectProto(wrapper);
+> +           !(AbstractWrapper::wrapperHandler(wrapper)->flags() &
+> +             WrapperFactory::IS_XRAY_WRAPPER_FLAG)) {
+> +        if (js::IsWrapper(wrapper) &&
+> +            js::GetProxyHandler(wrapper) == &sandboxProxyHandler) {
+> +            wrapper = SandboxProxyHandler::wrappedObject(wrapper);
+> +        } else {
+> +            wrapper = js::GetObjectProto(wrapper);
+> +        }
+
+Hm, Do we still need this prototype climbing gig now that we've dropped support
+for dom-objects-as-prototypes? Either way though, we need FindWrapper for the use
+case you're fixing. But it would be nice to rip out the prototype climbing for
+Xray if we don't need it anymore. I remember there was a reason we couldn't entirely
+eliminate that kind of logic in GetWrappedNativeOfJSObject - bug 658909 I think? I don't remember the details well enough to tell if the same issue applies here though.
+ 
+diff --git a/js/xpconnect/wrappers/XrayWrapper.h b/js/xpconnect/wrappers/XrayWrapper.h
+--- a/js/xpconnect/wrappers/XrayWrapper.h
++++ b/js/xpconnect/wrappers/XrayWrapper.h
+ 
++class SandboxProxyHandler : public js::AbstractWrapper {
++public:
++    SandboxProxyHandler() : js::AbstractWrapper(0)
++    {
++    }
++
++    virtual bool getPropertyDescriptor(JSContext *cx, JSObject *proxy, jsid id,
++                                       bool set, js::PropertyDescriptor *desc);
++    virtual bool getOwnPropertyDescriptor(JSContext *cx, JSObject *proxy,
++                                          jsid id, bool set,
++                                          js::PropertyDescriptor *desc);
++};
++
++extern SandboxProxyHandler sandboxProxyHandler;
+
+I'd really prefer to keep this in XPCComponents, and forward declare the
+class and extern singleton in xpcprivate.h. Can we do that?
+
+r=bholley assuming all the comments are at least considered. Feel free to land
+without checking in again if I'm not on IRC.
+> Why are these changes necessary, given the the |using| declaration in js::Wrapper?
+
+Strictly speaking, they're not, I bet.  The code seemed cleaner to me this way, but I can probably undo those changes if you really want to avoid the code churn.
+
+> Can we get a more detailed comment explaining why?
+
+Sure.
+
+> So is the idea here that holder_get needs tiny ids (reserved slot indices)
+> rather than name ids?
+
+No, the idea here is that the id passed to a property op should be the property name, not the value of the argument to the JSNative.  The old code was just wrong.  It happens that holder_get is not helped by this because it relies on the slot (which is why I have to explicitly avoid calling it) and quickstub ops ignore the id so they didn't care it was wrong all along, but other property ops might care, so it's safer to fix it.  This change was reviewed by jorendorff already.
+
+> Do we still need this prototype climbing gig now that we've dropped support
+> for dom-objects-as-prototypes?
+
+Apart from "climbing" from a Sandbox to its proto (our new proxy) and thence to the Xray, chances are no.  But I'd prefer making more substantive changes to this in a separate patch, honestly.
+
+> I'd really prefer to keep this in XPCComponents, and forward declare the
+> class and extern singleton in xpcprivate.h. Can we do that?
+
+I'll give it a shot.  We probably can.
+This got merged https://hg.mozilla.org/mozilla-central/rev/3e24a0ebd104 and then the backout was merged: https://hg.mozilla.org/mozilla-central/rev/d9cb12986a3a
+> Strictly speaking, they're not, I bet
+
+Well, the ones to the return type are.
+> I'll give it a shot.  We probably can.
+
+Not easily, because XRayWrapper.cpp needs to be able to work with the pointer and hence needs to know we inherit from js::ProxyHandler.
+Let's try this again:
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/bce6cabacc88
+https://hg.mozilla.org/mozilla-central/rev/bce6cabacc88
+bz: Some bad news... this patch caused a regression: bug 751077
+*** Bug 751699 has been marked as a duplicate of this bug. ***
+This patch also regressed the number of static constructors by 1:
+http://graphs.mozilla.org/graph.html#tests=[[81,63,18]]&sel=1334920642132.562,1335001383833.7231&displayrange=30&datatype=running
+Presumably for the xpc::SandboxProxyHandler
+
+I could heap-allocate that, I guess, instead of making it a static, if we think that's important....  It would sure complicate the code and make it harder to understand.
+I'm not a fan of complicating this any further.
+Verified as fixed with the steps from comment 0 on:
+Mozilla/5.0 (X11; Linux i686; rv:13.0) Gecko/20100101 Firefox/13.0
+Mozilla/5.0 (Windows NT 6.1; rv:13.0) Gecko/20100101 Firefox/13.0
+Mozilla/5.0 (Macintosh; Intel Mac OS X 10.6; rv:13.0) Gecko/20100101 Firefox/13.0
+BuildID: 20120528154913
+Verified as fixed with the steps from comment 0 on:
+Mozilla/5.0 (X11; Linux i686; rv:14.0) Gecko/20100101 Firefox/14.0
+Mozilla/5.0 (Windows NT 6.1; rv:14.0) Gecko/20100101 Firefox/14.0
+Mozilla/5.0 (Macintosh; Intel Mac OS X 10.6; rv:14.0) Gecko/20100101 Firefox/14.0 BuildID: 20120605113340
+
+
+Web Console uses |window| object as a prototype for the real global, which we no longer support
+
+addon-compat, regression
+
+Bug 726949.  Instead of using the given proto for the sandbox directly, use a proxy that forwards to the given proto but rebinds all getters/setters/methods to use the given proto, not the sandbox global, as this.  r=bholley, a=tracking-firefox
+
+Backout 3e24a0ebd104 (bug 726949) for M-oth orange; a=backout 
+
+Bug 726949.  Instead of using the given proto for the sandbox directly, use a proxy that forwards to the given proto but rebinds all getters/setters/methods to use the given proto, not the sandbox global, as this.  r=bholley, a=tracking-firefox

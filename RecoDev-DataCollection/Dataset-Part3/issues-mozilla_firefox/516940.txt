@@ -1,0 +1,421 @@
+Expiration at shutdown is confusing and slow.
+Rewriting expiration is not scope of this bug that is targeted 3.6, but results from this bug can be used in 3.7 rewrite.
+
+Expiration at shutdown is confusing and slow.
+Rewriting expiration is not scope of this bug that is targeted 3.6, but results from this bug can be used in 3.7 rewrite.
+Created attachment 401044
+patch v1.0
+
+this clean up expiration, moves some stuff from history to expiration file, this could help the rewrite making a better separation. Also introduces some experimental change we can reuse and clarify some code path that had completely broken names.
+
+The old cpp expiration code handles these cases:
+
+- onidle: we expire every 5 minutes of idle, this hits hard laptops batteries (bug 449124). I changed that to expire every 5 minutes of idle till we have stuff to expire, then wait 50 minutes before checking again. in case we have few items to expire this will try to expire every 50 minutes rather then 5 minutes. This should help temporary. Also moved all related code from history to historyexpire. on idle we expire 100 pages and 100 orphans per run (was 25 before).
+
+-onprefchange: the old partial expiration algorithm that was hitting at every add uri is no more used there (method named did confuse me a lot initially). cleaned up names, and make partial expiration run after 500ms every 10 seconds after a pref change, till we have enough items to expire. it was running after 3.5s and every 20s before. we expire 6 pages per run. These numbers are tweakable.
+
+-onquit: this was expiring up to 500 orphan pages, does not make much sense, ideally this should be in a situation where there is nothing to expire, reduced to 100, and i suspect the changes above will make this delete almost anything.
+
+in placesDBFlush i've added async removal of orphan pages. I'm not sure what was the scope of ExpiredPages notification, we already have onDeleteURI and we should at a maximum have onDeleteVisit. Also the wholeEntry thing is bogus, since even if a page has no visits, it could have bookmarks, or embed visits, while we just check visit_count...
+
+This is mostly to separate and fix code before the js porting. from tryserver runs looks like this can bring some Tshutdown gain on medium and big databases.
+
+I must say expiration code being splitted and old is really crappy and hard to follow, a separate component is more than wanted. high high 3.7 priority.
+Comment on attachment 401044
+patch v1.0
+
+asking review to Shawn since he implemented the async part of expiration.
+hm, the delete in the destructor is bad (indeed i was able to crash on it in another patch) but without it i see test_autocomplete_stopSearch_no_throw.js leaking nsTimerImpl. So looks like i still have to fix that.
+Btw, still having a first review would be cool.
+still, without the delete and taking also the other patch for shutdown (bug 478718) the leak disappears :\
+Created attachment 402096
+patch v1.1
+
+does not leak if bug 478718 is pushed with this. Still have to investigate why.
+Comment on attachment 401044
+patch v1.0
+
+http://reviews.visophyte.org/r/401044/
+
+on file: toolkit/components/places/src/nsNavHistory.h line 529
+>   nsNavHistoryExpire* mExpire;
+
+This file is not consistent, but the coding style guide says to do
+nsNavHistoryExpire *mExpire.  Let's stick with the coding style here.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.h line 71
+>   // Number of pages to expire at any partial expiration.
+>   PRBool mExpirePagesPerRun;
+
+a bool?  I think you want a number here
+
+
+on file: toolkit/components/places/src/nsPlacesDBFlush.js line 431
+>           "SELECT h.url, v.visit_date, h.hidden, 0 AS whole_entry " +
+
+Don't we want |(h.visit_count == 0) AS whole_entry| here?
+(In reply to comment #6)
+> on file: toolkit/components/places/src/nsNavHistoryExpire.h line 71
+> >   // Number of pages to expire at any partial expiration.
+> >   PRBool mExpirePagesPerRun;
+> 
+> a bool?  I think you want a number here
+
+was a bogus and useless entry from previous iterations
+
+> on file: toolkit/components/places/src/nsPlacesDBFlush.js line 431
+> >           "SELECT h.url, v.visit_date, h.hidden, 0 AS whole_entry " +
+> 
+> Don't we want |(h.visit_count == 0) AS whole_entry| here?
+
+actually we are removing a visit and we don't know if page will be removed (it could have an embed visit, or be a bookmark), relying on visit_count looks bad.
+Created attachment 403474
+patch v1.2
+Comment on attachment 403474
+patch v1.2
+
+this survived the tryserver, so should be good enough for review, should make easier to strip expiration out of history file once we move to a js async component.
+Comment on attachment 403474
+patch v1.2
+
+http://reviews.visophyte.org/r/403474/
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 71
+> #define EXPIRATION_PARTIAL_SUBSEQUENT_TIMEOUT ((PRUint32)10 * PR_MSEC_PER_SEC)
+
+You are only casting the 10 to a PRUint32 I think.  Add more parens to make
+this clearer please.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 80
+> #define EXPIRATION_IDLE_TIMEOUT ((PRUint32)5 * 60 * PR_MSEC_PER_SEC)
+
+You are only casting the 5 to a PRUint32 I think.  Add more parens to make
+this clearer please.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 103
+> /**
+>  * nsNavHistoryExpire::nsNavHistoryExpire
+>  */
+
+FWIW, these comments seem pretty darn useless.  The method name can already be
+found right below it.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 115
+>   (void)InitializeIdleTimer(EXPIRATION_IDLE_TIMEOUT);
+
+This is the only caller oft this.  I think we should just make it return void.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 163
+> /**
+>  * nsNavHistoryExpire::OnIdle
+>  *
+>  * We usually expire periodically, but that could not be fast enough, so on idle
+>  * we want to expire a bigget chunk of items to help partial expiration.
+>  * This way we try to hit when the user is not going to suffer from UI hangs.
+>  */
+
+This comment really belongs in the .h file.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 187
+>   (void)ExpireItems(EXPIRATION_MAX_PAGES_AT_IDLE, &keepGoing);
+>   (void)ExpireOrphans(EXPIRATION_MAX_PAGES_AT_IDLE);
+
+We never check these results either - we should just make them return void
+too.  Or better yet, just make expire items return a bool if it should keep
+going.  On error, it'd return false anyway.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 193
+>     InitializeIdleTimer(EXPIRATION_IDLE_TIMEOUT * 10);
+
+Technically, this returns something so you should cast it (but we don't check
+it anywhere, so we should change the signature).
+
+Also, pull the magic number out into a constant please.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 196
+>     InitializeIdleTimer(EXPIRATION_IDLE_TIMEOUT);
+
+Technically, this returns something so you should cast it (but we don't check
+it anywhere, so we should change the signature).
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 247
+> /**
+>  * nsNavHistoryExpire::ClearHistory
+>  *
+>  * Performance: ExpireItems sends notifications. We may want to disable this
+>  * for clear history cases. However, my initial tests show that the
+>  * notifications are not a significant part of clear history time.
+>  */
+
+Comment belongs in .h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 302
+> /**
+>  * nsNavHistoryExpire::OnExpirationChanged
+>  *
+>  * Called when the expiration length in days has changed. We clear any
+>  * next expiration time, meaning that we'll try to expire stuff next time,
+>  * and recompute the value if there's still nothing to expire.
+>  */
+
+comment belongs in .h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 314
+>   StartPartialExpirationTimer(EXPIRATION_PARTIAL_TIMEOUT);
+
+This returns nsresult, but we don't check it anywhere.  Should change the
+signature.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 317
+> /**
+>  * nsNavHistoryExpire::DoPartialExpiration
+>  */
+
+comment not useful
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 329
+>     StartPartialExpirationTimer(EXPIRATION_PARTIAL_SUBSEQUENT_TIMEOUT);
+
+This returns nsresult, but we don't check it anywhere.  Should change the
+signature.
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 407
+> /**
+>  * nsNavHistoryExpire::ExpireOrphans
+>  *
+>  * Try to expire aNumToExpire items that are orphans.  aNumToExpire only
+>  * limits how many moz_places we worry about.  Everything else (favicons,
+>  * annotations, and input history) is completely expired.
+
+.h file please
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 456
+> /**
+>  * nsNavHistoryExpire::FindVisits
+>  *
+>  * Find visits to expire, meeting the following criteria:
+>  *
+>  *   - With a visit date older than browser.history_expire_days ago.
+>  *   - With a visit date older than browser.history_expire_days_min ago
+>  *     if we have more than browser.history_expire_sites unique urls.
+>  *
+>  * aExpireThreshold is the time at which we will delete visits before.
+>  * If it is zero, we will match everything.
+>  *
+>  * aNumToExpire is the maximum number of visits to find. If it is 0, then
+>  * we will get all matching visits.
+>  */
+
+.h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 565
+> /**
+>  * nsNavHistoryExpire::EraseVisits
+>  */
+
+not needed
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 647
+> /**
+>  * nsNavHistoryExpire::EraseHistory
+>  *
+>  * This erases records in moz_places when there are no more visits.
+>  * We need to be careful not to delete: bookmarks, items that still have
+>  * visits and place: URIs.
+>  *
+>  * This will modify the input by setting the erased flag on each of the
+>  * array elements according to whether the history item was erased or not.
+
+.h file please
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 712
+> /**
+>  * nsNavHistoryExpire::EraseFavicons
+>  */
+
+not needed
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 754
+> /**
+>  * nsNavHistoryExpire::EraseAnnotations
+>  */
+
+not needed
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 786
+> /**
+>  * nsAnnotationService::ExpireAnnotations
+>  *
+>  * Periodic expiration of annotations that have time-sensitive
+>  * expiration policies.
+>  *
+>  * NOTE: Always specify the exact policy constant, as they're
+>  * not guaranteed to be in numerical order.
+
+.h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 892
+> /**
+>  * nsNavHistoryExpire::ExpireHistoryParanoid
+>  *
+>  * Deletes any dangling history entries that aren't associated with any
+>  * visits, bookmarks or "place:" URIs.
+>  *
+>  *    The aMaxRecords parameter is an optional cap on the number of 
+>  *    records to delete. If its value is -1, all records will be deleted.
+>  */
+
+.h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 934
+> /**
+>  * nsNavHistoryExpire::ExpireFaviconsParanoid
+>  *
+>  * Deletes any dangling favicons that aren't associated with any pages.
+>  */
+
+.h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 954
+> /**
+>  * nsNavHistoryExpire::ExpireAnnotationsParanoid
+>  *
+>  * Deletes session annotations, dangling annotations
+>  * and annotation names that are unused.
+>  */
+
+.h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 1007
+> /**
+>  * nsNavHistoryExpire::ExpireInputHistoryParanoid
+>  *
+>  * Deletes dangling input history
+>  */
+
+.h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 1029
+> /**
+>  * nsNavHistoryExpire::ComputeNextExpirationTime
+>  *
+>  * This computes mNextExpirationTime. See that var in the header file.
+>  * It is passed the number of microseconds that things expire in.
+>  */
+
+.h file
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 1057
+> /**
+>  * nsNavHistoryExpire::StartPartialExpirationTimer
+>  */
+
+not needed
+
+
+on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 1088
+> /**
+>  * nsNavHistoryExpire::GetExpirationTimeAgo
+>  */
+
+not needed
+
+
+on file: toolkit/components/places/src/nsPlacesDBFlush.js line 484
+>               "AND SUBSTR(h.url, 1, 6) <> 'place:' " +
+
+We do this in so many places, I feel like we should make a SQL function to
+detect place URI's in SQL:
+AND NOT PLACE_URI(h.url).  Can you file a follow-up please?
+
+
+r=sdwilsh
+(In reply to comment #10)
+> (From update of attachment 403474 [details])
+> http://reviews.visophyte.org/r/403474/
+> 
+> on file: toolkit/components/places/src/nsNavHistoryExpire.cpp line 71
+> > #define EXPIRATION_PARTIAL_SUBSEQUENT_TIMEOUT ((PRUint32)10 * PR_MSEC_PER_SEC)
+> 
+> You are only casting the 10 to a PRUint32 I think.  Add more parens to make
+> this clearer please.
+
+the problem is about the first element, that will then retain result for the subsequent multiplications, so that won't matter.
+
+> on file: toolkit/components/places/src/nsPlacesDBFlush.js line 484
+> >               "AND SUBSTR(h.url, 1, 6) <> 'place:' " +
+> 
+> We do this in so many places, I feel like we should make a SQL function to
+> detect place URI's in SQL:
+> AND NOT PLACE_URI(h.url).  Can you file a follow-up please?
+
+the problem is that we can optimize the TRUE case (using h.uri > "place:" AND h.uri < "place;") but we can't optimize the FALSE case (it would be an OR, so SUBSTR is faster)... since this follows two paths based on result it's hard to generalize it into a sqlite function, unless we do something like CHECK_PLACE_URI(true/false) that uses a different path based on input. btw i'll file the followup.
+filed Bug 521048 for the PLACE_URI function
+Created attachment 405267
+patch v1.3
+
+addressed comments
+http://hg.mozilla.org/mozilla-central/rev/7c97316f7de5
+Looking at about a 38% win for "MED" profiles for shutdown time for linux and mac.  A whopping 67% win for "MED" profiles on Windows XP.  Yikes!
+
+Maybe we want to take this on branch?
+Talk to me about safety, but I think we wouldn't scorn a win like that!
+Comment on attachment 405267
+patch v1.3
+
+do we want this on 1.9.2 then?
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv
+Comment on attachment 405267
+patch v1.3
+
+Nobody talked to me about risk here. Obviously baking for a long time on trunk, but not sure if we want to take a patch like this so late in the cycle.
+
+Big D: what do you think?
+i vote to take it:
+
+1. long bake time, no regressions
+2. most of the changes in the patch are just refactorings for clarity and organization, very little is the logic change
+3. long shutdown times are a prime source of other user problems during application updates and restarts for extension installs, so worth some risk while we're still in beta
+Comment on attachment 405267
+patch v1.3
+
+a192=beltzner
+http://hg.mozilla.org/releases/mozilla-1.9.2/rev/107a974f01aa

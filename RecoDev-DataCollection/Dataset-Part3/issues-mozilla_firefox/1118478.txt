@@ -1,0 +1,61 @@
+Created attachment 8544834
+STR
+
+In bug 1096490, I'm replacing the deprecated-sync-thenables promises, which are synchronous, with Promise.jsm promises, which are asynchronous. Doing so causes several tests in the style inspector to fail.
+
+To reproduce this issue, simply apply the attached patch, which changes the promise implementation in protocol.js, and (temporarily) defines a few debug helpers in Promise-backend.js to help figure out where promises that are rejected were created. It also includes the patch from bug 1105652, because several of the test failures in the style inspector are caused by uncaught promise rejections in the style editor (which that patch fixes).
+
+Created attachment 8544834
+STR
+
+In bug 1096490, I'm replacing the deprecated-sync-thenables promises, which are synchronous, with Promise.jsm promises, which are asynchronous. Doing so causes several tests in the style inspector to fail.
+
+To reproduce this issue, simply apply the attached patch, which changes the promise implementation in protocol.js, and (temporarily) defines a few debug helpers in Promise-backend.js to help figure out where promises that are rejected were created. It also includes the patch from bug 1105652, because several of the test failures in the style inspector are caused by uncaught promise rejections in the style editor (which that patch fixes).
+Brian and I have been looking at the test failures in browser_ruleview_edit-property-order.js. So far, we hypothesize the following is going on:
+
+The failing test tries to disable one out of two properties. This causes us to send a request to the server with a list of modifications that resets the first property, then tried to remove the second. Resetting the first property (probably) triggers a DOM mutation event, which in turn triggers a refresh in the inspector.
+
+During the refresh, we generate a list of text properties from the cssText of the corresponding rule, but in doing so we lose the information on which properties are disabled or not (all generated text properties are simply set to enabled in their constructor). As a result, after we override the existing text properties with the generated ones, the property we disabled before is now enabled again.
+
+This problem likely did not show up before because with synchronous promises, the then handler for applyModifications fires within the same tick. The refresh has to go through the event queue, and thus fires later. This means that when the test yields on the applyingModifications promise, the yield returns before the refresh has happened, and the property looks like it is disabled.
+
+With asynchronous promises, the then handler for applyModifications also has to go through the event queue, and therefore happens after the refresh has re-enabled the property again. That's what we're observing at least.
+Created attachment 8544841
+Partial fix
+
+This patch fixes the issues described in the comment #1 by forcibly doing another refresh after all modifications have been applied. By this time, the property will have been removed from the cssText, so the refresh function will properly deal with it.
+
+I'm not happy with this solution, because doing two refreshes after each modification is needlessly inefficient. It also doesn't address the real underlying problem: apparently we assume that if a property is in the cssText, it cannot be disabled. This does not take into account that several modifications may be pending that will remove that property from the cssText.
+
+Moreover, even with this patch applied, we're still seeing test failures. In particular:
+
+resource:///modules/devtools/styleinspector/rule-view.js:647 - TypeError: this.editor is undefined
+ resource:///modules/devtools/styleinspector/rule-view.js:2239 - TypeError: this.doc.defaultView is null
+
+Neither me or Brian understand how these values could be undefined/null at the point that these errors occur.
+
+Patrick, you're more familiar with the inspector code than any of us. We could really use your help. Could you spare some time tomorrow to look into what's causing these tests failures with me?
+Another way to fix this (I will attach a patch soon) is to make sure the rule-view panel's refresh method waits until all modifications have been done before doing anything.
+
+The panel refresh is caused by the markup-view. The markup-view listens for dom mutations and when it detects an attribute mutation, it sends an event ("layout-change") that causes a refresh of the rule-view (this is done in tyle-inspector.js). It does this because any attribute change on the selected node may change the set of CSS rules that apply to it (there could be rules with [attribute] selectors, or the attribute could be, like here, the style attribute).
+
+So, making the panel wait until pending modifications have been done fixes this particular test failure. But it does create the same 2 TypeError reported in comment 2.
+
+The |this.doc.defaultView| error is simple, it comes from the fact that the panel tries to refresh itself after the test has ended. This is to be expected because after the pending modifications are done, we refresh the panel as said earlier, but the test doesn't wait for this to be done.
+So we can simply add checks in the rule-view to verify if the panel hasn't been destroyed in the meantime.
+
+The |this.editor| one is weirder, and it's hard to track because |this| here is |TextProperty| and this class doesn't define the |editor| property itself and doesn't manage its lifecycle. It's set from outside, by |TextPropertyEditor|, so there's no knowing when it will be defined and when not. So, with my limited understanding of this specific part, I'm only going to advise adding an |if (this.editor)| around the code that fails.
+
+With these things fixed, the test passes fine when Eddy's STR patch is also applied, but it fails when it isn't...
+Created attachment 8545262
+bug1118478-rule-view-failures-with-async-promises-tests.patch
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #3)
+> With these things fixed, the test passes fine when Eddy's STR patch is also
+> applied, but it fails when it isn't...
+
+That may be an issue, since AFAIK the STR patch won't be applied until we are ready to completely switch to async promises.
+This patch does indeed fix the issue, but since it only works in combination with the protocol.js changes, I'm going to close this bug, and land everything as a single patch in bug 1096490.
+Comment on attachment 8544841
+Partial fix
+
+Removing the feedback flag on this bug.

@@ -1,0 +1,1199 @@
+Steps to reproduce:
+1. Bookmark http://blogs.yahoo.co.jp/alice0775/31315844.html
+   And make sure it should open in Sidebar(i.e Check "Load this bookmark in the sidebar")
+2. Open the bookmark
+3. Click a link "https://github.com/alice0775" in Sidebar panel
+
+Actual Results:
+New tab open, but no content.
+
+Expected Results:
+New tab open, and content should display.
+
+Steps to reproduce:
+1. Bookmark http://blogs.yahoo.co.jp/alice0775/31315844.html
+   And make sure it should open in Sidebar(i.e Check "Load this bookmark in the sidebar")
+2. Open the bookmark
+3. Click a link "https://github.com/alice0775" in Sidebar panel
+
+Actual Results:
+New tab open, but no content.
+
+Expected Results:
+New tab open, and content should display.
+Hey Brad,
+
+Here's another bug that I'm not sure should be in M2. Opening links from the bookmarks sidebar works - the problem seems to be opening window.open or target="_blank" links with content that is loaded in the sidebar (you can choose to have links open within the bookmarks sidebar).
+
+That, to me, sounds like an edge-case, and not necessarily something that should block M2. Am I good to remove this from the M2 list, or should we discuss this on Thursday?
+
+-Mike
+This is actually a very specific case of a more general problem, in that non-remote tabs in e10s windows can't currently open window.open or target="_blank" links.
+
+This means that any URI's that are remote-tabs blacklisted (any about: pages that are not about:blank or about:home) will not have working window.open or target="_blank" links.
+
+That sounds kinda bad. Still not sure if it's M2, though.
+let's renom and discuss in triage
+We decided in triage yesterday to take this off the M2 list.
+Created attachment 8485883
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+So I _think_ this will work.
+
+This does two things:
+
+1) This makes it so that in nsAppShellService::JustCreateTopWindow, if we have a parent context that is loading a new window, that we ensure that the parent context has UseRemoteTabs set to true AND that an opening tab was passed in. This means that if we have a non-remote tab in an e10s window, opening a popup window from that tab will result in the new window not being remote.
+
+2) All calls to nsBrowserAccess::OpenURI results in a browser that is not remote. That means that if we attempt to open a new window or tab from a link (or even if the user prefs override those behaviours and load that link in the current window), and that link is coming from a non-remote tab, then it will result in the new browser also being non-remote.
+
+#1 is straight forward, but #2 is something I want to check out a bit more. Right now, I can only find nsBrowserAccess::OpenURI being called from nsContentTreeOwner, which implies being opened from a non-remote browser (regardless of whether or not it's in an e10s window or not). I want to check any other callers of that method to make sure that I'm not introducing any weird side-effects here.
+Comment on attachment 8485883
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+
+Hey billm,
+
+I'm a little wary of my change to browser.js. I'm basically forcing any window-opening code that ends up in nsBrowserAccess to result in a non-remote browser. I _assume_ that if we ended up in nsBrowserAccess.openURI in the first place, that we're getting called from nsContentTreeOwner, which implies that the opener is not remote...
+
+Is that a reasonable assumption? I can't see how we'd end up in openURI if the opener was remote. If it is reasonable, should I make this assumption more explicit with some asserts? Perhaps assert that aOpener is not a CPOW?
+
+Let me know what you think.
+
+-Mike
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #6)
+> So I _think_ this will work.
+> 
+> This does two things:
+> 
+> 1) This makes it so that in nsAppShellService::JustCreateTopWindow, if we
+> have a parent context that is loading a new window, that we ensure that the
+> parent context has UseRemoteTabs set to true AND that an opening tab was
+> passed in. This means that if we have a non-remote tab in an e10s window,
+> opening a popup window from that tab will result in the new window not being
+> remote.
+
+This doesn't sound right to me. It means that if say about:preferences opens a new window for a link then any tabs in that window will be non-remote?
+
+> 2) All calls to nsBrowserAccess::OpenURI results in a browser that is not
+> remote. That means that if we attempt to open a new window or tab from a
+> link (or even if the user prefs override those behaviours and load that link
+> in the current window), and that link is coming from a non-remote tab, then
+> it will result in the new browser also being non-remote.
+
+I've never understood why nsIBrowserDOMWindow::OpenURI isn't passed the url we intend to load into the new window. Can we just add that parameter and then be sure we're doing the right thing here?
+(In reply to Dave Townsend [:mossop] from comment #8)
+> (In reply to Mike Conley (:mconley) - Needinfo me! from comment #6)
+> > So I _think_ this will work.
+> > 
+> > This does two things:
+> > 
+> > 1) This makes it so that in nsAppShellService::JustCreateTopWindow, if we
+> > have a parent context that is loading a new window, that we ensure that the
+> > parent context has UseRemoteTabs set to true AND that an opening tab was
+> > passed in. This means that if we have a non-remote tab in an e10s window,
+> > opening a popup window from that tab will result in the new window not being
+> > remote.
+> 
+> This doesn't sound right to me. It means that if say about:preferences opens
+> a new window for a link then any tabs in that window will be non-remote?
+> 
+
+I suppose that constraint is really only important if the opened window needs a reference to the opener, and the opener is non-remote.
+
+I'm pretty sure the only real reason that we're ever opening new tabs or windows in non-remote browsers (other than because their URL's are blacklisted), is because their openers are also non-remote, and so opener needs to work.
+
+> > 2) All calls to nsBrowserAccess::OpenURI results in a browser that is not
+> > remote. That means that if we attempt to open a new window or tab from a
+> > link (or even if the user prefs override those behaviours and load that link
+> > in the current window), and that link is coming from a non-remote tab, then
+> > it will result in the new browser also being non-remote.
+> 
+> I've never understood why nsIBrowserDOMWindow::OpenURI isn't passed the url
+> we intend to load into the new window. Can we just add that parameter and
+> then be sure we're doing the right thing here?
+
+As far as I can tell, nsIBrowserDOMWindow::OpenURI _is_ passed the url to be loaded into the new window/tab.
+
+I'm not 100% sure I understand what you're suggesting here - perhaps to dynamically choose whether or not to use remote browsers in OpenURI based on the URI? I think the problem there is that in the new tab case, OpenURI attempts to return browser.contentWindow, which is undefined for remote browsers. We could naively use browser.contentWindowAsCPOW, but I'm extremely wary of passing CPOW's around, especially back to native callers. Things explode that way.
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #9)
+> (In reply to Dave Townsend [:mossop] from comment #8)
+> > (In reply to Mike Conley (:mconley) - Needinfo me! from comment #6)
+> > > So I _think_ this will work.
+> > > 
+> > > This does two things:
+> > > 
+> > > 1) This makes it so that in nsAppShellService::JustCreateTopWindow, if we
+> > > have a parent context that is loading a new window, that we ensure that the
+> > > parent context has UseRemoteTabs set to true AND that an opening tab was
+> > > passed in. This means that if we have a non-remote tab in an e10s window,
+> > > opening a popup window from that tab will result in the new window not being
+> > > remote.
+> > 
+> > This doesn't sound right to me. It means that if say about:preferences opens
+> > a new window for a link then any tabs in that window will be non-remote?
+> > 
+> 
+> I suppose that constraint is really only important if the opened window
+> needs a reference to the opener, and the opener is non-remote.
+> 
+> I'm pretty sure the only real reason that we're ever opening new tabs or
+> windows in non-remote browsers (other than because their URL's are
+> blacklisted), is because their openers are also non-remote, and so opener
+> needs to work.
+
+Oh right, opener. Ugh.
+
+> > > 2) All calls to nsBrowserAccess::OpenURI results in a browser that is not
+> > > remote. That means that if we attempt to open a new window or tab from a
+> > > link (or even if the user prefs override those behaviours and load that link
+> > > in the current window), and that link is coming from a non-remote tab, then
+> > > it will result in the new browser also being non-remote.
+> > 
+> > I've never understood why nsIBrowserDOMWindow::OpenURI isn't passed the url
+> > we intend to load into the new window. Can we just add that parameter and
+> > then be sure we're doing the right thing here?
+> 
+> As far as I can tell, nsIBrowserDOMWindow::OpenURI _is_ passed the url to be
+> loaded into the new window/tab.
+> 
+> I'm not 100% sure I understand what you're suggesting here - perhaps to
+> dynamically choose whether or not to use remote browsers in OpenURI based on
+> the URI? I think the problem there is that in the new tab case, OpenURI
+> attempts to return browser.contentWindow, which is undefined for remote
+> browsers. We could naively use browser.contentWindowAsCPOW, but I'm
+> extremely wary of passing CPOW's around, especially back to native callers.
+> Things explode that way.
+
+Ah I see. So the url isn't passed (the URL parameter is null because the caller wants to handle the load: http://mxr.mozilla.org/mozilla-central/source/xpfe/appshell/nsContentTreeOwner.cpp#903). So we open a remote tab by default I think because a null URL implies about:blank. I wanted us to set remoteness based on the real URL rather than making the assumption. But yeah if a remote browser is unusable then that won't help. What should happen is that if you land this then bug 999239 will force us to re-create the browser as a remote browser when necessary what the caller initiates the load.
+Comment on attachment 8485883
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+
+Review of attachment 8485883:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +4138,5 @@
+>                                        referrerURI: referrer,
+>                                        fromExternal: aIsExternal,
+>                                        inBackground: loadInBackground});
+>      let browser = win.gBrowser.getBrowserForTab(tab);
+> +    win.gBrowser.updateBrowserRemoteness(browser, false);
+
+This doesn't seem right to me. We can get here from openURIInFrame, which is called whenever the child process asks to open a new tab:
+
+http://mxr.mozilla.org/mozilla-central/source/dom/ipc/TabParent.cpp#440
+
+We definitely don't want to open all new tabs non-remotely.
+
+I haven't looked at this code for a while though. Maybe I'm missing something?
+Created attachment 8487220
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+Comment on attachment 8487220
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+
+Hey Mossop,
+
+Is this going to work or conflict with the stuff you're doing for preserving history when flipping back and forth between remote and non-remote browsers?
+
+It's unfortunate that our link-opening logic is spread around in so many places. :( That seems to be a consequence of the embedding efforts.
+
+I'm going to write some tests for this.
+
+-Mike
+Comment on attachment 8487220
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+
+Review of attachment 8487220:
+-----------------------------------------------------------------
+
+I think it should be fine
+Comment on attachment 8487220
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+
+Review of attachment 8487220:
+-----------------------------------------------------------------
+
+I think it should be fine
+Comment on attachment 8487220
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+
+Alright, if Mossop is good with this, I guess we're ready for review here.
+
+billm for the browser.js stuff, and smaug for the nsAppShellService stuff.
+
+I'll attach my tests in a separate patch shortly.
+Created attachment 8487442
+Test that opening non-remote tabs in e10s windows open non-remote tabs or windows. r=?
+Comment on attachment 8487442
+Test that opening non-remote tabs in e10s windows open non-remote tabs or windows. r=?
+
+Feel OK reviewing these tests, Mossop? Hopefully, they're reasonably straight-forward.
+Comment on attachment 8487220
+Make it possible to load new windows from non-remote browsers within an e10s window. r=?
+
+Review of attachment 8487220:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +4107,5 @@
+>  
+>  nsBrowserAccess.prototype = {
+>    QueryInterface: XPCOMUtils.generateQI([Ci.nsIBrowserDOMWindow, Ci.nsISupports]),
+>  
+> +  _openURIInNewTab: function(aURI, aOpener, aIsExternal, aEnsureNonRemote) {
+
+Can you please make aEnsureNonRemote default to false (with |= false| in the param list).
+
+*** Bug 1041917 has been marked as a duplicate of this bug. ***
+Mike: your test patch is still waiting for review, but can we land your r+'d patch with the fix?  We're trying to close out our remaining M2 bugs today.
+Yeah, I think that should be fine. I'll do that now.
+Comment on attachment 8487442
+Test that opening non-remote tabs in e10s windows open non-remote tabs or windows. r=?
+
+Review of attachment 8487442:
+-----------------------------------------------------------------
+
+::: browser/base/content/test/general/browser_bug1047603.js
+@@ +14,5 @@
+> +    let element = content.document.getElementById("testAnchor");
+> +    element.click();
+> +  });
+> +  sendAsyncMessage("test:ready");
+> +}
+
+Is there a reason to do this with frame scripts vs cpow?
+
+@@ +126,5 @@
+> +    let windowOpenPromise = promiseTopicObserved("browser-delayed-startup-finished");
+> +    mm.sendAsyncMessage("test:click");
+> +    let [newWindow] = yield windowOpenPromise;
+> +    ok(!newWindow.gMultiProcessBrowser,
+> +       "The opened window should not be an e10s window.");
+
+I still think this is going to cause us problems down the line. If in-content preferences opens a new window (from the help link perhaps) that entire window is going to be non-remote even though we only need the first tab to be non-remote. Maybe this goes away when we no longer have the concept of non-remote windows.
+
+::: browser/base/content/test/general/head.js
+@@ +658,5 @@
+> +    tabs.addEventListener("TabOpen", function onTabOpen(event) {
+> +      resolve(event.target);
+> +    });
+> +  });
+> +}
+
+Update this to use promiseWaitForEvent which also removes the event listener.
+Thanks for the review!
+
+(In reply to Dave Townsend [:mossop] from comment #24)
+> Comment on attachment 8487442
+> Test that opening non-remote tabs in e10s windows open non-remote tabs or
+> windows. r=?
+> 
+> Review of attachment 8487442:
+> -----------------------------------------------------------------
+> 
+> ::: browser/base/content/test/general/browser_bug1047603.js
+> @@ +14,5 @@
+> > +    let element = content.document.getElementById("testAnchor");
+> > +    element.click();
+> > +  });
+> > +  sendAsyncMessage("test:ready");
+> > +}
+> 
+> Is there a reason to do this with frame scripts vs cpow?
+> 
+
+Hm. I guess I've been adopting a stance of "avoid CPOWs at all costs" in my browser coding, as they're really supposed to be a worst-case solution for front-end stuff. For tests, they're probably fine, but that was my reasoning. If you'd prefer I switch this over to using a CPOW instead, let me know, and I'll fix it in a follow-up.
+
+> @@ +126,5 @@
+> > +    let windowOpenPromise = promiseTopicObserved("browser-delayed-startup-finished");
+> > +    mm.sendAsyncMessage("test:click");
+> > +    let [newWindow] = yield windowOpenPromise;
+> > +    ok(!newWindow.gMultiProcessBrowser,
+> > +       "The opened window should not be an e10s window.");
+> 
+> I still think this is going to cause us problems down the line. If
+> in-content preferences opens a new window (from the help link perhaps) that
+> entire window is going to be non-remote even though we only need the first
+> tab to be non-remote. Maybe this goes away when we no longer have the
+> concept of non-remote windows.
+> 
+
+I agree - but I also think this problem will become more and more edge as more of our pages become remote-able.
+
+> ::: browser/base/content/test/general/head.js
+> @@ +658,5 @@
+> > +    tabs.addEventListener("TabOpen", function onTabOpen(event) {
+> > +      resolve(event.target);
+> > +    });
+> > +  });
+> > +}
+> 
+> Update this to use promiseWaitForEvent which also removes the event listener.
+
+Can do.
+It would be better to avoid CPOWs even in tests. Our long-term goal is to eliminate them, so there's no point in adding more.
+Thanks for the reviews! Fixed issues raised by billm and Mossop, landed as:
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/dc6a44c16a37
+This appears to have broken stuff on fx-team. *sigh*.
+
+Specifically: 
+
+
+63 ERROR TEST-UNEXPECTED-TIMEOUT | chrome://mochitests/content/browser/browser/base/content/test/general/browser_bug1047603.js | application timed out after 330 seconds with no output
+
+64 ERROR TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/base/content/test/general/browser_bug1047603.js | application terminated with exit code 6
+
+PROCESS-CRASH | chrome://mochitests/content/browser/browser/base/content/test/general/browser_bug1047603.js | application crashed [@ linux-gate.so + 0x424] 
+
+Looking into it now...
+Something is up with my test. When fx-team re-opens, I think we should keep the fix, but back out the test until I can fix it.
+Ah, I think I know what's up - this test opens an e10s window to do its testing in. That's totally not supported on Linux without OMTC on, and we show a prompt to that effect if someone attempts to open an e10s window.
+
+So I suspect this test just needs to be disabled on Linux until OMTC defaults to on.
+Landed patch to disable test on Linux:
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/1e0e069b5cc7
+
+Filed bug 1066856 to re-enable the test once OMTC is enabled by default on Linux.
+https://hg.mozilla.org/mozilla-central/rev/dc6a44c16a37
+https://hg.mozilla.org/mozilla-central/rev/1e0e069b5cc7
+(In reply to Dave Townsend [:mossop] from comment #8)
+> (In reply to Mike Conley (:mconley) - Needinfo me! from comment #6)
+> > 1) This makes it so that in nsAppShellService::JustCreateTopWindow, if we
+> > have a parent context that is loading a new window, that we ensure that the
+> > parent context has UseRemoteTabs set to true AND that an opening tab was
+> > passed in. This means that if we have a non-remote tab in an e10s window,
+> > opening a popup window from that tab will result in the new window not being
+> > remote.
+> 
+> This doesn't sound right to me. It means that if say about:preferences opens
+> a new window for a link then any tabs in that window will be non-remote?
+
+I think that's exactly what this patch ended up doing. Clicking a crash report in about:crashes loads that in a non-remote tab. Or is that a different bug if the same tab is re-used? I saw the same behavior if I modified the link to have target=_blank though.
+(In reply to Tim Taubert [:ttaubert] from comment #33)
+> (In reply to Dave Townsend [:mossop] from comment #8)
+> > (In reply to Mike Conley (:mconley) - Needinfo me! from comment #6)
+> > > 1) This makes it so that in nsAppShellService::JustCreateTopWindow, if we
+> > > have a parent context that is loading a new window, that we ensure that the
+> > > parent context has UseRemoteTabs set to true AND that an opening tab was
+> > > passed in. This means that if we have a non-remote tab in an e10s window,
+> > > opening a popup window from that tab will result in the new window not being
+> > > remote.
+> > 
+> > This doesn't sound right to me. It means that if say about:preferences opens
+> > a new window for a link then any tabs in that window will be non-remote?
+> 
+> I think that's exactly what this patch ended up doing. Clicking a crash
+> report in about:crashes loads that in a non-remote tab. Or is that a
+> different bug if the same tab is re-used? I saw the same behavior if I
+> modified the link to have target=_blank though.
+
+That's bug 1066694
+I asked RyanVM to back this out on central and respin nightlies, because of bug 1067164.
+Backed out at the request of ehsan and blassey.
+https://hg.mozilla.org/mozilla-central/rev/b50d767bb3e0
+And now I've got mochitest-e10s-browser-chrome perma-fails. Peachy.
+https://tbpl.mozilla.org/php/getParsedLog.php?id=48304016&tree=Mozilla-Central
+We had to disable a new social chat test failure as well - 
+
+https://hg.mozilla.org/mozilla-central/rev/4f2cac8d72da
+Sorry about the kerfuffle, folks. I'll be looking at alternatives today.
+Ok, my alternative proposal:
+
+Instead of unilaterally passing aEnsureNonRemote as true from openURI, instead only set that to true if the following conditions are met:
+
+1) aOpener exists
+2) aContext is nsIBrowserDOMWindow.OPEN_NEW
+
+If aOpener exists, then by the time we call openURIInNewTab, it must not be a CPOW, so we must be opening from a non-remote browser, meaning that we care that that the newly created browser is also non-remote.
+
+Making sure aContext is OPEN_NEW is more of a sanity check - I can't think of a single scenario where we'd want to call OpenURI with OPEN_EXTERNAL and pass an opener. Every instance of OpenURI I can find where OPEN_EXTERNAL is set as the context has aOpener set to null. And that, I think, makes sense - what would a new tab or window opened by an action from an external source pass as an opener? The external source itself? It's kinda non-sensical.
+
+I also think I've found some already-existing tests that would have caught but 1067164, but weren't enabled for e10s. I'm going to see if we can get those enabled for e10s.
+Created attachment 8491706
+Part 1: [e10s] Make it possible to load new windows from non-remote browsers within an e10s window (r+'d by smaug, Mossop)
+Created attachment 8491707
+Part 2: [e10s] Re-enable browser_bug562649.js for e10s windows
+Comment on attachment 8491706
+Part 1: [e10s] Make it possible to load new windows from non-remote browsers within an e10s window (r+'d by smaug, Mossop)
+
+Alright, so this patch adds a throw to openURI in the unlikely event that it is passed an opener and a OPEN_EXTERNAL context. We now only ensure remote if there is an opener.
+
+Here's the difference between the old and new patches (modulo the test stuff, which I've folded in): https://bugzilla.mozilla.org/attachment.cgi?oldid=8487220&action=interdiff&newid=8491706&headers=1
+
+What do you think, billm?
+Comment on attachment 8491707
+Part 2: [e10s] Re-enable browser_bug562649.js for e10s windows
+
+This is the test that would have caught bug 1067164.
+
+The reason it was disabled was because the isBusy property on XULBrowserWindow is not synchronously set to true. Also, just waiting for the condition to be true is unlikely to work, as the page we're loading is so small, that it's more likely for isBusy to switch from true back to false before waitForCondition is able to notice that it was ever true.
+
+I could add some kind of wrapper function around the isBusy setter, and monitor for it flipping around, but I'm not entirely sure checking for isBusy adds much in the way of value to this test. Dao, you wrote this test - is there much value in keeping the isBusy check?
+
+Try push: https://tbpl.mozilla.org/?tree=Try&rev=b5524b945cc3
+This time, without additional patch cruft:
+
+https://tbpl.mozilla.org/?tree=Try&rev=e4c1f5922dd5
+Comment on attachment 8491706
+Part 1: [e10s] Make it possible to load new windows from non-remote browsers within an e10s window (r+'d by smaug, Mossop)
+
+Review of attachment 8491706:
+-----------------------------------------------------------------
+
+So I guess what this boils down to is "if we have an opener (which we know is from the parent process), then we need the tab to be non-remote so it can use the opener". If so, I wonder if it would be clearer to just eliminate the extra parameter and use |!!aOpener| directly. I'll leave that up to you though.
+
+::: browser/base/content/test/general/browser.ini
+@@ +483,5 @@
+>  skip-if = e10s # Bug ?????? - test directly manipulates content (content.document.getElementById)
+>  [browser_bug1045809.js]
+>  skip-if = e10s
+> +[browser_bug1047603.js]
+> +skip-if = os == "linux" # Bug 1066856 - waiting for OMTC to be enabled by default on Linux.
+
+Could we change this to |skip-if = os == "linux" && !e10s|. That way we'll still get Linux coverage in e10s testing (where OMTC is enabled).
+This patch is related to bug 1066694, which we triaged today, and I think both blassey and Mossop had concerns about how we're switching over to a non-remote browser tabs opened from non-remote browsers.
+
+I want to hear more about these concerns, because I think it's going to impact this bug.
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #49)
+> This patch is related to bug 1066694, which we triaged today, and I think
+> both blassey and Mossop had concerns about how we're switching over to a
+> non-remote browser tabs opened from non-remote browsers.
+> 
+> I want to hear more about these concerns, because I think it's going to
+> impact this bug.
+
+I'm concerned because it means running web content in the main process still in some cases and I'd like to understand why that is necessary. You mentioned window.opener, but I very much hope that the web content's window.opener can't refer back to the privileged page that opened it.
+Comment on attachment 8491707
+Part 2: [e10s] Re-enable browser_bug562649.js for e10s windows
+
+I don't think the XULBrowserWindow.isBusy check is crucial to this particular test, but at the same time I'm worried that XULBrowserWindow.isBusy could be subject to the same problem when used in production code, in which case removing this from tests would be weird. Someone probably needs to audit the code using isBusy.
+So after a conversation with Mossop, this bug might actually get taken care of by his work in bug 999239. That bug adds some support in DocShell for developers to hook into a document load request. Firefox can then hook in, and check the URI to be loaded against the blacklist to see whether or not the browser should be remote or non-remote, and then ensure that the browser is in the correct state before kicking off the load of the page.
+
+If it works as advertised, that will mean that opening links from about:crashes, for example, will result in the browser safely transitioning from non-remote to remote, and that'll eliminate the need for us to allow non-remote browsers to be opened from non-remote browsers in e10s windows.
+
+I'm going to test Mossop's patch in bug 999239 to be sure, but I have a good feeling.
+So, the good news is that Mossop's patch fixes the case where we've transitioned a blacklisted page to a non-blacklisted page (say, about:crashes to a crash report on crash stats), and letting us open popups / new tabs from that page.
+
+So that's good.
+
+The bad news is that this doesn't fix the following cases:
+
+1) Blacklisted pages opening new tabs / windows directly
+2) Opening new tabs or windows from the bookmarks sidebar browser, which was the reason this bug was originally filed, still doesn't work properly.
+Hey Mossop, so regarding (1) and (2) in comment 53 - am I right in assuming that both of those cases are less serious than our original about:crashes-transition case?
+
+For example, I'm trying to find an about: page that opens a new tab or window directly either with window.open or _blank, and dxr isn't showing any hits.
+
+I do believe, however, that we don't want to regress the behaviour of the sidebar.
+
+I guess what I'm suggesting is, with your work in bug 999239, I believe we can probably downgrade the priority of this bug, as both the (1) and (2) cases sound really edge-casey to me.
+
+Do you agree?
+I agree, any main UI that is opening links should really be using openUILink, about:preferences does that, maybe about:crashes should too but that has other peculiarities. For the specific case of web content loaded in the sidebar I think this goes back to tracking+.
+*** Bug 1077023 has been marked as a duplicate of this bug. ***
+*** Bug 1060346 has been marked as a duplicate of this bug. ***
+*** Bug 1081856 has been marked as a duplicate of this bug. ***
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #54)
+> I'm trying to find an about: page that opens a new tab or
+> window directly either with window.open or _blank, and dxr isn't showing any
+> hits.
+
+If you follow the STR in bug 1081856, most of the links on the right are target="_blank".
+
+I have a question, I haven't seen in this bug any mention of javascript: links (<a href="javascript:doSomething();">). Are they covered in the scope of this bug? These also don't work in the page I referenced in bug 1081856, and they neither have a target attribute or use window.open, they just send a message from a content script to a chrome script.
+(In reply to Luís Miguel [:Quicksaver] from comment #59)
+> (In reply to Mike Conley (:mconley) - Needinfo me! from comment #54)
+> > I'm trying to find an about: page that opens a new tab or
+> > window directly either with window.open or _blank, and dxr isn't showing any
+> > hits.
+> 
+> If you follow the STR in bug 1081856, most of the links on the right are
+> target="_blank".
+> 
+> I have a question, I haven't seen in this bug any mention of javascript:
+> links (<a href="javascript:doSomething();">). Are they covered in the scope
+> of this bug? These also don't work in the page I referenced in bug 1081856,
+> and they neither have a target attribute or use window.open, they just send
+> a message from a content script to a chrome script.
+
+They would be a different bug, please file it.
+(In reply to Dave Townsend [:mossop] from comment #60)
+> They would be a different bug, please file it.
+
+I did, bug 1081856, it was marked as a duplicate of this bug. Should I re-open?
+(In reply to Luís Miguel [:Quicksaver] from comment #61)
+> (In reply to Dave Townsend [:mossop] from comment #60)
+> > They would be a different bug, please file it.
+> 
+> I did, bug 1081856, it was marked as a duplicate of this bug. Should I
+> re-open?
+
+To clarify, I filed bug 1081856 for both external links and javascript: links. Should I re-open and specify that it should be about javascript: links?
+(In reply to Luís Miguel [:Quicksaver] from comment #62)
+> (In reply to Luís Miguel [:Quicksaver] from comment #61)
+> > (In reply to Dave Townsend [:mossop] from comment #60)
+> > > They would be a different bug, please file it.
+> > 
+> > I did, bug 1081856, it was marked as a duplicate of this bug. Should I
+> > re-open?
+> 
+> To clarify, I filed bug 1081856 for both external links and javascript:
+> links. Should I re-open and specify that it should be about javascript:
+> links?
+
+Done, this is what happens when you file one bug for multiple issues ;)
+(In reply to Dave Townsend [:mossop] from comment #63)
+> (In reply to Luís Miguel [:Quicksaver] from comment #62)
+> > To clarify, I filed bug 1081856 for both external links and javascript:
+> > links. Should I re-open and specify that it should be about javascript:
+> > links?
+> 
+> Done, this is what happens when you file one bug for multiple issues ;)
+
+Yep, at the time I thought it could have been the same underlying issue, only realized that wasn't the case after reading this bug. Thanks for reopening. :)
+*** Bug 1098305 has been marked as a duplicate of this bug. ***
+Re-nomming, because we keep running into this in various places, and we might want to get this fixed sooner rather than later.
+*** Bug 1055590 has been marked as a duplicate of this bug. ***
+*** Bug 1099479 has been marked as a duplicate of this bug. ***
+*** Bug 1102683 has been marked as a duplicate of this bug. ***
+*** Bug 1103897 has been marked as a duplicate of this bug. ***
+Mike, I just wanted to let you know that I have a patch that might affect this somewhat in bug 567058. I posted a WIP there so you can see what's likely to change. Let me know if you want to talk about any conflicts.
+*** Bug 1112151 has been marked as a duplicate of this bug. ***
+*** Bug 1116598 has been marked as a duplicate of this bug. ***
+*** Bug 1116604 has been marked as a duplicate of this bug. ***
+*** Bug 1115687 has been marked as a duplicate of this bug. ***
+*** Bug 1117957 has been marked as a duplicate of this bug. ***
+Ok, enough's enough. Going to dig into this now.
+I think I'm fairly close to getting bug bug 567058 landed. There's still some orange I need to fix but it mostly looks pretty good. I'd appreciate if you could base your work on top of that.
+Yep, already applied. Thanks for the heads up. :)
+Comment on attachment 8491706
+Part 1: [e10s] Make it possible to load new windows from non-remote browsers within an e10s window (r+'d by smaug, Mossop)
+
+Reviving this solution - going to try to find a way of using it while not re-opening bug 1067164.
+Created attachment 8547830
+[e10s] Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+Created attachment 8547832
+[e10s] Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+Hey smaug,
+
+So this last patch seems to fix things for the case where we're opening a target="_blank" or window.open link from a non-remote tab in an e10s window.
+
+It, however, is pretty horribly broken if we attempt to do this with browser.link.open_newwindow set to 2 (so that we open links in new windows instead of new tabs).
+
+Here's what happens in that case (STR here[1]):
+
+https://www.dropbox.com/s/zqhpdolteycj1pa/Screenshot%202015-01-12%2017.30.36.png?dl=0
+
+The content gets loaded into the chrome docshell. :/
+
+The code that does it is in here in nsWindowWatcher::OpenWindowInternal:
+
+      if (newChrome) {
+        /* It might be a chrome nsXULWindow, in which case it won't have
+            an nsIDOMWindow (primary content shell). But in that case, it'll
+            be able to hand over an nsIDocShellTreeItem directly. */
+        nsCOMPtr<nsIDOMWindow> newWindow(do_GetInterface(newChrome));
+        if (newWindow)
+          GetWindowTreeItem(newWindow, getter_AddRefs(newDocShellItem));
+        if (!newDocShellItem)
+          newDocShellItem = do_GetInterface(newChrome);
+        if (!newDocShellItem)
+          rv = NS_ERROR_FAILURE;
+      }
+
+The problem is that we're not getting newWindow from newChrome - GetInterface is failing.
+
+The reason that GetInterface is failing is that the initial browser is being forced to be non-remote during the loading of the window, right here:
+
+http://hg.mozilla.org/mozilla-central/file/cac64af410a1/browser/base/content/browser.js#l912
+
+Forcing non-remoteness removes the DocShell, which clears out the mPrimaryContentShell from the nsXULWindow, and that mPrimaryContentShell is what we look to in order to GetInterface an nsIDOMWindow from newChrome (which is an nsContentTreeOwner in this particular case).
+
+And the reason we do that setting of the remoteness of the initial browser in the onLoad function is because the code I added in bug 989501 wants to have new windows opened from remote tabs to have a remote browser in it right away so that we can pass the PBrowser back to the caller synchronously.
+
+So the story is:
+
+If I want to take advantage of Mossop's patch, I need to make it so that the initial browser of a newly opened window or tab is non-remote. But that breaks the assumption when we open a new window from the content process, which wants to have the initial browser be remote.
+
+Do you have any suggestions on how I might approach this?
+
+[1]: STR
+
+0) Apply patch
+1) Set browser.link.open_newwindow to 2
+2) Open about:welcomeback in an e10s window
+3) Click on the "learn more about what you can do" link
+Created attachment 8548352
+Part 1: Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+Created attachment 8548354
+Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window
+Created attachment 8548355
+Part 3: Regression test
+Comment on attachment 8548354
+Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window
+
+So here's my solution to the problem I mentioned in comment 83.
+
+TabParent::AnswerCreateWindow was expecting the window to stash a remote browser into the new window's docshell - it was using GetOpenedRemote to get a handle on that. I'd added that code in bug 1021466.
+
+This alters that approach somewhat. We make it so that every window starts with the initial browser not being remote. We expose a method on nsIXULBrowserWindow to force the initial browser to be remote and return the nsITabParent associated with it. We call that function from AnswerCreateWindow, and bob's your uncle.
+
+This way, other code that relies on a new window having an mPrimaryContentWindow is going to get that requirement satisfied - and Mossop's patch from bug 999239 allows the browser to decide whether or not the URI we're going to really should be in a remote browser or not.
+
+What do you think of this solution, smaug?
+That sounds good, backwards compatible.
+Comment on attachment 8548354
+Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window
+
+I guess this works, and doesn't slow down window opening speed too much.
+Comment on attachment 8548355
+Part 3: Regression test
+
+I've exploded this into a number of smaller commits, so I'll use MozReview for this one.
+Created attachment 8548471
+MozReview Request: bz://1047603/mconley
+/r/2463 - Bug 1047603 - Part 1: Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=?
+/r/2467 - Bug 1047603 - Part 3: Regression test. r=?
+/r/2469 - Bug 1047603 - Part 4: Make browser_test_new_window_from_content.js work with e10s. r=?
+/r/2471 - Bug 1047603 - Part 5: Re-enable browser_bug562649.js test for e10s. r=?
+
+Pull down these commits:
+
+hg pull review -r dd8c53ab5c593b7694f57180ca842367e3a01909
+MozReview doesn't make this really clear just yet, but I've requested review from smaug on Part 2, and Mossop for the rest.
+
+Mossop - let me know if I should redirect some of that - I know it's not a small chunk of code I've just put in your queue.
+Try build:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=427c7874fe7b
+https://reviewboard.mozilla.org/r/2465/#review1625
+
+::: dom/ipc/TabParent.cpp
+(Diff revision 1)
+> +  NS_ENSURE_SUCCESS(rv, false);
+
+Remove rv = and 
+NS_ENSURE_SUCCESS(rv, false);
+There is anyway null check for xulWin and
+do_GetInterface is null-safe.
+
+::: dom/ipc/TabParent.cpp
+(Diff revision 1)
+> +  NS_ENSURE_SUCCESS(rv, false);
+
+(testing review board)
+https://reviewboard.mozilla.org/r/2465/#review1627
+
+Ship It!
+https://reviewboard.mozilla.org/r/2465/#review1629
+
+Ship It!
+Grrr - I've got some failing tests here in my try push. Thanks for the Ship-It's, smaug - but I may have been a little quick to make a review request. :/ I'll dig into it today.
+/r/2463 - Bug 1047603 - Part 1: Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=?
+/r/2467 - Bug 1047603 - Part 3: Regression test. r=?
+/r/2469 - Bug 1047603 - Part 4: Make browser_test_new_window_from_content.js work with e10s. r=?
+/r/2471 - Bug 1047603 - Part 5: Re-enable browser_bug562649.js test for e10s. r=?
+
+Pull down these commits:
+
+hg pull review -r dd8c53ab5c593b7694f57180ca842367e3a01909
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Part 1: Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=?
+/r/2467 - Bug 1047603 - Part 3: Regression test. r=?
+/r/2471 - Bug 1047603 - Part 4: Re-enable browser_bug562649.js test for e10s. r=?
+/r/2469 - Bug 1047603 - Part 5: Fix passing xul:tab in the initialization of a new e10s window.
+/r/2991 - Disable test browser_bug880101.js for e10s.
+/r/2993 - Bug 1047603 - Part 6: Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r 19d20de875365ef40b0fe0e4e417231f65db358c
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Part 1: Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Part 3: Regression test. r=?
+/r/2471 - Bug 1047603 - Part 4: Re-enable browser_bug562649.js test for e10s. r=?
+/r/2469 - Bug 1047603 - Part 5: Fix passing xul:tab in the initialization of a new e10s window.
+/r/2991 - Bug 1047603 - Part 6: Disable test browser_bug880101.js for e10s. r=?
+/r/2993 - Bug 1047603 - Part 7: Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r c8890015bcae852569e77e2ad7b657dd5df5d14b
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Part 1: Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Part 3: Regression test. r=?
+/r/2471 - Bug 1047603 - Part 4: Re-enable browser_bug562649.js test for e10s. r=?
+/r/2469 - Bug 1047603 - Part 5: Fix passing xul:tab in the initialization of a new e10s window.
+/r/2991 - Bug 1047603 - Part 6: Disable test browser_bug880101.js for e10s. r=?
+/r/2993 - Bug 1047603 - Part 7: Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r c8890015bcae852569e77e2ad7b657dd5df5d14b
+https://reviewboard.mozilla.org/r/2471/#review2453
+
+Ship It!
+https://reviewboard.mozilla.org/r/2991/#review2455
+
+Ship It!
+https://reviewboard.mozilla.org/r/2469/#review2457
+
+::: browser/base/content/browser.js
+(Diff revision 3)
+> +            if (!gMultiProcessBrowser) {
+
+Can you explain what situations this would happen in? If we have a remote browser to drag in, and dragging the tab has created this new window, when wouldn't that new window support remote browsers?
+https://reviewboard.mozilla.org/r/2467/#review2459
+
+::: browser/base/content/test/general/browser_testOpenNewRemoteTabsFromNonRemoteBrowsers.js
+(Diff revision 3)
+> +    testWindow.focus();
+
+should use waitForFocus here
+
+::: browser/base/content/test/general/browser_testOpenNewRemoteTabsFromNonRemoteBrowsers.js
+(Diff revision 3)
+> +  aWindow.gBrowser.updateBrowserRemoteness(browser, false);
+
+I don't understand why this step is necessary. Why do you need the remoteness to switch?
+
+::: browser/base/content/test/general/browser_testOpenNewRemoteTabsFromNonRemoteBrowsers.js
+(Diff revision 3)
+> +function waitForFrameScriptReady(mm) {
+
+This function is never used
+
+::: browser/base/content/test/general/head.js
+(Diff revision 3)
+> +  return promiseWaitForEvent(aTabBrowser.tabContainer, "TabOpen");
+
+I think the way this method is named suggests that the returned promise should be resolved with the tab and not the event.
+
+::: browser/base/content/test/general/head.js
+(Diff revision 3)
+> +        resolve([aSubject, aData]);
+
+resolving with {subject: aSubject, data: aData} will make code using this clearer.
+
+::: browser/base/content/test/general/browser_testOpenNewRemoteTabsFromNonRemoteBrowsers.js
+(Diff revision 3)
+> +    let [newWindow] = yield windowOpenPromise;
+
+In the private case I assume the new window should be private? Test that.
+
+::: browser/base/content/test/general/browser_testOpenNewRemoteTabsFromNonRemoteBrowsers.js
+(Diff revision 3)
+> +  Services.prefs.clearUserPref(OPEN_LOCATION_PREF);
+
+Do this in registerCleanupFunction to save later tests in case of timeout.
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+Waiting on responses/changes
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Part 1: Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Part 2: Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Part 3: Regression test. r=?
+/r/2471 - Bug 1047603 - Part 4: Re-enable browser_bug562649.js test for e10s. r=?
+/r/2469 - Bug 1047603 - Part 5: Fix passing xul:tab in the initialization of a new e10s window.
+/r/2991 - Bug 1047603 - Part 6: Disable test browser_bug880101.js for e10s. r=?
+/r/2993 - Bug 1047603 - Part 7: Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r c8890015bcae852569e77e2ad7b657dd5df5d14b
+https://reviewboard.mozilla.org/r/2467/#review2497
+
+> I don't understand why this step is necessary. Why do you need the remoteness to switch?
+
+Ah, this is a leftover from when I originally wrote this test (before your work for remoteness switching in bug 999239). Not necessary anymore - removed. Good eye.
+https://reviewboard.mozilla.org/r/2469/#review2499
+
+::: browser/base/content/browser.js
+(Diff revision 3)
+> +            if (!gMultiProcessBrowser) {
+
+You're right - if we've dragged the remote tab into a new window, we should definitely have an e10s window. I guess this is just more of a sanity-check.
+https://reviewboard.mozilla.org/r/2469/#review2501
+
+> Can you explain what situations this would happen in? If we have a remote browser to drag in, and dragging the tab has created this new window, when wouldn't that new window support remote browsers?
+
+Garr, accidentally reviewed myself. My reply is below.
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Regression test. r=?
+/r/2471 - Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+/r/2469 - Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=?
+/r/2991 - Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+/r/2993 - Bug 1047603 - Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r 6c6de2647e7ce5b69570b9f92f1412ec67913280
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Regression test. r=?
+/r/2471 - Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+/r/2469 - Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=?
+/r/2991 - Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+/r/2993 - Bug 1047603 - Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r 6c6de2647e7ce5b69570b9f92f1412ec67913280
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Regression test. r=?
+/r/2471 - Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+/r/2469 - Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=?
+/r/2991 - Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+/r/2993 - Bug 1047603 - Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r 6c6de2647e7ce5b69570b9f92f1412ec67913280
+https://reviewboard.mozilla.org/r/2463/#review2503
+
+Hey Mossop,
+
+I'm requesting review on this one from you now because I've altered it to move the Browser:LoadURI message handler to onLoad instead of onDelayedStartup. In my regression test (the one later in this review series), I noticed that when opening new e10s windows from non-remote tabs, that the Browser:LoadURI message would get fired before onDelayedStartup was called, so the message was never handled.
+
+I'm only kinda understanding how this redirect-load stuff works, but I moved the message handler into onLoad, and had RedirectLoad call LoadInOtherProcess after a tick of the event loop to give onLoad a chance to finish initialization before redirecting.
+
+Am I way off the rails with that?
+https://reviewboard.mozilla.org/r/2467/#review2505
+
+::: browser/base/content/test/general/browser_testOpenNewRemoteTabsFromNonRemoteBrowsers.js
+(Diff revisions 3 - 4)
+> -    let [newWindow] = yield windowOpenPromise;
+> +    let {subject: newWindow} = yield windowOpenPromise;
+
+You could do this in one line
+https://reviewboard.mozilla.org/r/2469/#review2507
+
+Ship It!
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #115)
+> I'm only kinda understanding how this redirect-load stuff works, but I moved
+> the message handler into onLoad, and had RedirectLoad call
+> LoadInOtherProcess after a tick of the event loop to give onLoad a chance to
+> finish initialization before redirecting.
+
+Moving registering the message handler to onLoad makes sense, the rest doesn't. Even though we register the message handler we can be guaranteed that RedirectLoad won't be called before onLoad finished executing. Now the question becomes is it safe to call RedirectLoad before delayedStartup has run. I don't know. It might be safest to check if it has run and if not wait for that.
+https://reviewboard.mozilla.org/r/2463/#review2515
+
+::: browser/base/content/browser.js
+(Diff revision 3)
+> +  }, 0);
+
+Per the discussion in the bug, wait for delayedStartup to complete.
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Regression test. r=Mossop.
+/r/2471 - Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+/r/2469 - Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=Mossop.
+/r/2991 - Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+/r/2993 - Bug 1047603 - Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r 9da9bbc70505d401ce7f2227041e81f82995606e
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Regression test. r=Mossop.
+/r/2471 - Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+/r/2469 - Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=Mossop.
+/r/2991 - Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+/r/2993 - Bug 1047603 - Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r 9da9bbc70505d401ce7f2227041e81f82995606e
+https://reviewboard.mozilla.org/r/2993/#review2559
+
+::: browser/components/sessionstore/test/browser_394759_behavior.js
+(Diff revision 4)
+> +          tab.removeEventListener("SSTabRestored", onTabRestored);
+
+I tried reading the other patches but I don't understand why the behavior changes now so that we "restore" the initial tab? I'm not too worried about the test, more about the general behavior that seems a little strange?
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+Hey Mossop,
+
+I've corrected the first patch in this review series to call LoadInOtherProcess after _delayedStartup, even if the message was received before _delayedStartup was called. Mind giving this another look?
+
+Here's the interdiff:
+
+https://reviewboard.mozilla.org/r/2463/diff/3-4/
+https://reviewboard.mozilla.org/r/2463/#review2569
+
+Ship It!
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+https://reviewboard.mozilla.org/r/2461/#review2571
+
+Ship It!
+https://reviewboard.mozilla.org/r/2993/#review2573
+
+> I tried reading the other patches but I don't understand why the behavior changes now so that we "restore" the initial tab? I'm not too worried about the test, more about the general behavior that seems a little strange?
+
+Mossop's work in bug 999239 makes it so that when we transition from a non-remote browser to a remote browser (or vice versa), we preserve history by causing a "restore" after the transition.
+
+This patch series changes the assumption of having the initial browser in an e10s window being remote. nsWindowWatcher::OpenWindowInternal expects to be able to get a handle on the mPrimaryContentTreeOwner of a XULWindow to send to the URL that the user is trying to open. It used to be the case that for e10s windows, we'd force the initial browser to be remote in onLoad, so that by the time nsWindowWatcher tried to get the mPrimaryContentTreeOwner... no such owner would exist.
+
+So now with this patch series, we don't force the initial browser to be remote (except in two cases - see /r/2465 that smaug reviewed, and /r/2469 that Mossop reviewed). Instead, we let the work in bug 999239 take over, so that once the browser attempts to go to a URL, it decides whether or not the browser should be remote (almost always yes), and then transitions that browser to become remote, which causes it to "restore".
+
+Admittedly, there might be little value in attempting to "restore" a tab that has just transitioned when the previous state was about:blank having not traveled anywhere. But I think maybe that's a separate bug.
+
+Does that make it clearer?
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #126)
+> This patch series changes the assumption of having the initial browser in an
+> e10s window being remote. nsWindowWatcher::OpenWindowInternal expects to be
+> able to get a handle on the mPrimaryContentTreeOwner of a XULWindow to send
+> to the URL that the user is trying to open. It used to be the case that for
+> e10s windows, we'd force the initial browser to be remote in onLoad, so that
+> by the time nsWindowWatcher tried to get the mPrimaryContentTreeOwner... no
+> such owner would exist.
+
+I think there is some improvement to be made to nsWindowWatcher at some point. If all it needs to do is to be able to load a URI into the new tba then it seems like there is a different way we could let it do that. Follow-up fodder I think though.
+
+> Admittedly, there might be little value in attempting to "restore" a tab
+> that has just transitioned when the previous state was about:blank having
+> not traveled anywhere. But I think maybe that's a separate bug.
+
+Yeah, if all the current session history is marked unpersisted (about:blank is) then restoring is kind of silly
+*** Bug 1128914 has been marked as a duplicate of this bug. ***
+*** Bug 1124527 has been marked as a duplicate of this bug. ***
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Regression test. r=Mossop.
+/r/2471 - Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+/r/2469 - Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=Mossop.
+/r/2991 - Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+/r/2993 - Bug 1047603 - Fix browser_394759_behaviour.js test. r=?
+
+Pull down these commits:
+
+hg pull review -r 9da9bbc70505d401ce7f2227041e81f82995606e
+https://reviewboard.mozilla.org/r/2993/#review2731
+
+Thanks for the explanation!
+
+::: browser/components/sessionstore/test/browser_394759_behavior.js
+(Diff revision 4)
+> +        tab.addEventListener("SSTabRestored", function onTabRestored() {
+
+Please use:
+
+promiseTabRestored(tab).then(tabReady);
+
+::: browser/components/sessionstore/test/browser_394759_behavior.js
+(Diff revision 4)
+> -      executeSoon(function() {
+> +        executeSoon(function() {
+
+While you're here, can you please use:
+
+promiseWindowClosed(win).then(() => { ...
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+Thought I toggled the "Ship It" thing, maybe not... Still not entirely sure how RB works, sorry :)
+Thanks all!
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/d846a8ebe879
+remote:   https://hg.mozilla.org/integration/fx-team/rev/dfe6ac341eb3
+remote:   https://hg.mozilla.org/integration/fx-team/rev/a4ec7ded1155
+remote:   https://hg.mozilla.org/integration/fx-team/rev/02dbbf0b017f
+remote:   https://hg.mozilla.org/integration/fx-team/rev/9346f1b17ff2
+remote:   https://hg.mozilla.org/integration/fx-team/rev/931b3b52e8e8
+remote:   https://hg.mozilla.org/integration/fx-team/rev/38c6689adcbb
+All backed out in https://hg.mozilla.org/integration/fx-team/rev/cb757c948bc0 for various bustages:
+
+https://treeherder.mozilla.org/logviewer.html#?job_id=1891839&repo=fx-team
+https://treeherder.mozilla.org/logviewer.html#?job_id=1892318&repo=fx-team
+Thanks for the backout - investigating the (unexpected) oranges now...
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+/r/2463 - Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+/r/2465 - Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+/r/2467 - Bug 1047603 - Regression test. r=Mossop.
+/r/2471 - Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+/r/2469 - Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=Mossop.
+/r/2991 - Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+/r/2993 - Bug 1047603 - Fix browser_394759_behaviour.js test. r=ttaubert.
+/r/3459 - Bug 1047603 - Make Marionette server force the initial browser to be remote when in an e10s window. r=?
+/r/3461 - Bug 1047603 - Make SessionStore test browser_423132.js wait for new e10s window tab to be restored. r=?
+
+Pull down these commits:
+
+hg pull review -r 6bbd0e12e036a9a71db1b184b2a3ad2d94a19459
+https://reviewboard.mozilla.org/r/3461/#review2771
+
+Hey ttaubert - I hit another one of these when I land/bounced. Similar story as https://reviewboard.mozilla.org/r/2993/, I'm afraid. :/
+https://reviewboard.mozilla.org/r/3459/#review2777
+
+Ship It!
+
+::: testing/marionette/marionette-server.js
+(Diff revision 1)
+> +    }
+
+This looks like the right work around until bug 1096488 is fixed. 
+
+I'm not sure about your commit message, though. Marionette is using the globalMessageManager and keeping in touch with a particular frame script to run commands in content based on an outer window ID. As I understand the problem with remoteness changes and marionette, the underlying window/frame script is replaced without marionette's awareness, so further commands are lost. That being said, I may not fully understand that situation yet, but bug 1096488 is on my todo list, so if you've seen anything to the contrary when looking into this, that would be very interesting to me. Thanks!
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+
+Already Ship it'd.
+Gentle review ping
+https://reviewboard.mozilla.org/r/3461/#review2841
+
+Ship It!
+Thanks chmanchester, ttaubert. I've updated the Marionette patch commit message to be more accurate, and pushed to try:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=518329112cde
+*** Bug 1131335 has been marked as a duplicate of this bug. ***
+Satisfied by the try push.
+
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/2d57d1d46007
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/73e42f528ee6
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/fc4dbee3da2b
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/8f27590f8417
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/1c3db6fcbc6c
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/573126edf2c8
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/be43b4de674d
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/179ab8bb80ae
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/ed3e996b3805
+https://hg.mozilla.org/mozilla-central/rev/2d57d1d46007
+https://hg.mozilla.org/mozilla-central/rev/73e42f528ee6
+https://hg.mozilla.org/mozilla-central/rev/fc4dbee3da2b
+https://hg.mozilla.org/mozilla-central/rev/8f27590f8417
+https://hg.mozilla.org/mozilla-central/rev/1c3db6fcbc6c
+https://hg.mozilla.org/mozilla-central/rev/573126edf2c8
+https://hg.mozilla.org/mozilla-central/rev/be43b4de674d
+https://hg.mozilla.org/mozilla-central/rev/179ab8bb80ae
+https://hg.mozilla.org/mozilla-central/rev/ed3e996b3805
+*** Bug 1132017 has been marked as a duplicate of this bug. ***
+Created attachment 8563433
+Bugnotes
+
+http://people.mozilla.org/~mconley2/bugnotes/bug-1047603.html
+QA help needed here to verify (some of) the duplicate bugs and make sure this fix actually fixes the problems they describe.
+I have verified that the basic scenario described in comment #0 works, but I am going to run through other scenarios before marking as verified. So far it's looking good.
+*** Bug 1095554 has been marked as a duplicate of this bug. ***
+Comment on attachment 8548471
+MozReview Request: bz://1047603/mconley
+Created attachment 8618246
+MozReview Request: Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug.
+Created attachment 8618247
+MozReview Request: Bug 1047603 - Make Marionette server force the initial browser to be remote when in an e10s window. r=?
+Created attachment 8618248
+MozReview Request: Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=Mossop.
+Created attachment 8618249
+MozReview Request: Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop.
+Created attachment 8618250
+MozReview Request: Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop.
+Created attachment 8618251
+MozReview Request: Bug 1047603 - Fix browser_394759_behaviour.js test. r=ttaubert.
+Created attachment 8618252
+MozReview Request: Bug 1047603 - Regression test. r=Mossop.
+Created attachment 8618253
+MozReview Request: Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=?
+Created attachment 8618254
+MozReview Request: Bug 1047603 - Make SessionStore test browser_423132.js wait for new e10s window tab to be restored. r=?
+I was able to re-enable the test case browser_social_flyout.js in bug 1192807. This bug was referenced in the skip-if.
+
+
+[e10s] Non-remote tabs and chrome in e10s windows do not handle target="_blank" or window.open links properly.
+
+
+
+Bug 1047603 - [e10s] Make it possible to load new windows from non-remote browsers within an e10s window. r=smaug,billm, feedback=Mossop. 
+
+Bug 1047603 - [e10s] Follow-up to disable test for Linux until OMTC is enabled by default. rs=dholbert on a CLOSED TREE. 
+
+Backed out changesets 1e0e069b5cc7 and dc6a44c16a37 (bug 1047603) for causing bug 1067164. a=me 
+
+Follow up for back out of bug 1047603, disable browser_social_flyout.js test that's failing in e10s. a=RyanVM CLOSED TREE 
+
+Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=Mossop. 
+
+Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug. 
+
+Bug 1047603 - Regression test. r=Mossop.
+
+Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop. 
+
+Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=Mossop.
+
+Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop. 
+
+Bug 1047603 - Fix browser_394759_behaviour.js test. r=ttaubert.
+
+Backed out 7 changesets (bug 1047603) for mn-e10s and bc1-e10s bustage
+
+Backed out changeset 38c6689adcbb (bug 1047603)
+
+Backed out changeset 931b3b52e8e8 (bug 1047603)
+
+Backed out changeset 9346f1b17ff2 (bug 1047603)
+
+Backed out changeset 02dbbf0b017f (bug 1047603)
+
+Backed out changeset a4ec7ded1155 (bug 1047603)
+
+Backed out changeset dfe6ac341eb3 (bug 1047603)
+
+Backed out changeset d846a8ebe879 (bug 1047603) 
+
+Bug 1047603 - Non-remote tabs and chrome in e10s windows do not handle target=_blank or window.open links properly. r=Mossop. 
+
+Bug 1047603 - Make TabParent::AnswerCreateWindow force the initial browser to be remote in a new window. r=smaug. 
+
+Bug 1047603 - Regression test. r=Mossop.
+
+Bug 1047603 - Re-enable browser_bug562649.js test for e10s. r=Mossop. 
+
+Bug 1047603 - Fix passing xul:tab in the initialization of a new e10s window. r=Mossop.
+
+Bug 1047603 - Disable test browser_bug880101.js for e10s. r=Mossop. 
+
+Bug 1047603 - Fix browser_394759_behaviour.js test. r=ttaubert.
+
+Bug 1047603 - Make Marionette server force the initial browser to be remote when in an e10s window. r=chmanchester.
+
+Bug 1047603 - Make SessionStore test browser_423132.js wait for new e10s window tab to be restored. r=ttaubert.

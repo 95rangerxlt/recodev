@@ -1,0 +1,397 @@
+Bug 1164077 makes it possible to attach to a worker. This allows you to listen for state changes on the worker, but it does not yet fire up a debugger in the worker. In general, loading a debugger server in a worker is expensive, so we want to avoid doing so unless absolutely necessary.
+
+This bug will be about making it possible to connect to a worker actor. This will fire up a debugger in the worker, load the debugger server, and create a thread actor. We then set up a form of packet forwarding, similar to what we do for child processes, to make it seem that the thread actor really lives in the debugger server on the main thread.
+
+This bug will be a bit more work than the previous ones, because we need to implement some prerequisites first. First, I want to clean up the worker loader  bit, to better reflect the way the worker debugger API now looks. Second, we need to refactor Promise.jsm so it can be loaded as a CommonJS module (we don't support JSMs in workers). Third, we need to define an instance of the worker loader that can run in the main thread. Four, we need a new typ of DebuggerTransport that uses the worker debugger API to send messages from one server to another.
+
+Finally, we have to implement a bootstrap script that fires up a debugger server in the worker, and implement the packet forwarding logic we need so that the main server can talk to it.
+
+Bug 1164077 makes it possible to attach to a worker. This allows you to listen for state changes on the worker, but it does not yet fire up a debugger in the worker. In general, loading a debugger server in a worker is expensive, so we want to avoid doing so unless absolutely necessary.
+
+This bug will be about making it possible to connect to a worker actor. This will fire up a debugger in the worker, load the debugger server, and create a thread actor. We then set up a form of packet forwarding, similar to what we do for child processes, to make it seem that the thread actor really lives in the debugger server on the main thread.
+
+This bug will be a bit more work than the previous ones, because we need to implement some prerequisites first. First, I want to clean up the worker loader  bit, to better reflect the way the worker debugger API now looks. Second, we need to refactor Promise.jsm so it can be loaded as a CommonJS module (we don't support JSMs in workers). Third, we need to define an instance of the worker loader that can run in the main thread. Four, we need a new typ of DebuggerTransport that uses the worker debugger API to send messages from one server to another.
+
+Finally, we have to implement a bootstrap script that fires up a debugger server in the worker, and implement the packet forwarding logic we need so that the main server can talk to it.
+Created attachment 8607448
+Clean up the worker loader
+
+This patch cleans up the worker loader to better reflect the way the worker debugger API now looks.
+Created attachment 8607449
+Refactor Promise-backend.js so it can be required as a CommonJS module
+
+This patch refactors Promise-backend.js so that it can be required as a CommonJS module by the worker loader (recall that we cannot use JSMs in workers).
+Created attachment 8607453
+Define an instance of the worker loader for worker threads.
+
+So far, the worker loader was only defined for the main thread. This patch defines an instance of the worker loader for worker threads.
+
+Unfortunately, there is a bit of a chicken/egg problem here. We really want some test coverage for loading a debugger server a worker, but we can't test any of this code until we are able to load a debugger server in a worker. The next few patches won't have any tests, but I'll make sure to add them in the last few patches before closing this bug.
+Created attachment 8607454
+Implement a WorkerDebuggerTransport
+
+This patch implements a DebuggerTransport that uses the worker debugger APIs to send messages between a server on the main thread and a server on a worker thread.
+Comment on attachment 8607449
+Refactor Promise-backend.js so it can be required as a CommonJS module
+
+Review of attachment 8607449:
+-----------------------------------------------------------------
+
+I don't know a whole lot about the promise backend. Not sure if it'd be worthwhile to loop someone else in who does, but this looks sane. Does this mean we won't get console errors for uncaught promise rejections?
+Comment on attachment 8607454
+Implement a WorkerDebuggerTransport
+
+Review of attachment 8607454:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/transport/transport.js
+@@ +761,5 @@
+> +    /**
+> +     * A transport that uses a WorkerDebugger to send packets from the main
+> +     * thread to a worker thread.
+> +     */
+> +    function WorkerDebuggerTransport(dbg, id) {
+
+When would the WorkerDebuggerTransport be used if you are on the main thread?
+I hit a small snag with the worker debugger API: the security wrapper we use for the debuggee global when it is exposed to the debugger global is too restrictive. The debugger server cannot access it, as intended, but the debugger API cannot access it either. I've filed bug 1166847 to resolve this.
+Try push for the worker loader cleanup patch:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=c26ef130d260
+https://hg.mozilla.org/integration/fx-team/rev/787bb8c566fb
+Try run for the Promise-backend.js refactor:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=aec003d0ff90
+https://hg.mozilla.org/integration/fx-team/rev/0e6d986389d2
+https://hg.mozilla.org/mozilla-central/rev/787bb8c566fb
+https://hg.mozilla.org/mozilla-central/rev/0e6d986389d2
+Try run for the worker loader instance for worker threads:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=0e4845e7be65
+Try run for WorkerDebuggerTransport:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=97f52cc08b30
+https://hg.mozilla.org/integration/fx-team/rev/26dad64fe595
+Created attachment 8611172
+Clean up the helper functions for the debugger tests.
+
+To test the upcoming patches, I will need to add several helper functions to head.js and code_frame_script.js. While adding these, I was getting annoyed by how messy these files got as a result. In particular, the way we do remote procedure calls from the test script to the frame script could use some love.
+
+This patch attempts to clean up the remote procedure call mechanism for the frame script, by modeling it on JSON RPC. It also adds some of the helper functions I will need for subsequent patches.
+Created attachment 8611174
+WorkerDebugger.initialize should not return failure when called more than once.
+
+I had to make a small change to WorkerDebugger.initialize. When a worker debugger is initialized twice, we want the second call to initialize to do nothing, instead of returning failure.
+Created attachment 8611207
+Implement WorkerActor.connect
+
+And finally, here is the patch that implements WorkerDebugger.connect. The process of connecting to a worker is quite involved, and not easy to understand. To make reviewing this patch earlier, I've outlined the overall steps here below:
+
+1. The client sends a connect request to the WorkerActor in the main thread
+2. The WorkerActor calls DebuggerServer.connectToWorker.
+3. DebuggerServer.connectToWorker initializes the worker debugger, and sends it a "connect" message.
+4. When the worker debugger receives the "connect" message, it calls DebuggerServer.connectToParent.
+5. DebuggerServer.connectToParent creates a new connection, as well as a transport for that connection.
+6. After calling DebuggerServer.connectToParent, the worker debugger creates a thread actor for the new connection, and calls its onAttach method.
+7. The transport we created in step 5 will automatically send the response packet for the call to onAttach back to the main thread.
+8. When DebuggerServer.connectToWorker receives the response to the call to onAttach we did in step 6, it creates a new transport, and sets up packet forwarding. This ensures that any future messages that are sent to actors in the worker thread are automatically forwarded to the worker debugger. Conversely, any response sent by the worker debugger are automatically forwarded to the client, as if they were sent by the server in the main thread.
+10. WorkerActor.connect sends a response containing the actorID of the thread actor for the worker.
+
+We can now talk to the thread actor for the worker as if it were living in the main thread!
+
+Note that this code is designed to support connections from more than one client. The test reflects this by creating two connections, and then setting a breakpoint via each.
+(In reply to Eddy Bruel [:ejpbruel] from comment #18)
+> Created attachment 8611207
+> Implement WorkerActor.connect
+> 
+> And finally, here is the patch that implements WorkerDebugger.connect. The
+> process of connecting to a worker is quite involved, and not easy to
+> understand. To make reviewing this patch earlier, I've outlined the overall
+> steps here below:
+> 
+> 1. The client sends a connect request to the WorkerActor in the main thread
+> 2. The WorkerActor calls DebuggerServer.connectToWorker.
+> 3. DebuggerServer.connectToWorker initializes the worker debugger, and sends
+> it a "connect" message.
+> 4. When the worker debugger receives the "connect" message, it calls
+> DebuggerServer.connectToParent.
+> 5. DebuggerServer.connectToParent creates a new connection, as well as a
+> transport for that connection.
+> 6. After calling DebuggerServer.connectToParent, the worker debugger creates
+> a thread actor for the new connection, and calls its onAttach method.
+> 7. The transport we created in step 5 will automatically send the response
+> packet for the call to onAttach back to the main thread.
+> 8. When DebuggerServer.connectToWorker receives the response to the call to
+> onAttach we did in step 6, it creates a new transport, and sets up packet
+> forwarding. This ensures that any future messages that are sent to actors in
+> the worker thread are automatically forwarded to the worker debugger.
+> Conversely, any response sent by the worker debugger are automatically
+> forwarded to the client, as if they were sent by the server in the main
+> thread.
+> 10. WorkerActor.connect sends a response containing the actorID of the
+> thread actor for the worker.
+> 
+> We can now talk to the thread actor for the worker as if it were living in
+> the main thread!
+> 
+> Note that this code is designed to support connections from more than one
+> client. The test reflects this by creating two connections, and then setting
+> a breakpoint via each.
+
+Maybe you could document this sequence somewhere in the code base?  Either a code comment or the server's docs directory?
+
+Then you'd be one step ahead of e10s / b2g debugging... ;)
+Yes, please add this as docs somewhere relevant in the codebase. I had this tab open to remember to make such a comment later. :)
+https://hg.mozilla.org/mozilla-central/rev/26dad64fe595
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #19)
+> (In reply to Eddy Bruel [:ejpbruel] from comment #18)
+> > Created attachment 8611207
+> > Implement WorkerActor.connect
+> > 
+> > And finally, here is the patch that implements WorkerDebugger.connect. The
+> > process of connecting to a worker is quite involved, and not easy to
+> > understand. To make reviewing this patch earlier, I've outlined the overall
+> > steps here below:
+> > 
+> > 1. The client sends a connect request to the WorkerActor in the main thread
+> > 2. The WorkerActor calls DebuggerServer.connectToWorker.
+> > 3. DebuggerServer.connectToWorker initializes the worker debugger, and sends
+> > it a "connect" message.
+> > 4. When the worker debugger receives the "connect" message, it calls
+> > DebuggerServer.connectToParent.
+> > 5. DebuggerServer.connectToParent creates a new connection, as well as a
+> > transport for that connection.
+> > 6. After calling DebuggerServer.connectToParent, the worker debugger creates
+> > a thread actor for the new connection, and calls its onAttach method.
+> > 7. The transport we created in step 5 will automatically send the response
+> > packet for the call to onAttach back to the main thread.
+> > 8. When DebuggerServer.connectToWorker receives the response to the call to
+> > onAttach we did in step 6, it creates a new transport, and sets up packet
+> > forwarding. This ensures that any future messages that are sent to actors in
+> > the worker thread are automatically forwarded to the worker debugger.
+> > Conversely, any response sent by the worker debugger are automatically
+> > forwarded to the client, as if they were sent by the server in the main
+> > thread.
+> > 10. WorkerActor.connect sends a response containing the actorID of the
+> > thread actor for the worker.
+> > 
+> > We can now talk to the thread actor for the worker as if it were living in
+> > the main thread!
+> > 
+> > Note that this code is designed to support connections from more than one
+> > client. The test reflects this by creating two connections, and then setting
+> > a breakpoint via each.
+> 
+> Maybe you could document this sequence somewhere in the code base?  Either a
+> code comment or the server's docs directory?
+> 
+> Then you'd be one step ahead of e10s / b2g debugging... ;)
+
+Agreed. I'll make sure to add this as a comment to the relevant code before landing the patch.
+Comment on attachment 8611172
+Clean up the helper functions for the debugger tests.
+
+Review of attachment 8611172:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/test/code_frame-script.js
+@@ +26,2 @@
+>  
+> +this.generateMouseClick = function (path) {
+
+What does this function (which was sendMouseClick before) have to do with workers? Did you just go ahead and move it because we need to do that for e10s anyway?
+Comment on attachment 8611207
+Implement WorkerActor.connect
+
+Review of attachment 8611207:
+-----------------------------------------------------------------
+
+This actually was pretty straight-forward to read, looks nice. Just a few small things.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +12,5 @@
+>  const { DebuggerServer } = require("devtools/server/main");
+>  const DevToolsUtils = require("devtools/toolkit/DevToolsUtils");
+>  const { dbg_assert, dumpn, update, fetch } = DevToolsUtils;
+>  const { dirname, joinURI } = require("devtools/toolkit/path");
+> +const Promise = require("promise");
+
+why this change? I don't see any changes in the rest of file to match this renaming
+
+::: toolkit/devtools/server/actors/utils/TabSources.js
+@@ +9,5 @@
+>  const DevToolsUtils = require("devtools/toolkit/DevToolsUtils");
+>  const { dbg_assert, fetch } = DevToolsUtils;
+>  const EventEmitter = require("devtools/toolkit/event-emitter");
+>  const { OriginalLocation, GeneratedLocation, getOffsetColumn } = require("devtools/server/actors/common");
+> +const { resolve } = require("promise");
+
+Why this change? Please revert this, you are introducing bug 1149910 again
+
+::: toolkit/devtools/server/actors/worker.js
+@@ +82,5 @@
+> +    }
+> +
+> +    return DebuggerServer.connectToWorker(this.conn, this._dbg, this.actorID,
+> +                                          request.options)
+> +                         .then(({ threadActor, transport }) => {
+
+minor nit, I like formatting this kind of code this way instead:
+
+connectToWorker(
+  this.conn, this._dbg, this.actorID, request.options
+).then(({ threadActor, transport }) => {
+
+...
+
+@@ +104,5 @@
+>      this.conn.sendActorEvent(this.actorID, "close");
+>    },
+>  
+> +  onError: function (filename, lineno, message) {
+> +    dump("ERROR:" + filename + ":" + lineno + ":" + message + "\n");
+
+where is `onError` called from? seems like this should use something like `reportException` instead so tests will fail
+
+::: toolkit/devtools/worker-loader.js
+@@ +434,5 @@
+>      };
+>    } else { // Worker thread
+>      let requestors = [];
+>  
+> +    let self = this;
+
+nit: don't make this self variable and use arrow functions below instead
+https://hg.mozilla.org/integration/fx-team/rev/bf640f8b71da
+Try push for the debugger helpers:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=67f4eaefa5e7
+The try push for the debugger helpers looks ok, but has been tainted by the patch for OpaqueCrossCompartmentWrapper (bug 1166847). The try push for that patch *did* fail, and I pushed this patch on top of it. Just to be sure, I'm pushing this patch to try again, this time on it's own:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=26e6139c174d
+Try push for WorkerDebugger.initialize:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=b55171a16197
+https://hg.mozilla.org/mozilla-central/rev/bf640f8b71da
+https://hg.mozilla.org/integration/fx-team/rev/389d8439f01b
+https://hg.mozilla.org/integration/fx-team/rev/a02a945edeb4
+https://hg.mozilla.org/mozilla-central/rev/389d8439f01b
+https://hg.mozilla.org/mozilla-central/rev/a02a945edeb4
+Created attachment 8615960
+Refactor Promise-backend.js.
+
+This patch refactors Promise-backend.js so it can be required as a CommonJS module on the main thread directly, without the need to preload it as a JSM. This avoids bug 1149910, while still making it possible to use require("promise").
+
+Note that this needs to land before I can land the patch for WorkerActor.connect.
+Try run for the Promise-backend.js refactor:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=d3905b388474
+Comment on attachment 8615960
+Refactor Promise-backend.js.
+
+Review of attachment 8615960:
+-----------------------------------------------------------------
+
+Looks good to me, but I'm not a toolkit peer, so let's make sure Paolo is OK with it.
+Comment on attachment 8615960
+Refactor Promise-backend.js.
+
+Review of attachment 8615960:
+-----------------------------------------------------------------
+
+This looks good in general but it's worth spending some time on a second pass, to ensure that for example if I look at this code in a month from now, I can still quickly recall why it was done this way :-)
+
+I found the existing comments useful while reviewing the patch this time, so rather than deleting them the patch should ehnance/rewrite them, and also use meaningful variable names.
+
+The reason for loading things through Promise.jsm on the main thread in the general case is that we want a single instance of the global walker loop regardless of how many times the module was loaded. According to bug 1149910 comment 25 (that I found very useful to understand what is going on and can form a basis for further code documentation) now we need at least one more instance of the walker loop, loaded in a sandbox that is { invisibleToDebugger: true }. So we have:
+
+1) Main-thread load through JSM, which is the normal chrome code case.
+2) Main-thread load for devtools, invisible to debugger. Is this correct?
+3) Worker (non-main-thread) load. Is this used by devtools at all?
+
+Main-thread cases (like 1 and 2) should have error reporting (FinalizationWitness).
+
+::: toolkit/devtools/Loader.jsm
+@@ -29,5 @@
+>  
+>  let loaderModules = {
+>    "Services": Object.create(Services),
+>    "toolkit/loader": loader,
+> -  "promise": promise,
+
+I'm not familiar with the devtools loader. How does this change the way the module is loaded? How does this relate to attachment 8594818?
+
+::: toolkit/modules/Promise-backend.js
+@@ +23,5 @@
+>  //// Globals
+>  
+> +let Cu = this.require ? require("chrome").Cu : this.Components.utils;
+> +
+> +if (Cu) {
+
+It's not clear in which cases this can be null. The "if" statements should check variables with a meaningful name instead. Also, retain comment where useful.
+
+Similar improvements are required in the rest of the patch.
+
+@@ -23,5 @@
+>  //// Globals
+>  
+> -// Do not load the FinalizationWitnessService is we are being required as a
+> -// CommonJS module, because the Components object is not available in workers.
+> -if (!isWorker) {
+
+isWorker was set to true by the worker loader. Has this become irrelevant?
+
+@@ +629,2 @@
+>    module.exports = Promise;
+>  }
+
+Looks like an improvement, but still worth mentioning in which cases this.module is available.
+
+::: toolkit/modules/Promise.jsm
+@@ -104,5 @@
+> -// To distinguish between these two cases, the worker loader defines a global
+> -// variable isWorker, and sets it to true. When loading Promise-backend.js as
+> -// a subscript, we need to make sure this variable is defined as well, and set
+> -// it to false.
+> -this.isWorker = false;
+
+Even if we don't end up checking isWorker, we still need the comment about what's going on - either in this file or Promise-backend.js.
+When thinking about which comments to add, it may be worth reasoning about which lines we'd need to annotate to avoid someone introducing bug 1149910 again in the future.
+Created attachment 8616578
+Promise-backend.js
+
+Writing good comments is something that can be time consuming, and often treated as an annoyance best avoided. That said, I wholeheartedly agree with the sentiment that comments are crucial in order to still be able to understand code like this a few months from now. This is why having a review process is great: it forces us to put in that little extra effort.
+
+Here's a new patch, in which I did my best to improve upon the old comments, rather than just throwing them away. With those new comments in place, I did not see much value in replacing the uses of Cu with a more meaningful name, so I left those as they are.
+Comment on attachment 8616578
+Promise-backend.js
+
+Thanks, this version seems good enough for landing to me. I still think something like "if (trackErrors && ...)" would be clearer than "if (Cu && ...)" but the comments supply that information. The reason for using setImmediate is very clear now.
+
+Still the devtools part of the patch doesn't answer the question: how does this change the way the module is loaded, and how does it relate to attachment 8594818?
+Previous try push for the Promise-backend.js refactor failed because of marionette issues. New try push, hopefully with problems addressed:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=420e1cb686d9
+https://hg.mozilla.org/integration/fx-team/rev/0ca665e88ae5
+Try push for the WorkerActor.connect patch:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=08d110494335
+(In reply to Pulsebot from comment #41)
+> https://hg.mozilla.org/integration/fx-team/rev/0ca665e88ae5
+
+Backed out for Linux debug test_promises_actor_onpromisesettled.js failures.
+https://treeherder.mozilla.org/logviewer.html#?job_id=3397190&repo=fx-team
+
+https://hg.mozilla.org/integration/fx-team/rev/540eaebc906c
+Which of course didn't show up on the try run. Ffs.
+Gabriel, I've taken a quick look at that failing test, and it looks like you are checking that the time for a promise to settle is always 0. I'm wondering how you can ever guarantee that?
+Had a quick chat with Gabriel on irc yesterday, and he agreed that the test is probably racy. Here's a new try run for the Promise-backend.js refactor with the offending test backed out:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5c9199cebda6
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=376cf6ded18e
+https://hg.mozilla.org/integration/fx-team/rev/b93a5e3d522d
+https://hg.mozilla.org/mozilla-central/rev/b93a5e3d522d
+Try run for the WorkerActor.connect patch:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=1d9735b285ee
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=fa078009ca5a
+https://hg.mozilla.org/integration/fx-team/rev/0b55b1cac565
+sorry had to back this out for test failures like https://treeherder.mozilla.org/logviewer.html#?job_id=3455608&repo=fx-team
+Backout:
+https://hg.mozilla.org/integration/fx-team/rev/a33b99e5c8d3
+And once again, those failures didn't show up on the try run. Sigh.
+
+Since this patch is only failing on Linux, it's probably a race condition issue. I've made a new try push with some log statements added to figure out what's causing it:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=bb4d7daa7dc7
+I think I know what's causing these failures. Packet forwarding doesn't always work correctly with child processes + workers. Here's a new try push with a patch that hopefully addresses these issues:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=b7c10861a30c
+https://hg.mozilla.org/integration/fx-team/rev/012aa1862a20
+https://hg.mozilla.org/mozilla-central/rev/012aa1862a20

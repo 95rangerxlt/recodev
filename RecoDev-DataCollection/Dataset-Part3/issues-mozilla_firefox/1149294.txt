@@ -1,0 +1,248 @@
+There is no technical reason why ChromeUtils.readHeapSnapshot and the HeapSnapshot interface aren't exposed in workers, but we should be doing heavy graph computations (like dominator trees) off main thread. The MemoryActor in the devtools server should have a worker for this stuff.
+
+There is no technical reason why ChromeUtils.readHeapSnapshot and the HeapSnapshot interface aren't exposed in workers, but we should be doing heavy graph computations (like dominator trees) off main thread. The MemoryActor in the devtools server should have a worker for this stuff.
+A way to monitor memory consumption from a Service Worker was something discussed as desirable during the Service Workers work week in Madrid, adding the corresponding dependency. Thanks!
+Note that because of bug 1173002, we will have to do a work around to expose ChromeUtils and HeapSnapshot to workers. We will need to use a custom exposure function: https://developer.mozilla.org/en-US/docs/Mozilla/WebIDL_bindings#Func
+Upon further digging, it appears that JS::ubi::RootList is not thread safe.
+Created attachment 8617541
+Part 1: Don't trace permanent atoms and well known symbols that are owned by a parent JSRuntime inside SimpeEdgeVectorTracer
+Created attachment 8617542
+Part 2: expose ChromeUtils and HeapSnapshot to workers
+Comment on attachment 8617542
+Part 2: expose ChromeUtils and HeapSnapshot to workers
+
+Bobby, should I rename ChromeUtils to ThreadSafeChromeUtils as a part of this patch series?
+Comment on attachment 8617541
+Part 1: Don't trace permanent atoms and well known symbols that are owned by a parent JSRuntime inside SimpeEdgeVectorTracer
+
+Review of attachment 8617541:
+-----------------------------------------------------------------
+
+This doesn't handle well-known symbols, so that at least needs fixing. Also, using a template doesn't really get you anything here since you don't have the type at all. Also you shouldn't need to check the runtime directly -- just as fast to look at the string/symbol flags. Turns out we have an instance in the tree that's doing basically what you need. Please try something like:
+
+https://dxr.mozilla.org/mozilla-central/source/js/src/gc/Verifier.cpp#289
+Created attachment 8617589
+Part 1: Don't trace permanent atoms and well known symbols that are owned by a parent JSRuntime inside SimpeEdgeVectorTracer
+Created attachment 8617594
+Part 1: Don't trace permanent atoms and well known symbols that are owned by a parent JSRuntime inside SimpeEdgeVectorTracer
+Comment on attachment 8617594
+Part 1: Don't trace permanent atoms and well known symbols that are owned by a parent JSRuntime inside SimpeEdgeVectorTracer
+
+Well, that was a lot simpler.
+Comment on attachment 8617594
+Part 1: Don't trace permanent atoms and well known symbols that are owned by a parent JSRuntime inside SimpeEdgeVectorTracer
+
+Review of attachment 8617594:
+-----------------------------------------------------------------
+
+Nice!
+Comment on attachment 8617542
+Part 2: expose ChromeUtils and HeapSnapshot to workers
+
+Review of attachment 8617542:
+-----------------------------------------------------------------
+
+This patch should definitely put these methods in ThreadsafeChromeUtils. But we'll also still need a ChromeUtils for non-threadsafe things.
+
+There are other in-flight patches that add non-threadsafe things to ChromeUtils, notably bug 1170097. I'm concerned that, even if this patch does the rename and adds an empty ChromeUtils interface, the other patches are likely to apply in such a way that the methods end up in ThreadsafeChromeUtils. Please find some way to coordinate with that bug such that this doesn't happen.
+
+r=me with that.
+
+::: dom/webidl/HeapSnapshot.webidl
+@@ +6,5 @@
+>  
+>  /**
+>   * A HeapSnapshot represents a snapshot of the heap graph
+>   */
+> +[ChromeOnly, Exposed=(Window,System, Worker)]
+
+Nit - remove the space after the comma
+Created attachment 8620643
+Part 3: Create an empty ThreadSafeChromeUtils interface
+Created attachment 8620644
+Part 4: Move heap snapshot methods to ThreadSafeChromeUtils and update tests accordingly
+I think all of the implementation methods (threadsafe and not) should live in a file called dom/base/ChromeUtils.cpp.
+Comment on attachment 8620644
+Part 4: Move heap snapshot methods to ThreadSafeChromeUtils and update tests accordingly
+
+Note that this is pretty much just a mechanical change.
+Parts 3 and 4 should make rebasing pretty easy for whoever lands first.
+Comment on attachment 8620643
+Part 3: Create an empty ThreadSafeChromeUtils interface
+
+Review of attachment 8620643:
+-----------------------------------------------------------------
+
+Per above I don't think this stuff should live in devtools anymore. Move it to dom/base/ChromeUtils.{cpp,h} (for both threadsafe and non-threadsafe).
+
+r=me with that.
+
+::: dom/webidl/ThreadSafeChromeUtils.webidl
+@@ +5,5 @@
+> + */
+> +
+> +/**
+> + * A collection of **thread-safe** static utility methods that are only exposed
+> + * to Chrome.
+
+Mention workers here.
+Comment on attachment 8620644
+Part 4: Move heap snapshot methods to ThreadSafeChromeUtils and update tests accordingly
+
+Review of attachment 8620644:
+-----------------------------------------------------------------
+
+Canceling review per the above.
+(In reply to Bobby Holley (:bholley) from comment #15)
+> I think all of the implementation methods (threadsafe and not) should live
+> in a file called dom/base/ChromeUtils.cpp.
+
+But then devtools people would have to get DOM review for everything...
+(In reply to Nick Fitzgerald [:fitzgen][:nf] from comment #20)
+> (In reply to Bobby Holley (:bholley) from comment #15)
+> > I think all of the implementation methods (threadsafe and not) should live
+> > in a file called dom/base/ChromeUtils.cpp.
+> 
+> But then devtools people would have to get DOM review for everything...
+
+Why? If a devtools-y method happens to live in dom/base, it can still be reviewed by a devtools person. Or alternatively, the method can delegate to a helper that lives inside devtools.
+
+ChromeUtils is clearly becoming more general than devtools. It shouldn't live there.
+Created attachment 8620656
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+Created attachment 8620665
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+Comment on attachment 8620665
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+
+Sorry for the bugspam, I forgot to mention workers above the ThreadSafeChromeUtils interface definition in the old patch.
+Created attachment 8620707
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+Comment on attachment 8620707
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+
+Review of attachment 8620707:
+-----------------------------------------------------------------
+
+Combines the ChromeUtils.* and ThreadSafeChromeUtils.* into one file. Makes ChromeUtils inherit from ThreadSafeChromeUtils as discussed on IRC.
+Created attachment 8620710
+combined.patch
+
+This is a rollup of all the patches, and exhibits the codegen bug where the generated cpp bindings don't include mozilla/dom/ChromeUtils.h and also the following error:
+
+> 0:19.37 In file included from /Users/fitzgen/src/mozilla-central/obj.noindex/dom/bindings/UnifiedBindings2.cpp:338:
+> 0:19.37 ./ChromeUtilsBinding.cpp:75:67: error: no member named 'GetProtoObjectHandle' in namespace 'mozilla::dom::ThreadSafeChromeUtilsBinding'
+> 0:19.38   JS::Handle<JSObject*> parentProto(ThreadSafeChromeUtilsBinding::GetProtoObjectHandle(aCx, aGlobal));
+> 0:19.38                                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+> 0:19.38 1 error generated.
+Comment on attachment 8620707
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+
+Review of attachment 8620707:
+-----------------------------------------------------------------
+
+Main issue to figure out here is why the codegen doesn't work, but might as well fix these issues in the mean time.
+
+::: dom/base/ChromeUtils.cpp
+@@ +249,5 @@
+>  };
+>  
+>  // A JS::ubi::BreadthFirst handler that serializes a snapshot of the heap into a
+>  // core dump.
+> +class MOZ_STACK_CLASS HeapSnapshotHandler
+
+As mentioned on IRC, I think it makes the most sense to have the devtools guts live in devtools, and call those guts more abstractly from ChromeUtils. That will prevent the #include dependencies of ChromeUtils from growing even faster than they need to.
+
+::: dom/bindings/Bindings.conf
+@@ +269,5 @@
+>  'ChromeUtils': {
+>      # The codegen is dumb, and doesn't understand that this interface is only a
+>      # collection of static methods, so we have this `concrete: False` hack.
+>      'concrete': False,
+> +    'headerFile': 'mozilla/dom/ChromeUtils.h',
+
+The headerFile directive shouldn't be necessary I don't think, and it doesn't seem to be helping with your include issue. So I'd drop it for this patch, and let bz figure out what's going on with the codegen.
+
+::: toolkit/devtools/server/tests/unit/test_ReadHeapSnapshot.js
+@@ +11,5 @@
+>  function run_test() {
+>    const filePath = getFilePath("core-dump.tmp", true, true);
+>    ok(filePath, "Should get a file path");
+>  
+> +  ThreadSafeChromeUtils.saveHeapSnapshot(filePath, { globals: [this] });
+
+Given our desired inheritance scheme, these shouldn't need to change, right?
+Looks alright to me, not sure why the codegen isn't working. Let's see if bz can figure it out.
+> This is a rollup of all the patches,
+
+This totally doesn't apply on tip, and there is no way it can: it looks like it was created by just concatenating several patches, not as an actual diff, but the concatenation was in the wrong order...
+OK, so I semi-appplied the patch by hand (enough to be able to run codegen).  Looks ok to me.  ChromeUtilsBinding.cpp has:
+
+  JS::Handle<JSObject*> constructorProto(ThreadSafeChromeUtilsBinding::GetConstructorObjectHandle(aCx, aGlobal));
+
+so ChromeUtils.__proto__ should be ThreasafeChromeUtils, as expected.
+(In reply to Not doing reviews right now from comment #31)
+> so ChromeUtils.__proto__ should be ThreasafeChromeUtils, as expected.
+
+The issue that fitzgen was flagging you for was compilation failures. But I agree that he should provide a rollup that applies to trunk before asking you to debug them. ;-)
+Created attachment 8620982
+combined.patch
+
+Sorry about the mess! I suspect my `hgp` git alias can't handle commit ranges...
+
+This patch should apply cleanly on top of the following commit:
+
+> commit cc90f6649e24d4a8ef0e30b83644fc6c3a4dc7f1
+> Author: Kim Moir <kmoir@mozilla.com>
+> Date:   Wed Jun 10 12:07:30 2015 -0400
+> 
+>     a=me no bug update mozharness.json to a64e1cbfb998
+OK, so there are two bugs: an empty non-concrete interface that has a parent still needs to include the impl header, and we have no interface prototype objects for things that have no concrete descendants, so need to not be asking for them in that situation.
+Created attachment 8621859
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+Comment on attachment 8621859
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+
+Review of attachment 8621859:
+-----------------------------------------------------------------
+
+This is going to need to be rebased on top of yoshi's landing.
+
+r=me with comments addressed.
+
+::: dom/base/ChromeUtils.h
+@@ +28,5 @@
+> +                               const nsAString& filePath,
+> +                               const HeapSnapshotBoundaries& boundaries,
+> +                               ErrorResult& rv);
+> +
+> +  static already_AddRefed<devtools::HeapSnapshot> ReadHeapSnapshot(GlobalObject& global,
+
+Please add a comment above each of these indicating where it's implemented.
+
+::: toolkit/devtools/server/tests/unit/heap-snapshot-worker.js
+@@ +7,5 @@
+>    console.log("Starting test.");
+>    try {
+>      const { filePath } = e.data;
+>  
+> +    ok(ThreadSafeChromeUtils, "Should have access to ThreadSafeChromeUtils");
+
+Can you check that you don't have access to ChromeUtils while you're at it?
+Created attachment 8622749
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+Comment on attachment 8622749
+Part 3: Split thread-safe methods on ChromeUtils out into a new ThreadSafeChromeUtils interface and move the utils interfaces into dom/base
+
+Rebased on latest m-c, carrying over r+.
+
+And now we wait for bug 1173829.
+
+Try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=1696276c07f2
+Try push is green.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/38873310354d
+https://hg.mozilla.org/integration/mozilla-inbound/rev/b905fe812fab
+https://hg.mozilla.org/integration/mozilla-inbound/rev/6e4dca36cb90
+https://hg.mozilla.org/mozilla-central/rev/38873310354d
+https://hg.mozilla.org/mozilla-central/rev/b905fe812fab
+https://hg.mozilla.org/mozilla-central/rev/6e4dca36cb90

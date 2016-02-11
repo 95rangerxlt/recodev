@@ -1,0 +1,1535 @@
+Reimplement a version of the Session Restore saveState() feature, e10s-style:
+- all data collection should be handled by a content script, communicating with the (async) main loop by messages;
+- all post-processing should be done only once data collection is complete;
+- by the way, post-processing should be done on a worker thread.
+
+Once this is done, we can think of extending the approach to async versions of the rest of Session Restore.
+
+Reimplement a version of the Session Restore saveState() feature, e10s-style:
+- all data collection should be handled by a content script, communicating with the (async) main loop by messages;
+- all post-processing should be done only once data collection is complete;
+- by the way, post-processing should be done on a worker thread.
+
+Once this is done, we can think of extending the approach to async versions of the rest of Session Restore.
+Looking at this with a little more time, it seems that moving things to the worker will be enough work for a followup bug. For this bug, let's start with moving stuff to content scripts.
+I started to write a prototype and thought about how this could work and came across a few questions...
+
+I think the ideal API would be replacing _collectTabData(aTab) by just sending a single message to a <browser> that then responds with its current state. This way the main sessionstore component doesn't need to know much about what the stored data for a tab looks like. This would also mean that the content script can take care of invalidating only certain parts of its tab's data.
+
+The content script would then just need to notify the main component that it should invalidate its tab data cache for a given browser and should request new data when the next save operation
+takes place.
+
+This would be the setup once we're done making sessionstore e10s-ready. For now, it should be okay for the main component to handle invalidation and migrate tab data serialization to the content script step by step.
+
+The big question is now: if we move all the serialization code to the content script, the smallest chunk we can process is a whole tab, right? Because we won't actually have multiple processes for quite a while. If we wanted even smaller chunks we'd need to use setTimeout(0) in the content script to give some room to process the event queue. That seems ugly to me.
+
+So the only option at the moment seems to be to request the data in chunks by sending multiple messages (one for the DOMSesssionStorage, one for the session history, etc...). The main component is then still responsible for assembling the tab data even when everything has been moved to the content script, as long as we don't have multiple processes or threads.
+
+I'm all ears for any ideas and feedback on this approach. Maybe anyone with more insight into how e10s actually works right now can help to find a good way to collect data in chunks now, without swinging off the main path too much.
+(In reply to Tim Taubert [:ttaubert] from comment #2)
+> The big question is now: if we move all the serialization code to the
+> content script, the smallest chunk we can process is a whole tab, right?
+> Because we won't actually have multiple processes for quite a while. If we
+> wanted even smaller chunks we'd need to use setTimeout(0) in the content
+> script to give some room to process the event queue. That seems ugly to me.
+
+I don't have much experience with this sort of programming, but it seems like promises could make this sort of thing pretty clean. We could chain together a sequence like this, using .then():
+
+  collect the session history
+  serialize the "super cookies"
+  collect the scroll data
+  send the result to the chrome process
+
+It seems like that would just be a few lines of code, and it would run the event loop in between each .then clause.
+(In reply to Tim Taubert [:ttaubert] from comment #2)
+> I started to write a prototype and thought about how this could work and
+> came across a few questions...
+> 
+> I think the ideal API would be replacing _collectTabData(aTab) by just
+> sending a single message to a <browser> that then responds with its current
+> state. This way the main sessionstore component doesn't need to know much
+> about what the stored data for a tab looks like. This would also mean that
+> the content script can take care of invalidating only certain parts of its
+> tab's data.
+> 
+> The content script would then just need to notify the main component that it
+> should invalidate its tab data cache for a given browser and should request
+> new data when the next save operation
+> takes place.
+
+I envisioned it the other way around, with the content process sending data to the chrome process whenever it considered this necessary.
+
+Essentially, the content process would own everything that is currently called by handleEvent() or receiveMessage(). It would be responsible for collecting its own data, using whatever caching mechanism it prefers, and for sending it, asynchronously of course. Typically, we could keep a variant of the current saveStateDelayed mechanism and collect/send data only if it has been invalidated, capped to e.g. 15 seconds.
+
+The chrome process (preferably the SessionWorker) would be responsible for keeping copies of that data and saving it to disk, again with a limit of e.g. 15 seconds.
+
+While both designs would essentially achieve the same results, I believe that "tab knows better" is more robust e.g. to tabs freezing or being killed for some reason.
+
+> This would be the setup once we're done making sessionstore e10s-ready. For
+> now, it should be okay for the main component to handle invalidation and
+> migrate tab data serialization to the content script step by step.
+> 
+> The big question is now: if we move all the serialization code to the
+> content script, the smallest chunk we can process is a whole tab, right?
+> Because we won't actually have multiple processes for quite a while. If we
+> wanted even smaller chunks we'd need to use setTimeout(0) in the content
+> script to give some room to process the event queue. That seems ugly to me.
+
+Well, in a first version, we should certainly try to just collect/send per-tab, without any chunkification attempt. Between per-tab caching and the setTimeout() that is built-in the current implementation of pre-e10s, it might be that we have resolved any performance issue for 99% of our users. Telemetry will tell us whether more effort is necessary.
+
+> So the only option at the moment seems to be to request the data in chunks
+> by sending multiple messages (one for the DOMSesssionStorage, one for the
+> session history, etc...). The main component is then still responsible for
+> assembling the tab data even when everything has been moved to the content
+> script, as long as we don't have multiple processes or threads.
+> 
+> I'm all ears for any ideas and feedback on this approach. Maybe anyone with
+> more insight into how e10s actually works right now can help to find a good
+> way to collect data in chunks now, without swinging off the main path too
+> much.
+
+I know of a chunkification patch that could be reused, if necessary :) But we definitely should not go that deep before we have real-world data.
+(In reply to Bill McCloskey (:billm) from comment #3)
+> It seems like that would just be a few lines of code, and it would run the
+> event loop in between each .then clause.
+
+I like that idea, very easy to implement.
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #4)
+> I envisioned it the other way around, with the content process sending data
+> to the chrome process whenever it considered this necessary.
+> 
+> While both designs would essentially achieve the same results, I believe
+> that "tab knows better" is more robust e.g. to tabs freezing or being killed
+> for some reason.
+
+I agree that on the one hand it's great if sessionstore could just forward messages to the worker without knowing much about the tabs themselves. On the other hand, if we never know when to expect data from the tab we're going to have trouble, imagine this situation:
+
+There is code that purges a tabs session history. Right after doing something else requests the tab's state and receives stale data from the cache, because we have no idea that it got invalidated and the content process just sent a message that is still waiting in the queue.
+
+If we however send a message to the content process to ask for data, then the "purge sesion history" message will arrive before the "retrieve state" message and all will be fine. If we want up-to-date data we need to send a message to the content script/process.
+> (In reply to David Rajchenbach Teller [:Yoric] from comment #4)
+> > I envisioned it the other way around, with the content process sending data
+> > to the chrome process whenever it considered this necessary.
+> > 
+> > While both designs would essentially achieve the same results, I believe
+> > that "tab knows better" is more robust e.g. to tabs freezing or being killed
+> > for some reason.
+> 
+> I agree that on the one hand it's great if sessionstore could just forward
+> messages to the worker without knowing much about the tabs themselves. On
+> the other hand, if we never know when to expect data from the tab we're
+> going to have trouble, imagine this situation:
+> 
+> There is code that purges a tabs session history. Right after doing
+> something else requests the tab's state and receives stale data from the
+> cache, because we have no idea that it got invalidated and the content
+> process just sent a message that is still waiting in the queue.
+> 
+> If we however send a message to the content process to ask for data, then
+> the "purge sesion history" message will arrive before the "retrieve state"
+> message and all will be fine. If we want up-to-date data we need to send a
+> message to the content script/process.
+
+I was thinking that the cache would live in the chrome process. That way, chrome could could immediately invalidate it. Since the "purge session history" action happens from chrome, I think it would just work. Also, the cache could be where we store the session data that arrives from the content process.
+
+It seems like the question of which side decides when to send the session data is mostly about performance. Originally I was thinking that content would decide when to send the data as David suggested, since that seems more robust. But then I was worried that this might be slower if chrome code only uses the session data infrequently. We don't want to be sending the history every 15 seconds if chrome only needs it every 15 minutes. In that case, having chrome code request the data would seem to make more sense.
+(In reply to Bill McCloskey (:billm) from comment #6)
+> I was thinking that the cache would live in the chrome process. That way,
+> chrome could could immediately invalidate it. Since the "purge session
+> history" action happens from chrome, I think it would just work. Also, the
+> cache could be where we store the session data that arrives from the content
+> process.
+
+I agree that we need a cache on the chrome process, e.g. to be able to reply instantaneously to getBrowserState()-style requests.
+
+> It seems like the question of which side decides when to send the session
+> data is mostly about performance. Originally I was thinking that content
+> would decide when to send the data as David suggested, since that seems more
+> robust. But then I was worried that this might be slower if chrome code only
+> uses the session data infrequently. We don't want to be sending the history
+> every 15 seconds if chrome only needs it every 15 minutes. In that case,
+> having chrome code request the data would seem to make more sense.
+
+Well, chrome code needs to use session data every 15 seconds to save it to disk. So there shouldn't be much discrepancy/waste here.
+Created attachment 783386
+WIP v1
+
+WIP patch. Doesn't play nicely with the new TabStateCache, yet. Ugly, needs more work.
+Created attachment 793537
+part 1 - Move tab state collection routines to a separate object
+
+This moves all the tab state collection routines to a separate object and doesn't change how things work. Just a small cleanup basically to prepare for things to come.
+Created attachment 793542
+part 2 - Implement asynchronous data collection for session storage and history
+
+This part implements the asynchronous data collection. It copies session storage and history data collection to the content script and implements TabState.collect() that returns a promise.
+Created attachment 793544
+part 3 - Use asynchronous data collection for delayed save state calls
+
+This hooks up TabState.collect() with SessionSaver.runDelayed(). It uses TabState.collect() to fill tab caches and causes a synchronous saveState() call.
+I started writing the patch with hooking into getCurrentState() that then didn't collect data for the parts we were able to collect asynchronously and fill those holes later when the messages came back from the content processes.
+
+The problem with that approach is that we actually keep and pass references to open windows tracked by SessionStore. this._windows is accessed all over the place and it's really hard to keep track of invalidation and changes.
+
+As we care about collecting tab state asynchronously (not windows, cookies, etc.) and David recently introduced the TabStateCache, I came up with a much simpler and more solid method that starts to fill tab state caches asynchronously and then issues a synchronous saveState() call.
+
+If no tabs have been invalidated while waiting for the messages to return, no extra work has to be done and all the data can be read from the caches. If there was any invalidation we just fallback to sync collection for the few tabs affected.
+
+This should cover most of our tabs and situations as collecting tabs asynchronously is quite fast. Should the user click a link or the like while collecting then it's just a single tab that we will collect synchronously.
+
+I think this is the easiest way to keep both sync and async collection supported right now as well as progressing towards async collection functionality and e10s support.
+https://tbpl.mozilla.org/?tree=Try&rev=cfc30ca6da43
+Comment on attachment 793542
+part 2 - Implement asynchronous data collection for session storage and history
+
+Review of attachment 793542:
+-----------------------------------------------------------------
+
+Looks great! Just a couple small things.
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +136,5 @@
+> +   *        TODO
+> +   */
+> +  read: function (privacyLevel) {
+> +    let data = {};
+> +    let shistory = webNavigation.sessionHistory;
+
+NIT: |sHistory| instead?
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4268,5 @@
+> +
+> +      return tabData;
+> +    });
+> +
+> +    return promise;
+
+We don't add the promise to |this_pendingCollections| before returning it. I feel like that should probably happen just before returning here.
+
+@@ +4358,5 @@
+>        return tabData;
+>      }
+>  
+>      // Collection session history data.
+> +    if (!options || !options.omitSessionHistory) {
+
+Now that this |options| parameter has changed a bit we should probably change the documentation for the method.
+
+Right now it's listed as "An object that will be passed to session history and sessionstorage data collection methods.", but we are now using it in this function to decide if we even call those collection methods.
+
+Might be good to document what the new available options are as well.
+
+@@ +4817,5 @@
+> +    }
+> +
+> +    let delay = (options && options.timeout) || 5000;
+> +    let timeout = setTimeout(onTimeout, delay);
+> +    let deferred = Promise.defer();
+
+NIT: I know this isn't a very large function, and these will be hoisted, but I might find things slightly more readable with these declared before their use. Up to you.
+Comment on attachment 793544
+part 3 - Use asynchronous data collection for delayed save state calls
+
+Review of attachment 793544:
+-----------------------------------------------------------------
+
+Other than the one thing, which may just be me over, or under analyzing the situation, things look good here!
+
+::: browser/components/sessionstore/src/SessionSaver.jsm
+@@ +279,5 @@
+> +    SessionStore.fillTabCachesAsynchronously().then(() => {
+> +      // Write to disk only if there were not other saveState*()
+> +      // calls while we waited for the tab caches to be filled.
+> +      if (this._lastSaveID == id) {
+> +        this._saveState();
+
+I think we may have a bit of a race condition here, albeit one that would be very hard to make cause problems.
+
+Assume |runDelayed()| is called, and sometime after we call |fillTabCachesAsynchronously().then(...)| here. Before this call, we did a |this.cancel()|, so |this._timeoutID| can be filled by another |runDelayed()| call.
+
+Now, right when the tab cache starts being filled asynchronously, another |runDelayed()| call comes in, and adds a |_saveStateAsync()| timeout. If filling the tab cache takes longer than this timeout, we'll get another |fillTabCachesAsynchronously()| before the first has finished. This will update the |_lastSaveID|, and start another asynchronous fill of the tab cache.
+
+Next, the first |fillTabCachesAsynchronously()| promise is resolved, and we run this code here. We won't call |_saveState()| since the |_lastSaveID| was updated.
+
+Now, if we can get this to happen repeatedly, we'll have a problem. If for some reason the asynchronous tab cache filling is taking longer than the |runDelayed()| timeout, and we're repeatedly getting actions causing new |runDelayed()| calls, we would never actually save the session. If this went on for long enough, and then the browser crashed, we could lose a large interval of changes to the session. For this to happen we'd have to be invalidating a lot of tabs quickly, have collection take a very long time / have the runDelayed timeout be very short.
+
+In practice, I'm not even sure all of this is possible. Maybe in theory it could happen with a very large number of tabs, a slow CPU, and many things changing very rapidly.
+Created attachment 794162
+part 2 - Implement asynchronous data collection for session storage and history, v2
+
+(In reply to Steven MacLeod [:smacleod] from comment #14)
+> > +    let shistory = webNavigation.sessionHistory;
+> 
+> NIT: |sHistory| instead?
+
+I renamed it to sessionHistory because we use the sVariable naming scheme for static variables in native code.
+
+> We don't add the promise to |this_pendingCollections| before returning it.
+
+Can't believe I forgot that. Thanks!
+
+> >      // Collection session history data.
+> > +    if (!options || !options.omitSessionHistory) {
+> 
+> Now that this |options| parameter has changed a bit we should probably
+> change the documentation for the method.
+
+Updated.
+
+> > +    let delay = (options && options.timeout) || 5000;
+> > +    let timeout = setTimeout(onTimeout, delay);
+> > +    let deferred = Promise.defer();
+> 
+> NIT: I know this isn't a very large function, and these will be hoisted, but
+> I might find things slightly more readable with these declared before their
+> use. Up to you.
+
+Yes, good point.
+Comment on attachment 793537
+part 1 - Move tab state collection routines to a separate object
+
+Review of attachment 793537:
+-----------------------------------------------------------------
+
+Looks good to me, with a few minor nits.
+It is my understanding that (besides splitting |_collectBaseTabData|), everything you have done in this patch is rather mechanical, isn't it? If you feel that I am missing something, do not hesitate to point me to some chunks in the patch that you believe deserve a second review.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4213,5 @@
+> +    return Promise.resolve(this.collectSync(tab));
+> +  },
+> +
+> +  /**
+> +   * Collect data related to a single tab synchronously.
+
+µNit: Comma before "synchronously".
+
+@@ +4245,5 @@
+> +   * @param tab
+> +   *        tabbrowser tab
+> +   *
+> +   * @returns {object} An object with the data for this tab. This object
+> +   * is recomputed at every call.
+
+Could you take the opportunity to improve the formulation of that last sentence? I realize it's not very clear.
+
+@@ +4292,5 @@
+> +      return tabData;
+> +    }
+> +
+> +    // Collection session history data.
+> +    this._collectTabHistory(tab, tabData, options);
+
+Good call. That method was way too long.
+
+@@ +4335,5 @@
+> +      delete tabData.extData;
+> +
+> +    // Collect DOMSessionStorage data.
+> +    this._collectTabSessionStorage(tab, tabData, options);
+> +
+
+Good call here, too.
+
+@@ +4360,5 @@
+> +      // this could happen if we catch a tab during (de)initialization
+> +    }
+> +
+> +    // XXXzeniko anchor navigation doesn't reset __SS_data, so we could reuse
+> +    //           data even when we shouldn't (e.g. Back, different anchor)
+
+Must... resist... urge... to get rid of __SS_data immediately.
+
+@@ +4447,5 @@
+> +   * @param aIsPinned
+> +   *        the tab is pinned and should be treated differently for privacy
+> +   * @returns object
+> +   */
+> +  _serializeHistoryEntry: function (aEntry, aIncludePrivateData, aIsPinned) {
+
+Nit: not the same argument naming conventions as in the other methods.
+
+@@ +4450,5 @@
+> +   */
+> +  _serializeHistoryEntry: function (aEntry, aIncludePrivateData, aIsPinned) {
+> +    let entry = { url: aEntry.URI.spec };
+> +
+> +    if (aEntry.title && aEntry.title != entry.url) {
+
+Do you know what that second condition represents? Is it to avoid storing a title for "about:config", etc.?
+
+@@ +4456,5 @@
+> +    }
+> +    if (aEntry.isSubFrame) {
+> +      entry.subframe = true;
+> +    }
+> +    if (!(aEntry instanceof Ci.nsISHEntry)) {
+
+This seems to contradict the documentation of the method. If you understand that condition, could you document it?
+
+@@ +4480,5 @@
+> +    if (aEntry.isSrcdocEntry)
+> +      entry.isSrcdocEntry = aEntry.isSrcdocEntry;
+> +
+> +    if (aEntry.contentType)
+> +      entry.contentType = aEntry.contentType;
+
+I believe that all these fields are either |true| or not defined at all to save some memory. That's rather irregular and that's not how JITs want objects to be used, but that's ok. However, it would be nice to mention the rationale somewhere.
+
+@@ +4483,5 @@
+> +    if (aEntry.contentType)
+> +      entry.contentType = aEntry.contentType;
+> +
+> +    let x = {}, y = {};
+> +    aEntry.getScrollPosition(x, y);
+
+Ah, the nice XPCOM outparams calling conventions...
+
+@@ +4488,5 @@
+> +    if (x.value != 0 || y.value != 0)
+> +      entry.scroll = x.value + "," + y.value;
+> +
+> +    try {
+> +      let prefPostdata = Services.prefs.getIntPref("browser.sessionstore.postdata");
+
+Note for later: this looks like something we want to get out of the loop.
+
+@@ +4497,5 @@
+> +        let stream = Cc["@mozilla.org/binaryinputstream;1"].
+> +                     createInstance(Ci.nsIBinaryInputStream);
+> +        stream.setInputStream(aEntry.postData);
+> +        let postBytes = stream.readByteArray(stream.available());
+> +        let postdata = String.fromCharCode.apply(null, postBytes);
+
+Note for followup bug: there may be a nice way to make this use a TypedArray instead of a JavaScript array.
+
+@@ +4531,5 @@
+> +          scriptableStream.readByteArray(scriptableStream.available());
+> +        // We can stop doing base64 encoding once our serialization into JSON
+> +        // is guaranteed to handle all chars in strings, including embedded
+> +        // nulls.
+> +        entry.owner_b64 = btoa(String.fromCharCode.apply(null, ownerBytes));
+
+Note for followup bug: Looks like all of this can also be simplified/modernized.
+
+@@ +4643,5 @@
+> +   * @param aIsPinned
+> +   *        the tab is pinned and should be treated differently for privacy
+> +   */
+> +  _updateTextAndScrollDataForFrame: function (aWindow, aContent, aData,
+> +                                              aUpdateFormData, aIncludePrivateData, aIsPinned) {
+
+Nit: Inconsistent argument naming.
+Comment on attachment 794162
+part 2 - Implement asynchronous data collection for session storage and history, v2
+
+Review of attachment 794162:
+-----------------------------------------------------------------
+
+Shaping up good.
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +7,3 @@
+>  function debug(msg) {
+>    Services.console.logStringMessage("SessionStoreContent: " + msg);
+> +  dump("SessionStoreContent: " + msg + "\n");
+
+Leftover debugging code?
+
+@@ +14,5 @@
+> +Cu.import("resource://gre/modules/Task.jsm", this);
+> +
+> +const PRIVACY_NONE = 0;
+> +const PRIVACY_ENCRYPTED = 1;
+> +const PRIVACY_FULL = 2;
+
+Nit: documentation needed.
+
+@@ +88,5 @@
+> +        break;
+> +    }
+> +  },
+> +
+> +  _collect: function (name, {id, privacyLevel, storePostData}) {
+
+Nit: Please document all of this.
+
+@@ +103,5 @@
+> +      data.entries = history.entries;
+> +
+> +      sendAsyncMessage(name, {id: id, data: data});
+> +    });
+> +  }
+
+No error handling: not good.
+
+@@ +130,3 @@
+>  ProgressListener.init();
+> +
+> +let DomStorage = {
+
+I believe that the code of this module needs to be kept in sync with the code of SessionStorage.jsm. Could you mention this in the source code of both files?
+
+@@ +132,5 @@
+> +let DomStorage = {
+> +  /**
+> +   * Reads all DOMSessionStorage data.
+> +   * @param privacyLevel
+> +   *        The current privacy level chosen by the user.
+
+@return ?
+
+@@ +145,5 @@
+> +        continue;
+> +
+> +      // Check if we're allowed to store sessionStorage data.
+> +      let isHTTPS = principal.URI && principal.URI.schemeIs("https");
+> +      if (privacyLevel < (isHTTPS ? PRIVACY_ENCRYPTED : PRIVACY_FULL)) {
+
+I don't follow |privacyLevel|. Shouldn't this be > ?
+
+@@ +158,5 @@
+> +        }
+> +      }
+> +    }
+> +
+> +    return Promise.resolve(data);
+
+Is there any point to making this a promise?
+
+@@ +195,5 @@
+> +
+> +  /**
+> +   * Returns a given history entry's URI.
+> +   * @param index
+> +   *        The history entry's index
+
+@return – type information would be nice.
+
+@@ +202,5 @@
+> +    try {
+> +      return Services.scriptSecurityManager.getDocShellCodebasePrincipal(
+> +        webNavigation.sessionHistory.getEntryAtIndex(index, false).URI, docShell);
+> +    } catch (e) {
+> +      // This might throw for some reason.
+
+That comment doesn't look too good (either here or in SessionStorage.jsm). Could you elaborate and/or file a followup bug?
+
+@@ +208,5 @@
+> +  }
+> +};
+> +
+> +let SessionHistory = {
+> +  _isBroken: false,
+
+Documentation needed. And yes, I realize that __SS_broken_history isn't documented in the first place.
+
+@@ +232,5 @@
+> +        // non-release builds, and still save sessionstore.js. We'll track if
+> +        // we've shown the assert for this tab so we only show it once.
+> +        // cf. bug 669196.
+> +        if (!this._isBroken) {
+> +          // First Focus the window & tab we're having trouble with.
+
+Except we're not doing that, are we?
+
+@@ +250,5 @@
+> +
+> +    return Promise.resolve(data);
+> +  },
+> +
+> +  _serializeEntry: function (aEntry, privacyLevel, storePostData) {
+
+Nit: naming conventions.
+Also, please document the relationship with _serializeHistoryEntry. Same remark for the other methods that need to be kept in sync with the chrome process counterpart.
+
+@@ +253,5 @@
+> +
+> +  _serializeEntry: function (aEntry, privacyLevel, storePostData) {
+> +    let entry = { url: aEntry.URI.spec };
+> +
+> +    if (aEntry.title && aEntry.title != entry.url) {
+
+Same remarks as for the chrome process implementation.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4262,5 @@
+> +      // Reading preferences is not supported from content processes,
+> +      // so we need to explicitly pass them for now.
+> +      privacyLevel: Services.prefs.getIntPref("browser.sessionstore.privacy_level"),
+> +      storePostData: Services.prefs.getIntPref("browser.sessionstore.postdata")
+> +    };
+
+Nit: I don't think that |data| really reflects the content of this message.
+
+@@ +4264,5 @@
+> +      privacyLevel: Services.prefs.getIntPref("browser.sessionstore.privacy_level"),
+> +      storePostData: Services.prefs.getIntPref("browser.sessionstore.postdata")
+> +    };
+> +
+> +    let promise = Messenger.send(tab, "SessionStore:collect", data).then(({data}) => {
+
+... especially since you redefine the name here.
+Also, could you briefly document the contents of |{data}|?
+
+@@ +4289,5 @@
+> +        }
+> +      }
+> +
+> +      return tabData;
+> +    });
+
+Please make sure that you report errors.
+
+@@ +4314,5 @@
+>      if (!tab) {
+>        throw new TypeError("Expecting a tab");
+>      }
+> +    if (TabStateCache.has(tab)) {
+> +      return TabStateCache.get(tab);
+
+I realize that you prefer the double-lookup, but is there a specific reason?
+
+@@ +4324,5 @@
+>      }
+> +
+> +    // Prevent all running asynchronous collections from filling the cache.
+> +    // Every collection started before a collectSync() call (even in the same
+> +    // tick) can't possibly rely on getting data any different from a
+
+"data any different"?
+I understand the idea, but I can't parse that sentence.
+
+@@ +4357,5 @@
+>     * @param options
+>     *        An object that will be passed to session history and session
+>     *        storage data collection methods.
+> +   *        {omitSessionHistory: true} to skip collecting session history data
+> +   *        {omitSessionStorage: true} to skip collecting session storage data
+
+Here, I'm not sure I understand. What's the rationale for these options?
+
+@@ +4388,5 @@
+>        return tabData;
+>      }
+>  
+>      // Collection session history data.
+> +    if (!options || !options.omitSessionHistory) {
+
+|options| defaults to |{}|, so you can probably skip |!options|.
+
+@@ -4390,5 @@
+> -        browser.__SS_data.entries[history.index].url == browser.currentURI.spec &&
+> -        history.index < this._sessionhistory_max_entries - 1 && !includePrivateData) {
+> -      tabData = browser.__SS_data;
+> -      tabData.index = history.index + 1;
+> -    }
+
+I don't understand why we can suddenly skip this check.
+
+@@ +4804,5 @@
+> +
+> +/**
+> + * A module that handles communication between the main and content processes.
+> + */
+> +let Messenger = {
+
+Wouldn't it be better to move Messenger to its own module?
+
+@@ +4807,5 @@
+> + */
+> +let Messenger = {
+> +  // The id of the last message we sent. This is used to assign a unique ID to
+> +  // every message we send to handle multiple responses from the same browser.
+> +  _lastMessageID: 0,
+
+"latest" rather than "last"
+
+@@ +4826,5 @@
+> +   */
+> +  send: function (tab, type, data = {}, options = {}) {
+> +    let browser = tab.linkedBrowser;
+> +    let mm = browser.messageManager;
+> +    let id = data.id = ++this._lastMessageID;
+
+Side-effects on |data|? This should be either avoided or documented.
+
+@@ +4835,5 @@
+> +      if (msg.data.id == id) {
+> +        mm.removeMessageListener(type, onMessage);
+> +        clearTimeout(timeout);
+> +        deferred.resolve(msg.data);
+> +      }
+
+I suspect that you need an |else| branch, as a support for debugging.
+Comment on attachment 794162
+part 2 - Implement asynchronous data collection for session storage and history, v2
+
+Review of attachment 794162:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4839,5 @@
+> +      }
+> +    }
+> +
+> +    mm.sendAsyncMessage(type, data);
+> +    mm.addMessageListener(type, onMessage);
+
+It probably doesn't matter, but it would be nice to add the listener after sending the message.
+Oops, I meant before.
+Created attachment 795016
+part 1 - Move tab state collection routines to a separate object, v2
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #17)
+> It is my understanding that (besides splitting |_collectBaseTabData|),
+> everything you have done in this patch is rather mechanical, isn't it?
+
+Yes, there shouldn't be any changes to how things work. I did see *lots* of opportunities to improve code (as you did) but I think we should do this in smaller steps and follow-ups. I didn't want to increase the amount of review necessary to get the first e10s stuff landed.
+
+> > +    // XXXzeniko anchor navigation doesn't reset __SS_data, so we could reuse
+> > +    //           data even when we shouldn't (e.g. Back, different anchor)
+> 
+> Must... resist... urge... to get rid of __SS_data immediately.
+
+I feel your pain. I can't wait to land all those patches.
+
+> > +    if (aEntry.title && aEntry.title != entry.url) {
+> 
+> Do you know what that second condition represents? Is it to avoid storing a
+> title for "about:config", etc.?
+
+Yes, that should be the reason. All the serialization methods in SessionStore (also cookies etc.) try to keep the resulting object as small as possible with as few properties as possible. That will of course shrink the resulting string a little.
+
+> > +    if (!(aEntry instanceof Ci.nsISHEntry)) {
+> 
+> This seems to contradict the documentation of the method. If you understand
+> that condition, could you document it?
+
+That is a really good question. I don't know if that's maybe legacy code that is still around? We could try and see what 'hg blame' comes up with.
+
+> > +    if (aEntry.contentType)
+> > +      entry.contentType = aEntry.contentType;
+> 
+> I believe that all these fields are either |true| or not defined at all to
+> save some memory. That's rather irregular and that's not how JITs want
+> objects to be used, but that's ok. However, it would be nice to mention the
+> rationale somewhere.
+
+Yeah, I'll add a comment.
+Created attachment 795393
+part 1.5 - Move privacy level checks into a module
+
+While working on addressing all feedback for part 2 I came across the checkPrivacyLevel() function which is called internally a lot when collecting data and which complicates modularizing the code.
+
+We should move privacy level checks into their own module. This is totally fine to be called from content scripts as well as reading preferences is supported - I was wrong and will adapt part 2 to that new knowledge as well.
+
+> > +      // Check if we're allowed to store sessionStorage data.
+> > +      let isHTTPS = principal.URI && principal.URI.schemeIs("https");
+> > +      if (privacyLevel < (isHTTPS ? PRIVACY_ENCRYPTED : PRIVACY_FULL)) {
+> 
+> I don't follow |privacyLevel|. Shouldn't this be > ?
+
+If privacyLevel=0 then it is always lower than PRIVACY_ENCRYPTED=1 or PRIVACY_FULL=2 because we want to always save data. If privacyLevel=1 the condition is only true for unencrypted sites. If privacyLevel=2 we never want so save data and the condition is always false. So much magic.
+
+I pulled this out into a separate function with a lot more documentation.
+Created attachment 795398
+part 1.5 - Move privacy level checks into a module
+
+Fixed a few things.
+Created attachment 795400
+part 1.5 - Move privacy level checks into a module
+
+Forgot to add the new module to the moz.build file, sorry.
+Comment on attachment 795400
+part 1.5 - Move privacy level checks into a module
+
+Review of attachment 795400:
+-----------------------------------------------------------------
+
+That's much nicer on the eyes, thanks.
+
+::: browser/components/sessionstore/src/PrivacyLevel.jsm
+@@ +26,5 @@
+> +
+> +/**
+> + * Returns whether we will resume the session automatically on next startup.
+> + */
+> +function resumeAutomatically() {
+
+Nit: |resumeAutomatically| suggests that this function does something. This should perhaps be |getResumeAutomatically| or |shouldResumeAutomatically|.
+
+@@ +38,5 @@
+> + * @param isPinned
+> + *        Whether to return the privacy level for pinned tabs.
+> + * @return {bool} The privacy level as read from the user's preferences.
+> + */
+> +function currentLevel(isPinned) {
+
+Here, too, |getCurrentLevel|.
+
+@@ +43,5 @@
+> +  let pref = PREF_NORMAL;
+> +
+> +  // If we're in the process of quitting and we're not autoresuming the session
+> +  // then we should treat it as a deferred session. We have a different privacy
+> +  // pref for that case.
+
+... for non-pinned tabs.
+
+@@ +44,5 @@
+> +
+> +  // If we're in the process of quitting and we're not autoresuming the session
+> +  // then we should treat it as a deferred session. We have a different privacy
+> +  // pref for that case.
+> +  if (!isPinned && Services.startup.shuttingDown && !resumeAutomatically()) {
+
+Are you sure that Services.startup.shuttingDown is equivalent to STATE_QUITTING?
+
+@@ +61,5 @@
+> +   *
+> +   * @param isHttps
+> +   *        Whether the site uses secure communication over HTTPS.
+> +   * @param isPinned
+> +   *        Whether the site is loaded in a pinned tab.
+
+Why not an object {isHttps, isPinned}?
+
+@@ +64,5 @@
+> +   * @param isPinned
+> +   *        Whether the site is loaded in a pinned tab.
+> +   * @return {bool} Whether we can save data for the specified site.
+> +   */
+> +  check: function (isHttps, isPinned) {
+
+Nit: "check" is not very meaningful. Perhaps |shouldSave|?
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ -272,5 @@
+>    },
+>  
+> -  checkPrivacyLevel: function ss_checkPrivacyLevel(aIsHTTPS, aUseDefaultPref) {
+> -    return SessionStoreInternal.checkPrivacyLevel(aIsHTTPS, aUseDefaultPref);
+> -  },
+
+If this was a public API, have you checked whether anyone used it?
+
+@@ +4657,5 @@
+>      let href = (content.parent || content).document.location.href;
+>      let isHTTPS = makeURI(href).schemeIs("https");
+>      let topURL = content.top.document.location.href;
+>      let isAboutSR = topURL == "about:sessionrestore" || topURL == "about:welcomeback";
+> +    if (includePrivateData || PrivacyLevel.check(isHTTPS, isPinned) || isAboutSR) {
+
+Nit: shouldn't we put |isAboutSR| before the call to |PrivacyLevel.check|?
+Created attachment 795494
+part 1.5 - Move privacy level checks into a module, v2
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #25)
+> > +function resumeAutomatically() {
+> 
+> Nit: |resumeAutomatically| suggests that this function does something. This
+> should perhaps be |getResumeAutomatically| or |shouldResumeAutomatically|.
+
+Renamed it to willResumeAutomatically().
+
+> > +function currentLevel(isPinned) {
+> 
+> Here, too, |getCurrentLevel|.
+
+Done.
+
+> > +  // If we're in the process of quitting and we're not autoresuming the session
+> > +  // then we should treat it as a deferred session. We have a different privacy
+> > +  // pref for that case.
+> 
+> ... for non-pinned tabs.
+
+Yeah sorry, I forgot to adapt this ancient comment.
+
+> > +  if (!isPinned && Services.startup.shuttingDown && !resumeAutomatically()) {
+> 
+> Are you sure that Services.startup.shuttingDown is equivalent to
+> STATE_QUITTING?
+
+Yes, that was the first thing I checked before writing the patch. We set STATE_QUITTING when receiving quit-application-granted here:
+
+http://hg.mozilla.org/mozilla-central/file/14b1e8c2957e/browser/components/sessionstore/src/SessionStore.jsm#l990
+
+The notification is sent here:
+
+http://hg.mozilla.org/mozilla-central/file/4887845b1142/toolkit/components/startup/nsAppStartup.cpp#l380
+
+mShuttingDown is set to true a few lines before that. So I'm pretty certain that this is fine and I will file a follow-up bug to get rid of STATE_QUITTING altogether. We shouldn't track state twice.
+
+> > +   * @param isHttps
+> > +   *        Whether the site uses secure communication over HTTPS.
+> > +   * @param isPinned
+> > +   *        Whether the site is loaded in a pinned tab.
+> 
+> Why not an object {isHttps, isPinned}?
+
+Yeah, that makes call sites a little more expressive.
+
+> > +  check: function (isHttps, isPinned) {
+> 
+> Nit: "check" is not very meaningful. Perhaps |shouldSave|?
+
+Renamed to canSave().
+
+> > -  checkPrivacyLevel: function ss_checkPrivacyLevel(aIsHTTPS, aUseDefaultPref) {
+> > -    return SessionStoreInternal.checkPrivacyLevel(aIsHTTPS, aUseDefaultPref);
+> > -  },
+
+Yup, luckily no clients in the add-ons MXR.
+
+> If this was a public API, have you checked whether anyone used it?
+> 
+> >      let isAboutSR = topURL == "about:sessionrestore" || topURL == "about:welcomeback";
+> > +    if (includePrivateData || PrivacyLevel.check(isHTTPS, isPinned) || isAboutSR) {
+> 
+> Nit: shouldn't we put |isAboutSR| before the call to |PrivacyLevel.check|?
+
+Good catch.
+Created attachment 795612
+part 1.6 - Move session history collection into a module
+
+In order to re-use the session history collection code in the content script, we need to move it to a module as well, just like SessionStorage.jsm.
+Created attachment 795908
+part 2 - Implement asynchronous data collection for session storage and history, v3
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #18)
+> I believe that the code of this module needs to be kept in sync with the
+> code of SessionStorage.jsm. Could you mention this in the source code of
+> both files?
+
+Yes, this is stupid. I moved all of the code that's being reused to their own JSMs in previous patches. The content-sessionStore.js changes are now very small and just call the JSM APIs.
+
+> > +    return Promise.resolve(data);
+> 
+> Is there any point to making this a promise?
+
+We don't actually *need* promises for anything collected here because that's all sync but we use promises in combination with tasks to cut the data collection into chunks and each of them runs on a separate tick.
+
+I moved the Task to the chrome side and split this into multiple messages now.
+
+> @@ +4289,5 @@
+> > +      return tabData;
+> > +    });
+> 
+> Please make sure that you report errors.
+
+collect() returns a promise and expects the caller to handle timeouts or script errors - which is done in part 3 by fillTabCachesAsynchronously().
+
+> > +    if (TabStateCache.has(tab)) {
+> > +      return TabStateCache.get(tab);
+> 
+> I realize that you prefer the double-lookup, but is there a specific reason?
+
+No, the code just looks cleaner to me. The condition tells you with one look that all I'm interested in is knowning whether there is a value or not.
+
+> > +   *        {omitSessionHistory: true} to skip collecting session history data
+> > +   *        {omitSessionStorage: true} to skip collecting session storage data
+> 
+> Here, I'm not sure I understand. What's the rationale for these options?
+
+The asynchronous data collection needs a basic tabData object *not* including the data that will be collected asynchronously. We will wait for the data to be sent and then tack it onto the tabData object and put that into the cache.
+
+If we don't omit collection session history and data there would be no win as we collect it sync and then async afterwards.
+
+> >      // Collection session history data.
+> > +    if (!options || !options.omitSessionHistory) {
+> 
+> |options| defaults to |{}|, so you can probably skip |!options|.
+
+Hmm. Not if someone passes 'null' which shouldn't really happen with an internal API but...
+
+> @@ -4390,5 @@
+> > -        browser.__SS_data.entries[history.index].url == browser.currentURI.spec &&
+> > -        history.index < this._sessionhistory_max_entries - 1 && !includePrivateData) {
+> > -      tabData = browser.__SS_data;
+> > -      tabData.index = history.index + 1;
+> > -    }
+> 
+> I don't understand why we can suddenly skip this check.
+
+Ah, sorry I wanted to say a few words about this change. The condition here just makes sure that the current entry didn't change and we can still re-use the object cached in __SS_data. This cache turned out to be a little problematic in combination with the async collection used in part 3.
+
+The content script doesn't fill the __SS_data property (because it can't) so the sync collection will then use stale data. I just removed the use of the cache.
+
+> > +let Messenger = {
+> 
+> Wouldn't it be better to move Messenger to its own module?
+
+Maybe, yes. I planned on doing that once we need it? Or are you saying this should even be a toolkit module?
+
+> > +  // The id of the last message we sent. This is used to assign a unique ID to
+> > +  // every message we send to handle multiple responses from the same browser.
+> > +  _lastMessageID: 0,
+> 
+> "latest" rather than "last"
+
+Well, it's also the last message ID we used.
+
+> > +  send: function (tab, type, data = {}, options = {}) {
+> > +    let browser = tab.linkedBrowser;
+> > +    let mm = browser.messageManager;
+> > +    let id = data.id = ++this._lastMessageID;
+> 
+> Side-effects on |data|? This should be either avoided or documented.
+
+Yeah I didn't like that too much either, fixed.
+
+> > +      if (msg.data.id == id) {
+> > +        mm.removeMessageListener(type, onMessage);
+> > +        clearTimeout(timeout);
+> > +        deferred.resolve(msg.data);
+> > +      }
+> 
+> I suspect that you need an |else| branch, as a support for debugging.
+
+I don't think we need one. When calling .send() with one browser multiple times we will have multiple listeners on the same browser waiting for their messages. Every time a message arrives, n-1 active listeners will receive a message with the wrong ID. This is expected and nothing we need to handle as an error.
+
+(In reply to Bill McCloskey (:billm) from comment #19)
+> > +    mm.sendAsyncMessage(type, data);
+> > +    mm.addMessageListener(type, onMessage);
+> 
+> It probably doesn't matter, but it would be nice to add the listener after
+> sending the message.
+
+Done.
+Comment on attachment 795612
+part 1.6 - Move session history collection into a module
+
+Review of attachment 795612:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionHistory.jsm
+@@ +16,5 @@
+> +XPCOMUtils.defineLazyModuleGetter(this, "PrivacyLevel",
+> +  "resource:///modules/sessionstore/PrivacyLevel.jsm");
+> +
+> +function debug(msg) {
+> +  Services.console.logStringMessage("SessionStoreContent: " + msg);
+
+Wouldn't it be useful to mention "History" somewhere in the logged message?
+
+@@ +76,5 @@
+> +      }
+> +      data.index = history.index + 1;
+> +    } else {
+> +      let uri = webNavigation.currentURI.spec;
+> +      if (uri != "about:blank" || webNavigation.document.body.hasChildNodes()) {
+
+Could you document this?
+
+@@ +107,5 @@
+> +    }
+> +    if (shEntry.isSubFrame) {
+> +      entry.subframe = true;
+> +    }
+> +    if (!(shEntry instanceof Ci.nsISHEntry)) {
+
+As mentioned above, documenting this would be nice.
+
+@@ +148,5 @@
+> +        entry.postdata_b64 = postdata;
+> +      }
+> +    } catch (ex) {
+> +      // POSTDATA is tricky - especially since some extensions don't get it right
+> +      debug(ex);
+
+Could add some human-readable message to that |debug|?
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4350,5 @@
+>    _collectTabHistory: function (tab, tabData, options = {}) {
+>      let includePrivateData = options && options.includePrivateData;
+> +    let docShell = tab.linkedBrowser.docShell;
+> +
+> +    if (docShell instanceof Ci.nsIDocShell) {
+
+The original version didn't have this check. Why do you need it? Is it a cleaner version of "// this could happen"?
+
+@@ -4365,5 @@
+> -        browser.__SS_data.entries[history.index] &&
+> -        browser.__SS_data.entries[history.index].url == browser.currentURI.spec &&
+> -        history.index < this._sessionhistory_max_entries - 1 && !includePrivateData) {
+> -      tabData = browser.__SS_data;
+> -      tabData.index = history.index + 1;
+
+The new version doesn't have this __SS_data stuff. While I generally enjoy such changes, can you explain why we can just get rid of it? Was it just caching?
+
+@@ -4385,5 @@
+> -        // try-catch, we'll update history to where it breaks, assert for
+> -        // non-release builds, and still save sessionstore.js. We'll track if
+> -        // we've shown the assert for this tab so we only show it once.
+> -        // cf. bug 669196.
+> -        if (!tab.__SS_broken_history) {
+
+Also, you get rid of __SS_broken_history. Why can you do that?
+
+@@ -4397,5 @@
+> -      }
+> -      tabData.index = history.index + 1;
+> -
+> -      // make sure not to cache privacy sensitive data which shouldn't get out
+> -      if (!includePrivateData)
+
+Side-note: That comment doesn't seem to match what's written below.
+(In reply to Tim Taubert [:ttaubert] from comment #28)
+> Yes, this is stupid. I moved all of the code that's being reused to their
+> own JSMs in previous patches. The content-sessionStore.js changes are now
+> very small and just call the JSM APIs.
+
+\o/
+
+> > Is there any point to making this a promise?
+> 
+> We don't actually *need* promises for anything collected here because that's
+> all sync but we use promises in combination with tasks to cut the data
+> collection into chunks and each of them runs on a separate tick.
+> 
+> I moved the Task to the chrome side and split this into multiple messages
+> now.
+
+Ok. Using promises was not wrong, but if you do it for essentially synchronous code, please document the reason.
+
+> > @@ +4289,5 @@
+> > > +      return tabData;
+> > > +    });
+> > 
+> > Please make sure that you report errors.
+> 
+> collect() returns a promise and expects the caller to handle timeouts or
+> script errors - which is done in part 3 by fillTabCachesAsynchronously().
+
+Ok, fair enough.
+
+> > > +   *        {omitSessionHistory: true} to skip collecting session history data
+> > > +   *        {omitSessionStorage: true} to skip collecting session storage data
+> > 
+> > Here, I'm not sure I understand. What's the rationale for these options?
+> 
+> The asynchronous data collection needs a basic tabData object *not*
+> including the data that will be collected asynchronously. We will wait for
+> the data to be sent and then tack it onto the tabData object and put that
+> into the cache.
+> 
+> If we don't omit collection session history and data there would be no win
+> as we collect it sync and then async afterwards.
+
+Ok, then please make this clear in your documentation.
+
+> > @@ -4390,5 @@
+> Ah, sorry I wanted to say a few words about this change. The condition here
+> just makes sure that the current entry didn't change and we can still re-use
+> the object cached in __SS_data. This cache turned out to be a little
+> problematic in combination with the async collection used in part 3.
+> 
+> The content script doesn't fill the __SS_data property (because it can't) so
+> the sync collection will then use stale data. I just removed the use of the
+> cache.
+
+So much for me reviewing before reading replies. Thanks for the clarification.
+
+> > > +let Messenger = {
+> > 
+> > Wouldn't it be better to move Messenger to its own module?
+> 
+> Maybe, yes. I planned on doing that once we need it? Or are you saying this
+> should even be a toolkit module?
+
+I wasn't claiming anything so bold, just making it a .jsm.
+No hurry, of course.
+
+> 
+> > > +  // The id of the last message we sent. This is used to assign a unique ID to
+> > > +  // every message we send to handle multiple responses from the same browser.
+> > > +  _lastMessageID: 0,
+> > 
+> > "latest" rather than "last"
+> 
+> Well, it's also the last message ID we used.
+
+If it's "last", you are not going to use it anymore, which I believe is not the case.
+
+> > > +      if (msg.data.id == id) {
+> > > +        mm.removeMessageListener(type, onMessage);
+> > > +        clearTimeout(timeout);
+> > > +        deferred.resolve(msg.data);
+> > > +      }
+> > 
+> > I suspect that you need an |else| branch, as a support for debugging.
+> 
+> I don't think we need one. When calling .send() with one browser multiple
+> times we will have multiple listeners on the same browser waiting for their
+> messages. Every time a message arrives, n-1 active listeners will receive a
+> message with the wrong ID. This is expected and nothing we need to handle as
+> an error.
+
+Ah, right. My bad.
+Comment on attachment 795908
+part 2 - Implement asynchronous data collection for session storage and history, v3
+
+Review of attachment 795908:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +89,5 @@
+> +        break;
+> +      default:
+> +        debug("received unknown message '" + name + "'");
+> +        break;
+> +    }
+
+In case of error, we don't handle errors but we rather timeout. Have you tested whether this causes an error message to be dumped somewhere? Otherwise, debugging will be painful.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4634,5 @@
+> +        mm.removeMessageListener(type, onMessage);
+> +        clearTimeout(timeout);
+> +        deferred.resolve(data);
+> +      }
+> +    }
+
+Note: in a future version, it may be useful to be able to handle negative results, i.e. non-timeout results that cause rejections.
+(In reply to Tim Taubert [:ttaubert] from comment #26)
+> Created attachment 795494
+> part 1.5 - Move privacy level checks into a module, v2
+> 
+
+function getCurrentLevel always return PREF_DEFERRED value
+
+>+ return Services.prefs.getIntPref(PREF_DEFERRED);
+
+need to be:
+>+ return Services.prefs.getIntPref(pref);
+Created attachment 796505
+part 1.5 - Move privacy level checks into a module, v3
+
+(In reply to onemen.one from comment #32)
+> function getCurrentLevel always return PREF_DEFERRED value
+> 
+> >+ return Services.prefs.getIntPref(PREF_DEFERRED);
+> 
+> need to be:
+> >+ return Services.prefs.getIntPref(pref);
+
+Great catch, thanks a lot!
+Created attachment 796591
+part 1.6 - Move session history collection into a module, v2
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #29)
+> > +      let uri = webNavigation.currentURI.spec;
+> > +      if (uri != "about:blank" || webNavigation.document.body.hasChildNodes()) {
+> 
+> Could you document this?
+
+Sure, let me find out what this is about... This was introduced in bug 367052. Ok, added a comment.
+
+> > +    if (!(shEntry instanceof Ci.nsISHEntry)) {
+> 
+> As mentioned above, documenting this would be nice.
+
+Yeah... if I only knew what this is for. It has been introduced with the first landing of sessionstore code in Firefox (bug 328159).
+
+Ok after a little investigation I found out that nsIHistoryEntry is a parent of nsISHEntry and the instanceof call basically called QueryInterface() on the shEntry.
+
+We seem to never create nsIHistoryEntries but only nsISHEntries. nsISHistory.getEntryAtIndex() however always returns nsIHistoryEntries. A QueryInterface() before passing it to _serializeEntry() should be the right thing to do. Subframes will always be nsISHEntries as nsISHContainer.getChildAt() always returns nsISHEntries.
+
+No failures in the test suite with that change. Filed bug 910161 and after working on that I'm quite sure that every nsIHistoryEntry is secretly also an nsISHEntry :)
+
+> > +    if (docShell instanceof Ci.nsIDocShell) {
+> 
+> The original version didn't have this check. Why do you need it? Is it a
+> cleaner version of "// this could happen"?
+
+Yeah that's a cleaner version of it. Once the <browser> binding has been destroyed the docShell property doesn't exist anymore. I modified _collectTabSessionStorage() to do the same.
+
+> > -        if (!tab.__SS_broken_history) {
+> 
+> Also, you get rid of __SS_broken_history. Why can you do that?
+
+The problem here is that I tried maintaining a WeakMap of docShells that we failed to collect history for but using docShells as WeakMap keys is not possible. As I don't have anything else to use for identification, I just removed the code.
+
+I haven't seen this bug in a while and all this does is prevent multiple errors messages from being printed. There may be a lot error messages but they don't do any harm and certainly don't prevent the data collection from working.
+
+> > -      // make sure not to cache privacy sensitive data which shouldn't get out
+> > -      if (!includePrivateData)
+> 
+> Side-note: That comment doesn't seem to match what's written below.
+
+That code is going away anyway :)
+Created attachment 796595
+part 2 - Implement asynchronous data collection for session storage and history, v4
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #30)
+> > If we don't omit collection session history and data there would be no win
+> > as we collect it sync and then async afterwards.
+> 
+> Ok, then please make this clear in your documentation.
+
+Done.
+
+> > > Wouldn't it be better to move Messenger to its own module?
+> > 
+> > Maybe, yes. I planned on doing that once we need it? Or are you saying this
+> > should even be a toolkit module?
+> 
+> I wasn't claiming anything so bold, just making it a .jsm.
+> No hurry, of course.
+
+Ok, moved to a JSM.
+
+> > > > +  _lastMessageID: 0,
+> > > 
+> > > "latest" rather than "last"
+> > 
+> > Well, it's also the last message ID we used.
+> 
+> If it's "last", you are not going to use it anymore, which I believe is not
+> the case.
+
+Changed to _latestMessageID.
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #31)
+> > +      default:
+> > +        debug("received unknown message '" + name + "'");
+> > +        break;
+> > +    }
+> 
+> In case of error, we don't handle errors but we rather timeout. Have you
+> tested whether this causes an error message to be dumped somewhere?
+> Otherwise, debugging will be painful.
+
+Calling an undefined function in the content script yields a script error about the undefined function. A couple seconds later there is a message about the message timeout. I think we should be good here.
+
+> > +        mm.removeMessageListener(type, onMessage);
+> > +        clearTimeout(timeout);
+> > +        deferred.resolve(data);
+> > +      }
+> > +    }
+> 
+> Note: in a future version, it may be useful to be able to handle negative
+> results, i.e. non-timeout results that cause rejections.
+
+Right, let's extend that as needed.
+Created attachment 796614
+part 3 - Use asynchronous data collection for delayed save state calls, v2
+
+(In reply to Steven MacLeod [:smacleod] from comment #15)
+> In practice, I'm not even sure all of this is possible. Maybe in theory it
+> could happen with a very large number of tabs, a slow CPU, and many things
+> changing very rapidly.
+
+That's a valid concern although I think this will probably never happen, at least with our default configuration. I could see ways to make this fail with really low intervals and lots of data, like you mentioned. I did a couple of things in this patch to guard against this:
+
+1) _saveStateAsync() calls updateLastSaveTime() after nulling the current _timeoutID. That's basically the same change that we needed for 902280. Otherwise a subsequent runDelayed() call would have called _saveStateAsync() right afterwards.
+
+2) _lastSaveID is only increment after we bail out if we detect a long-running data collection. If the ID has changed, this can only be caused by a sync save operation.
+
+3) I introduced the flag _waitingForTabCachesToFill which basically tells whether there is an async save currently in progress. If there is, we will re-schedule and will be fired after another interval has passed. This will also double the current interval length as it's obviously too low for whatever reason.
+
+Is automatically increasing the interval length too harsh? Should this be done only for the session? Only for a couple of minutes to accommodate hiccups?
+Created attachment 797119
+part 3 - Use asynchronous data collection for delayed save state calls, v3
+
+With the recent introduction of gIntervalBattery I figured that it's probably a bad idea to increase the interval permanently. If we discover that the data collection takes a really long time and writes would be conflicting, we should just increase the interval temporarily, until the session ends.
+https://tbpl.mozilla.org/?tree=Try&rev=7b1ed7db7d69
+Created attachment 797198
+part 3 - Use asynchronous data collection for delayed save state calls, v4
+
+The try run didn't go so well, also partly because of bug 506975. Anyway I re-thought the whole approach and I think we don't need any kinds of shields against long-running data collections.
+
+When calling fillTabCachesAsynchronously() in succession, there should be less and less work because even the second run should have nothing left to do.
+
+Also, we're filling tab caches and calling _saveState() which collects state synchronously again. That means we never end up writing stale data even if we've been interrupted by a synchronous write call. This probably almost never happens in the wild but only in tests.
+
+This makes the patch a little simpler again and it hardens against cases where tests set the interval to '0' to cause an immediate saveState() call.
+Comment on attachment 797198
+part 3 - Use asynchronous data collection for delayed save state calls, v4
+
+Review of attachment 797198:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionSaver.jsm
+@@ +257,5 @@
+> +      return;
+> +    }
+> +
+> +    // Cancel any pending timeouts or just clear
+> +    // the timeout if this is why we've been called.
+
+Nit: That sentence is not very clear.
+
+@@ +264,5 @@
+> +    // Update the last save time to make sure we wait at least another interval
+> +    // length until we call _saveStateAsync() again.
+> +    this.updateLastSaveTime();
+> +
+> +    // Save state synchronously after collecting tab data asynchronously.
+
+Nit: Perhaps one more sentence to mention that this ensures that we reuse cached data?
+This is actually not 100% true, since in a few rare cases, the data may have been invalidated in the meantime, but tab state cache telemetry should tell us if we need to invest time in this.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +1934,5 @@
+> +  /**
+> +   * Kicks off asynchronous data collection for all tabs that do not have any
+> +   * cached data. The returned promise will only notify that the tab collection
+> +   * has been finished without resolving to any data. The tab collection for a
+> +   * a few or all tabs might have failed or timed out. This is intended to be
+
+Nit: "By calling fillTabCachesAsynchronously and waiting for the promise to be resolved before calling getCurrentState, callers ensure [...]" - is that what you had in mind?
+
+@@ +1956,5 @@
+> +
+> +    // The callback that will be called when a promise is rejected, i.e. we
+> +    // we couldn't collect the tab data because of a script error or a timeout.
+> +    function fail(reason) {
+> +      Cu.reportError(reason);
+
+We generally use debug() in that file. Is there a particular reason to use Cu.reportError here?
+
+@@ +1985,5 @@
+> +    if (countdown == 0) {
+> +      return Promise.resolve();
+> +    }
+> +
+> +    return deferred.promise;
+
+Note: an alternative strategy would be to do
+
+  let tasks = [];
+  for (let win of ...) {
+    if (...)
+      break;
+    for (let tab of win.gBrowser.tabs) {    
+      if (...) {
+        tasks.push(TabState.collect(tab));
+      }
+    }
+  }
+  return Task.spawn(function() {
+    for (let task of tasks) {
+      try {
+        yield task;
+      } catch (ex) {
+        Cu.reportError(ex);
+      }
+    }
+  });
+
+I believe that this is a little more readable but ymmv.
+Created attachment 797225
+part 3 - Use asynchronous data collection for delayed save state calls, v5
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #40)
+> > +    // Cancel any pending timeouts or just clear
+> > +    // the timeout if this is why we've been called.
+> 
+> Nit: That sentence is not very clear.
+
+Fixed.
+
+> > +    // Save state synchronously after collecting tab data asynchronously.
+> 
+> Nit: Perhaps one more sentence to mention that this ensures that we reuse
+> cached data?
+
+Fixed.
+
+> This is actually not 100% true, since in a few rare cases, the data may have
+> been invalidated in the meantime, but tab state cache telemetry should tell
+> us if we need to invest time in this.
+
+Right.
+
+> > +   * Kicks off asynchronous data collection for all tabs that do not have any
+> > +   * cached data. The returned promise will only notify that the tab collection
+> > +   * has been finished without resolving to any data. The tab collection for a
+> > +   * a few or all tabs might have failed or timed out. This is intended to be
+> 
+> Nit: "By calling fillTabCachesAsynchronously and waiting for the promise to
+> be resolved before calling getCurrentState, callers ensure [...]" - is that
+> what you had in mind?
+
+Yeah, fixed.
+
+> > +    function fail(reason) {
+> > +      Cu.reportError(reason);
+> 
+> We generally use debug() in that file. Is there a particular reason to use
+> Cu.reportError here?
+
+No, fixed.
+
+> Note: an alternative strategy would be to do
+> 
+> [snip]
+> 
+> I believe that this is a little more readable but ymmv.
+
+I thought about doing this but isn't calling .then() for every promise taking a little too much time? I thought that we'll be waiting one tick before the fulfilled callback is called. That would mean we needlessly wait n ticks where n=number of tabs, no?
+
+Whereas with the current approach lots of fulfilled callbacks will probably be called in the same tick.
+David and I talked on IRC and we came to the conclusion that it's probably a bad idea to land this stuff now that I'm on PTO for a week starting tomorrow.
+
+Another reason to wait is that we first would like to gather a little more telemetry data about our TabStateCache hit/miss rates that will soon land in bug 896545.
+
+It would be great if someone took care of writing tests in the meantime so that we could land it right away when I'm back. I will unfortunately not have enough time to start writing any tests today. Also I currently have no clue how to ensure we're reusing cached data but I will think a bit more about that.
+https://tbpl.mozilla.org/?tree=Try&rev=6b696f6db5e7
+Created attachment 797649
+part 1.6 - Move session history collection into a module, v3
+
+Removed the QI to nsISHEntry as I just landed bug 910161.
+Do you think you'll be able to land this soon?
+I'd really like to land this soon but I first wanted to write at least a couple of tests for it. This is currently blocked by bug 911115.
+Created attachment 805248
+part 1.5 - Move privacy level checks into a module, v4
+
+Fixing bit rot from bug 785884.
+Created attachment 805860
+part 1 - Move tab state collection routines to a separate object, v3
+
+Rebased.
+Created attachment 805866
+part 1.5 - Move privacy level checks into a module, v5
+
+Rebased.
+I talked to Yoric and we decided to speed up the process a little. We will write tests in a follow-up bug and land the patches now as it's early in the cycle. The patches will otherwise just keep bitrotting.
+https://hg.mozilla.org/integration/fx-team/rev/108e2b8e177c
+https://hg.mozilla.org/integration/fx-team/rev/3caa785122bf
+https://hg.mozilla.org/integration/fx-team/rev/91303ff403ac
+https://hg.mozilla.org/integration/fx-team/rev/5b621d8eb5e9
+https://hg.mozilla.org/integration/fx-team/rev/778adbf10481
+Backed out for intermittent mochitest-bc failures.
+https://hg.mozilla.org/integration/fx-team/rev/83c1b9a4fa8b
+FTR, landing this introduced the following intermittent failure:
+
+TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_601955.js | first tab should be pinned by now
+
+It was definitely not failing on every run but also not infrequently.
+Created attachment 807131
+part 2 - Implement asynchronous data collection for session storage and history, v5
+
+Simple fix for the intermittent failure:
+
+If we happen to kick off an async data collection for a tab and pin it right afterwards, the unpinned state will be saved to the cache. This can be fixed by simply calling _collectBaseTabData() after we collected all responses from the content script.
+
+Try agrees:
+
+https://tbpl.mozilla.org/?tree=Try&rev=e35de9e61a33
+https://hg.mozilla.org/integration/fx-team/rev/bfc44d649d47
+https://hg.mozilla.org/integration/fx-team/rev/b2bf48df1309
+https://hg.mozilla.org/integration/fx-team/rev/8d3aca1feb20
+https://hg.mozilla.org/integration/fx-team/rev/d91f5cf9d5f4
+https://hg.mozilla.org/integration/fx-team/rev/a9e154e8fe33
+https://hg.mozilla.org/mozilla-central/rev/bfc44d649d47
+https://hg.mozilla.org/mozilla-central/rev/b2bf48df1309
+https://hg.mozilla.org/mozilla-central/rev/8d3aca1feb20
+https://hg.mozilla.org/mozilla-central/rev/d91f5cf9d5f4
+https://hg.mozilla.org/mozilla-central/rev/a9e154e8fe33

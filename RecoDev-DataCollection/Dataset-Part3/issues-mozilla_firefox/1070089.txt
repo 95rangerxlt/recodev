@@ -1,0 +1,472 @@
+Currently marker times are relative to the point at which
+timeline recording was started; but this can vary by docshell.
+Instead, ake the times relative to some consistent epoch.
+
+Currently marker times are relative to the point at which
+timeline recording was started; but this can vary by docshell.
+Instead, ake the times relative to some consistent epoch.
+Making them relative to 'window.performance.now()' could be an option.
+What about using a absolute timestamp? Like always using `TimeStamp::Now()`? What's the point of doing `TimeStamp::Now() - mProfileTimelineStartTime`?
+Created attachment 8493183
+change timeline markers to start at epoch
+
+Victor -- the particular hacky bit is in actors/timeline.js, where the
+marker start and end times are offset.
+Comment on attachment 8493183
+change timeline markers to start at epoch
+
+Review of attachment 8493183:
+-----------------------------------------------------------------
+
+Should get a review from benwa as well for the docshell changes.
+
+::: browser/devtools/timeline/timeline.js
+@@ +108,5 @@
+>     */
+>    _startRecording: function*() {
+>      this._markers = [];
+> +    this._markers.startTime = 1000 * Date.now();
+> +    this._markers.endTime = 1000 * Date.now();
+
+These should be set after calling start with the startTime retrieved from the actor, since communication over the protocol might take a noticeable amount of time. See my remarks inside the actor code.
+
+Something like this:
+
+_startRecording: function*() {
+  TimelineView.handleRecordingStarted();
+  let startTime = yield gFront.start();  
+  this._markers = [];
+  this._markers.startTime = startTime;
+  this._markers.endTime = startTime;
+})
+
+::: browser/devtools/timeline/widgets/overview.js
+@@ +56,5 @@
+>      this.setBlueprint(TIMELINE_BLUEPRINT);
+>  
+>      var preview = [];
+> +    preview.startTime = 1000 * Date.now();
+> +    preview.endTime = preview.startTime + 1000 * 1000;
+
+These don't need to be changed, they're just here to offer a nice default preview with a few divisions when the graph is initially built.
+
+::: toolkit/devtools/server/actors/timeline.js
+@@ +116,5 @@
+>      if (markers.length > 0) {
+> +      for (let marker of markers) {
+> +        marker.start -= this._startTime;
+> +        marker.end -= this._startTime;
+> +      }
+
+Instead of iterating over all the markers here (which might take cpu time and slow down devices with restricted hardware), it might be a better idea to expose the startTime when calling `start`, and offset everything in the frontend. See below.
+
+@@ +153,5 @@
+>        docShell.recordProfileTimelineMarkers = true;
+>      }
+>  
+>      this._pullTimelineData();
+>    }, {}),
+
+(function() {
+  ...
+  return this._startTime;
+}, {
+  request: {},
+  response: {
+    value: RetVal("number")
+  }
+})
+
+
+Then, take a look inside browser/devtools/timeline/widgets/overview.js, grep "Draw the timeline markers.". The `start` and `end` properties should be offset there by `this._data.startTime`.
+
+
+I *think* that should be enough. If I'm missing something, I'll take a look myself at an updated patch.
+If you store milliseconds/nanosecond in float/double since epoch you're very likely to run into precision issues. The JS precision is insufficient for nanosecond since epoch. We also avoided using PRTime since it's deprecated. So we normalized everything from a common timestamp, the profiling start.
+(In reply to Benoit Girard (:BenWa) from comment #5)
+> If you store milliseconds/nanosecond in float/double since epoch you're very
+> likely to run into precision issues. The JS precision is insufficient for
+> nanosecond since epoch. We also avoided using PRTime since it's deprecated.
+> So we normalized everything from a common timestamp, the profiling start.
+
+But the profiling start can vary by docshell.
+It depends, I suppose, on the timing of this loop in timeline.js:
+
+    for (let docShell of this.docShells) {
+      docShell.recordProfileTimelineMarkers = true;
+    }
+
+
+The patch here is using microseconds since epoch, but that does cause issues,
+since the timeline is formulated to use milliseconds.  My current tree
+is using milliseconds since epoch.  This also fits better with the
+use of DOMTimeStamp in ProfileTimelineMarker.webidl, as that is defined in
+milliseconds.
+
+I think milliseconds since epoch doesn't overflow for quite a long time.
+Assuming my math is right, 2^53+1 is when an integer overflows, so computing
+seconds:
+
+(2^53+1)/1000
+9007199254740.99300000000000000000
+
+Feeding into date:
+
+date --date=@9007199254741
+Wed Oct 12 02:59:01 MDT 287396
+
+So we have hundreds of thousands of years.
+
+I agree about nanoseconds since the epoch.  If that is what we want then
+we need another approach, probably also changing the webidl.
+
+
+I couldn't find anything about PRTime being deprecated.  
+
+
+FWIW I'm happy to try some other approach.  One idea might be to let timeline.js
+tell docshell the start time.  I think we ruled out performance.now because it is
+also computed relative to events we want to mark - reloads I think.  Also it wasn't
+clear how to fetch this from the c++ side, though that's surmountable I'm sure.
+Created attachment 8493972
+change timeline markers to start at epoch
+
+This patch addresses Victor's comments.  Thanks Victor!
+
+It also changes the times on the markers to be in milliseconds since
+the epoch.  This was needed because the timeline and other code is all
+done in terms of milliseconds (mostly this matters for the labels...);
+but it is also simpler and more consistent with other code.
+Comment on attachment 8493972
+change timeline markers to start at epoch
+
+Review of attachment 8493972:
+-----------------------------------------------------------------
+
+I love the timeline changes.
+https://tbpl.mozilla.org/?tree=Try&rev=37c6ace7890f
+Just FYI - the patch needs a little work to fix up the other test cases.
+I will do that tomorrow.
+https://tbpl.mozilla.org/?tree=Try&rev=17dc860f2d1d
+> I couldn't find anything about PRTime being deprecated.  
+
+Victor filled me in that this is true but not necessarily written down.
+
+Also the current patch using PR_Now shows odd behavior on Windows -- for example
+the marker array start time coming after the time of the first marker.
+
+I'm looking into using some other approach now.
+Created attachment 8498729
+change timeline markers to have a consistent epoch
+
+The previous patch used Date.now to get a consistent epoch.  However
+this caused some failures on Windows, presumably due to the well-known
+issues with Date.now.
+
+This new patch uses the chrome window's performance object as a
+baseline.  This ensures consistent times from all the docshells.
+
+The current tree has another subtle problem where timeline/timeline.js
+uses local times.  It's only really correct to use times from the
+actor; there's no guarantee that the times are in sync.
+
+The patch mostly fixes this, but currently computes an approximate
+elapsed time.  See _startRecording and _onRecordingTick.  Without this
+change, the timeline will update only when data arrives from the
+actor.  Another approach here would be to have the actor send a
+periodic "heartbeat" event with just the time, but I chose to go with
+less traffic.
+
+Finally, this patch changes ProfileTimelineMarker.webidl to note the
+new type of the time that is delivered.
+Try: https://tbpl.mozilla.org/?tree=Try&rev=2224b38fa355
+Comment on attachment 8498729
+change timeline markers to have a consistent epoch
+
+Review of attachment 8498729:
+-----------------------------------------------------------------
+
+Very happy with the changes outside nsDocShell.
+
+::: browser/devtools/timeline/timeline.js
+@@ +162,5 @@
+>     */
+>    _onRecordingTick: function() {
+> +    // Compute an approximate ending time for the view.  This is
+> +    // needed to ensure that the view updates even when new data is
+> +    // not being generated.
+
+This is a very reasonable compromise. Updating the overview periodically is done mostly to give a sense of time passing even though there are no new markers, and doesn't necessarily have to be precise.
+this needs dom peer review it seems:
+
+WebIDL file dom/webidl/ProfileTimelineMarker.webidl altered in changeset 7fe43ea5ffbe without DOM peer review
+Comment on attachment 8498729
+change timeline markers to have a consistent epoch
+
+This patch needs DOM peer review for the webidl change.
+(and changes to docshell/ need a docshell peer review ;) )
+Comment on attachment 8498729
+change timeline markers to have a consistent epoch
+
+> nsDocShell::AddProfileTimelineMarker(const char* aName,
+>                                      TracingMetadata aMetaData)
+> {
+> #ifdef MOZ_ENABLE_PROFILER_SPS
+>-  if (!mProfileTimelineStartTime.IsNull()) {
+>-    float delta = GetProfileTimelineDelta();
+>-    ProfilerMarkerTracing* payload = new ProfilerMarkerTracing("Timeline",
+>-                                                               aMetaData);
+>-    mProfileTimelineMarkers.AppendElement(
+>-      new InternalProfileTimelineMarker(aName, payload, delta));
+>+  nsCOMPtr<nsIDocShellTreeItem> root;
+>+  if (mProfileTimelineRecording
+>+      && NS_SUCCEEDED(GetRootTreeItem(getter_AddRefs(root)))) {
+>+    nsDocShell* topDocShell = static_cast<nsDocShell*>(root.get());
+>+    nsCOMPtr<nsIDocument> doc(do_GetInterface(GetAsSupports(topDocShell)));
+>+    if (doc) {
+>+      nsCOMPtr<nsPIDOMWindow> win = doc->GetInnerWindow();
+>+      if (win) {
+>+        DOMHighResTimeStamp when = win->GetPerformance()->Now();
+I don't understand how this works in case of page loads. In such case inner window is changed and 
+"The now method MUST return a DOMHighResTimeStamp representing the number of milliseconds from the navigationStart
+attribute of the PerformanceTiming interface [NavigationTiming], the start of navigation of the document, to the occurrence of the call to the now method. "
+
+r+ for the .webidl change, but r- for the Docshell change, since I'm not aware of anything which guarantees we reset timeline profiling when a new page is loaded.
+If we do such reset, please explain and ask review again.
+(In reply to Olli Pettay [:smaug] from comment #19)
+> Comment on attachment 8498729
+> change timeline markers to have a consistent epoch
+> 
+> > nsDocShell::AddProfileTimelineMarker(const char* aName,
+> >                                      TracingMetadata aMetaData)
+> > {
+> > #ifdef MOZ_ENABLE_PROFILER_SPS
+> >-  if (!mProfileTimelineStartTime.IsNull()) {
+> >-    float delta = GetProfileTimelineDelta();
+> >-    ProfilerMarkerTracing* payload = new ProfilerMarkerTracing("Timeline",
+> >-                                                               aMetaData);
+> >-    mProfileTimelineMarkers.AppendElement(
+> >-      new InternalProfileTimelineMarker(aName, payload, delta));
+> >+  nsCOMPtr<nsIDocShellTreeItem> root;
+> >+  if (mProfileTimelineRecording
+> >+      && NS_SUCCEEDED(GetRootTreeItem(getter_AddRefs(root)))) {
+> >+    nsDocShell* topDocShell = static_cast<nsDocShell*>(root.get());
+> >+    nsCOMPtr<nsIDocument> doc(do_GetInterface(GetAsSupports(topDocShell)));
+> >+    if (doc) {
+> >+      nsCOMPtr<nsPIDOMWindow> win = doc->GetInnerWindow();
+> >+      if (win) {
+> >+        DOMHighResTimeStamp when = win->GetPerformance()->Now();
+> I don't understand how this works in case of page loads. In such case inner
+> window is changed and 
+> "The now method MUST return a DOMHighResTimeStamp representing the number of
+> milliseconds from the navigationStart
+> attribute of the PerformanceTiming interface [NavigationTiming], the start
+> of navigation of the document, to the occurrence of the call to the now
+> method. "
+
+The idea was to find the outermost docshell's window and use it as the base point.
+The window in question here is the chrome window.
+In gdb with "set print object on":
+
+(gdb) p win.mRawPtr
+$3 = (nsGlobalChromeWindow *) 0x7fa2874db400
+
+The idea here was that this won't change across page loads.
+A simple hand test of this (start the timeline, see some markers, then
+reload and wait for more markers) shows that it seems to work.
+
+I'm not sure if the patch expresses this idea in the best way or not.
+
+And TBH I am still not certain this is the very best approach since I
+still don't know how this timer will be correlated with the memory events,
+which are using PR_Now.  (But see above for the reasons this patch isn't using PR_Now.)
+
+Needinfo'ing you to tell me if this is ok or not.
+(In reply to Tom Tromey :tromey from comment #20)
+> The idea was to find the outermost docshell's window and use it as the base
+> point.
+> The window in question here is the chrome window.
+No it isn't in e10s/child process, and that is where the web pages live in e10s.
+
+Do we just need some random time and offset from that? Couldn't we then have a static TimeStamp in
+Docshell or something?
+> Do we just need some random time and offset from that? Couldn't we then have
+> a static TimeStamp in
+> Docshell or something?
+
+I think we need access to the baseline in order to draw the graph properly.
+From actor/timeline.js:
+
+    this._startTime = this._chromeWin.performance.now();
+
+Having a static in docshell would work ok if we could access the value from JS.
+If this is ok with you I will try it out.
+
+I'm still not sure how synchronizing with the memory data will work given
+that this data is using PR_Now.
+Why do we need to access the start time if we stored offset to the start time?
+(In reply to Olli Pettay [:smaug] from comment #23)
+> Why do we need to access the start time if we stored offset to the start
+> time?
+
+We'd like to know when the timeline started so we can display events
+as relative to this point.
+
+There's a (semi-) hack in the current patch to do a bit of this on the client
+side.  That's not strictly correct but it seems ok-ish given that it's only used
+to compute the end time when no events are coming.  (This lets the timeline continue
+to update when nothing is happening.)
+
+It would be possible to do this for the start time as well, provided we don't mind
+some unknown amount of error.  This may impact the memory data synchronization.  I
+am not sure if it would otherwise be noticeable by the user.
+Created attachment 8505512
+change timeline markers to have a consistent epoch
+
+Here is a new version.
+
+Olli said on irc that exposing the docShell timestamp baseline via
+nsIDocShell.idl was ok.
+
+I chose the process start time as a baseline because it already exists
+and because the baseline is arbitrary.
+
+Testing locally has worked fine, though I'll send this through a "try"
+build shortly just to be sure.
+Created attachment 8505517
+change timeline markers to have a consistent epoch
+
+I had neglected to update the UUID in nsIDocShell;
+fixed in this version.
+https://tbpl.mozilla.org/?tree=Try&rev=3ba7544f361e
+Comment on attachment 8505517
+change timeline markers to have a consistent epoch
+
+I think the one oddity in the "try" is an unrelated intermittent failure.
+Comment on attachment 8505517
+change timeline markers to have a consistent epoch
+
+>   _startRecording: function*() {
+>+    TimelineView.handleRecordingStarted();
+>+    let startTime = yield gFront.start();
+>+    // Times must come from the actor in order to be self-consistent.
+>+    // However, we also want to update the view with the elapsed time
+>+    // even when the actor is not generating data.  To do this we get
+>+    // the local time and use it to compute a reasonable elapsed time.
+>+    // See _onRecordingTick.
+>+    this._localStartTime = performance.now();
+Not reviewing the .js code, but do we actually want to use performance.now() here?
+
+>+nsresult
+>+nsDocShell::Now(DOMHighResTimeStamp* when)
+aWhen
+
+
+
+
+>   /**
+>+   * "Now" according to the docshell.  This uses an arbitrary baseline
+>+   * for the time -- but, importantly, the same baseline that is used
+>+   * by the timestamps on markers.
+I wouldn't use word baseline here, but just say something like
+
+"The now method returns a DOMHighResTimeStamp representing the number of milliseconds
+ from an arbitrary point of time. Each DocShell object use the same point of time."
+and then something about markers
+(In reply to Olli Pettay [:smaug] from comment #29)
+> Comment on attachment 8505517
+
+> >+    this._localStartTime = performance.now();
+> Not reviewing the .js code, but do we actually want to use performance.now()
+> here?
+
+Yeah.  This is the semi-hack referred to in comment #24; also see comment #13
+and comment #15.  In short we need something on the client side to ensure the
+display updates when no markers are coming; and as this does not need to be
+truly exact, it seemed better to do it locally, as opposed to sending timestamp
+events from the server.
+
+> >+nsresult
+> >+nsDocShell::Now(DOMHighResTimeStamp* when)
+> aWhen
+
+Fixed.
+
+> >   /**
+> >+   * "Now" according to the docshell.  This uses an arbitrary baseline
+> >+   * for the time -- but, importantly, the same baseline that is used
+> >+   * by the timestamps on markers.
+> I wouldn't use word baseline here, but just say something like
+> 
+> "The now method returns a DOMHighResTimeStamp representing the number of
+> milliseconds
+>  from an arbitrary point of time. Each DocShell object use the same point of
+> time."
+> and then something about markers
+
+How about this?
+
+  /**
+   * Return a DOMHighResTimeStamp representing the number of
+   * milliseconds from an arbitrary point in time.  The reference
+   * point is shared by all DocShells and is also used by timestamps
+   * on markers.
+   */
+  DOMHighResTimeStamp now();
+Created attachment 8506123
+change timeline markers to have a consistent epoch
+
+Here's a patch with the review issues fixed.
+I'm "carrying forward" your r+ provisionally.
+I've rebased this onto today's fx-team, which required a
+minor conflict resolution, nothing serious.
+The improved comment looks ok.
+Thanks.  I think I have all the needed reviews now, so marking checkin-needed.
+Actually, let me cancel that, because I remembered again about synchronizing
+with the memory data.  I don't see how that can be done without a more globally
+agreed-upon time baseline, or the use of absolute time.  Victor, what do you think?
+Ok, I finally re-read the patch in bug 1069421.  The times are
+generated in actors/timeline.js:
+
+    if (this._memoryActor) {
+      events.emit(this, "memory", Date.now(), this._memoryActor.measure());
+    }
+
+This can trivially be changed to follow what the patch in this bug does.
+So, I'm clearing the needinfo and adding checkin-needed.
+https://hg.mozilla.org/integration/fx-team/rev/9acb83f0af3b
+(In reply to Tom Tromey :tromey from comment #35)
+
+Thanks for fixing this!
+https://hg.mozilla.org/mozilla-central/rev/9acb83f0af3b
+Jordan, to make the work on bug 1077442 (the fake actor front) easier, this (and bug 1085407) will need to be uplifted to aurora, to avoid subtle differences in the timeline actor's behavior between Firefox 35 and 36. Does this make sense to you or is there something else you'd prefer?
+Sounds good, don't think it'll change much in the front.
+Tom, does this patch require manual QA coverage? If that is the case, please set the qe-verify flag accordingly. Any information on how to verify this fix would also be appreciated.
+(In reply to Andrei Vaida, QA [:avaida] from comment #41)
+> Tom, does this patch require manual QA coverage? If that is the case, please
+> set the qe-verify flag accordingly. Any information on how to verify this
+> fix would also be appreciated.
+
+I never knew how to reproduce it :(
+The possibility was obvious from the code, though, and there was a
+report of it happening in bug 1069818; however, no reproducer.
+
+I'm not sure what I should do about the qe-verify flag.
+(In reply to Tom Tromey :tromey from comment #42)
+> (In reply to Andrei Vaida, QA [:avaida] from comment #41)
+> > Tom, does this patch require manual QA coverage? If that is the case, please
+> > set the qe-verify flag accordingly. Any information on how to verify this
+> > fix would also be appreciated.
+> 
+> I never knew how to reproduce it :(
+> The possibility was obvious from the code, though, and there was a
+> report of it happening in bug 1069818; however, no reproducer.
+> 
+> I'm not sure what I should do about the qe-verify flag.
+
+I see, thank you for clarifying this.
+
+The qe-verify[?|+|-] flag is used to filter bugs that need manual QA coverage, so if a bug needs to be verified by QA, it will be marked qe-verify+, otherwise qe-verify-. I'm gonna go ahead and set qe-verify- for this one, but I'll take a look at Bug 1069818 myself and try to reproduce it, just to be safe.
+Sorry for the spam. Moving bugs to Firefox :: Developer Tools: Performance Tools (Profiler/Timeline).
+
+dkl

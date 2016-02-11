@@ -1,0 +1,136 @@
+The frontend should have access to what optimization level sampled frames are showing up at.  To this end, we want to include in the profiler frames information about the "jitLevel" (baseline or ion) of the frame.
+
+The frontend should have access to what optimization level sampled frames are showing up at.  To this end, we want to include in the profiler frames information about the "jitLevel" (baseline or ion) of the frame.
+Created attachment 8578154
+forward-jitlevel-info-to-profiler.patch
+
+This works by always adding the 'J' optimization-info tag to all frame entries that are either Baseline or Ion.  Later on when streaming, the 'J' entries are looked up using GetProfilingKindFromNativeAddr, which indicates both the jitLevel and whether or not there is opt info for that frame.
+Comment on attachment 8578154
+forward-jitlevel-info-to-profiler.patch
+
+Review of attachment 8578154:
+-----------------------------------------------------------------
+
+LGTM with comments addressed. This looks simpler to land than bug 1143860. Could you land this and I will rebase bug 1143860 on top of this?
+
+::: js/public/ProfilingFrameIterator.h
+@@ +123,5 @@
+>      bool isJit() const;
+>  };
+>  
+> +extern JS_PUBLIC_API(ProfilingFrameIterator::FrameKind)
+> +GetProfilingFrameKindFromNativeAddr(JSRuntime *runtime, void *pc, bool *hasOptInfo);
+
+Could you remove the hasOptInfo outparam? The optimization streaming part of the code is rewritten for bug 1143860 anyhow.
+
+Let's eat the extra skiplist lookups for now. If this becomes a perf problem, we should invest in something more flexible than extra outparams, like a shadow JitcodeGlobalEntry type.
+
+::: tools/profiler/ProfileEntry.cpp
+@@ +416,5 @@
+> +                                     frameKind == JS::ProfilingFrameIterator::Frame_Baseline);
+> +                          const char *jitLevelString =
+> +                            (frameKind == JS::ProfilingFrameIterator::Frame_Ion) ? "ion"
+> +                                                                                 : "baseline";
+> +                          b.NameValue("jitLevel", jitLevelString);
+
+Could we use "implementation" here? Debugger.Frame instances have such an "implementation" property describing what tier of the engine the frame is in. It'd be nice to maintain parity with existing nomenclature.
+Sure.  I'm getting try oranges in |dt2| on osx and windows (not on linux).  Will fix that and address comments before sending it to you for review.
+Try run for reference: https://treeherder.mozilla.org/#/jobs?repo=try&revision=b5d14a86da30
+*** Bug 1046840 has been marked as a duplicate of this bug. ***
+I tracked down the issue.  What's happening is related to the fact that we don't flush the sample buffer when the profiler is stopped.  The sequence of events is:
+
+Jitcode J is compiled.
+Sample S is taken of of jitcode J.  Entry for J is marked as sampled.
+Profiler is stopped, jitcode J becomes non-live (doesn't matter what order these happen in).
+Garbage collection runs - cleaning up entry for jitcode J since profiler is off.
+Profiler is started again.
+Profiler streams samples, trying to stream sampled S from before.
+But entry for sample S is gone since it got garbage collected.
+
+I have a patch that should fix it (flushing the sample buffers on profiler stop), which _is_ getting executed.. but the problem is still showing up.  I think the patch is not really flushing the sample buffers "for real", somehow.
+So the ProfileBuffer we're calling reset() on and the ProfileBuffer that's streaming the samples that hits the assert are not the same.  Not sure what's going on but I need to dig into how these things are allocated and used within the profiler.
+Created attachment 8579906
+fml.patch
+
+Continuing Kannan's investigation, the problem is nsRefreshDriver.
+
+First, some background. The sampler makes ProfileBuffers for two uses:
+  1) The async (e.g., normal) case - as a circular buffer for sampling.
+  2) The sync case - as a buffer to hold a backtrace when the main thread calls profiler_get_backtrace().
+
+nsRefreshDriver calls profiler_get_backtrace() to synchronously capture backtraces at reflow and restyle (?) times, into mReflowCause and mStyleCause.
+
+The problem is that these backtraces may be live across a ***GC during which the profiler is disabled***. In that case, the JS engine is free to discard all its JIT code profiling map stuff since, well, the profiler is disabled.
+
+The synchronous case (case 2 above) should not be using the same code paths at all, really. It really needs to be serialized up front. A technical illustration of the current situation is as follows:
+
+
+                             :            :         +-'~`---------------------------------/\--
+                             :            :        ||"""""""""""""""""""""""""""""""" \\\\\\  \/~)
+                             :            :        ||                                  \\\\\\  \/_
+                             :            :         |~~~~~~~~-________________-_________________\ ~--_
+                             :            :         !---------|_________       ------~~~~~(--   )--~~
+                            .'            :                             \ /~~~~\~~\   )--- \_ /(
+                        _.-"              :                              ||     |  | \   ()   \\
+                    _.-"                  '.                             \\____/_ / ()\        \\
+    ..__...____...-"                       :                              `~~~~~~~~~-. \        \\
+   : \_\                                    :                                         \ \  <($)> \\
+   :    .--"                                 :                                         \ \        \\
+   `.__/  .-" _                               :                                         \ \        \\
+      /  /  ," ,-                            .'                                          \ \        \\
+     (_)(`,(_,'L_,_____       ____....__   _.'                                            \ \  ()    \|
+      "' "             """""""          """                                               _\_\__====~~~
+
+   Figure 1.
+
+So all that stuff about profiler flushing has been a red herring. I think the problem Kannan identified about the markers racing is probably real, but we can shave both of those yaks another time...
+
+This patch seems to fix the problem for me locally, even with the buffer flushing stuff commented out.
+Ugh.
+Try is closed.  I merged your changes into my patch.  Ready to run on try once it opens up.  In the meantime, going to do some more cleanup.
+Created attachment 8580112
+expose-jit-level-info.patch
+Shu and I discussed today about using the optimization strategy constant names (GetProp_IC) as a unique identifier to a strategy. This let's us have a unique identifier for when we add heuristics in the future, link to docs on further explanation on a strategy, and compress data sent when a profile ends (via a definition of mapping constant names to enum values [which can change], and then "attempts" reference this enum value, and we can make the references on the client). The debugging strings shouldn't be sent, as those would have to be localized, and don't provide much more information than the constant name (so, not make sense outside of JIT engineers). While the strategy constant names don't mean much information to those outside of JIT/SM developers, for V1 (hidden behind a pref), we're just showing pretty much raw optimization strategy outcomes, so this'll work great.
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #12)
+> Shu and I discussed today about using the optimization strategy constant
+> names (GetProp_IC) as a unique identifier to a strategy. This let's us have
+> a unique identifier for when we add heuristics in the future, link to docs
+> on further explanation on a strategy, and compress data sent when a profile
+> ends (via a definition of mapping constant names to enum values [which can
+> change], and then "attempts" reference this enum value, and we can make the
+> references on the client). The debugging strings shouldn't be sent, as those
+> would have to be localized, and don't provide much more information than the
+> constant name (so, not make sense outside of JIT engineers). While the
+> strategy constant names don't mean much information to those outside of
+> JIT/SM developers, for V1 (hidden behind a pref), we're just showing pretty
+> much raw optimization strategy outcomes, so this'll work great.
+
+This probably isn't the right bug for this. I filed bug 1145440 for this.
+Try run looks good: https://treeherder.mozilla.org/#/jobs?repo=try&revision=9b2051e4441d
+Comment on attachment 8580112
+expose-jit-level-info.patch
+
+Review of attachment 8580112:
+-----------------------------------------------------------------
+
+LGTM!
+
+::: tools/profiler/TableTicker.cpp
+@@ +596,5 @@
+> +      // captured backtrace is usually externally stored for an indeterminate
+> +      // amount of time, such as in nsRefreshDriver. Problematically, the
+> +      // stored backtrace may be alive across a GC during which the profiler
+> +      // itself is disabled. In that case, the JS engine is free to discard
+> +      // its JIT code. This means that is we inserted such 'J' entries into
+
+Oops, I typoed the comment here.
+
+This means that is -> This means that if
+https://hg.mozilla.org/mozilla-central/rev/e080ca1e7044
+
+
+Forward jit level information to profiler frontend
+
+
+
+Bug 1143802 - Forward jit level information to profiler frontend. r=shu 

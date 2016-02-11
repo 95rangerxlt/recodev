@@ -1,0 +1,202 @@
+
+
+
+Created attachment 8520082
+patch
+
+The actual patch for this is trivial. What keeps us from landing it is a handful of test failures. The most likely cause of these is a subtle difference in semantics between the deprecated-sync-thenables and Promise.jsm promises. In the former, promise handlers are called immediately when a promise is resolved. In the latter, promise handlers are called on the next tick. This causes problems for code that expects to be able to do things within the same tick as the one during which the event occurs.
+
+When I apply the patch locally, the following mochitest-devtools tests fail for me:
+
+browser/devtools/framework/test/browser_devtools_api.js
+browser/devtools/framework/test/browser_new_activation_workflow.js
+browser/devtools/framework/test/browser_toolbox_dynamic_registration.js
+browser/devtools/framework/test/browser_toolbox_tool_ready.js
+browser/devtools/framework/test/browser_toolbox_tool_remote_reopen.js 
+browser/devtools/framework/test/browser_toolbox_window_shortcuts.js 
+browser/devtools/framework/test/browser_toolbox_zoom.js 
+browser/devtools/inspector/test/browser_inspector_search-navigation.js 
+browser/devtools/inspector/test/browser_inspector_select-last-selected.js 
+browser/devtools/responsivedesign/test/browser_responsiveuiaddcustompreset.js
+browser/devtools/storage/test/browser_storage_dynamic_updates.js
+browser/devtools/storage/test/browser_storage_sidebar.js
+browser/devtools/storage/test/browser_storage_values.js
+browser/devtools/styleeditor/test/browser_styleeditor_bug_870339.js
+browser/devtools/styleeditor/test/browser_styleeditor_cmd_edit.js 
+browser/devtools/styleeditor/test/browser_styleeditor_filesave.js 
+browser/devtools/styleeditor/test/browser_styleeditor_sourcemaps.js 
+browser/devtools/styleinspector/test/browser_ruleview_add-rule_03.js
+browser/devtools/styleinspector/test/browser_ruleview_edit-property-order.js
+browser/devtools/styleinspector/test/browser_ruleview_override.js
+
+Unfortunately, most of these are in tools that I am not very familiar with. Since these bugs are likely very subtle, it could take me quite some time to find them on my own.
+
+It would be awesome if we could find some people that are familiar with these respective tools to volunteer to help out. This isn't exactly top priority, but it's an important blocker in the process of cleaning up the debugger server code. Moreover, the number of failing tests per tool is relatively small, so it shouldn't be too much work for somebody who knows what he/she is doing.
+
+victorporof, pbrosset, and/or mikeratcliffe, would any of you be interested in helping out with one or more of the above tools?
+Thanks for looking into this! It's been a while since I worked on this code, but if I remember correctly, originally this couldn't be changed in protocol.js because it would cause some packets to be transmitted or processed out of order. But I believe this may have been fixed in the meantime, and now it might be just be a matter of the tests themselves making timing assumptions.
+
+It would be interesting to see what the behavior of the tests is if you apply the scheduling changes in bug 1094208 (which requires the patch in bug 1095443 as well). If the issue is the interaction with timers or other events, the new scheduling is more similar to the sync-thenables (though still different with regard to when the "then" function returns).
+Created attachment 8520515
+Fix test failures in browser_devtools_api.js
+Created attachment 8520589
+Fix test failures in browser_new_activation_workflow.js
+For some reason, I can't get browser/devtools/framework/test/browser_toolbox_dynamic_registration.js to fail anymore, even without the above fixes applied. Might have been a fluke.
+Created attachment 8522156
+Fix test failures in browser_toolbox_tool_ready.js
+
+This test was actually failing before because of a missing string, but the failure was silently ignored because we didn't have a catch handler installed. Promise.jsm promises have a mechanism to find uncaught promise rejections, which brought this issue to light.
+The test failure in browser/devtools/framework/test/browser_toolbox_tool_remote_reopen.js had the same underlying cause as comment 6, so we get that one for free :-)
+Created attachment 8522165
+Fix test failures in browser_toolbox_window_shortcuts.js
+
+The problem with this patch is that we didn't wait for the storage panel to be fully initialized before continuing with the rest of the test. When we reach the end of the test, we close our connection to the debugger server, which causes the promise in the StorageUI constructor to be rejected with a ConnectionClosed error.
+browser/devtools/framework/test/browser_toolbox_zoom.js seems to just work now.
+Comment on attachment 8522165
+Fix test failures in browser_toolbox_window_shortcuts.js
+
+Review of attachment 8522165:
+-----------------------------------------------------------------
+
+LGTM. Just asking for a quick extra review by optimizer as he knows this better.
+Comment on attachment 8522165
+Fix test failures in browser_toolbox_window_shortcuts.js
+
+Review of attachment 8522165:
+-----------------------------------------------------------------
+
+Although the changes look fine, they will now delay the firing of "ready" event for storage panel. The ready event will now happen after all the storage items have been fetched and UI has been completely initialized.
+
+Though I can also think why it (the original code) would have caused shortcuts test to fail as the test might be over before the response of listStores returns.
+
+Overall its all good.
+Created attachment 8523945
+Fix early return bug in selector-search.js
+
+The test failures in browser_inspector_search-navigation.js were caused by a bug in selector-search.js. By not returning early in that case, we caused the processing-done event to be emitted twice for the same keypress (once sync, once async). As a result, the async event would be interpreted as caused by a subsequent keypress, causing us to examine the state at the wrong time.
+
+I also changed a rejected promise into a resolved promise in onHTMLSearch, because none of the callers handle that promise rejection properly. Since that promise is only used for sequencing events, and we don't care about its actual resolution value, returning a promise that resolves to undefined seems good enough here.
+Comment on attachment 8523945
+Fix early return bug in selector-search.js
+
+Review of attachment 8523945:
+-----------------------------------------------------------------
+
+r+ for the selector-search.js file assuming a green try push (not sure if you meant to include the changes to Promise-backend.js in here)
+As I feared, pushing these changes to try all at once causes other tests to fail. Most likely there are other tests which rely on the faulty behavior I fixed so far:
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=0b051c691867
+
+It looks like I'm going to have to land these patches one at a time.
+Green try run for the fix for browser_devtools_api.js:
+https://hg.mozilla.org/try/rev/13681e8c3525
+https://hg.mozilla.org/integration/mozilla-inbound/rev/9986a68aa635
+https://hg.mozilla.org/mozilla-central/rev/9986a68aa635
+The patch to fix the test failures in browser_new_activation_workflow.js is a lot harder than I had anticipated.
+
+Here are some of the problems I've discovered:
+
+1. In browser/devtools/styleeditor/test/head.js, there is a function addTabAndCheckOnStyleEditorAdded that opens the style editor, calls a callback for each editor that is already loaded, and sets up a listener for editors that will load in the future.
+
+The problem is that an editor is considered to be already loaded when it has added itself to the editors array in browser/devtools/styleeditor/StyleEditorUI.jsm. It does so in _addStyleSheetEditor, *before* it finished fetching the source. We don't wait for the source to be loaded, so initialization completes, we iterate over each editor in the editors array, and call the callback for each one, even though its sources may not have been loaded yet.
+
+The result is that editors are not guaranteed to be fully loaded by the time we run our assertions on them. By some lucky coincidence this did not manifest while protocol.js used the deprecated-sync-thenables, but it does when we switch it to Promise.jsm promises. For instance, browser_styleeditor_init.js complains that editor.summary is undefined, because we don't set it until *after* the source has loaded.
+
+2. The solution to the above problem should be to not add each editor to the editor array until after its source has loaded. We still have to iterate over the editors array after initialization because its not clear that its impossible for an editor to finish loading its source before initialization completes.
+
+Of course, the problem with this solution is that since loading the source is an async operation, and we load the source for all editors at once, there is no guarantee that editors are loaded in order. Our tests do make that assumption however, so we need to make sure that we don't start loading the next editor until the previous one has completed, which is needlessly inefficient. What we should really be doing is rewrite our tests so that they do not rely on editors being loaded in a particular order.
+
+3. Other tests, such as browser_styleeditor_private_perwindowpb.js, do not take into account that _addStyleSheet can call _addStyleSheetEditor twice. It creates an editor, then loads the original sources of the stylesheet, and if applicable, then destroys the editor and creates a new one for the original sources. Consequently, the editor-added event is emitted twice, but often we only listen for it once.
+
+As a result, the test finishes and shuts down while the second editor is still being created. By the time we try to add it to the view, the view has been destroyed, so we get an error.
+
+4. More generally, our tests (not just those for the style editor) are very fragile in the sense that we often don't wait for all operations to complete before shutting down. Almost none of our code is robust in the face of a sudden connection close while there are still pending actor requests, which causes test failures.
+
+This is a problem that needs to be solved on multiple levels: first, our actors should be made more robust in the face of unexpected connection closes. Actually, actors are robust in the sense that they will send an error message back to the client, so its mostly the frontend that needs to be prepared to deal with these errors.
+
+Moreover, our tests should be more robust in the sense that they need to wait for *all* activity to finish before shutting down, not just activity we happen to be testing for. In the example above, we really should wait for the second editor-added event before shutting down the test.
+Fixing the issues in comment #18 is hard enough that I'm going to need help from somebody who is more knowledgeable about the source editor.
+
+Heather, pbrosset tells me that you're the resident expert on the source editor. Could you help me out? If you take a look at comment #18, you'll see that we run into multiple unrelated problems when switching protocol.js to the Promise.jsm promises. Solving those problems properly would require a big refactor, which I'm trying to avoid.
+
+Ideally, we should be able to fix the tests failures I'm seeing with a couple of one line fixes, but my knowledge of the style editor code is too limited to figure out the best way to solve things. Subtly changing the order we do things in one place to fix one test happens to break several others because they either have wrong assumptions or rely on broken behavior.
+
+It would be really helpful if we could spend a couple of hours looking into this issue together. If you could make some time for me this week, that would be awesome. I'm usually available until noon your time.
+
+Thanks!
+Ugh, the patch to fix the test failures in browser_toolbox_window_shortcuts.js is causing a large number of other tests to fail as well:
+https://tbpl.mozilla.org/?tree=Try&rev=9b9ad1ef2671
+I've opened a separate bug for the async issues in the style editor (bug 1105652). Once those are fixed, I'm going to have another shot at this.
+Created attachment 8548671
+Remove the deprecated-sync-thenables from protocol.js
+
+This patch removes the deprecated-sync-thenables from protocol.js and fixes some bugs that pop up in the style inspector as a result (based on a patch by pbrosset in bug 1118478).
+
+These need to land as a single patch because these fixes only work when the deprecated-sync-thenables are removed. Otherwise, they cause test failures.
+This needinfo request is no longer relevant.
+Comment on attachment 8548671
+Remove the deprecated-sync-thenables from protocol.js
+
+Review of attachment 8548671:
+-----------------------------------------------------------------
+
+::: browser/devtools/styleinspector/rule-view.js
+@@ +1043,5 @@
+>  
+>    setValue: function(aValue, aPriority, force=false) {
+>      let store = this.rule.elementStyle.store;
+>  
+> +    if (this.editor && aValue !== this.editor.committed.value || force) {
+
+This is weird, but we do this in other functions already in TextProperty so I think it's fine.  We should refactor how this.editor is set / nulled out so we can keep better track of this and prevent all of these checks.
+
+@@ +1593,5 @@
+> +    }
+> +
+> +    return promise.all(promises).then(() => {
+> +      return this._populate(true);
+> +    });
+
+Seems like this should have a .catch - this will be rejected if any of the promises in the array are rejected.  Or are these never going to be rejected in this place?
+Try push for the above patch:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=93694884dc23
+Try push looks green, landing on fx-team:
+https://hg.mozilla.org/integration/fx-team/rev/4d427be40f81
+
+Fingers crossed!
+sorry had to back this out for test failures like https://treeherder.mozilla.org/logviewer.html#?job_id=1699115&repo=fx-team
+(In reply to Carsten Book [:Tomcat] from comment #27)
+> sorry had to back this out for test failures like
+> https://treeherder.mozilla.org/logviewer.html#?job_id=1699115&repo=fx-team
+
+I filed bug 1122123 for those test failures. Will try again once that lands.
+With the patch from that bug applied the WebIDE test failures now seem to be gone:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=153a03262528
+
+Of course, now there are style editor tests failing that weren't failing before. We can't figure out where the unhandled promise rejections come from without keeping track of the stack whenever a promise is created, so here is another try run with some debugger helpers included:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=73f9ec01e31a
+Argh, I forgot to include a patch in that try run :-(
+
+Second attempt:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5dce48880d4a
+New try push with the patch from bug 1123211 included:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=3e1c32caffdf
+Bug 1123211 landed, and try run looks green, so pushing to fx-team again:
+https://hg.mozilla.org/integration/fx-team/rev/f9c20f576d9f
+
+I included the platforms/testsuites that were failing previously in this try run, so hopefully the patch will stick this time.
+https://hg.mozilla.org/mozilla-central/rev/f9c20f576d9f
+Booyah!
+Great work! \o/
+
+
+Remove the deprecated-sync-thenables from protocol.js
+
+
+
+Bug 1096490 - Fix test failures in browser_devtools_api.js;r=vporof
+
+Bug 1096490 - Remove the deprecated-sync-thenables from protocol.js;r=bgrins 
+
+Backed out changeset 4d427be40f81 (bug 1096490) for breaking m-oth tests on a CLOSED TREE 
+
+Bug 1096490 - Remove the deprecated-sync-thenables from protocol.js;r=bgrins 

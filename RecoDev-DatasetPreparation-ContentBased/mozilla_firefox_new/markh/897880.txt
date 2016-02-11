@@ -1,0 +1,597 @@
+I've had the Mozilla phonebook as part of my newtab grid for a while and it never once lacked a thumbnail. Now that the BackgroundPageThumbs service is active its thumbnail has been overwritten with an image of a blank page that says "Authorization Required".
+
+We should make sure that we don't capture thumbnails for sites that we already have an image for. The image will most likely not be better than the original one and we should avoid the extra network traffic and CPU usage.
+
+I've had the Mozilla phonebook as part of my newtab grid for a while and it never once lacked a thumbnail. Now that the BackgroundPageThumbs service is active its thumbnail has been overwritten with an image of a blank page that says "Authorization Required".
+
+We should make sure that we don't capture thumbnails for sites that we already have an image for. The image will most likely not be better than the original one and we should avoid the extra network traffic and CPU usage.
+In bug 870100 comment #23 I requested that we put the .captureIfStale() call in PageThumbsProtocol.js. It's not entirely wrong putting it in the about:newtab page's page.js but about:newtab is not the only thumbnail client.
+Or was that done intentionally to only cover about:newtab for the moment?
+Anyhow, I see now where the regression is coming from. It's a good goal to not have thumbnails that are too stale but even if I didn't click the phonebook for a long while its thumbnail should not be overwritten.
+
+We should capture thumbnails for sites that don't have any. The staleness check should only apply to thumbnails that have been captured by the BackgroundPageThumbs service in the first way.
+Another thing we could do is try and be smarter about >= 400 responses (ie, never overwrite existing thumbnails on such a response).  This wouldn't solve the problem for sites that use exclusively cookie-auth, but it would help a little.
+
+(FWIW, it's not immediately obvious to me how the thumbnail service(s) could simply grow knowledge about whether the f/g or b/g implementation did an existing capture)
+Speaking with Gavin, I think we agreed:
+
+* We should never overwrite an existing thumbnail if the background service gets a response code >= 400.  (We didn't discuss this, but I guess we probably should keep thumbnails for such responses when one doesn't already exist - a thumbnail with a 401 is probably better then nothing at all)
+
+* If we decline to keep the new thumbnail, we should update the timestamp on the existing thumbnail file so it will not continually be considered stale.  ie, once we get an error response, we should not check again for the default staleness period (currently 2 days).  Note that OS.File doesn't have a way to update the modifiedTime for a file, so we will work around this by using OS.File to open the file for append then immediately close it.
+
+Sound OK?
+Created attachment 784837
+897880-no-thumbnail-overwrite-on-error.patch
+
+a WIP that (hopefully) does as described in comment 5.  I'm struggling a little with how to make a good test for this - the .sjs files seem to be reloaded each request, so I can't keep state there.  Without that, it will be hard to have 2 requests for the same URL cause different responses.
+
+All feedback welcome in the meantime.
+Have you tried getState and setState? https://developer.mozilla.org/en-US/docs/Mochitest#How_do_I_keep_state_across_loads_of_different_server-side_scripts.3F
+(In reply to Matthew N. [:MattN] from comment #7)
+> Have you tried getState and setState?
+No! Thanks for the pointer.
+Comment on attachment 784837
+897880-no-thumbnail-overwrite-on-error.patch
+
+>diff --git a/toolkit/components/thumbnails/PageThumbsWorker.js b/toolkit/components/thumbnails/PageThumbsWorker.js
+
+>+  touch: function Agent_touch(path) {
+>+    // No OS.File way to update the modification date of the file, so we just
+>+    // open it for appending then close it.
+>+    let file = OS.File.open(path, { write: true });
+>+    file.close();
+
+Are you sure this works across all platforms?
+
+>diff --git a/toolkit/components/thumbnails/content/backgroundPageThumbsContent.js b/toolkit/components/thumbnails/content/backgroundPageThumbsContent.js
+
+>+  get _isErrorResponse() {
+
+>+    let httpChannel;
+>+    try {
+>+      httpChannel = channel.QueryInterface(Ci.nsIHttpChannel);
+>+    } catch (e) { /* Not an HTTP channel. */ }
+>+    if (!httpChannel)
+>+      // it might be FTP etc, so assume it's ok.
+>+      return false;
+
+Can just use instanceof instead of try/catch:
+
+if (!(channel instanceof Ci.nsIHttpChannel))
+  return false;
+// channel is now QIed to nsIHttpChannel
+
+>+    // 400 or greater is an error.
+>+    try {
+>+      return httpChannel.responseStatus >= 400;
+
+I think you could use requestSucceeded here, which effectively returns responseStatus == 2** (you still need to try/catch it, though, apparently).
+(In reply to Mark Hammond (:markh) from comment #5)
+> Sound OK?
+
+Sounds good to me!
+Created attachment 786805
+897880-no-thumbnail-overwrite-on-error.patch
+
+/me thought this bug would be simple.  /me was wrong :)
+
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #9)
+> Comment on attachment 784837
+> 897880-no-thumbnail-overwrite-on-error.patch
+> 
+> >diff --git a/toolkit/components/thumbnails/PageThumbsWorker.js b/toolkit/components/thumbnails/PageThumbsWorker.js
+> 
+> >+  touch: function Agent_touch(path) {
+> >+    // No OS.File way to update the modification date of the file, so we just
+> >+    // open it for appending then close it.
+> >+    let file = OS.File.open(path, { write: true });
+> >+    file.close();
+> 
+> Are you sure this works across all platforms?
+
+I'm now sure it doesn't :)  I ended up needing to go with (a) open for read/write (b) seek to zero and read 1 byte (c) seek to zero and write the same byte (d) close the file.  Sadly that is the best I could come up with - maybe we should open a bug to add this to OS.File?  (OTOH though, it's not clear if we would want to add just a .touch() method, or a more generic "writable stat" implementation, which would be non-trivial.)  The IO is still off the main thread and would be no worse than if we actually wrote real data, so I see this as a minor wart rather than a real issue.
+
+> Can just use instanceof instead of try/catch:
+...
+> I think you could use requestSucceeded here, which effectively returns
+> responseStatus == 2** (you still need to try/catch it, though, apparently).
+
+Done and done.
+
+The other slightly nasty part of this patch is the change to retrieveImageDataForURL - the old version just created an image, but never inserted it into a document, and in these tests it failed to recognise a change in the thumbnail data - it was reusing a previously fetched copy of the thumbnail instead of re-fetching it (and I verified the protocol impl was never re-asked for the channel).  The new version loads the thumbnail into its own tab - the semantics should be identical and it avoids that problem.
+
+The other slightly strange thing I should call out is the "trampoline" needed for runTests() to work correctly - I'm not sure if there is a better way - but I couldn't find it :)
+
+Try at https://tbpl.mozilla.org/?tree=Try&rev=5198c68e974d (although it is before a final rebase of the patches and my first patch generated with this new-fangled git thing... :)
+Comment on attachment 786805
+897880-no-thumbnail-overwrite-on-error.patch
+
+Review of attachment 786805:
+-----------------------------------------------------------------
+
+The r- is mainly for polling in the tests, but let me know if I'm missing something there.
+
+But also:
+
+PageThumbs.captureAndStore should decline to store thumbnails of non-2xx response, too, right?  That sounds like a separate bug since the code paths are different, but instead of duplicating logic in backgroundPageThumbsContent.js and PageThumbs, we could kill two birds with one stone and build that logic into PageThumbs._store.  It would check a passed-in response code, and then check whether a file already exists for non-2xx responses.  That would mean wasted cycles drawing canvases that _store is just going to discard, but that's not the common case, and it doesn't outweigh duplicated code complexity IMO.  What do you think?
+
+::: toolkit/components/thumbnails/BackgroundPageThumbs.jsm
+@@ +276,5 @@
+> +      id: this.id,
+> +      url: this.url,
+> +      skipIfErrorResponse: !!this.options.skipIfErrorResponse
+> +    };
+> +    this._msgMan.sendAsyncMessage("BackgroundPageThumbs:capture", captureOptions);
+
+Please write this without the captureOptions temp variable:
+
+sendAsyncMessage("...", {
+  id: this.id,
+  url: this.url,
+  ...
+});
+
+@@ +358,4 @@
+>        callOnDones();
+>        return;
+>      }
+> +    if (data && data.wasErrorResponse) {
+
+No need for the first term in this conditional, since an earlier conditional causes the method to return when !data.
+
+::: toolkit/components/thumbnails/PageThumbs.jsm
+@@ +199,5 @@
+>        if (!result.ok) {
+> +        // result.ok can be false to indicate the file exists but was stale,
+> +        // or null to indicate the file didn't exist.  If the former, we don't
+> +        // want to overwrite the thumbnail with one from an error response.
+> +        let options = { skipIfErrorResponse: result.ok === false };
+
+I don't like how result.ok can take boolean values in what is really a three-way enum.  And at first I didn't notice the triple-equals, and that's my fault, but it is subtle.  I'd prefer the return values to be distinguished more clearly.  Three constant ints would be ideal (e.g., RECENT, NOT_RECENT, DOESNT_EXIST), but I guess it would be hard to share their definitions between the worker file and other files, so they'd need to be defined in at least two places.  So maybe Agent.isFileRecent could return an object with two bools, { isRecent, exists }?
+
+::: toolkit/components/thumbnails/PageThumbsWorker.js
+@@ +182,5 @@
+> +
+> +  touch: function Agent_touch(path) {
+> +    // No OS.File way to update the modification date of the file, so we open
+> +    // it for reading and writing, read 1 byte from the start of the file,
+> +    // then write that byte back out.
+
+Oh boy.  We should definitely file a bug for OS.File.touch like you say in comment 11.
+
+I'd much prefer to forget OS.File entirely in this case, until touch is implemented, and use nsIFile.lastModifiedTime, like ensureThumbnailStale in the test does.  So could you change that, please?
+
+::: toolkit/components/thumbnails/content/backgroundPageThumbsContent.js
+@@ +65,5 @@
+>  
+> +      let finalURL = this._webNav.currentURI.spec;
+> +      // if we have been asked to skip the capture if there was an error
+> +      // response, handle that now.
+> +      if (msg.json.skipIfErrorResponse && this._isErrorResponse) {
+
+Please rename skipIfErrorResponse something like dontDrawIfErrorResponse so it's clear what is being skipped.
+
+@@ +70,5 @@
+> +        sendAsyncMessage("BackgroundPageThumbs:didCapture", {
+> +          id: msg.json.id,
+> +          imageData: null,
+> +          finalURL: finalURL,
+> +          wasErrorResponse: true,
+
+Please rename wasErrorResponse something like skippedDueToErrorResponse (or didntDrawDueToErrorResponse, in line with my previous suggestion) to capture the fact that this boolean encompasses two orthogonal conditionals: skip && isErrorResponse.
+
+::: toolkit/components/thumbnails/test/browser_thumbnails_update.js
+@@ +13,5 @@
+> +    goodResponseUpdateTest,
+> +  ];
+> +  for (let test of tests) {
+> +    info("Running subtest " + test.name);
+> +    for (let thing of test())
+
+The proper name for these "things" is "iterators," right? :-)  The test functions are generators that produce iterators when they're called.
+
+@@ +102,5 @@
+> +  const URL = "http://mochi.test:8888/browser/toolkit/components/thumbnails/test/thumbnails_update.sjs?fail";
+> +  yield addTab(URL);
+> +
+> +  yield captureAndCheckColor(0, 255, 0, "we have a green thumbnail");
+> +  // reset browser URL, else it will re-capture after 1 second
+
+Why will it recapture after one second?  And what's "it"?
+
+@@ +123,5 @@
+> +  };
+> +
+> +  waitForCondition(() => getThumbnailModifiedTime(URL) >= now,
+> +                   checkThumbnailNotUpdated,
+> +                   "didn't see modified time of thumbnail change");
+
+Polling is bad in tests, especially for file I/O.  Couldn't you modify captureIfStale to take a callback or return a promise?  It would pass the callback to BPT.capture or call it in the !result.ok case.  Then you'd check your test condition in the callback.
+
+@@ +136,5 @@
+> +  yield addTab(URL);
+> +  let browser = gBrowser.selectedBrowser;
+> +
+> +  yield captureAndCheckColor(0, 255, 0, "we have a green thumbnail");
+> +  // reset browser URL, else it will re-capture after 1 second
+
+Same recapture question.
+
+@@ +157,5 @@
+> +  };
+> +
+> +  waitForCondition(() => getThumbnailModifiedTime(URL) >= now,
+> +                   checkThumbnailUpdated,
+> +                   "didn't see modified time of thumbnail change");
+
+Same here about polling.
+
+::: toolkit/components/thumbnails/test/head.js
+@@ +55,5 @@
+> +      if (value && typeof value.then == "function") {
+> +        value.then(result => {
+> +          next(result);
+> +        }, error => {
+> +          ok(false, error + "\n" + error.stack);
+
+Nice!
+
+@@ +134,4 @@
+>  function retrieveImageDataForURL(aURL, aCallback) {
+>    let width = 100, height = 100;
+>    let thumb = PageThumbs.getThumbnailURL(aURL, width, height);
+> +  // create a tab with a chrome:// URL so it can host the thumbnail image.
+
+Why is this change necessary?  I read your comment 11 but don't understand, since this change still doesn't actually "insert" the img into a document.  Is it that the img's src is using the chrome protocol, so it can only be accessed from a page hosted at a chrome URL?  In any case, please expand this comment just enough to better explain why the chrome URL is necessary.  (And was the old version of this function not actually working correctly?)
+
+::: toolkit/components/thumbnails/test/thumbnails_update.sjs
+@@ +27,5 @@
+> +    else
+> +      aResponse.setStatusLine(aRequest.httpVersion, 200, "OK - It's red");
+> +    aResponse.write("<html><body bgcolor=ff0000></body></html>");
+> +  }
+> +  setState(aRequest.queryString, "yep");
+
+Shouldn't this state be removed on the second request so that the next test's first request will get a blank slate?
+(In reply to Drew Willcoxon :adw from comment #12)
+> ::: toolkit/components/thumbnails/content/backgroundPageThumbsContent.js
+> @@ +65,5 @@
+> >  
+> > +      let finalURL = this._webNav.currentURI.spec;
+> > +      // if we have been asked to skip the capture if there was an error
+> > +      // response, handle that now.
+> > +      if (msg.json.skipIfErrorResponse && this._isErrorResponse) {
+> 
+> Please rename skipIfErrorResponse something like dontDrawIfErrorResponse so
+> it's clear what is being skipped.
+
+Er, that's dumb, nevermind this comment.  ("skip" is good since it means "skip the whole capture," and it's passed by BPT consumers; it's not some internal option like I mistakenly thought my first time reading this patch.)
+Created attachment 790663
+0001-Bug-897880-BackgroundPageThumbs-service-must-not-ove.patch
+
+Nice review, thanks.  This version is quite a bit cleaner.
+
+(In reply to Drew Willcoxon :adw from comment #12)
+> Comment on attachment 786805
+> 897880-no-thumbnail-overwrite-on-error.patch
+> 
+> PageThumbs.captureAndStore should decline to store thumbnails of non-2xx
+> response, too, right?  That sounds like a separate bug since the code paths
+> are different, but instead of duplicating logic in
+> backgroundPageThumbsContent.js and PageThumbs, we could kill two birds with
+> one stone and build that logic into PageThumbs._store.  It would check a
+> passed-in response code, and then check whether a file already exists for
+> non-2xx responses.  That would mean wasted cycles drawing canvases that
+> _store is just going to discard, but that's not the common case, and it
+> doesn't outweigh duplicated code complexity IMO.  What do you think?
+
+That certainly simplified lots of things, and as you mention, kills 2 birds with one stone.  It is less efficient, but I agree that isn't a problem.  To be clear though, this new behaviour (ie, decline to update a thumbnail on an error response) is now the default behaviour and can't be suppressed (which I think was what you suggested, but it's worth checking.)  I added a couple of new tests to check the behaviour of the "foreground" service in this case too.
+
+> Please write this without the captureOptions temp variable:
+...
+> No need for the first term in this conditional, since an earlier conditional
+> causes the method to return when !data.
+...
+> I don't like how result.ok can take boolean values in what is really a...
+
+All of these are redundant in the new patch.
+
+> Oh boy.  We should definitely file a bug for OS.File.touch like you say in
+> comment 11.
+
+Done, and a comment referencing the bug was added.
+
+> I'd much prefer to forget OS.File entirely in this case, until touch is
+> implemented, and use nsIFile.lastModifiedTime, like ensureThumbnailStale in
+> the test does.  So could you change that, please?
+
+As discussed in IRC, that's sadly not possible - but I updated the comment to reflect this.
+
+> The proper name for these "things" is "iterators," right? :-)  The test
+> functions are generators that produce iterators when they're called.
+
+Done.
+
+> Why will it recapture after one second?  And what's "it"?
+
+Updated the comment.
+
+> Polling is bad in tests, especially for file I/O.  Couldn't you modify
+> captureIfStale to take a callback or return a promise?  It would pass the
+> callback to BPT.capture or call it in the !result.ok case.  Then you'd check
+> your test condition in the callback.
+
+I'm interested why you believe this?  It seems polling in a test (including IO or not) is a little ugly, but not inherently bad - the machine running the test is just doing a little more work while waiting for the condition to become true.  To my mind, adding new code to the runtime that is only exercised during tests is a worse evil - the (admittedly small) additional overhead is now paid for by everyone :)
+
+But I agree that's completely subjective, so I did it :)
+
+> Why is this change necessary?  I read your comment 11 but don't understand,
+> since this change still doesn't actually "insert" the img into a document. 
+> Is it that the img's src is using the chrome protocol, so it can only be
+> accessed from a page hosted at a chrome URL?  In any case, please expand
+> this comment just enough to better explain why the chrome URL is necessary. 
+> (And was the old version of this function not actually working correctly?)
+
+I updated the comment - hopefully it's clearer now.  While the underlying reason I had that problem still escapes me, I speculated in the comment ;)
+
+> Shouldn't this state be removed on the second request so that the next
+> test's first request will get a blank slate?
+
+Done - that wasn't strictly necessary in the first patch, but is now that I've added "error response" tests for the foreground service too.
+(In reply to Mark Hammond (:markh) from comment #14)
+> To be clear though, this new behaviour (ie, decline to update a thumbnail
+> on an error response) is now the default behaviour and can't be suppressed
+> (which I think was what you suggested, but it's worth checking.)
+
+Yes, I think that's the behavior we want.
+
+> > Polling is bad in tests, especially for file I/O.
+> 
+> I'm interested why you believe this?  It seems polling in a test (including
+> IO or not) is a little ugly, but not inherently bad - the machine running
+> the test is just doing a little more work while waiting for the condition to
+> become true.  To my mind, adding new code to the runtime that is only
+> exercised during tests is a worse evil - the (admittedly small) additional
+> overhead is now paid for by everyone :)
+
+It leads to test failures in bug-free code.  If you're polling for a condition that doesn't have an upper bound on the time it will take to occur, then it will occasionally be the case that the condition just doesn't happen within the polling period.  In practice, conditions that are very nondeterministic, like the time it takes some build machine to access a file, are especially prone.  You can always increase the polling period, but did you increase it enough?  Can you?
+
+You can't prove that you'll catch your condition 100% of the time.  You could make the polling period a year, but if you ran your test enough times, eventually your condition happens in a year and a day.  You can't prove it won't, even if so far it has observably worked 100% percent of the time.  Doesn't that bother you?
+
+Sometimes you can't avoid polling, so you do the best you can.  And if there's an upper bound on the time it takes for your condition to happen, then polling might be a fine choice.
+
+> But I agree that's completely subjective, so I did it :)
+
+(I disagree it's subjective but) Thanks! :-)
+(In reply to Drew Willcoxon :adw from comment #15)
+> You can't prove that you'll catch your condition 100% of the time.  You
+> could make the polling period a year, but if you ran your test enough times,
+> eventually your condition happens in a year and a day.  You can't prove it
+> won't, even if so far it has observably worked 100% percent of the time. 
+> Doesn't that bother you?
+
+It's not ideal, but IMO it is often pragmatic.  Of all the oranges I've been involved in, I've *never* encountered a problem that was due to this.  So given the 2 evils of polling versus adding extra overhead to the runtime that exists only for the sake of tests, I would often choose the efficiency of the runtime.
+Comment on attachment 790663
+0001-Bug-897880-BackgroundPageThumbs-service-must-not-ove.patch
+
+Review of attachment 790663:
+-----------------------------------------------------------------
+
+I'm sorry to r- again, but I think there's a race condition in the test.  Let me know if I'm wrong.
+
+::: toolkit/components/thumbnails/PageThumbs.jsm
+@@ +211,3 @@
+>      let filePath = PageThumbsStorage.getFilePathForURL(aUrl);
+>      PageThumbsWorker.post("isFileRecent", [filePath, MAX_THUMBNAIL_AGE_SECS]
+>      ).then(result => {
+
+I do a double-take every time I see these two lines, with the line that starts with a ) following a line that's indented the same amount.  Would you mind changing them to better match front-end style, either this way:
+
+PageThumbsWorker.post(...).
+  then(...
+
+(or with the dot before the `then` if you prefer), or this way:
+
+PageThumbsWorker.post(
+  "isFileRecent",
+   [filePath, ... ]
+).then(...
+
+@@ +214,5 @@
+>        if (!result.ok) {
+>          // Sadly there is currently a circular dependency between this module
+>          // and BackgroundPageThumbs, so do the import locally.
+>          let BPT = Cu.import("resource://gre/modules/BackgroundPageThumbs.jsm", {}).BackgroundPageThumbs;
+> +        BPT.capture(aUrl, {onDone: deferredResult.resolve});
+
+Does this work?  You don't need to deferredResult.resolve.bind(deferredResult)?
+
+@@ +357,5 @@
+>     * @param aFinalURL The URL to which aOriginalURL ultimately resolved.
+>     * @param aData An ArrayBuffer containing the image data.
+>     * @return {Promise}
+>     */
+> +  _store: function PageThumbs__store(aOriginalURL, aFinalURL, aData, aWasErrorResponse) {
+
+Please add a @param for aWasErrorResponse.
+
+@@ +365,5 @@
+> +      // it so we consider the old version fresh.
+> +      if (aWasErrorResponse) {
+> +        let exists = yield PageThumbsStorage.exists(aFinalURL);
+> +        if (exists) {
+> +          yield PageThumbsStorage.touch(aFinalURL);
+
+How about PageThumbsStorage.touchIfExists, which returns true if the file exists?
+
+1. This logic would be simpler.
+2. One less round trip to and from the worker.
+3. That's really all we need here.  In fact, we don't intend on touching thumbnail files that don't already exist.  It's an error to do that, so let's make it impossible to do.
+
+@@ +375,5 @@
+> +          }
+> +          return;
+> +        }
+> +        // was an error response, but no existing thumbnail - just store
+> +        // that error response as something is (arguably) better than nothing.
+
+something is -> something that is
+
+@@ +616,5 @@
+> +  },
+> +
+> +  /**
+> +   * Update the modification time of the data file for a single thumbnail to
+> +   * now.
+
+Probably should say that an empty file is created if the file doesn't already exist since that's what happens.  But I think you should replace this with touchIfExists as I say.
+
+::: toolkit/components/thumbnails/content/backgroundPageThumbsContent.js
+@@ +34,5 @@
+>    get _webNav() {
+>      return docShell.QueryInterface(Ci.nsIWebNavigation);
+>    },
+>  
+> +  get _isErrorResponse() {
+
+backgroundPageThumbsContent.js already imports PageThumbs.jsm, and PageThumbs has this same logic, so please move this to PageThumbs, make it a method that takes a channel, and have both PageThumbs and backgroundPageThumbsContent call it.
+
+::: toolkit/components/thumbnails/test/browser_thumbnails_update.js
+@@ +88,5 @@
+> +  yield addTab(URL);
+> +
+> +  yield captureAndCheckColor(0, 255, 0, "we have a green thumbnail");
+> +  // reset browser URL else the foreground capturing service will re-capture
+> +  // after 1 second and update the modified time, possibly defeating this test.
+
+Oh, I see, because a new tab has loaded, and gBrowserThumbnails has a one-second capture timeout on TabSelect and onStateChange.  Hmm.
+
+I'm trying to convince myself that it's impossible for that timeout to fire before you start loading about:blank here, but I think it is possible since captureAndCheckColor doesn't return control until the thumbnail is written to disk.  So it's possible that the FG service will start capturing and writing the file while the test is running, which could cause random failures in the date calculations, or at least misbehavior even if it still happens to pass.
+
+Can't we just set the pref that disables automatic thumbnailing, and then pass an override bool to all the capture functions called by the tests?  That would be foolproof, in addition to avoiding the complexity of workarounds like loading about:blank at certain times.  It would only be necessary for tests that load pages, and then maybe not all of them, depending on what they do.
+Created attachment 791040
+0001-Bug-897880-BackgroundPageThumbs-service-must-not-ove.patch
+
+(In reply to Drew Willcoxon :adw from comment #17)
+> I do a double-take every time I see these two lines, with the line that
+> starts with a ) following a line that's indented the same amount.  Would you
+> mind changing them to better match front-end style, either this way:
+
+Done.
+
+> Does this work?  You don't need to
+> deferredResult.resolve.bind(deferredResult)?
+
+The only consumer of this is the test, and it seems reasonably clear the promise is resolved as the test doesn't hang.
+
+> Please add a @param for aWasErrorResponse.
+
+Done.
+
+> How about PageThumbsStorage.touchIfExists, which returns true if the file
+> exists?
+
+Done.
+
+> something is -> something that is
+
+Done.
+
+> backgroundPageThumbsContent.js already imports PageThumbs.jsm, and
+> PageThumbs has this same logic, so please move this to PageThumbs, make it a
+> method that takes a channel, and have both PageThumbs and
+> backgroundPageThumbsContent call it.
+
+Done.
+
+> Can't we just set the pref that disables automatic thumbnailing, and then
+> pass an override bool to all the capture functions called by the tests? 
+> That would be foolproof, in addition to avoiding the complexity of
+> workarounds like loading about:blank at certain times.  It would only be
+> necessary for tests that load pages, and then maybe not all of them,
+> depending on what they do.
+
+I just had the .sjs for this test return Cache-Control: no-store which avoid this issue for everything touched by this test.  If you have concerns about all the existing thumbnail tests which aren't touched by this bug having an issue around this, I think a followup would be better.
+Comment on attachment 791040
+0001-Bug-897880-BackgroundPageThumbs-service-must-not-ove.patch
+
+Review of attachment 791040:
+-----------------------------------------------------------------
+
+(In reply to Mark Hammond (:markh) from comment #18)
+> > Does this work?  You don't need to
+> > deferredResult.resolve.bind(deferredResult)?
+> 
+> The only consumer of this is the test, and it seems reasonably clear the
+> promise is resolved as the test doesn't hang.
+
+OK, we'll rely on the apparent feature of deferredResult.resolve being automatically bound for us, then.
+
+> I just had the .sjs for this test return Cache-Control: no-store
+
+Smart!
+
+::: toolkit/components/thumbnails/PageThumbs.jsm
+@@ +211,3 @@
+>      let filePath = PageThumbsStorage.getFilePathForURL(aUrl);
+> +    PageThumbsWorker.post("isFileRecent", [filePath, MAX_THUMBNAIL_AGE_SECS])
+> +    .then(result => {
+
+Please indent this line.
+
+@@ +363,5 @@
+> +          }
+> +          return;
+> +        }
+> +        // was an error response, but no existing thumbnail - just store
+> +        // that error response as something that is (arguably) better than nothing.
+
+I didn't catch that "as" means "because" in this sentence.  I thought you made a typo by leaving out "that," but you didn't, so feel free to revert this change.  (Very important, I know.  I can hear your eyes rolling.)  Sorry about that. :-)
+
+::: toolkit/components/thumbnails/test/thumbnails_update.sjs
+@@ +11,5 @@
+> +// * If the second request is an error, the new thumbnail should be ignored.
+> +
+> +function handleRequest(aRequest, aResponse) {
+> +  aResponse.setHeader("Content-Type", "text/html;charset=utf-8", false);
+> +  // we want to disable the automatic time-based capture for these responses,
+
+Time-based isn't the salient point, on-load and on-TabSelect is, so please mention it along with gBrowserThumbnails, so something like, "... disable gBrowserThumbnails's on-load capture..."
+Updating title to reflect this is now done for all captured thumbnails.
+
+https://hg.mozilla.org/integration/fx-team/rev/67714091ce5b
+Hey Mark,
+
+sorry i had to back this out since in https://hg.mozilla.org/integration/fx-team/rev/85b6f4124b7b this caused orange mochitests chrome for OS X and Linux Tests like https://tbpl.mozilla.org/php/getParsedLog.php?id=26625724&tree=Fx-Team
+Created attachment 791895
+0002-Allow-1-second-of-slop-to-account-for-higher-precisi.patch
+
+The problem seems to be that the precision of Date.now() is greater than the file-system.  I found the same problem at:
+
+http://mxr.mozilla.org/mozilla-central/source/toolkit/components/osfile/tests/mochi/worker_test_osfile_front.js#699
+
+The fix I came up with was to just allow 1 second of "slop" - the same as the test above does.  This seems safe as we explicitly make the thumbnail *very* stale, so if it moves to < 1 second the test has worked.  FWIW, various dump() debugging statements shows it really is working as expected, just that the timestamps screw us.  The fix is hacky enough I felt a quick review was justified.
+
+Try at https://tbpl.mozilla.org/?tree=Try&rev=ab473e9e8af3
+
+Note that I'll merge this commit into the original when relanding.
+https://hg.mozilla.org/integration/fx-team/rev/1a9597b9fd19
+https://hg.mozilla.org/mozilla-central/rev/1a9597b9fd19
+Mark, ready for uplift to Aurora 25?
+This is a relatively large patch, and it looks like background thumbnails aren't going to ride the next train to beta, so we can probably just let this ride as normal.
+Bug 912763 prevents background thumbnails from moving to beta, so this no longer needs to track 25.  As it is fixed in 26, I'm clearing the tracking flag.
+
+
+Thumbnail service must not overwrite existing thumbnails if it gets an error response
+
+regression
+
+Bug 897880 - Thumbnail service must not overwrite existing thumbnails if it gets an error response.  r=adw 
+
+Backed out changeset 67714091ce5b (bug 897880) for suspecion of causing a orange mochitest failure 
+
+Bug 897880 - Thumbnail service must not overwrite existing thumbnails if it gets an error response.  r=adw 
+
+before bug 897880 - i.e. load the thumbnail image in the context of the
+
+bug 897880 comment #11. 

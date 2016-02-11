@@ -1,0 +1,260 @@
+Copy paste from IRC because I'm too lazy to paraphrase:
+
+04:53 < shu> past: http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/script.js#l1373 should be innermost: true
+04:53 < shu> past: this has never surfaced because the full gc every debug mode toggle has been concealing it
+04:54 < shu> past: but if you look at http://mxr.mozilla.org/mozilla-central/source/browser/devtools/debugger/test/code_script-switching-02.js
+04:54 < shu> past: there are 4 (!) scripts in that file
+04:54 < shu> past: the top-level script, the script for secondCall, the script for eval, and the script for foo
+04:55 < shu> past: the test requests a breakpoint at line 4
+04:55 < shu> past: it so happens the top-level script's bytecode consists of a sole JSOP_RETRVAL, which source notes says is at line 4
+04:55 < shu> past: before my patch to get rid of the massive GC, this top script just got swept by that GC and so didn't get iterated over
+04:56 < past> shu: I think we didn't want the innermost script on purpose at that point, but I can't remember why at the moment
+04:56 < past> shu: could it be that the test is wrong, but not the code?
+04:57 < shu> past: possible, but i can't imagine the usefulness of setting a breakpoint at the retrval of the toplevel script
+04:58 < past> shu: yes, I don't think line 4 is particularly important here
+04:58 < past> line 5 would be sufficient, too
+04:59 < shu> past: setting a breakpoint at the line of the fundef is a very real use case though
+04:59 < past> that's true
+04:59 < shu> past: intuitively we would break at the first pc of the function
+
+Copy paste from IRC because I'm too lazy to paraphrase:
+
+04:53 < shu> past: http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/script.js#l1373 should be innermost: true
+04:53 < shu> past: this has never surfaced because the full gc every debug mode toggle has been concealing it
+04:54 < shu> past: but if you look at http://mxr.mozilla.org/mozilla-central/source/browser/devtools/debugger/test/code_script-switching-02.js
+04:54 < shu> past: there are 4 (!) scripts in that file
+04:54 < shu> past: the top-level script, the script for secondCall, the script for eval, and the script for foo
+04:55 < shu> past: the test requests a breakpoint at line 4
+04:55 < shu> past: it so happens the top-level script's bytecode consists of a sole JSOP_RETRVAL, which source notes says is at line 4
+04:55 < shu> past: before my patch to get rid of the massive GC, this top script just got swept by that GC and so didn't get iterated over
+04:56 < past> shu: I think we didn't want the innermost script on purpose at that point, but I can't remember why at the moment
+04:56 < past> shu: could it be that the test is wrong, but not the code?
+04:57 < shu> past: possible, but i can't imagine the usefulness of setting a breakpoint at the retrval of the toplevel script
+04:58 < past> shu: yes, I don't think line 4 is particularly important here
+04:58 < past> line 5 would be sufficient, too
+04:59 < shu> past: setting a breakpoint at the line of the fundef is a very real use case though
+04:59 < past> that's true
+04:59 < shu> past: intuitively we would break at the first pc of the function
+What about when there is something like this on a single line?
+
+  foo(bar); function f() {} function g() {} return baz(quux);
+
+Would we still be able to break on the foo call or the baz call if we had innermost set as true?
+
+Or what if we had this:
+
+  (function () { function dummy() {} foo(1); }());
+
+In this case the innermost function is never used, and so if we only set breakpoints on it, we would never break on this line.
+
+Last time I was doing significant changes, I thought I asked Jim if we should do this, and I recall him saying we shouldn't.
+
+I believe that the behavior we want is to set a breakpoint on every entry point of the line, regardless of whether that entry point belongs to the innermost script or not.
+Bug 793214 is where I originally added the code that looks for the outermost script, for the reason that Nick mentions above. There is a similar case in that bug that doesn't work if only innermost scripts are considered.
+Disassembly for the relevant scripts in http://mxr.mozilla.org/mozilla-central/source/browser/devtools/debugger/test/code_script-switching-02.js
+
+Note how the top-level script has a retrval at line 4.
+
+ loc   line  op
+ ----- ----  --
+ 00000:   1  deffun function secondCall() {
+   // This comment is useful: :
+   eval("debugger;");
+   function foo() {}
+   if (true) {
+     foo();
+   }
+ }
+ main:
+ 00005:   4  retrval
+
+ loc   line  op
+ ----- ----  --
+ 00000:   4  arguments
+ 00001:   4  setaliasedvar "arguments" (hops = 0, slot = 3)
+ 00010:   4  pop
+ main:
+ 00011:   7  lambda function foo() {}
+ 00016:   7  setaliasedvar "foo" (hops = 0, slot = 2)
+ 00025:   7  pop
+ 00026:   6  callname "eval"
+ 00031:   6  undefined
+ 00032:   6  notearg
+ 00033:   6  string "debugger;"
+ 00038:   6  notearg
+ 00039:   6  eval 1
+ 00042:   6  lineno 6
+ 00045:   6  pop
+ 00046:   9  callaliasedvar "foo" (hops = 0, slot = 2)
+ 00055:   9  undefined
+ 00056:   9  notearg
+ 00057:   9  call 0
+ 00060:   9  pop
+ 00061:   9  retrval
+Am I missing something or misreading? The retrval looks like it is reported at line 9...
+What problem would the "innermost" fix, exactly? If the outer script is going to be GC'd, then it should be harmless to set a breakpoint in it.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #4)
+> Am I missing something or misreading? The retrval looks like it is reported
+> at line 9...
+
+The output Shu posted disassembles *two* scripts. The first is the top-level script, which includes only two bytecodes: deffun, and retrval. There, the retrval is on line 4.
+
+The second is secondCall's script; there, the retrval is at line 9.
+
+I think the bug here is that the top-level script's retrval should be attributed to the line that produces the eval script's value - in this case, an implicit 'return undefined;', which we ought to be putting on the last line of the script.
+Ah, I missed that first bit.
+The general principle is that a breakpoint "on a line" should hit whenever control enters that line from elsewhere. So setting a breakpoint on a line like this:
+
+    x.o = function f() { ...
+
+should set a breakpoint both before the assignment to x.o and at f's entry point. Setting a breakpoint on the first line of the following code:
+
+    for (obj = f(); obj; obj = g(obj)) {
+       ...
+    }
+
+should set two breakpoints: one before the call to f, but also one before the call to g, in the update clause of the 'for' loop head.
+
+In that context, here's another interesting dilemma. If I set a breakpoint on the "blargh" line here:
+
+    f();
+    // blargh
+    g();
+
+I think it's reasonable to expect that breakpoint to be set just before the call to g: there's no code on the indicated line, so we have to slide it forward to the next line that has code. But that can't be the whole principle; consider setting a breakpoint on the "blargh" line here:
+
+    f();
+    function g() {
+      // blargh
+      h();
+    }
+    j();
+
+The outer script and the inner script both cover the "blargh" line; applying the "slide" principle blindly would have us put breakpoints both before the call to h() (reasonable) and the call to j() (not reasonable).
+
+So, I think the full algorithm is this:
+
+- Find all scripts covering the given line.
+
+- In the innermost script, if the line contains no code, slide forward to the next line that does.
+
+- In all but the innermost script, set a breakpoint only if the line contains code.
+
+(We don't quite implement this now, but I think we have the primitives to do so if we wanted.)
+Created attachment 828341
+Part 1: Update position after lazily parsing a function. (r=?)
+Comment on attachment 828341
+Part 1: Update position after lazily parsing a function. (r=?)
+
+Review of attachment 828341:
+-----------------------------------------------------------------
+
+Needs a test.
+Created attachment 828373
+Update position after lazily parsing a function. (r=?)
+
+Note that this test only fails with patch from 933882 applied.
+(In reply to Jim Blandy :jimb from comment #8)
+> The general principle is that a breakpoint "on a line" should hit whenever
+> control enters that line from elsewhere. So setting a breakpoint on a line
+> like this:
+> 
+>     x.o = function f() { ...
+> 
+> should set a breakpoint both before the assignment to x.o and at f's entry
+> point. Setting a breakpoint on the first line of the following code:
+> 
+
+I played with implementing the new algorithm. I found this case extremely unintuitive. I assumed the above is elided from
+
+1    x.o = function f() {
+2        doSomething();
+3    };
+
+I don't expect setting a breakpoint on line 1 to set a breakpoint on line 1 and a slid-forward breakpoint on line 2. It's a big surprise to request a BP on one line, but end up setting an additional BP on another line due to being consistent with the "all entry points" rule. I think the current behavior sliding forward only when no breakpoints can be set (instead of always sliding forward the innermost script) is less surprising, even at the cost of inconsistency.
+
+Changing title to reflect that I'm not going to change the current setBreakpoint behavior.
+Comment on attachment 828373
+Update position after lazily parsing a function. (r=?)
+
+Review of attachment 828373:
+-----------------------------------------------------------------
+
+I... sure, ok.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/555e5759fe5f
+Backed out as part of https://hg.mozilla.org/integration/mozilla-inbound/rev/67f5d934127c because something in the push caused various test bustage on Linux ASAN's browser-chrome suite: 
+
+https://tbpl.mozilla.org/php/getParsedLog.php?id=30444281&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=30444457&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=30445445&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=30445739&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=30445414&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=30446297&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=30446502&tree=Mozilla-Inbound
+
+Shu and RyanVM both suspect that https://hg.mozilla.org/integration/mozilla-inbound/rev/ce4011f33422 was the cause for the failures, but I backed out the whole push just to be sure.
+https://hg.mozilla.org/mozilla-central/rev/b8d3be6e3c1a
+backout completed as part of https://tbpl.mozilla.org/?tree=Mozilla-Inbound&rev=494827a9190e as part of discussion in https://bugzilla.mozilla.org/show_bug.cgi?id=937997#c48
+
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/b0e18dd50141
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/0bfc071cd47c
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/4e3a84277bd2
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/01b9888de10c
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/5c1d58a7dfc9
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/3382fad9edf0
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/49229e7d1afd
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/494827a9190e
+
+however see bug 937997 for investigations going on for the root cause and tree reopening
+https://hg.mozilla.org/mozilla-central/rev/22a26c92bf00
+Created attachment 8341340
+Update end position after lazily parsing a function. (
+Comment on attachment 8341340
+Update end position after lazily parsing a function. (
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #):
+  Bug 754201 most recently. Not sure what introduced AutoDebugModeGC initially.
+
+User impact if declined: 
+  Firebug unusable with many tabs. Firebug has worked around this by disabling JITs permanently if it's on, which is in some ways worse since it slows down *all* tabs.
+
+Testing completed (on m-c, etc.): 
+  On m-c.
+
+Risk to taking this patch (and alternatives if risky): 
+  GC behavior changes surfacing existing leaks/OOMs. When landing on m-c new leaks were surfaced (and eventually fixed). I am nominating those fixes for uplift also.
+
+String or IDL/UUID changes made by this patch:
+  None
+
+The Firebug slowness metabug is bug 815603. List of bugs I'm nominating for uplift in this batch:
+
+ - bug 936143
+ - bug 935228
+ - bug 933882
+ - bug 935470 
+ - bug 942346
+ - bug 934799
+Comment on attachment 8341340
+Update end position after lazily parsing a function. (
+
+We can take this on Aurora and thus it will be on Beta in a week, but we're way past the point of taking untracked, major change to Firefox 26 as we are going to build our final candidate today as well as the RC.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/0d47cfb2bb10
+
+
+Fix source notes for lazy scripts
+
+
+
+Bug 935470 - Update end position after lazily parsing a function. (r=jorendorff) 
+
+Backed out 7 changesets (bug 935228, bug 936143, bug 935470, bug 933882, bug 934799) for breaking ASAN browser-chrome tests on a CLOSED TREE
+
+Backed out changeset 555e5759fe5f (bug 935470)
+
+Bug 935470 - Update end position after lazily parsing a function. (r=jorendorff) 
+
+Backed out changeset b8d3be6e3c1a (bug 935470) as result of the discussion of Bug 937997 Comment 48 Trees Closed due to OOM on a CLOSED TREE 
+
+Bug 935470 - Update end position after lazily parsing a function. (r=jorendorff) 

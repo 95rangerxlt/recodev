@@ -1,0 +1,249 @@
+We should refactor this because:
+
+1) It's currently included in the ThumbnailStorage and this is more about policy than actual storage. So we could move it to a separate object/file and clean up the code.
+
+2) The current code does not remove excluded browsers from the internal list when tabs get closed and keeps those objects alive.
+
+3) The current code accesses .contentDocument, .webProgress and does some other stuff that is not e10s safe. Make it future-proof.
+
+We should refactor this because:
+
+1) It's currently included in the ThumbnailStorage and this is more about policy than actual storage. So we could move it to a separate object/file and clean up the code.
+
+2) The current code does not remove excluded browsers from the internal list when tabs get closed and keeps those objects alive.
+
+3) The current code accesses .contentDocument, .webProgress and does some other stuff that is not e10s safe. Make it future-proof.
+Created attachment 549126
+patch v1
+
+Here's what I did:
+
+* removed all storage policy related code from ThumbnailStorage
+* added the StoragePolicy object
+* refactored tabview/content.js and added e10s code related to the storage policy
+* updated the test for bug 627239
+Comment on attachment 549126
+patch v1
+
+Looks good
+Created attachment 551808
+patch v2
+
+Renamed browser_tabview_bug627239.js to browser_tabview_storage_policy.js so that we have a named test for the storage policy object.
+Created attachment 552553
+patch v3
+
+Fixed a DOMDocument leak in browser/base/content/tabview/content.js.
+Comment on attachment 552553
+patch v3
+
+Review of attachment 552553:
+-----------------------------------------------------------------
+
+r=me with a few minor changes.
+
+::: browser/base/content/tabview/content.js
+@@ +57,5 @@
+>    }
+> +};
+> +
+> +let MessageHandler = {
+> +  isDocumentLoaded: function MessageHandler_isDocumentLoaded(cx) {
+
+add a short comment summarizing why sending these?
+
+@@ +65,5 @@
+> +    sendAsyncMessage(cx.name, {isLoaded: isLoaded});
+> +  }
+> +};
+> +
+> +let WebProgressListener = {
+
+add summary comment about what the progress listener is doing and why.
+
+@@ +105,5 @@
+> +  },
+> +
+> +  _isNoStoreResponse: function WebProgressListener__isNoStoreResponse(req) {
+> +    try {
+> +      return req.isNoStoreResponse();
+
+does this really throw?
+
+also, maybe we need a utils.tryThisAndReturnFalseOnException(function).
+
+@@ +135,5 @@
+> +// add message listeners
+> +addMessageListener("Panorama:isDocumentLoaded", MessageHandler.isDocumentLoaded);
+> +
+> +// add web progress listener
+> +webProgress.addProgressListener(WebProgressListener, Ci.nsIWebProgress.NOTIFY_STATE_ALL);
+
+Code organization nits:
+
+* s/EventHandler/WindowEventHandler/
+* s/MessageListener/WindowMessageListener/
+
+Also, I find it clearer to have the listener code and the add*Listener calls adjacent.
+
+These organization nits are optional fixes.
+
+::: browser/base/content/tabview/storagePolicy.js
+@@ +92,5 @@
+> +  // Function: _initializeBrowser
+> +  // Initializes the given browser and checks if we need to add it to our
+> +  // internal exclusion list.
+> +  _initializeBrowser: function StoragePolicy__initializeBrowser(browser) {
+> +    let self = this;
+
+you're bind()ing above, which should remove the need for this right?
+
+@@ +131,5 @@
+> +  },
+> +
+> +  // ----------
+> +  // Function: uninit
+> +  // Should be called when window is unloaded.
+
+"should" is a funny word to use here. can you comment on what code exactly calls it?
+
+@@ +186,5 @@
+> +
+> +  // ----------
+> +  // Function: canStoreThumbnailFor
+> +  // Returns whether we're allowed to store the thumbnail of the given tab.
+> +  canStoreThumbnailFor: function StoragePolicy_canStoreThumbnailFor(tab) {
+
+canStoreThumbnailForTab would be clearer. but longer. or are you planning on supporting other things to be passed?
+
+@@ +192,5 @@
+> +  },
+> +
+> +  // ----------
+> +  // Function: observe
+> +  // Observe pref changes.
+
+Someday, we should make a module for binding vars to prefs, instead of duplicating this pref observer infrastructure all over the tree. Something like:
+
+Cu.import('prefbindery.js').bind('pref.name', myLocalVar)
+(In reply to Dietrich Ayala (:dietrich) from comment #5)
+> > +    try {
+> > +      return req.isNoStoreResponse();
+> 
+> does this really throw?
+
+Yeah, I've seen lots of errors in old test logs. Also documented in https://developer.mozilla.org/en/NsIHttpChannel#isNoStoreResponse%28%29
+
+> also, maybe we need a utils.tryThisAndReturnFalseOnException(function).
+
+Added Utils.attempt() that accepts any number of functions. It returns immediately the return value of the first non-failed function without executing successive functions, or null.
+
+> > +  _initializeBrowser: function StoragePolicy__initializeBrowser(browser) {
+> > +    let self = this;
+> 
+> you're bind()ing above, which should remove the need for this right?
+
+No, we still need it for checkExclusion() and waitForDocumentLoad() which are defined in _initializeBrowser().
+
+> > +  // Function: canStoreThumbnailFor
+> > +  // Returns whether we're allowed to store the thumbnail of the given tab.
+> > +  canStoreThumbnailFor: function StoragePolicy_canStoreThumbnailFor(tab) {
+> 
+> canStoreThumbnailForTab would be clearer. but longer. or are you planning on
+> supporting other things to be passed?
+
+Actually, no. Renamed to canStoreThumbnailForTab.
+
+> Someday, we should make a module for binding vars to prefs, instead of
+> duplicating this pref observer infrastructure all over the tree. Something
+> like:
+> 
+> Cu.import('prefbindery.js').bind('pref.name', myLocalVar)
+
++1. That would make lots of code much easier. This pattern is repeated all over the code base...
+>+// add web progress listener
+>+webProgress.addProgressListener(WebProgressListener, Ci.nsIWebProgress.NOTIFY_STATE_ALL);
+
+You don't actually use ALL state messages. We found that tightening the filter yielded a Tp improvement in bug 632005.
+(In reply to Mark Finkle (:mfinkle) from comment #7)
+> You don't actually use ALL state messages. We found that tightening the
+> filter yielded a Tp improvement in bug 632005.
+
+Good point! Updated from NOTIFY_STATE_ALL to NOTIFY_STATE_WINDOW (that saves an "if" as well, nice). Thanks!
+http://hg.mozilla.org/integration/fx-team/rev/7837b186b10b
+Backed out because of bug 671101:
+
+http://hg.mozilla.org/integration/fx-team/rev/eb8e9468f409
+Comment on attachment 552553
+patch v3
+
++  // ----------
++  // Function: _initializeBrowser
++  // Initializes the given browser and checks if we need to add it to our
++  // internal exclusion list.
++  _initializeBrowser: function StoragePolicy__initializeBrowser(browser) {
++    let self = this;
++
++    function checkExclusion() {
++      if (browser.currentURI.schemeIs("https"))
++        self._deniedBrowsers.push(browser);
++    }
++
++    function waitForDocumentLoad() {
++      mm.addMessageListener("Panorama:Load", function onLoad(cx) {
++        mm.removeMessageListener(cx.name, onLoad);
++        checkExclusion(browser);
++      });
+
+mm isn't defined within _initializeBrowser()?
+
++    }
++
++    this._isDocumentLoaded(browser, function (isLoaded) {
++      if (isLoaded)
++        checkExclusion();
++      else
++        waitForDocumentLoad();
++    });
++  },
+Created attachment 554816
+patch v4
+
+(In reply to Raymond Lee [:raymondlee] from comment #11)
+> +    function waitForDocumentLoad() {
+> +      mm.addMessageListener("Panorama:Load", function onLoad(cx) {
+> +        mm.removeMessageListener(cx.name, onLoad);
+> +        checkExclusion(browser);
+> +      });
+> 
+> mm isn't defined within _initializeBrowser()?
+
+Oops :/ my bad. Fixed.
+Created attachment 554826
+patch v5
+
+Added missing "capture" argument to addEventListener() calls.
+Created attachment 555676
+patch v6
+
+Changes:
+
+1) Wrapped the variable "webProgress" in a getter to not leak docShells (see bug 671101). Approach tested on try - http://tbpl.allizom.org/?tree=Try&usebuildbot=1&rev=14f76836536d.
+
+2) Replaced the "load" event with "DOMContentLoaded" because we actually want to know when the content has loaded, the "load" event fires way too late.
+http://hg.mozilla.org/integration/fx-team/rev/63becbe85737
+Comment on attachment 555676
+patch v6
+
+http://hg.mozilla.org/mozilla-central/rev/63becbe85737
+
+
+refactor the webProgressListener used to keep track of whether to save tab thumbnails
+
+
+
+Bug 674926 - refactor the webProgressListener used to keep track of whether to save tab thumbnails; r=dietrich 
+
+Back out bug 674926 (changeset 7837b186b10b) 
+
+Bug 674926 - refactor the webProgressListener used to keep track of whether to save tab thumbnails; r=dietrich 

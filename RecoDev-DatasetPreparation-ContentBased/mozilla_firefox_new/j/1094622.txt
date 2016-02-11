@@ -1,0 +1,373 @@
+Steps to reproduce:
+1. open console
+2. focus last child of a node
+3. delete it
+
+Expected:
+Previous child highlighted.
+
+Result:
+Parent highlighted.
+
+With the current behavior it's difficult to delete a couple of consecutive nodes because the focus jumps immediately to the parent.
+
+Steps to reproduce:
+1. open console
+2. focus last child of a node
+3. delete it
+
+Expected:
+Previous child highlighted.
+
+Result:
+Parent highlighted.
+
+With the current behavior it's difficult to delete a couple of consecutive nodes because the focus jumps immediately to the parent.
+Basically, the call to navigate() needs to take the previousSibling || parent instead of just parent: http://dxr.mozilla.org/mozilla-central/source/browser/devtools/markupview/markup-view.js#527.  The this.walker.previousSibling call will be async, but can be fetched like so:
+
+this.walker.previousSibling(aNode).then(previousSibling => {
+
+});
+
+Also there is a test for markup view deletion here: http://dxr.mozilla.org/mozilla-central/source/browser/devtools/markupview/test/browser_markupview_tag_edit_04.js.  We should probably add coverage to check which node is selected in the markup view after the deletion.
+Created attachment 8522528
+devtools-navigate.patch
+
+Here's the patch. I changed the test a little bit (added deleteAndAssert function which is not really a good name) to test both cases: has previous sibling and does not have it.
+
+I was thinking about the focus when we do undo. But it feels for me best not to focus the reverted node.
+
+Please have a look.
+Comment on attachment 8522528
+devtools-navigate.patch
+
+Review of attachment 8522528:
+-----------------------------------------------------------------
+
+Looking good, a few notes on the test and some wondering about the correct time to calculate previous sibling.  I'm inclined to say do it out of the undo call just because that's when the parent is found as well - it also seems to help with the case where I hold down the delete button.
+
+::: browser/devtools/markupview/markup-view.js
+@@ +523,5 @@
+>        let parent = aNode.parentNode();
+>        let sibling = null;
+>        this.undo.do(() => {
+>          if (container.selected) {
+> +          this.walker.previousSibling(aNode).then(previousSibling => {
+
+Given this test case I'm seeing the parent get selected when holding the delete button:
+
+data:text/html,<body><script type="text/javascript">for (var i = 0; i < 1000; i++) { var div = document.createElement("div"); div.id = div.textContent = "div" + i; document.body.appendChild(div); }</script></body>
+
+I'm not sure if this is a totally better way to handle this, but if I instead wrap the undo.do call entirely inside of the previous sibling call it works more like I'd expect:
+
+this.walker.previousSibling(aNode).then(previousSibling => {
+  this.undo.do(() => {
+// etc
+  })
+});
+
+::: browser/devtools/markupview/test/browser_markupview_tag_edit_04.js
+@@ +4,5 @@
+>  
+>  "use strict";
+>  
+> +// Tests that a node can be deleted from the markup-view with the delete key.
+> +// Also checks that after deletion the previous sibling is highlighted.
+
+// Also checks that after deletion the correct element is highlighted.
+// The previous sibling is preferred, but the parent is a fallback.
+
+@@ +11,2 @@
+>  
+> +function* deleteAndAssert(inspector, nodeSelector, focusedNodeSelector) {
+
+How about deleteAndCheckSelection?
+
+@@ +18,5 @@
+>    EventUtils.sendKey("delete", inspector.panelWin);
+> +
+> +  yield Promise.all([mutated, inspector.once("inspector-updated")]);
+> +
+> +  is(inspector.selection.node, content.document.querySelector(focusedNodeSelector),
+
+This will fail in e10s.  Instead use this:
+
+  let nodeFront = yield getNodeFront(focusedNodeSelector, inspector);
+  is(inspector.selection.nodeFront, nodeFront,
+     "Right node (previousSibling or parent) should be selected after a node gets deleted");
+Created attachment 8523310
+devtools-navigate.patch
+
+Updated patch that changes the behavior of removeNode in a backwards compatible way.
+
+Please have a look.
+Comment on attachment 8523310
+devtools-navigate.patch
+
+Review of attachment 8523310:
+-----------------------------------------------------------------
+
+Ryan, can you please review the backwards compatibility of the protocol bits (the return value of removeNode in inspector.js and the usage of it in markup-view.js).  What's supposed to happen here is that if it's talking to an old server then 'siblings' will just be a single node and 'nextSibling' will be assigned to that like it used to.  Same with 'previousSibling' / 'parent'.  My question is will this work in a backwards compatible manner with old servers, or should this be done in some other way.
+Ryan, I should add that even if it does technically work, future consumers of the removeNode function would most likely not be added in a backwards compatible way since it's very hard to understand the history of this.  But adding a new method just to change the return type seems like overkill.  Could the return type change be something that is handled by the WalkerFront, or is there some other way to handle this that I'm not thinking of?
+Comment on attachment 8523310
+devtools-navigate.patch
+
+Review of attachment 8523310:
+-----------------------------------------------------------------
+
+::: browser/devtools/markupview/markup-view.js
+@@ +526,5 @@
+> +        // removeNode used to return nextSibling. Now it returns
+> +        // {previousSibling, nextSibling} so we can focus the previousSibling.
+> +        this.walker.removeNode(aNode).then(siblings => {
+> +          nextSibling = siblings.nextSibling || siblings;
+> +          let focusNode = siblings.previousSibling || parent;
+
+This seems generally safe overall, but you should move this compatibility code to the front so it doesn't need to be repeated by each consumer.
+
+See various cases on the WalkerFront, like pick[1], for examples.  The "impl" protocol JS option moves the "real" method to some private name of your choosing.  So, you'd add a new "removeNode" method to the front, call the private version, and put the compatibility logic there instead of here.
+
+[1]: http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/inspector.js#2552
+To be absolutely sure whether something will at least work at all for compatibility, it's generally easiest to start an FxOS simulator and test your patch.
+
+I tried the 2.0 simulator and deleting nodes continues to work by going to the parent as expected.
+
+Potentially it could be confusing to some future consumer of |removeNode| if they were expecting |previousSibling| to really be a sibling and were not anticipating this fix up for older servers where it's really the parent, but that's a question that hopefully Brian can answer better.  
+
+Does it seem okay to have an API that gives you "probably the previous sibling, but maybe your parent"?  If that seems okay for all imagined consumers of |removeNode|, then the approach here is okay.  But if you can imagine some future work not expecting this, then maybe something more explicit (like a new method) is preferable.
+
+It would be unfortunate if someone ends up having detect and undo the compatibility fix as a consumer:
+
+this.walker.removeNode(aNode).then(siblings => {
+  let { previousSibling } = siblings;
+  // Might be a parent though, old servers are sneaky!
+  let isAnythingReallyTrue = previousSibling.reallyForSureSibling();
+});
+
+So, just think carefully about your API surface.
+(In reply to J. Ryan Stinnett [:jryans] from comment #8)
+> Potentially it could be confusing to some future consumer of |removeNode| if
+> they were expecting |previousSibling| to really be a sibling and were not
+> anticipating this fix up for older servers where it's really the parent, but
+> that's a question that hopefully Brian can answer better.  
+> 
+> Does it seem okay to have an API that gives you "probably the previous
+> sibling, but maybe your parent"?  If that seems okay for all imagined
+> consumers of |removeNode|, then the approach here is okay.  But if you can
+> imagine some future work not expecting this, then maybe something more
+> explicit (like a new method) is preferable.
+>
+> It would be unfortunate if someone ends up having detect and undo the
+> compatibility fix as a consumer:
+> 
+> this.walker.removeNode(aNode).then(siblings => {
+>   let { previousSibling } = siblings;
+>   // Might be a parent though, old servers are sneaky!
+>   let isAnythingReallyTrue = previousSibling.reallyForSureSibling();
+> });
+> 
+> So, just think carefully about your API surface.
+
+We have some consumers of removeNode, but this is the only one that uses the return value.  I could imagine others in the future that would use it as well, so I think it should not expose parentNode as the previous sibling, but to let consumers deal with that case separately.
+
+The tricky part I think is distinguishing between when a previousSibling is null because it's an old server versus previous sibling is null because it's the first child.  I guess we could handle that with null/undefined return values from the front.
+
+Alternatively in the case of an old server, I think we could just have this new front method do a walker query for previousSibling on the returned nextSibling and include that in the return value.  In this case it should be the same element that would have been returned anyway since the current node has now been removed.  If that works how I think it should, then the front API would be consistent across old and new server versions.
+Comment on attachment 8523310
+devtools-navigate.patch
+
+Review of attachment 8523310:
+-----------------------------------------------------------------
+
+It looks good overall except for the API discussion from Comments 7 - 9 - let me know if this doesn't make sense.  In particular, I think the ideal option would be if we could make it work as explained in the last paragraph of comment 9 because we could keep API consistency with old servers.
+(In reply to Brian Grinstead [:bgrins] from comment #9)
+> Alternatively in the case of an old server, I think we could just have this
+> new front method do a walker query for previousSibling on the returned
+> nextSibling and include that in the return value.  In this case it should be
+> the same element that would have been returned anyway since the current node
+> has now been removed.  If that works how I think it should, then the front
+> API would be consistent across old and new server versions.
+
+That does sound the most reasonable and should be possible too. :)
+Created attachment 8525541
+devtools-navigate.patch
+
+So I created removeNode in WalkerFront that takes care of the incompatibilities. It took me, however, some time to do it since that file is awefully huge. WalkerActor and WalkerFront look like pretty self-contained things to live in separate files. Maybe you want to makes this file easier to follow by splitting this file before it's too late and it becomes browser.js?
+
+Going back to the issue: it seems to work fine now. The test is passing and I also tested manually by undoing removeNode changes in WalkerActor.
+
+Please have a look. It should match what was said in comment 11.
+(In reply to Tomasz Kołodziejski [:tomasz] from comment #12)
+> It took me, however, some time to do it since that file
+> is awefully huge. WalkerActor and WalkerFront look like pretty
+> self-contained things to live in separate files. Maybe you want to makes
+> this file easier to follow by splitting this file before it's too late and
+> it becomes browser.js?
+
+We had discussed this at one point but I think were afraid of losing historical context of the changes.  I suppose if it's bound to happen sooner or later then sooner would be better to limit what context is lost.  Patrick, what do you think about breaking inspector.js up into smaller pieces?
+Comment on attachment 8525541
+devtools-navigate.patch
+
+Review of attachment 8525541:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/inspector.js
+@@ +2882,5 @@
+>      }
+>      return returnNode;
+> +  },
+> +
+> +  removeNode: protocol.custom(function(node) {
+
+Sorry for leading you in different directions throughout this bug.  I like the approach, but realized it wasn't actually returning the previous sibling for older servers.  I think it's something to do with the promise return value or something, BUT here is what I think will work:
+
+1) Revert the changes to the actor's removeNode method.
+2) Make the front's removeNode method look like this:
+
+  removeNode: protocol.custom(Task.async(function*(node) {
+    let previousSibling = yield this.previousSibling(node);
+    let nextSibling = yield this._removeNode(node);
+    return promise.resolve({
+      nextSibling: nextSibling,
+      previousSibling: previousSibling,
+    });
+  }), {
+    impl: "_removeNode"
+  }),
+
+This provides backwards-compat (as tested on a 2.0 simulator), and moves all of this junk into the front without requiring any actor changes.
+Yeah, it's taking pretty long for such a tiny change. But hopefully we'll finally make it.
+
+That's strange that you see it not working. I tested it by just not reverting the change to the actor and it seemed to work. Can I test it with that 2.0 simulator without having to compile the universe?
+
+Implementing it like this it will result in a condition between taking previousSibling and removeNode (and it is in my last patch for old servers but not for the new ones). If we don't care that much then we don't have to touch removeNode either. We can just throw getting previousSibling into deleteNode method. What would you say?
+(In reply to Tomasz Kołodziejski [:tomasz] from comment #15)
+> Yeah, it's taking pretty long for such a tiny change. But hopefully we'll
+> finally make it.
+> 
+> That's strange that you see it not working. I tested it by just not
+> reverting the change to the actor and it seemed to work. Can I test it with
+> that 2.0 simulator without having to compile the universe?
+
+Yes, you can use the Web IDE: https://developer.mozilla.org/en-US/docs/Tools/WebIDE.  You can install a simulator from the 'select runtime' dropdown there.   Once it's installed, start up the simulator then select an app (like calendar) from the top left dropdown.  This should automatically open up devtools against the older version of the server.
+
+> Implementing it like this it will result in a condition between taking
+> previousSibling and removeNode (and it is in my last patch for old servers
+> but not for the new ones).
+
+Sorry, I'm not sure what you mean by "condition between taking previousSibling and removeNode"?
+
+> If we don't care that much then we don't have to
+> touch removeNode either. We can just throw getting previousSibling into
+> deleteNode method. What would you say?
+
+I like keeping this in the Front - it seems like a more natural place, and makes the usage in markup view much less confusing.  Also if we do have future consumers that want to do something similar it will be much more clear.
+(In reply to Brian Grinstead [:bgrins] from comment #13)
+> (In reply to Tomasz Kołodziejski [:tomasz] from comment #12)
+> > It took me, however, some time to do it since that file
+> > is awefully huge. WalkerActor and WalkerFront look like pretty
+> > self-contained things to live in separate files. Maybe you want to makes
+> > this file easier to follow by splitting this file before it's too late and
+> > it becomes browser.js?
+> 
+> We had discussed this at one point but I think were afraid of losing
+> historical context of the changes.  I suppose if it's bound to happen sooner
+> or later then sooner would be better to limit what context is lost. 
+> Patrick, what do you think about breaking inspector.js up into smaller
+> pieces?
+
+I think we should do it. I like to think that files inside toolkit/server/actors/ should represent one "thing" in the content webpage. The more self-contained we can make those "things", the easier we can maintain the code and make the modules easy to share/reuse.
+
+I think the obvious candidates to split out of this file are: NodeActor/Front and NodeListActor/Front (+ any other protocol types and helper functions that should be moved with them). These could go in a file named domnode.js or something like this.
+This would only leave InspectorActor/Front and WalkerActor/Front in inspector.js, which makes sense to me. InspectorActor is very small, it's just the entry point actor for the inspector-panel basically. So I don't think there's a compelling reason to move WalkerActor/Front into its own separate file.
+
+In practice, it's not as easy as moving code around, cause we need to make sure protocol.js types are registered correctly, but this should be doable (we should file a separate bug for this, or at least make this part of a separate patch).
+Created attachment 8526030
+devtools-navigate.patch
+
+> Sorry, I'm not sure what you mean by "condition between taking previousSibling and removeNode"?
+
+Race condition. I ate "race" editing that comment. It's async so previousSibling my be out of date. If it's implemented server side that inconsistency is impossible.
+
+This patch should comply with comment 14.
+Comment on attachment 8526030
+devtools-navigate.patch
+
+Review of attachment 8526030:
+-----------------------------------------------------------------
+
+r+ for code changes, but needs a fix to toolkit/devtools/server/tests/mochitest/test_inspector-remove.html before landing (see errors here: https://tbpl.mozilla.org/?tree=Try&rev=ae0a855b8bad).
+
+Basically we just need to change nextSiblingFront to siblingFronts, and update assertion on the count of the ownership tree to be originalOwnershipSize - 26.  See relevant code here: http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/tests/mochitest/test_inspector-remove.html#65-74
+Ok, I understand why this fails but don't really get:
+
+> Basically we just need to change nextSiblingFront to siblingFronts
+
+There's no siblingsFront. This part I can fix just by checking siblings.nextSibling. I also wanted to check previousSibling ` is(siblings.previousSibling.rawNode(), nextSibling.previousSibling)` but this fails. It looks like previousSibling is ignoring "blank nodes" as the comment "Duplicate the walker logic to skip blank nodes..." suggests. I suppose you just meant to do exactly this.
+
+> update assertion on the count of the ownership tree to be originalOwnershipSize - 26
+
+It currently is exactly that value and it fails. I don't really know what's the ownership tree. I can blindly modify it so that it matches but do can you point me to the place I can understand that ownership tree?
+(In reply to Tomasz Kołodziejski [:tomasz] from comment #20)
+> Ok, I understand why this fails but don't really get:
+> 
+> > Basically we just need to change nextSiblingFront to siblingFronts
+> 
+> There's no siblingsFront. This part I can fix just by checking
+> siblings.nextSibling. I also wanted to check previousSibling `
+> is(siblings.previousSibling.rawNode(), nextSibling.previousSibling)` but
+> this fails. It looks like previousSibling is ignoring "blank nodes" as the
+> comment "Duplicate the walker logic to skip blank nodes..." suggests. I
+> suppose you just meant to do exactly this.
+
+That was just a bad name I came up with when looking at the error.  Calling it siblings as you suggest would be better.
+
+As for the previousSibling, it's not returning the right thing because we aren't skipping empty text nodes like the walker does, so it would fail if you did something like:
+
+    is(siblings.previousSibling.rawNode(), nextSibling.previousSibling, "Should have returned the previous sibling.");
+
+But you could add a function I guess like so:
+
+function getNonEmptyPreviousSibling(node) {
+  let prevSibling = node.previousSibling;
+  // Duplicate the walker logic to skip blank nodes...
+  while (prevSibling &&
+    prevSibling.nodeType === Components.interfaces.nsIDOMNode.TEXT_NODE &&
+     !/[^\s]/.exec(prevSibling.nodeValue)) {
+    prevSibling = prevSibling.previousSibling;
+  }
+  return prevSibling;
+}
+
+Then call:
+
+    is(siblingFronts.previousSibling.rawNode(), getNonEmptyPreviousSibling(nextSibling), "Should have returned the previous sibling.");
+
+I'm not sure if there is an easier way to compare to the element we want.  We don't want to reuse the walker's logic to make sure that we can actually catch a bug in there.  Feel free to flag me for review again on that if you want another set of eyes - I forgot that adding that in would be more than a single line.
+
+> > update assertion on the count of the ownership tree to be originalOwnershipSize - 26
+> 
+> It currently is exactly that value and it fails. I don't really know what's
+> the ownership tree. I can blindly modify it so that it matches but do can
+> you point me to the place I can understand that ownership tree?
+
+Sorry, I meant - 25 (and the assertion message should be updated as well to say 25 - I think the assertion message is actually out of date right now).  Basically that's comparing what nodes the client and server know about: http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/tests/mochitest/inspector-helpers.js#156.  The count is lower after the removal because the #longlist element and it's children are no longer needed.  However, it needs to have one more node than what it currently is in the test because the server and client are now aware of another node (the previous sibling).
+Created attachment 8526911
+devtools-navigate.patch
+
+I updated the patch and pushed to try:
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=2d1219893069
+
+Will come back later with checkin-needed or more test fixes.
+Looks good - pushed to fx team:
+
+https://hg.mozilla.org/integration/fx-team/rev/8f2f3001ab0b
+Thanks for you help Brian!
+https://hg.mozilla.org/mozilla-central/rev/8f2f3001ab0b
+
+
+Deleting node should select previous sibling and not parent
+
+
+
+Bug 1094622 - Deleting node in inspector now selects previous sibling and not parent. r=bgrins

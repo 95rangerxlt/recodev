@@ -1,0 +1,221 @@
+As any other dom storage entry we are cleared with cookies when the user choices Clear Recent History.
+Using an offline app manifest does not look like an options (would need lots of special casing, for example we don't need to ask user permission to store data, we don't want to appear in offline apps and so on...)
+
+I could special case DOM Storage query to avoid clearing moz-safe-about scoped entries since those are for internal use.
+
+Cc-ing Honza to get feedback on this.
+
+As any other dom storage entry we are cleared with cookies when the user choices Clear Recent History.
+Using an offline app manifest does not look like an options (would need lots of special casing, for example we don't need to ask user permission to store data, we don't want to appear in offline apps and so on...)
+
+I could special case DOM Storage query to avoid clearing moz-safe-about scoped entries since those are for internal use.
+
+Cc-ing Honza to get feedback on this.
+and another issue, when Private browsing is active localstore is replaced with the privatebrowsing database. So our data is not available anymore. It's a bit strange that persisted data disappears though since it's already there, I thought it was a passthrough (so data saved during pb is not persisted, but previous persisted data is still available).
+So, I also suppose that if a user uses persistent private browsing mode, any data we save is dismissed with each session, and the page becomes unusable.
+Created attachment 471511
+patch v1.0
+
+So, while the getKeyValue pass-through is probably acceptable (there is no privacy hit here after all), the "home" domain bypass is mostly a bad hack.
+Any idea how to better special case this code to avoid clearing safe about pages?
+
+If we don't workaround these issues somehow, we will have to find another communication tunnel for chrome->content, and time is running out quickly :(
+and I also have to somehow bypass the privatebrowsing check in setKey for persistent private browsing mode, otherwise my key ends up being added in the first pb session, and then removed.
+Comment on attachment 471511
+patch v1.0
+
+The first hunk seems more or less ok, but as you say, it is a horrible hack.  Anyway, we could potentially live with that.
+
+As about the second hunk, I cannot accept this.  No data is copied when entering the PB mode.  It is by design, see https://bugzilla.mozilla.org/show_bug.cgi?id=487695#c16, what is an accepted solution.
+
+
+I would like to check I understand the behavior of about:home page, so:
+- it is a local copy of the start page, the data is under our control
+- it wants to ignore PB mode, offline application settings
+- it wants to use content API to store data locally - localStorage, but wants these data be persisted in a way different from how content does, I mainly mean privileges of that data
+
+Seems to me that it behaves more like a chrome page.  But we don't want it to have chrome privileges, right?
+
+So, as the most easy fix (thought some more typing) is to let nsDOMStorageDBWrapper ask the storage (that is passed to every method) if it wants to always use a permanent storage independently on current PB/cookies mode.  nsDOMStorageDBWrapper sees the storage class, so it can be a simple getter like 'bool AlwaysPersistOverride();'.  It should return true for about: or only for about:home page.  This should be made by a principal check, not just by URI or db-scope key checking.  But depends.  nsDOMStorage2 (localStorage impl) keeps the principal.  Note: AlwaysPersistOverride() must return false for sessionStorage and globalStorage, see mStorageType.
+
+
+Please use context of 8 lines for your future patches.
+Maybe the absolutely best would be to let about: domain use it's own database file, i.e. to have an mPersistentDBForHome or something like that.  This would exclude the data from quota checking, usage numbers, non-offline domains cleanup.  But might be considered a resource waste, as we need one more sqlite connection.
+(In reply to comment #1)
+> and another issue, when Private browsing is active localstore is replaced with
+> the privatebrowsing database. So our data is not available anymore. It's a bit
+
+I actually think this is fine; we'll likely have default content to be shown in cases when the DOMstorage for this page is empty, and I think that will be fine to show during PB mode.
+(In reply to comment #6)
+> (In reply to comment #1)
+> > and another issue, when Private browsing is active localstore is replaced with
+> > the privatebrowsing database. So our data is not available anymore. It's a bit
+> 
+> I actually think this is fine; we'll likely have default content to be shown in
+> cases when the DOMstorage for this page is empty, and I think that will be fine
+> to show during PB mode.
+
+the search field won't work and default content won't be available, as well, it's like detachind the hard drive from a computer and waiting for it to work :)
+(In reply to comment #4)
+> I would like to check I understand the behavior of about:home page, so:
+> - it is a local copy of the start page, the data is under our control
+> - it wants to ignore PB mode, offline application settings
+> - it wants to use content API to store data locally - localStorage, but wants
+> these data be persisted in a way different from how content does, I mainly mean
+> privileges of that data
+> 
+> Seems to me that it behaves more like a chrome page.  But we don't want it to
+> have chrome privileges, right?
+
+well the problem is easier explainable, we need a way for chrome to asynchronous pass data to content, but not the other way. So chrome must set data to some kind of storage that later content can retrieve.
+i think this doesn't block. if the stored data gets wiped out, then we show the default, until the next time about:home pulls the remote data. that doesn't seem like a showstopper to me, so blocking-.
+So, you push some data from chrome to storage for about:home before it is first displayed.  Couldn't we do this again after we enter the PB mode?
+Btw, what I suggest in comment 4 would not need to do that, the normal persistent storage would be used by about:home even in PB mode.
+(In reply to comment #9)
+> i think this doesn't block. if the stored data gets wiped out, then we show the
+> default
+
+The default is stored in dom storage, so after a clear history the search field won't work. reasking blocking. Nothing will work as intended with this bug.
+(In reply to comment #11)
+> Btw, what I suggest in comment 4 would not need to do that, the normal
+> persistent storage would be used by about:home even in PB mode.
+
+I have a wip patch, but have to finish it.
+Created attachment 472496
+patch v1.1
+
+Could you please check if this procedure is correct or I need more/different checks?
+Search field not working = blocking, yeah.
+Created attachment 472572
+patch v1.2
+
+This is a bit more generic for about: pages, and with a more complete test.
+I was also thinking, as an alternative, that maybe the first time SetItem is called by a chrome context (using IsCallerchrome) on a certain scope, it could be marked as "privileged" in the table and use this stuff, instead of hardcoding certain scopes. But this would require a schema change to add such a "privileged" column.
+(In reply to comment #16)
+> Created attachment 472572 [details]
+> patch v1.2
+> 
+> This is a bit more generic for about: pages, and with a more complete test.
+> I was also thinking, as an alternative, that maybe the first time SetItem is
+> called by a chrome context (using IsCallerchrome) on a certain scope, it could
+> be marked as "privileged" in the table and use this stuff, instead of
+> hardcoding certain scopes. But this would require a schema change to add such a
+> "privileged" column.
+
+I don't think it is a good idea.  We may leak that privilege by accident to pages we don't want to have it.
+
+The best here would be to have this new privilege be set in the principal the storage gets (chrome and about:).  Then there would be no need to for setting flags based on checking for about: schema.
+
+How complicated would that be?  If really very simple I'd vote to go rather that way.
+well it's not "chrome and about" because the about page as well could store stuff and it should have the "enlarged" quota for that. I have no idea how hard would be to inject it in principal since I never touched that code, but I guess it would be harder to have someone accept a change to global principal that holds security.
+Comment on attachment 472572
+patch v1.2
+
+>diff --git a/dom/src/storage/nsDOMStoragePersistentDB.cpp b/dom/src/storage/nsDOMStoragePersistentDB.cpp
+>@@ -277,18 +277,22 @@ nsDOMStoragePersistentDB::Init()
+>+  // Local about: pages are for internal use, so don't clear their store here.
+>+  // See bug 592990.
+>   rv = mConnection->CreateStatement(
+>-         NS_LITERAL_CSTRING("DELETE FROM webappsstore2"),
+>+         NS_LITERAL_CSTRING("DELETE FROM webappsstore2 "
+>+                            "WHERE scope NOT GLOB '*:about' "
+>+                              "AND scope NOT GLOB '*:moz-safe-about'"),
+
+Uh.. we should use a different database for about: and moz-safe-about: storage that will never be deleted.
+
+>@@ -571,17 +575,22 @@ nsDOMStoragePersistentDB::RemoveOwners(c
+>-    expression.AppendLiteral("DELETE FROM webappsstore2 WHERE scope NOT IN (");
+>+    // Local about: pages are for internal use, so don't clear their store here.
+>+    // See bug 592990.
+>+    expression.AppendLiteral("DELETE FROM webappsstore2 "
+>+                             "WHERE scope NOT GLOB '*:about' "
+>+                             "AND scope NOT GLOB '*:moz-safe-about' "
+>+                             "AND scope NOT IN (");
+
+As well here... this is horrible.  I have to think of it.
+
+
+I'll do a full review soon.
+yes, that part is horrible, I hoped to inject a list of items to skip in the deletion but the method is called by an observer that does not know anything but that it should delete everything. Building a 4th database for override looks a bit too much overhead though, not hard, but it's lot of code for just skipping "clear all". I'm looking both for feedback and ideas to make this at least acceptable or figure out better way to handle a shared chrome/content storage.
+
+Maybe there could be a flag on each key, and if the key has been setup by a chrome caller it should not be cleared as a page data. Something like the "secure" field, it could also check that content doesn't call setItem on a chrome item and that chrome does not call getItem on a content item. This would either require a schema change, or to make "secure" a bitfield rather than a simple bool int.
+(In reply to comment #20)
+> Building a 4th database for override
+> looks a bit too much overhead though
+
+I was thinking of using the existing implementation, but simply adding a new member to the wrapper class.  But as I said, I have to think of it first.
+
+> 
+> Maybe there could be a flag..
+
+We did change the schema many times in the past and this would be forward compatible.  However, we would need to add an index for this column to make deleting fast, that means to lower the INSERT/UPDATE performance even more.
+
+But I can say I think we can go with this solution and find something better in a followup.
+i'm not much worried by the speed of deletion since it's part of a slow path that is clear history. Sqlite 3.7.1 can also auto-generate indices on-the-fly when it thinks they could be useful to speed up a query.
+I think the index can be avoided considering the size of this database and the fact the column is a simple int (secure does not have an index, as well)
+
+Checking the flag on getItem would be almost free since we'd just have to fetch an additional column.
+Checking the flag on setItem would be almost free, because before setting the new value we already check the old one.
+(In reply to comment #22)
+> i'm not much worried by the speed of deletion
+
+So, you want to make something that is slow even slower? No...
+
+> (secure does not have an index, as well)
+
+We do not search by it, so not an argument for me.
+
+> Checking the flag on setItem would be almost free, because before setting the
+> new value we already check the old one.
+
+This will be changed by patch for bug 536544.  However, we cache all items and we can fetch the flag as well.
+
+I'm not that much against this flag, but I would like to think of this first more deeply.  Changing the schema costs and it's always better to avoid it.  Making the deletion slower is also not a good idea.  BTW, your patch is already making the statement to walk the table sequentially, not using the index.
+
+So, why not to have beside webappsstore.sqlite a new db file called say chromeappsstore.sqlite?  nsDOMStoragePersistentDB::Init() would take a string argument - the name of the file and there would be a new member of nsDOMStorageDBWrapper, called say mChromePersistentDB, used when the override is set on the storage object?
+Created attachment 472864
+patch v1.3
+
+no reasons, unless we want to avoid creating a new db. This does what you suggested, creating a new database. It's less horrible than the previous query change.
+Comment on attachment 472864
+patch v1.3
+
+jst, please take a look.  Also consider there is a different patch in this bug that modifies db queries, but it is not a consistent change IMO and also makes some operations much slower.
+
+I'm not sure how much a new database costs.  But take into account that it is not instantiated (open) until the storage is accessed.
+Comment on attachment 472864
+patch v1.3
+
+Shawn, can you please judge if this patch, v1.3 (a new database), is more optimal then patch v1.2 (just modified, but very slow queries + not really a nice patch)?
+Comment on attachment 472864
+patch v1.3
+
+This is pretty clean :)
+Marco, if the patch v1.3 works for you, we can land it.
+That would be AWESOME. Thank you very much for your help.
+http://hg.mozilla.org/mozilla-central/rev/4b41b425c4fa
+backed out due to a test failure, will recheck.
+9351 ERROR TEST-UNEXPECTED-FAIL | /tests/dom/tests/mochitest/bugs/test_bug463000.html | got wrong response - got "child-response\n Pair-A existed unexpectedly\n Pair-B existed unexpectedly", expected "child-response"
+
+2228 ERROR TEST-UNEXPECTED-FAIL | chrome://mochikit/content/chrome/dom/tests/mochitest/chrome/test_domstorage.xul | per-domain size constraint - got false, expected true
+2229 ERROR TEST-UNEXPECTED-FAIL | chrome://mochikit/content/chrome/dom/tests/mochitest/chrome/test_domstorage.xul | per-domain size constraint second check - got false, expected true
+
+these are strange, code should not touch those paths.
+ah, I initialized mCanUseChromePersist in the copy constructor, but not in the constructor.
+Created attachment 473503
+patch v1.4
+
+ok, this should make it. will pass through tryserver.
+(In reply to comment #33)
+> ah, I initialized...
+ah, I really need a new glasses...
+http://hg.mozilla.org/mozilla-central/rev/737c80aa9134
+
+
+about:home DOM storage is cleared with cookies and private browsing
+
+
+
+Bug 592990 - about:home DOM storage is cleared with cookies and private browsing. r=mayhemer a=blocking 
+
+Bug 592990 - about:home DOM storage is cleared with cookies and private browsing. r=mayhemer a=blocking

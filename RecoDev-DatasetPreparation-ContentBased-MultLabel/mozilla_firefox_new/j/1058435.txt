@@ -1,0 +1,681 @@
+As part of bug 771630, we need the ContentPrefService to record a timestamp for when prefs are added/changed, and the ability to clear all permissions changed after a specified time.  This will involve:
+
+* A change to the sqlite schema used to store the prefs - almost certainly on the "prefs" table.  This will require a schema migration, and relevant tests for the migration.  The new column may also need an index.
+
+* Store/update modification date - this should not require any interface changes, but instead just storing now() at the relevant times.
+
+* new method on nsIContentPrefService2 - something like .removeAllDomainsSince(...)
+
+* Tests for all the above.
+
+Marking as no QA for this specific bug - the tests should be comprehensive and the QA can be done as part of the bug 771630.
+
+As part of bug 771630, we need the ContentPrefService to record a timestamp for when prefs are added/changed, and the ability to clear all permissions changed after a specified time.  This will involve:
+
+* A change to the sqlite schema used to store the prefs - almost certainly on the "prefs" table.  This will require a schema migration, and relevant tests for the migration.  The new column may also need an index.
+
+* Store/update modification date - this should not require any interface changes, but instead just storing now() at the relevant times.
+
+* new method on nsIContentPrefService2 - something like .removeAllDomainsSince(...)
+
+* Tests for all the above.
+
+Marking as no QA for this specific bug - the tests should be comprehensive and the QA can be done as part of the bug 771630.
+I will work on it with adw as my mentor.
+Created attachment 8488420
+pref-dates.patch
+
+Please have a look. Don't go into details yet, just high-level overview whether it makes sense. There is a bunch of TODO in this patch (you may want to anwser those TODO questions) and open questions as what do we do with private mode/no dates in cache.
+Comment on attachment 8488420
+pref-dates.patch
+
+Review of attachment 8488420:
+-----------------------------------------------------------------
+
+I've only looked at the non-test code so far.  I wanted to give you feedback ASAP.  I'll look at the tests next and leave the feedback? for now.
+
+This looks good.  One thing.  removeAllDomainsSince is very similar to removeAllDomains.  I think you could factor out removeAllDomains's body into a method that takes a since/timestamp param and then call it from both, like how the get, set, and main remove methods all delegate to common helpers.  Your new method would need some conditionals to handle the optional since/timestamp arg of course, but those conditionals should be trivial enough that the factorization is worth it.  Let me know if I'm wrong.
+
+::: dom/interfaces/base/nsIContentPrefService2.idl
+@@ +295,1 @@
+>     *
+
+Whenever you change an interface in an IDL file, you have to change the interface's ID (the "iid").  In this case that's this hash here: http://mxr.mozilla.org/mozilla-central/source/dom/interfaces/base/nsIContentPrefService2.idl?rev=9b59ba1ae73e#70
+
+My Mac has /usr/bin/uuidgen.  I don't remember if it came preinstalled.  You can also ping firebot on #fx-team: `firebot: uuid`
+
+@@ +307,5 @@
+> +   * @param callback  handleCompletion is called when the operation completes.
+> +   */
+> +  void removeAllDomainsSince(in PRTime since,
+> +                        in nsILoadContext context,
+> +                        [optional] in nsIContentPrefCallback2 callback);
+
+Please indent the final two lines with the opening paren.
+
+::: toolkit/components/contentprefs/ContentPrefService2.jsm
+@@ +352,5 @@
+>    removeGlobal: function CPS2_removeGlobal(name, context,callback) {
+>      this._remove(null, name, false, context, callback);
+>    },
+>  
+> +  // TODO: probably do a range?
+
+If we were designing the API with no use cases in mind, then a range would probably make more sense.  But right now we can assume that the upper bound is fixed to "now," so I think removeAllDomainsSince is fine.  In general I find it's usually a better idea to design your API with specific use cases in mind rather than attempting to satisfy many hypothetical use cases.  We can always add a range-based method later that removeAllDomainsSince's implementation would delegate to.
+
+@@ +373,5 @@
+> +    stmt.params.since = since;
+> +    stmts.push(stmt);
+> +
+> +    // Do the actual remove.
+> +    let stmt = this._stmt(`
+
+You're redeclaring stmt here.
+
+@@ +386,5 @@
+> +    let prefs = new ContentPrefStore();
+> +    this._execStmts(stmts, {
+> +      onRow: function onRow(row) {
+> +        // TODO: Many onRow methods in this file do exactly this. Abstract them out?
+> +        // Save just removed values do prefs.
+
+These callbacks passed to _execStmts are different enough that I'm not sure it makes sense to factor them out.  It looks like the largest number of identical onRow's in this file is 2.  onError on the other hand is the same in all of them.  Maybe I could see a StmtCallback constructor with a StmtCallback.prototype.onError.
+
+@@ +394,5 @@
+> +        this._cache.set(grp, name, undefined);
+> +      },
+> +      onDone: function onDone(reason, ok) {
+> +        // TODO: This nukes all the groups in _pbStore since we don't have their timestamp
+> +        // information.
+
+I'm not a fan of leaving TODOs in shipping code.  That's what Bugzilla and hg blame are for. :-)  Other than that this comment is good, though.
+
+@@ +797,5 @@
+>        },
+>        handleError: function handleError(error) {
+>          try {
+>            if (callbacks.onError)
+> +            callbacks.onError.call(self, error);
+
+I don't think you meant to keep this?
+
+::: toolkit/components/contentprefs/nsContentPrefService.js
+@@ +1011,5 @@
+>        prefs:      "id           INTEGER PRIMARY KEY, \
+>                     groupID      INTEGER REFERENCES groups(id), \
+>                     settingID    INTEGER NOT NULL REFERENCES settings(id), \
+> +                   value        BLOB, \
+> +                   timestamp    INTEGER"
+
+We should ask Marco if we should index this column.
+
+@@ +1174,2 @@
+>        }
+> +      this._dbMigrate3To4(aDBConnection);
+
+This is nice, but I don't really like how it assumes the current version is 4.  Ideally we'd write this method once so it never has to change, and then it'd hook into per-version migration functions.  (Even if we rarely have migrations.)  That's how it works now, but it sucks because to migrate to version N you have to write N-1 functions, so we end up with N^2 functions in total. :-(
+
+How about this?
+
+for (let i = aOldVersion; i < aNewVersion; i++) {
+  this["_dbMigrate" + i + "To" + (i + 1)](aDBConnection);
+}
+
+Then we only have to have N _dbMigrate{n-1}To{n} functions.
+
+It looks like 0 is a special case, so _dbMigrate should handle that specially and call _dbCreateSchema.
+
+@@ +1176,5 @@
+> +
+> +      aDBConnection.schemaVersion = aNewVersion;
+> +      aDBConnection.commitTransaction();
+> +    }
+> +    catch(ex) {
+
+Nit: space between catch and paren (I know it didn't have one before):
+
+catch (ex) {
+Marco, Tom is adding a timestamp column to the prefs table so we can do queries like this:
+
++    // Get prefs that are about to be removed to notify about their removal.
++    let stmt = this._stmt(`
++      SELECT groups.name AS grp, settings.name AS name
++      FROM prefs
++      JOIN settings ON settings.id = prefs.settingID
++      JOIN groups ON groups.id = prefs.groupID
++      WHERE timestamp >= :since
++    `);
+
+Should we add an index on timestamp?
+Comment on attachment 8488420
+pref-dates.patch
+
+Review of attachment 8488420:
+-----------------------------------------------------------------
+
+::: toolkit/components/contentprefs/ContentPrefService2.jsm
+@@ +374,5 @@
+> +    stmts.push(stmt);
+> +
+> +    // Do the actual remove.
+> +    let stmt = this._stmt(`
+> +      DELETE FROM prefs WHERE groupID NOTNULL AND timestamp >= :since
+
+The comment above should mention that rows with null timestamps are not deleted because in SQLite nulls are considered less than any other value (http://sqlite.org/datatype3.html).
+
+More of a comment for final review, but I had to look that up.
+(In reply to Drew Willcoxon :adw from comment #5)
+> The comment above should mention that rows with null timestamps are not
+> deleted because in SQLite nulls are considered less than any other value
+> (http://sqlite.org/datatype3.html).
+
+Er, given that one of your tests causes NULL >= 0 comparisons that the test expects to be true, I must have misunderstood the doc.  I'm still trying to find where it says what happens to NULLs in this case even though your test shows that they're casted to 0.
+Comment on attachment 8488420
+pref-dates.patch
+
+Review of attachment 8488420:
+-----------------------------------------------------------------
+
+Tests look good, Tom.  I have some minor comments but I'll leave them for review.
+
+::: toolkit/components/contentprefs/tests/unit_cps2/test_migrationToSchema4.js
+@@ +50,5 @@
+> +  runAsyncTests(tests, true);
+> +}
+> +
+> +
+> +// WARNING: Database will reset after every test. This limitation comes from
+
+Let's change that if it's getting in your way.  I wonder if we should test migrations from versions < 3.  I guess not.
+
+@@ +64,5 @@
+> +      ["foo.com", "dir-setting", "/download/dir"],
+> +    ];
+> +    yield dbOK(dbExpectedState);
+> +    yield cps.removeAllDomainsSince(1e9, null, makeCallback());
+> +    yield dbOK(dbExpectedState);
+
+Should probably get the DB connection and make sure the schemaVersion is 4.  You may even want to make sure the timestamp column is present.
+
+::: toolkit/components/contentprefs/tests/unit_cps2/test_removeAllDomainsSince.js
+@@ +59,5 @@
+> +    ]);
+> +  },
+> +
+> +  // TODO: What really expect here?
+> +  // function privateBrowsing() {
+
+That everything in the PB store is gone.
+
+@@ +93,5 @@
+> +    yield true;
+> +  },
+> +
+> +  // TODO: What expect here?
+> +  // function invalidateCache() {
+
+Same here.
+(In reply to Drew Willcoxon :adw from comment #4)
+> Marco, Tom is adding a timestamp column to the prefs table so we can do
+> queries like this:
+> 
+> +    // Get prefs that are about to be removed to notify about their removal.
+> +    let stmt = this._stmt(`
+> +      SELECT groups.name AS grp, settings.name AS name
+> +      FROM prefs
+> +      JOIN settings ON settings.id = prefs.settingID
+> +      JOIN groups ON groups.id = prefs.groupID
+> +      WHERE timestamp >= :since
+> +    `);
+> 
+> Should we add an index on timestamp?
+
+The number of prefs is expected to be larger than 100, so I think it's a good idea to have an index.
+The perfect index here, to avoid the double lookup (sqlite first gets rowids from the index, then fetches data from the original table using the rowids), would be (timestamp, settingID, groupID)... Though in this case the table is not huge so I don't think it matters.
+Yes, I'd just add a simple index on timestamp.
+Created attachment 8489746
+pref-dates.patch
+
+This ended up being quite big but luckily mainly because of tests.
+
+I tried to address all the issues pointed by you adw but please have once again a thorough look.
+
+We can also discuss as what you think about migrating the old values to one of the logical values in {0, Date.now()} instead of NULL. Having NULLs in db also adds special case to handle them and we may try to avoid it. It looks like Date.now() does not make sense in a case pointed out by adw: someone does the migration and clears the last-hour prefs right-away. This destroys his values which are most likely older than that. Since we only target removing last values it may make sense to set the migrated ones to be the oldest possible and set them to 0.
+Comment on attachment 8489746
+pref-dates.patch
+
+Review of attachment 8489746:
+-----------------------------------------------------------------
+
+Like we talked about, let's store timestamps in seconds in the DB and use milliseconds in the API, and set timestamp values in the DB to zero on migration.
+
+::: toolkit/components/contentprefs/ContentPrefService2.jsm
+@@ +417,5 @@
+>    },
+>  
+> +  // Delete settings and groups that are no longer used. The NOTNULL term in
+> +  // the subquery of the second statment is needed because of SQLite's weird
+> +  // IN behavior vis-a-vis NULLs.  See http://sqlite.org/lang_expr.html.
+
+Please move this comment inside the body.  If you want to have a comment outside describing the method, that's fine, but please write it like, "Deletes settings and groups that are no longer used.", and still move the second two sentences to a comment inside the body.
+
+@@ +418,5 @@
+>  
+> +  // Delete settings and groups that are no longer used. The NOTNULL term in
+> +  // the subquery of the second statment is needed because of SQLite's weird
+> +  // IN behavior vis-a-vis NULLs.  See http://sqlite.org/lang_expr.html.
+> +  _settingsAndGroupsCleanupStmt: function() {
+
+Nit: Stmt should be plural, Stmts, technically.
+
+@@ +420,5 @@
+> +  // the subquery of the second statment is needed because of SQLite's weird
+> +  // IN behavior vis-a-vis NULLs.  See http://sqlite.org/lang_expr.html.
+> +  _settingsAndGroupsCleanupStmt: function() {
+> +    let stmts = [];
+> +    stmts.push(this._stmt(`
+
+Nit: You could do simply:
+
+return [
+  this._stmt(...),
+  this._stmt(...),
+];
+
+@@ +525,5 @@
+>      });
+>    },
+>  
+> +  // Removes all domains since some specified date.
+> +  // If since !== null removes domains with timestamp >= since (and timestamp not null).
+
+Nit: I'd use typeof(since) == "number" to distinguish instead.  It's a little safer but mainly a style preference, so no big deal.
+
+@@ +532,3 @@
+>      checkCallbackArg(callback, false);
+>  
+> +    // Invalidate all the group cache because we don't know which groups will be removed.
+
+This is a good comment, but the one it's replacing is also good, so please add this to it instead of replacing it.
+
+@@ +542,5 @@
+>        SELECT groups.name AS grp, settings.name AS name
+>        FROM prefs
+>        JOIN settings ON settings.id = prefs.settingID
+>        JOIN groups ON groups.id = prefs.groupID
+> +    ` + (since !== null ? ' WHERE timestamp >= :since' : ''));
+
+Let's take advantage of the `${expression}` syntax:
+
+  JOIN groups ON groups.id = prefs.groupID
+  ${since !== null ? ' WHERE timestamp >= :since' : ''}
+`);
+
+@@ +551,5 @@
+>  
+> +    // Do the actual remove.
+> +    stmt = this._stmt(`
+> +      DELETE FROM prefs WHERE groupID NOTNULL
+> +    ` + (since !== null ? ' AND timestamp >= :since' : ''));
+
+Here too.
+
+@@ +594,5 @@
+> +  removeAllDomainsSince: function CPS2_removeAllDomainsSince(since, context, callback) {
+> +    this._removeAllDomainsSince(since, context, callback);
+> +  },
+> +
+> +  removeAllDomains: function CPS2_removeAllDomains(context, callback) {
+
+Nit: Please move these definitions above the _removeAllDomainsSince definition.  In this file, the API access points are defined right above the helper methods they delegate to -- see the existing get, set, and remove methods.
+
+::: toolkit/components/contentprefs/tests/unit_cps2/head.js
+@@ +173,5 @@
+> +      let row = results.getNextRow();
+> +      res = row.getResultByName('timestamp');
+> +    },
+> +    handleCompletion: function (reason) {
+> +      next(res);
+
+This should do_throw if res is still the empty string since that would indicate an error in the test.  Also, leaving res undefined or setting it to be null initially would make more sense than setting it to the empty string.
+
+@@ +286,5 @@
+>      do_check_true(actualPref === null);
+>  }
+>  
+>  function arraysOfArraysOK(actual, expected, cmp) {
+> +  cmp = cmp || function (a, b) equal(a, b);
+
+Where's equal defined?
+
+::: toolkit/components/contentprefs/tests/unit_cps2/test_removeAllDomainsSince.js
+@@ +60,5 @@
+> +    yield set("a.com", "foo", 1);
+> +    let end = Date.now() * 1000;
+> +    let timestamp = yield getDate("a.com", "foo");
+> +    ok(start <= timestamp, "Timestamp is at lest start.");
+> +    ok(timestamp <= end, "Timestamp is at most end.");
+
+This is dangerous because Date.now() is not guaranteed to monotonically increase.  For example, we have automated test machines that run Windows XP, and on Windows XP, the system timer doesn't monotonically increase, and Date.now() is tied to the system timer.  So we've had random test failures in the past where tests were doing things like this.
+
+performance.now would be fine -- CPS2.set would have to use it too -- but it's a DOM API that we can't access here as far as I can tell, not even through Cu.importGlobalProperties.
+
+So the best you can do here is to compare the dates using a sufficiently large fudge factor.  TBH I'm not sure off-hand what that would be -- maybe 1-3s to be safe.
+
+let fudge = 1500; // assuming everything's in ms
+ok(start - fudge <= timestamp && timestamp <= start + fudge);
+
+Also, I think this test function should go in test_setGet.js.
+
+@@ +114,5 @@
+> +    getCachedGlobalOK(["bar"], true, 4);
+> +    getCachedOK(["b.com", "foo"], false);
+> +    getCachedOK(["b.com", "bar"], false);
+> +    getCachedOK(["b.com", "foobar"], false);
+> +    yield;
+
+yield true;
+
+yield without an argument is deprecated.
+Comment on attachment 8489746
+pref-dates.patch
+
+Review of attachment 8489746:
+-----------------------------------------------------------------
+
+I'll post an updated patch in a sec. It looks like I cannot use review and add attachment at this same time.
+
+::: toolkit/components/contentprefs/tests/unit_cps2/head.js
+@@ +173,5 @@
+> +      let row = results.getNextRow();
+> +      res = row.getResultByName('timestamp');
+> +    },
+> +    handleCompletion: function (reason) {
+> +      next(res);
+
+Not necessarily. With current implementation of migrations I believe that NULL timestamp will return empty string here and it is not error right away.
+
+@@ +286,5 @@
+>      do_check_true(actualPref === null);
+>  }
+>  
+>  function arraysOfArraysOK(actual, expected, cmp) {
+> +  cmp = cmp || function (a, b) equal(a, b);
+
+It's defined in head.js of testing library. do_check_eq is deprecated and does not support messages which was the reason I changed it two lines below.
+
+::: toolkit/components/contentprefs/tests/unit_cps2/test_removeAllDomainsSince.js
+@@ +60,5 @@
+> +    yield set("a.com", "foo", 1);
+> +    let end = Date.now() * 1000;
+> +    let timestamp = yield getDate("a.com", "foo");
+> +    ok(start <= timestamp, "Timestamp is at lest start.");
+> +    ok(timestamp <= end, "Timestamp is at most end.");
+
+I didn't realize that but now it makes perfect sense. Thank you for pointing this out!
+Created attachment 8491086
+pref-dates.patch
+
+As discussed on IRC I changed this patch to store the timestamp in seconds (we don't need any more granularity than that, right? After I asked the question it makes me thinking so please also stop for a second on this) and so that the API uses milliseconds (because it is natural for JS).
+
+I think I addressed all the comments. Please have a look.
+Created attachment 8491093
+pref-dates.patch
+
+I forgot to update migration schema tests to the slightly modified version (seconds/ms changes). It was also a little bit wrong to use 1e9 instead of 0.
+(In reply to Tomasz Kołodziejski [:tomasz] from comment #11)
+> It's defined in head.js of testing library. do_check_eq is deprecated and
+> does not support messages which was the reason I changed it two lines below.
+
+Oh, thanks. :-)
+
+(In reply to Tomasz Kołodziejski [:tomasz] from comment #12)
+> As discussed on IRC I changed this patch to store the timestamp in seconds
+> (we don't need any more granularity than that, right? After I asked the
+> question it makes me thinking so please also stop for a second on this)
+
+Right.
+(In reply to Drew Willcoxon :adw from comment #10)
+> Like we talked about, let's store timestamps in seconds in the DB and use
+> milliseconds in the API, and set timestamp values in the DB to zero on
+> migration.
+
+FTR, the preference manager stores times as ms in the DB.  One "feature" of that is it makes testing faster - no need to sleep a full second to ensure you have a different tick.
+
+This comment is made without much in the way of context, so take it for what it cost you ;)
+Comment on attachment 8491093
+pref-dates.patch
+
+Review of attachment 8491093:
+-----------------------------------------------------------------
+
+Looks good, r+ with comments addressed.
+
+::: dom/interfaces/base/nsIContentPrefService2.idl
+@@ +299,5 @@
+>    void removeAllDomains(in nsILoadContext context,
+>                          [optional] in nsIContentPrefCallback2 callback);
+>  
+>    /**
+> +   * Removes all preferences created after |since|.
+
+Now that I think about it, it's after *and including* since.
+
+::: toolkit/components/contentprefs/ContentPrefService2.jsm
+@@ +524,5 @@
+>        }
+>      });
+>    },
+>  
+> +  _removeAllDomainsSince: function CPS2__removeAllDomainsSince(since, context, callback) {
+
+Would be good to add a comment above this method saying that `since` is in seconds, not ms.
+
+@@ +590,5 @@
+> +    this._removeAllDomainsSince(since / 1000, context, callback);
+> +  },
+> +
+> +  removeAllDomains: function CPS2_removeAllDomains(context, callback) {
+> +    this._removeAllDomainsSince(0, context, callback);
+
+Oh, nice!
+
+::: toolkit/components/contentprefs/nsContentPrefService.js
+@@ +1212,5 @@
+>      this._dbCreateIndices(aDBConnection);
+>    },
+>  
+> +  _dbMigrate3To4: function ContentPrefService__dbMigrate3To4(aDBConnection) {
+> +    aDBConnection.executeSimpleSQL("ALTER TABLE prefs ADD COLUMN timestamp INTEGER NOT NULL DEFAULT 0");
+
+So specifying DEFAULT 0 makes SQLite fill in the new column with 0 for existing rows?
+
+::: toolkit/components/contentprefs/tests/unit_cps2/head.js
+@@ +87,4 @@
+>    callbacks = callbacks || {};
+> +  if (!callbacks.handleError) {
+> +    callbacks.handleError = function (error) {
+> +      do_throw("handleError was called with result: " + error.result + " and message: " + error.message);
+
+Oh, I meant to comment on this earlier: this is left over from when you were changing the error handler interface, right?  `error` is an nsresult (integer) IIRC, so error.result and .message will be undefined.
+
+@@ +166,5 @@
+> +  `);
+> +  stmt.params.name = name;
+> +  stmt.params.group = group;
+> +
+> +  let res = '';
+
+I still don't think it makes sense to init this var, which stores integers, with an empty string.
+
+@@ +198,2 @@
+>    if (strict)
+> +    ok(actual.value === expected.value);
+
+strictEqual?
+
+::: toolkit/components/contentprefs/tests/unit_cps2/test_removeAllDomainsSince.js
+@@ +54,5 @@
+> +      ["b.com", "foobar", 7],
+> +    ]);
+> +  },
+> +
+> +  function setSetsCurrentDate() {
+
+Please move this function to test_setGet.js.
+
+@@ +57,5 @@
+> +
+> +  function setSetsCurrentDate() {
+> +    // Because Date.now() is not guaranteed to be monotonically increasing
+> +    // we just do here rough sanity check with one minute tolerance.
+> +    const MINUTE = 60 * 1000 * 1000;
+
+This is usecs, but you want millis here -- Date.now is millis, and so is the value yielded by getDate.
+Comment on attachment 8491093
+pref-dates.patch
+
+Review of attachment 8491093:
+-----------------------------------------------------------------
+
+I'll post updated patch in a second. It looks like it's about time to push it to try.
+
+As regards the comment 15 - it'd be easier to use ms everywhere so we don't have to do any calculations at all. It looks like sqlite has 4, 6 and 8 bytes integer (http://sqlite.org/datatype3.html). So if we keep it in ms (assume 6 bytes) then Math.pow(2,6*8) / 1000 / 60 / 60 / 24 / 365 = 8926. For seconds we're good in 4 bytes, at least for some time: Math.pow(2,4*8) / 60 / 60 / 24 / 365 = 136.
+
+What do you guys think?
+
+::: dom/interfaces/base/nsIContentPrefService2.idl
+@@ +299,5 @@
+>    void removeAllDomains(in nsILoadContext context,
+>                          [optional] in nsIContentPrefCallback2 callback);
+>  
+>    /**
+> +   * Removes all preferences created after |since|.
+
+Good point!
+
+::: toolkit/components/contentprefs/ContentPrefService2.jsm
+@@ +524,5 @@
+>        }
+>      });
+>    },
+>  
+> +  _removeAllDomainsSince: function CPS2__removeAllDomainsSince(since, context, callback) {
+
+I'll do the calculation in this function instead so that since as a function argument is consistent.
+
+::: toolkit/components/contentprefs/nsContentPrefService.js
+@@ +1212,5 @@
+>      this._dbCreateIndices(aDBConnection);
+>    },
+>  
+> +  _dbMigrate3To4: function ContentPrefService__dbMigrate3To4(aDBConnection) {
+> +    aDBConnection.executeSimpleSQL("ALTER TABLE prefs ADD COLUMN timestamp INTEGER NOT NULL DEFAULT 0");
+
+Yes. If you do alter table add column sth not null then you have to say default something. Otherwise it's an error since sql can't leave the columns null and has no default value to fill them with. In our case 0 is a default we want.
+
+::: toolkit/components/contentprefs/tests/unit_cps2/head.js
+@@ +87,4 @@
+>    callbacks = callbacks || {};
+> +  if (!callbacks.handleError) {
+> +    callbacks.handleError = function (error) {
+> +      do_throw("handleError was called with result: " + error.result + " and message: " + error.message);
+
+Right. I'll change this to just show error.
+
+::: toolkit/components/contentprefs/tests/unit_cps2/test_removeAllDomainsSince.js
+@@ +54,5 @@
+> +      ["b.com", "foobar", 7],
+> +    ]);
+> +  },
+> +
+> +  function setSetsCurrentDate() {
+
+Right, that's better place.
+
+@@ +57,5 @@
+> +
+> +  function setSetsCurrentDate() {
+> +    // Because Date.now() is not guaranteed to be monotonically increasing
+> +    // we just do here rough sanity check with one minute tolerance.
+> +    const MINUTE = 60 * 1000 * 1000;
+
+Good point. It looks like I got lost in the changes myself :-)
+ms in the DB is OK with M-E. :-)
+(In reply to Mark Hammond [:markh] from comment #15)
+> FTR, the preference manager stores times as ms in the DB.  One "feature" of
+> that is it makes testing faster - no need to sleep a full second to ensure
+> you have a different tick.
+
+If not that on Windows timers precision is 16ms, then all time comparisons are already broken :)
+(In reply to Marco Bonardo [::mak] (needinfo? me) from comment #19)
+
+> If not that on Windows timers precision is 16ms, then all time comparisons
+> are already broken :)
+
+And indeed can go backwards by a few ms depending on what timer you use :)  But at least you can still reliably wait less than a full second!
+Created attachment 8491593
+pref-dates.patch
+
+Updated patch and try run https://tbpl.mozilla.org/?tree=Try&rev=75427af3b0db.
+
+Time is still in db in seconds. I don't feel like I know enough to make a decision. Do you guys have any more arguments as whether we need ms in db and if the potential cost of that is ok?
+(In reply to Drew Willcoxon :adw from comment #10)
+> @@ +114,5 @@
+> > +    getCachedGlobalOK(["bar"], true, 4);
+> > +    getCachedOK(["b.com", "foo"], false);
+> > +    getCachedOK(["b.com", "bar"], false);
+> > +    getCachedOK(["b.com", "foobar"], false);
+> > +    yield;
+> 
+> yield true;
+> 
+> yield without an argument is deprecated.
+
+Sorry, that seems not to be true.  I can't reproduce the deprecation warning I remember getting in the past, so either I misunderstood it or I made it up. :-/
+
+(In reply to Tomasz Kołodziejski [:tomasz] from comment #21)
+> Time is still in db in seconds. I don't feel like I know enough to make a
+> decision. Do you guys have any more arguments as whether we need ms in db
+> and if the potential cost of that is ok?
+
+I don't think it's important.  Let's just pick one and move on.
+A quick look implies there isn't an end-to-end test here - eg, that we add a perm, sleep and record the time, add another perm, then check the removal from that recorded time only removes the first and not the second.  Maybe I missed it, or maybe there's agreement it's not necessary, but I thought I'd raise it anyway (and this is the type of test in which I think the choice of seconds means a much longer sleep to get this coverage)
+Thanks Mark.  There's a test that the setter functions set the right timestamp, and there are tests that reach into the database to set prefs with specific timestamps and then make sure those prefs are or aren't removed appropriately.  I think the two in combination are equivalent to the test you describe.
+Comment on attachment 8491593
+pref-dates.patch
+
+Review of attachment 8491593:
+-----------------------------------------------------------------
+
+::: dom/interfaces/base/nsIContentPrefService2.idl
+@@ +299,5 @@
+>    void removeAllDomains(in nsILoadContext context,
+>                          [optional] in nsIContentPrefCallback2 callback);
+>  
+>    /**
+> +   * Removes all non-global preferences created after and including than |since|.
+
+Remove "than"
+
+::: toolkit/components/contentprefs/tests/unit_cps2/head.js
+@@ +87,4 @@
+>    callbacks = callbacks || {};
+> +  if (!callbacks.handleError) {
+> +    callbacks.handleError = function (error) {
+> +      do_throw("handleError call was no expected, error: " + error);
+
+no -> not
+Created attachment 8492402
+pref-dates.patch
+Should I mark it as checkin-needed? I think that I addressed all the issues, posted the updated patch and forgot about it.
+Yes, thanks.
+https://hg.mozilla.org/integration/fx-team/rev/9910f35506c6
+https://hg.mozilla.org/mozilla-central/rev/9910f35506c6
+
+
+ContentPrefService should record the time a permission was added/modified, and offer a way to reset those changed after a specified date
+
+
+
+Bug 1058435 - Add removeAllDomainsSince to ContentPrefService2. r=adw 

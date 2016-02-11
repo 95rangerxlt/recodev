@@ -1,0 +1,115 @@
+ 
+
+ 
+Created attachment 283307
+attempt #1
+
+This avoids us going through the content window to get the host, which I imagine might avoid some security-wrapper overhead, and also avoids nsLocation::GetURI's call to fixupURI which shouldn't be needed for our purposes. It maintains the special case for JAR URIs added in bug 53124.
+10 runs of loading cnn.com talos record (14 calls to onSecurityChange per pageload).
+
+Doing nothing (entire method body commented):
+
+  FUNCTION                         COUNT    AVG(us)      SUM(us)
+  nsIWebProgressListener::onSecu    140        147        20625
+
+Current Impl:
+
+  FUNCTION                         COUNT    AVG(us)      SUM(us)
+  nsIWebProgressListener::onSecu    140       3645       510320
+
+Attachment 283307:
+
+  FUNCTION                         COUNT    AVG(us)      SUM(us)
+  nsIWebProgressListener::onSecu    140        502        70391
+Created attachment 283358
+attempt #1, revised
+
+Hmm, we might the createExposableURI after all, to deal with wyciwyg URIs (see bug 179269 where it was added to nsLocation::GetURI). This should be relatively cheap for non-wyciwyg URIs, though (an additional SchemeIs/GetUserName call+overhead of calling the method). Rob, can you do the same test with this patch applied?
+Comment on attachment 283358
+attempt #1, revised
+
+This patch seems to lose the speed advantage. I tried a couple times with and without patch.
+On irc, Gavin and I dicussed the fact that we get an onLocationChange event, so we might not need to check the location so much in onSecurityChange. However, these two events are fired by different code, so we'll need to determine whether tying them together causes a regression.
+
+It looks like nsDocShell::SetCurrentURI almost always fires it, except for one caller:
+
+nsDocShell::CreateContentViewer
+  PRBool onLocationChangeNeeded = OnLoadingSite(aOpenedChannel, PR_FALSE);
+    nsDocShell::OnNewURI
+      nsDocShell::SetCurrentURI
+Created attachment 283568
+trust onLocationChange
+
+After investigation and consulting with bz, it looks like the only time the docshell URI changes without firing onLocationChange is error pages and subframes, so we should be safe.
+
+I gave this function a name so I could see perf differences separate from xpconnect traffic. It looks like the current code is about twice as slow as the patch in the common case, but can also be pathologically slow occasionally.
+
+Current code:
+
+   FUNCTION                        COUNT    AVG(us)      SUM(us)
+   browser_onSecChange               140       3811       533653
+
+   browser_onSecChange                               
+           value  ------------- Distribution ------------- count    
+          131072 |                                         0        
+          262144 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@    130      
+          524288 |@@                                       8        
+         1048576 |                                         0        
+         2097152 |                                         0        
+         4194304 |                                         0        
+         8388608 |                                         0        
+        16777216 |                                         0        
+        33554432 |                                         0        
+        67108864 |                                         1        
+       134217728 |                                         0        
+       268435456 |                                         1        
+       536870912 |                                         0
+
+With patch:
+
+   FUNCTION                        COUNT    AVG(us)      SUM(us)
+   browser_onSecChange               140        263        36892
+
+   browser_onSecChange                               
+           value  ------------- Distribution ------------- count    
+           65536 |                                         0        
+          131072 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@            103      
+          262144 |@@@@@@@@@@                               36       
+          524288 |                                         1        
+         1048576 |                                         0
+If this works out, we can move this optimization into nsBrowserStatusFilter.cpp, and avoid crossing xpconnect a bunch.
+Created attachment 283583
+set the host in onSecurityChange
+
+gavin points out that this is better because it will deal with the silly URI schemes we litter the product with. :)
+Created attachment 283584
+preserve the try block
+Created attachment 283586
+set the host to null if there's a failure
+Created attachment 283588
+use reportError and change boolean check for style
+Created attachment 283593
+make sure the assert doesn't fire when this._host is null
+
+and change the comment a little
+Comment on attachment 283593
+make sure the assert doesn't fire when this._host is null
+
+>Index: browser/base/content/browser.js
+
+>+      if (this._host && this._host != contentHost) {
+
+Compare against undefined, to still catch the case where getting the host failed and it's null?
+Created attachment 283595
+with gavin's fix
+Comment on attachment 283595
+with gavin's fix
+
+a=beltzner
+looks good for a 1%+ Tp win on windows, at least.
+isn't gBrowser.contentWindow.location.host more expensive than gBrowser.currentURI.host? I think Gavin mentioned that once.
+(In reply to comment #17)
+> isn't gBrowser.contentWindow.location.host more expensive than
+> gBrowser.currentURI.host? I think Gavin mentioned that once.
+
+Yes, but that's only because it doesn't do fixup (bug 179269), or dig into JAR URIs (bug 53124), and those are both things we need to do. Doing the equivalent in the chrome JS (see attachment 283358) cancelled out any wins from changing the way we get the URI (see comment 4).

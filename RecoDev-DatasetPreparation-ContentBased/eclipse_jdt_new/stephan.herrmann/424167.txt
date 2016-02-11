@@ -1,0 +1,158 @@
+As discussed in bug 420525 comment 6 it's tricky to find the right location where type inference should be finalized, i.e., if during inference we work on lambda copies etc., at what point should this information be accepted into the original lambda?
+
+The current solution works from two sides: in PGMB.computeCompatibleMethod() right after inference, and: ASTNode.resolvePolyExpressionArguments() between two possible attempts of finding a suitable method binding. This works acceptably well for simple examples but gets more and more difficult with deep nesting of poly expressions.
+
+Looking at the spec this issue relates to the distinction of invocation applicability inference (18.5.1) vs. invocation type inference (18.5.2). The former can be performed many times for the same invocation, and after selecting the most specific method the latter is invoked *once*.
+
+Thus the difficulty to find the location for finalizing resolution into poly expressions relates to the fact that we haven't yet hooked invocation type inference into the proper location.
+
+Initial analysis suggests that
+- invocation applicability inference corresponds to
+  Scope.computeCompatibleMethod(MethodBinding,TypeBinding[],InvocationSite)
+- invocation type inference corresponds to
+  Scope.mostSpecificMethodBinding(..)
+
+Both methods end up calling PGMG.computeCompatibleMethod(). Out of 8 clients calling the former, only 5 clients also call the latter.
+
+For now I will draft a solution whereby these clients pass a parameter which control whether we should perform part 1 or part 2 of the inference or both.
+
+A final solution should later check how much of methods like mostSpecificMethodBinding should actually be *replaced* with a 1.8-specific implementation.
+
+As discussed in bug 420525 comment 6 it's tricky to find the right location where type inference should be finalized, i.e., if during inference we work on lambda copies etc., at what point should this information be accepted into the original lambda?
+
+The current solution works from two sides: in PGMB.computeCompatibleMethod() right after inference, and: ASTNode.resolvePolyExpressionArguments() between two possible attempts of finding a suitable method binding. This works acceptably well for simple examples but gets more and more difficult with deep nesting of poly expressions.
+
+Looking at the spec this issue relates to the distinction of invocation applicability inference (18.5.1) vs. invocation type inference (18.5.2). The former can be performed many times for the same invocation, and after selecting the most specific method the latter is invoked *once*.
+
+Thus the difficulty to find the location for finalizing resolution into poly expressions relates to the fact that we haven't yet hooked invocation type inference into the proper location.
+
+Initial analysis suggests that
+- invocation applicability inference corresponds to
+  Scope.computeCompatibleMethod(MethodBinding,TypeBinding[],InvocationSite)
+- invocation type inference corresponds to
+  Scope.mostSpecificMethodBinding(..)
+
+Both methods end up calling PGMG.computeCompatibleMethod(). Out of 8 clients calling the former, only 5 clients also call the latter.
+
+For now I will draft a solution whereby these clients pass a parameter which control whether we should perform part 1 or part 2 of the inference or both.
+
+A final solution should later check how much of methods like mostSpecificMethodBinding should actually be *replaced* with a 1.8-specific implementation.
+(In reply to Stephan Herrmann from comment #0)
+> As discussed in bug 420525 comment 6 it's tricky to find the right location
+> where type inference should be finalized, i.e., if during inference we work
+> on lambda copies etc., at what point should this information be accepted
+> into the original lambda?
+
+Could you explain what exactly is the need for working on lambda during inference ?
+i.e you resolve them and do what with it ? What is the information extracted from
+the resolution ? Once I understand this better, I may be able to suggest something.
+(In reply to Srikanth Sankaran from comment #1)
+> (In reply to Stephan Herrmann from comment #0)
+> > As discussed in bug 420525 comment 6 it's tricky to find the right location
+> > where type inference should be finalized, i.e., if during inference we work
+> > on lambda copies etc., at what point should this information be accepted
+> > into the original lambda?
+> 
+> Could you explain what exactly is the need for working on lambda during
+> inference ?
+> i.e you resolve them and do what with it ? What is the information extracted
+> from
+> the resolution ? Once I understand this better, I may be able to suggest
+> something.
+
+
+To answer your questions: in 18.2.1 we need to be able to ask isCompatibleWith (for any kind of expression).
+
+More specifically, the main section to pull lambdas into inference is 18.2.1.1. This starts out by asking whether the lambda is void-compatible or value-compatible. Next, for lambdas with explicit argument types those need to be known. Finally, for all result expression we create a constraint, which for further reduction needs to query the resolved type of the result expression.
+
+To read the same in code see ConstraintExpressionFormula.reduce(InferenceContext18), look for "if (this.left instanceof LambdaExpression)". AFAICS, working off my current version of lambda.getResolvedCopyForInferenceTargeting() is quite promising.
+
+
+
+What keeps me busy right now, is not what to do on the lambda (although there's certainly room for improvement), but where inside Scope within the range findMethod() -> computeCompatibleMethod() different steps must be triggered. Basically, what I had in one location inside PGMB has to be scattered over all those locations.
+
+I believe to be making some good progress right now. But I should warn you that this will be a significant patch. Not sure whether you want to accept this into EA2 at this point in time. I believe, however, I might be closing the one remaining relevant gap in this implementation. Should I upload a snapshot of my patch for your inspection?
+(In reply to Stephan Herrmann from comment #2)
+
+> I believe to be making some good progress right now. But I should warn you
+> that this will be a significant patch. Not sure whether you want to accept
+> this into EA2 at this point in time.
+
+Let us make haste slowly :)
+
+> I believe, however, I might be closing
+> the one remaining relevant gap in this implementation. Should I upload a
+> snapshot of my patch for your inspection?
+
+At your convenience, since we are not looking at this for EA2, there is no
+hurry.
+Created attachment 238391
+advanced work in progress
+
+With this patch I got rid of my incomplete heuristics of when to trigger which part of inference. Integration with overload resolution is basically done. 
+
+Changes are mostly in those parts that control inference at a high level. Only few changes in FunctionalExpression and friends (e.g., a bit more usage of copy()).
+
+The patch causes a few new regressions in tests, most of which seem to be just switching back to the test results of an earlier version, a handful may be semantically relevant.
+
+On top of this patch I hope advanced issues like bug 420525 _should_ be solvable in a fairly straight-forward way. Without this patch I will have to waive that task.
+Created attachment 238421
+corrected and cleaned-up patch
+
+This patch should be ready for pushing right after EA2 has sailed.
+
+All recent regressions have been fixed, with one single exception in OverloadResolutionTest8.test004(), which looks like a bug in how LE uses enclosingScopesHaveErrors(). I'll file a ticket in a minute.
+
+The main work in this bug has been documented in the javadoc of PGMB.computeCompatibleMethod(). The responsibility to drive the inference has been split over PGMB plus Scope (findMethod()... family of methods). This should implement the correct interleaving of early inference, overload resolution then final inference (pending bug 423505).
+
+Main responsibility for pushing final inference results into AST nodes is now at InferenceContext18.rebindInnerPolies(), which is integrated into the final part of inference. Conversely, much old stuff could be removed from ASTNode.resolvePolyExpressionArguments(), which is now pretty close to the original state that I found when I started :)
+
+We no longer need to keep track in individual AST nodes, whether resolve is tentative or final, in fact most of the "tentatively" stuff (incl. the unsafe attempts to cleanup afterwards) could be removed after LE.getResolvedCopyForInferenceTargeting() proved to work real well.
+
+One method that could use some more scrutiny is Scope.parameterCompatibilityLevel18(). This is used to "help" findMethod() et al to recognize that parameters will be compatible once the inference results from different levels can be used. In particular the division of responsibilities between the following three methods could use a better explanation:
+- InferenceContext18.rebindInnerPolies()
+- ASTNode.resolvePolyExpressionArguments()
+- Scope.parameterCompatibilityLevel18()
+In some part the perform same/similar tasks, but from different scenarios.
+
+
+Only one bad workaround is still in use: Expression.unresolve(). I added a note referring to the two tests that would currently fail without. I hope to find a better solution, soon.
+(In reply to Stephan Herrmann from comment #5)
+> All recent regressions have been fixed, with one single exception in
+> OverloadResolutionTest8.test004(), which looks like a bug in how LE uses
+> enclosingScopesHaveErrors(). I'll file a ticket in a minute.
+
+-> bug 424290
+*** Bug 424285 has been marked as a duplicate of this bug. ***
+Trying the use case from bug 401272 comment 0 I get an NPE in acceptPendingPolyArguments().
+
+Root cause is: site.inferenceKind() says CHECK_LOOSE, whereas the inference actualy used CHECK_VARARG. This indicates that keeping the inference kind in the AST node is not correct (since several attempts may use different inference kinds). This field should be moved to InferenceContext18. To be included in a next version of the patch.
+The previous patch associated an unfinished InferenceContext18 directly to a PGMB, which is not a complete solution. A distinct IC18 may be in use for each *pair* of (Invocation x MethodBinding). Thus I changed the field in PGMB to a map (PGMB -> IC18) in each implementation of Invocation. (Placing this map in AST classes rather than PGMB facilitates cleanup when no longer in use).
+
+Based on this structure we can now better control the lifecycle of an inference, in particular mark when an inference hasFinished so we don't need to run it again and again. Also some updates (see ASTNode.resolvePolyExpressionArguments) should only be performed when the enclosing inference has finished.
+
+I also unified the handling of varargs arguments: as per comment 8 it's now the IC18 that remembers the inferenceKind (specif. LOOSE vs. VARARGS). Based on that information IC18.getParameter extracts "the ith variable-arity parameter type of a method" according to 15.12.2.4.
+
+With this infrastructure in place we can rely on the inference context knowing about varargs invocations - some more varargs bugs could be fixed.
+
+I also prevented one case were Scope would call mostSpecificMethodBinding() for a one-element array of candidates :)
+Created attachment 238529
+improved patch
+
+Accumulative patch implementing the items mentions in comment 9
+*** Bug 424415 has been marked as a duplicate of this bug. ***
+*** Bug 401850 has been marked as a duplicate of this bug. ***
+*** Bug 424592 has been marked as a duplicate of this bug. ***
+I've pushed a polished patch as https://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=57e8dd41219d846363c918d62edb5007994c5c79
+
+InferenceContext18 now has some javadoc as an entry point to understanding the implementation of type inference and its integration with the rest of the compiler.
+
+The fix also resolves several other reports, details to be commented in the respective bugs.
+*** Bug 401850 has been marked as a duplicate of this bug. ***
+
+
+[1.8] Fully integrate type inference with overload resolution
+
+
+
+Bug 424167 - [1.8] Fully integrate type inference with overload resolution 

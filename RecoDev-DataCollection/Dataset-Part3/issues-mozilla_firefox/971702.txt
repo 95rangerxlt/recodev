@@ -1,0 +1,345 @@
+Based on bug 971698, the style editor will be able to listen to mouse interactions on the currently edited stylesheet, and be able to provide a simple API to consumers who wish to know what css "object" is being hovered over:
+- a property
+- a value
+- a selector
+
+Thanks to this new API, we would be able to achieve various things:
+- show tooltips for background-image url previews (like in the rule-view today)
+- highlight all nodes matching a given selector (see bug 971662)
+- ...
+
+Based on bug 971698, the style editor will be able to listen to mouse interactions on the currently edited stylesheet, and be able to provide a simple API to consumers who wish to know what css "object" is being hovered over:
+- a property
+- a value
+- a selector
+
+Thanks to this new API, we would be able to achieve various things:
+- show tooltips for background-image url previews (like in the rule-view today)
+- highlight all nodes matching a given selector (see bug 971662)
+- ...
+As discussed Optimizer, I'm assigning this bug to you.
+Created attachment 8376768
+patch
+
+Patrick, how about this ?
+
+try : https://tbpl.mozilla.org/?tree=Try&rev=7a4bdc9ecab5
+Created attachment 8376792
+patch 0.2
+
+try was green but a wild debugger statement appeared in the patch. I used pikachu to defeat it.
+Created attachment 8380073
+patch v0.3
+
+Lets provide all the info we can.
+
+Adds an array of all the selectors for the code block if state is property or value. The array is undefined for selector state at which point, selector has the string of the current selector.
+Created attachment 8380207
+patch v0.4
+
+Rebased on top of the new patch in bug 944499
+Created attachment 8380354
+patch v0.5
+
+I somehow messed up my mq series and lost the changes I actually did. This is the patch I was talking about in last 2 comments.
+Comment on attachment 8380354
+patch v0.5
+
+Review of attachment 8380354:
+-----------------------------------------------------------------
+
+Thanks for the patch. I've applied it (+ the dependency) locally and gave it a try via the scratchpad (running in browser environment, getting the toolbox to then get the styleeditor instance, then the editor, then calling getInfoAt). Seems to be working fine!
+
+I have 2 main comments though (which you'll see below):
+- performance: I think we should avoid re-tokenizing if we've already done it once (or make cssTokenizer yield tokens and be interruptible),
+- refactoring: the getInfoAt function is pretty long and has some large chunks of similar code, making it easy-ish to refactor into smaller functions.
+
+::: browser/devtools/sourceeditor/css-autocompleter.js
+@@ +190,5 @@
+>  
+>      let cursor = 0;
+>      // This will maintain a stack of paired elements like { & }, @m & }, : & ; etc
+>      let token = null;
+> +    let selectorBeforeNot = null;
+
+Concerning all the changes (like this one) that you made to the resolveState function, I'm not very comfortable reviewing them.
+They seem ok from what I can see, but I understand too little about this function yet.
+Can you ask the person who reviewed it in the first place to give a quick look at the changes in this function?
+
+My only comment about this function is that it's 500+ lines long!
+But functions of this kind are usually long and can't really be split in a way that they would become more readable anyway.
+
+@@ +918,5 @@
+> +      return [...list.slice(0, line - 1), list[line - 1].slice(0, ch)].join("\n");
+> +    }
+> +
+> +    // Get the state at the given line, ch
+> +    let state = this.resolveState(limit(source, caret), caret);
+
+resolveState will call cssTokenizer to get the current state, however, looking at the code below, it seems we call cssTokenizer again 5 times.
+
+Twice if the state is selector, twice if it's a value, and once if it's a property.
+
+Couldn't resolveState be modified a little bit so that it returns the list of tokens (with location, so it's easy to walk through it)?
+
+In standard cases where your CSS text is nicely formatted, the extra calls to cssTokenizer below aren't a big deal because you're only backward and forward tokenizing on one line, but imagine a case where the CSS is minified on 1 line!
+Since cssTokenizer is not interruptible, it will have to tokenize the whole line before you can loop over the tokens and decide you've found the value or selector.
+
+So I'm a bit worried about performance here.
+
+Another option is to refactor the cssTokenizer function so that it yields tokens and can be interrupted. With something like this, callers to the function would be able to consume tokens as they are being parsed and would be able to tell it to stop parsing at any given point, making it therefore a lot more performant.
+
+@@ +928,5 @@
+> +      // either when the state changes or the selector becomes empty and a
+> +      // single selector can span multiple lines.
+> +      let limitedSource = limit(source, caret);
+> +      let start, end;
+> +      // Backward loop to determine the beginning location of the selector.
+
+There are in total in this function 4 such backward/forward do/while loops that are very very similar in terms of code.
+I've diff'd them and it seems they differ by less than 10%.
+So they are good candidates to extract to an external function.
+
+This would reduce the length of getInfoAt quite a lot, it's 249 lines long today which makes it pretty hard to understand at first.
+
+::: browser/devtools/sourceeditor/test/browser_css_getInfo.js
+@@ +4,5 @@
+> +
+> +"use strict";
+> +
+> +const cssAutoCompleter  = require("devtools/sourceeditor/css-autocompleter");
+> +const { Cc, Ci } = require("chrome");
+
+Not used anywhere in this file. Please remove this require.
+
+@@ +9,5 @@
+> +
+> +const CSS_URI = "http://mochi.test:8888/browser/browser/devtools/sourceeditor" +
+> +                "/test/css_statemachine_testcases.css";
+> +const TESTS_URI = "http://mochi.test:8888/browser/browser/devtools/sourceeditor" +
+> +                  "/test/css_statemachine_tests.json";
+
+These 2 URIs aren't used either. Please remove them.
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #7)
+> Comment on attachment 8380354
+> patch v0.5
+> 
+> Review of attachment 8380354:
+> -----------------------------------------------------------------
+> 
+> Thanks for the patch. I've applied it (+ the dependency) locally and gave it
+> a try via the scratchpad (running in browser environment, getting the
+> toolbox to then get the styleeditor instance, then the editor, then calling
+> getInfoAt). Seems to be working fine!
+> 
+> I have 2 main comments though (which you'll see below):
+> - performance: I think we should avoid re-tokenizing if we've already done
+> it once (or make cssTokenizer yield tokens and be interruptible),
+
+cssTokenizer is an upstream library by Tab Atkins. Its not super active and he is already mid way of so many other changes that even if I send a PR making tokenizer yieldable, it will be to master HEAD and not apply to the version that we are using.
+
+We can definitely have the resolveState return the tokens along with other details like the starting location of the token as now, resolveState does not tokenizes the whole source passed to it.
+
+> - refactoring: the getInfoAt function is pretty long and has some large
+> chunks of similar code, making it easy-ish to refactor into smaller
+> functions.
+
+I agree that the 4 do-while loops are similar, will combine them.
+
+
+> ::: browser/devtools/sourceeditor/css-autocompleter.js
+> @@ +190,5 @@
+> >  
+> >      let cursor = 0;
+> >      // This will maintain a stack of paired elements like { & }, @m & }, : & ; etc
+> >      let token = null;
+> > +    let selectorBeforeNot = null;
+> 
+> Concerning all the changes (like this one) that you made to the resolveState
+> function, I'm not very comfortable reviewing them.
+> They seem ok from what I can see, but I understand too little about this
+> function yet.
+> Can you ask the person who reviewed it in the first place to give a quick
+> look at the changes in this function?
+> 
+> My only comment about this function is that it's 500+ lines long!
+> But functions of this kind are usually long and can't really be split in a
+> way that they would become more readable anyway.
+
+I have plans to make it more readable and break it down to functional blocks of if ()s . If you see that method, it has repeating if() blocks. But alas. no time.
+
+Dave reviewed the initial method, will ask him.
+
+
+> @@ +918,5 @@
+> > +      return [...list.slice(0, line - 1), list[line - 1].slice(0, ch)].join("\n");
+> > +    }
+> > +
+> > +    // Get the state at the given line, ch
+> > +    let state = this.resolveState(limit(source, caret), caret);
+> 
+> resolveState will call cssTokenizer to get the current state, however,
+> looking at the code below, it seems we call cssTokenizer again 5 times.
+> 
+> Twice if the state is selector, twice if it's a value, and once if it's a
+> property.
+> 
+> Couldn't resolveState be modified a little bit so that it returns the list
+> of tokens (with location, so it's easy to walk through it)?
+> 
+> In standard cases where your CSS text is nicely formatted, the extra calls
+> to cssTokenizer below aren't a big deal because you're only backward and
+> forward tokenizing on one line, but imagine a case where the CSS is minified
+> on 1 line!
+> Since cssTokenizer is not interruptible, it will have to tokenize the whole
+> line before you can loop over the tokens and decide you've found the value
+> or selector.
+> 
+> So I'm a bit worried about performance here.
+
+I think we can be a little loose wrt to minified CSS case here as they are anyways unreadable and non debuggable. I will try to reuse tokens fetched in the first resolveState call but that is the most we can do to improve performance because refactoring the tokenizer to yield tokens in both forward and backward direction would be a very big task.
+
+> Another option is to refactor the cssTokenizer function so that it yields
+> tokens and can be interrupted. With something like this, callers to the
+> function would be able to consume tokens as they are being parsed and would
+> be able to tell it to stop parsing at any given point, making it therefore a
+> lot more performant.
+
+
+In your testing, how much of a lag did you notice ? What kind of file did you test on ?
+(In reply to Girish Sharma [:Optimizer] from comment #8)
+> cssTokenizer is an upstream library by Tab Atkins. Its not super active and
+> he is already mid way of so many other changes that even if I send a PR
+> making tokenizer yieldable, it will be to master HEAD and not apply to the
+> version that we are using.
+Ok, gotcha.
+Are there any risks associated with branching away our own copy of cssTokenizer then? 
+Maybe we should just keep the version we have and implement the changes described on that version.
+This will make impossible (or harder) to move to a new version of Tab's tokenizer, but is that a problem?
+
+> I have plans to make it more readable and break it down to functional blocks
+> of if ()s . If you see that method, it has repeating if() blocks. But alas.
+> no time.
+> 
+> Dave reviewed the initial method, will ask him.
+Sounds good.
+
+> I think we can be a little loose wrt to minified CSS case here as they are
+> anyways unreadable and non debuggable. I will try to reuse tokens fetched in
+> the first resolveState call but that is the most we can do to improve
+> performance because refactoring the tokenizer to yield tokens in both
+> forward and backward direction would be a very big task.
+I'm happy to R+ without a new interruptible tokenizer if we can reuse the tokens fetched in the first resolveState call.
+
+> In your testing, how much of a lag did you notice ? What kind of file did
+> you test on ?
+I haven't profiled anything during my tests, so I don't have any figures. It did seemed a little slow on a 21000 characters long one-line css string, but I can't be sure.
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #9)
+> Ok, gotcha.
+> Are there any risks associated with branching away our own copy of
+> cssTokenizer then? 
+> Maybe we should just keep the version we have and implement the changes
+> described on that version.
+> This will make impossible (or harder) to move to a new version of Tab's
+> tokenizer, but is that a problem?
+> 
+
+There are no risks and by the looks of it Tab is also not working on his tokenizer since last 9 months. Just that we will have to implement new CSS syntaxes ourselves. By syntax I mean things like css variables etc.
+
+> I'm happy to R+ without a new interruptible tokenizer if we can reuse the
+> tokens fetched in the first resolveState call.
+> 
+> > In your testing, how much of a lag did you notice ? What kind of file did
+> > you test on ?
+> I haven't profiled anything during my tests, so I don't have any figures. It
+> did seemed a little slow on a 21000 characters long one-line css string, but
+> I can't be sure.
+
+21K :)
+After trying to address both the major review comments, I am not happy with the results.
+
+This is how the combined do-while loop method looks like https://pastebin.mozilla.org/4443885
+
+Almost every line has a if else condition due to the reverse loop check.
+
+Due to this method, I get overall line benefit of ~70 lines (~150 reduced to ~80 lines)
+
+If I make two methods, one for forward direction and other for backward, the method size reduces to 45 lines, so overall line benefit will be ~50 lines.
+
+I am not sure if this much benefit is an improvement considering the fact that it is causing a lot of confusion (at least in the first case where all 4 while loops are combined into 1) about the code flow and the logic behind the loops.
+
+Of course I can add comments, but adding comments will further diminish the line benefits.
+
+
+As for reusing tokens from the first resolveState call.
+
+ - It is impossible to reuse tokens in the forward loop as in the initial resolveState call, tokens were generated only till the caret location, but the forward loop starts from the caret location and goes forward.
+ - Modifying the resolveState method to return the list of tokens (for at least the backward loop) was also a bit hack-ish in a sense that resolveState will not always tokenize the source with the correct line numbers and columns in mind as it removes any source before the closest known null state.
+
+I say that we go with a custom tokenizer approach which is faster, smaller and iteratable, but in a separate bug and not blocking this bug as this patch is pretty fast for normal CSS source and only slow-ish for minified CSS files. Filed  bug 978557 for the same.
+(In reply to Girish Sharma [:Optimizer] from comment #11)
+> After trying to address both the major review comments, I am not happy with
+> the results.
+> 
+> This is how the combined do-while loop method looks like
+> https://pastebin.mozilla.org/4443885
+> 
+> Almost every line has a if else condition due to the reverse loop check.
+> 
+> Due to this method, I get overall line benefit of ~70 lines (~150 reduced to
+> ~80 lines)
+> 
+> If I make two methods, one for forward direction and other for backward, the
+> method size reduces to 45 lines, so overall line benefit will be ~50 lines.
+> 
+> I am not sure if this much benefit is an improvement considering the fact
+> that it is causing a lot of confusion (at least in the first case where all
+> 4 while loops are combined into 1) about the code flow and the logic behind
+> the loops.
+> 
+> Of course I can add comments, but adding comments will further diminish the
+> line benefits.
+The overall line benefit isn't nearly as important as the easiness to read and understand the code when looking at it for the first time.
+I guess my issue with this function is that the 3 most important pieces of information one requires to start understanding the function correctly are the 3 `if (state == something)`, and since the function is so long, it's hard to grasp this structure at a first glance. This is why it'd be really great to be able to break it down a little more.
+Just a proposal here: what if you come up with 2 traverse functions (as in your pastbin) instead of 1: traverse and traverseReverse. This would end up being longer, but would remove the need for all these nasty if/else all over the place, and would probably make the getInfoAt function simpler to read.
+
+> As for reusing tokens from the first resolveState call.
+> 
+>  - It is impossible to reuse tokens in the forward loop as in the initial
+> resolveState call, tokens were generated only till the caret location, but
+> the forward loop starts from the caret location and goes forward.
+>
+>  - Modifying the resolveState method to return the list of tokens (for at
+> least the backward loop) was also a bit hack-ish in a sense that
+> resolveState will not always tokenize the source with the correct line
+> numbers and columns in mind as it removes any source before the closest
+> known null state.
+Ok, got it.
+
+> I say that we go with a custom tokenizer approach which is faster, smaller
+> and iteratable, but in a separate bug and not blocking this bug as this
+> patch is pretty fast for normal CSS source and only slow-ish for minified
+> CSS files. Filed  bug 978557 for the same.
+Sounds like a good plan to me, but just let me know if my proposal for getInfoAt above makes sense and can be done, it's always easier to get these kind of things done before we land something.
+
+Thanks for the hard work on this complex feature!
+Created attachment 8393805
+patch v0.6
+
+So this has two methods, traverseForwards and traverseBackwards.
+Comment on attachment 8393805
+patch v0.6
+
+Review of attachment 8393805:
+-----------------------------------------------------------------
+
+I'm fine with these latest changes.
+I think the getInfoAt function is easier to read now.
+Thanks
+landed in fx-team : https://hg.mozilla.org/integration/fx-team/rev/a4c4616c884a
+Created attachment 8396427
+patch that landed
+
+Fixed some wrong comments in the function doc and addressed original review comments.
+https://hg.mozilla.org/mozilla-central/rev/a4c4616c884a
+Sorry, wrong bug.

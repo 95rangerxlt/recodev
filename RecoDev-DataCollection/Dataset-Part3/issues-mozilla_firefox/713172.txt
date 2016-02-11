@@ -1,0 +1,226 @@
+User Agent: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0a1) Gecko/20111222 Firefox/12.0a1
+Build ID: 20111222031055
+
+Steps to reproduce:
+
+1. Install Nightly version 12.0a1; the regression happened on the same day as the version bump from 11 to 12.
+2. Start Nightly with a fresh profile.
+3. Open preferences, privacy tab. Select Nightly will: Use custom settings for history.
+4. Check "Clear history when Nightly closes", then click the settings button for this option.
+5. Select only "When I quit Nightly, it should automatically clear all: Cookies".
+6. Restart Nightly. 
+
+
+Actual results:
+
+The Flash plugin was loaded on browser startup (plugin-container.exe is running immediately after browser startup, even when using about:blank for homepage).
+
+
+Expected results:
+
+The Flash plugin should be instructed to clear LSOs at browser shutdown, not at startup, and only if the plugin has been loaded in the current browser session.
+
+The pushlog for the regression is:
+http://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=2afd7ae68e8b&tochange=cd921d073b22
+
+The most likely cause of the observed change would seem to be:
+http://hg.mozilla.org/mozilla-central/rev/b121a045b451
+
+The comments in bug 709262 don't mention Flash or cookies, so I suspect this change was unintentional.
+
+User Agent: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:12.0a1) Gecko/20111222 Firefox/12.0a1
+Build ID: 20111222031055
+
+Steps to reproduce:
+
+1. Install Nightly version 12.0a1; the regression happened on the same day as the version bump from 11 to 12.
+2. Start Nightly with a fresh profile.
+3. Open preferences, privacy tab. Select Nightly will: Use custom settings for history.
+4. Check "Clear history when Nightly closes", then click the settings button for this option.
+5. Select only "When I quit Nightly, it should automatically clear all: Cookies".
+6. Restart Nightly. 
+
+
+Actual results:
+
+The Flash plugin was loaded on browser startup (plugin-container.exe is running immediately after browser startup, even when using about:blank for homepage).
+
+
+Expected results:
+
+The Flash plugin should be instructed to clear LSOs at browser shutdown, not at startup, and only if the plugin has been loaded in the current browser session.
+
+The pushlog for the regression is:
+http://hg.mozilla.org/mozilla-central/pushloghtml?fromchange=2afd7ae68e8b&tochange=cd921d073b22
+
+The most likely cause of the observed change would seem to be:
+http://hg.mozilla.org/mozilla-central/rev/b121a045b451
+
+The comments in bug 709262 don't mention Flash or cookies, so I suspect this change was unintentional.
+Josh -> Can you take a quick look and see if this might be related to bug 709262?
+Thank you for this report Ziga, this is a great find. It turns out it's not bug 709262 at fault, but bug 711536 instead. We close the download connection early enough in the shutdown process that when we try to check the download manager (to determine if we even _can_ sanitize it), we throw an error, even though we're not trying to clear the downloads.
+Created attachment 584226
+Part 1: Avoid aborting the whole sanitization if the download manager isn't available.
+Created attachment 584227
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+Comment on attachment 584226
+Part 1: Avoid aborting the whole sanitization if the download manager isn't available.
+
+Gavin, I'm undecided on whether we want this or not. It will stop a misbehaving routine from aborting the sanitization unnecessarily in the future, but it will also hide similar problems that crop up.
+Comment on attachment 584227
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+
+Is there any reason the connection needs to be closed during quit-application instead of later?
+Comment on attachment 584226
+Part 1: Avoid aborting the whole sanitization if the download manager isn't available.
+
+Seems to me like nsDownloadManager::GetCanCleanUp should just never fail (and default to returning false).
+(In reply to Gavin Sharp (use gavin@gavinsharp.com for email) from comment #7)
+> Seems to me like nsDownloadManager::GetCanCleanUp should just never fail
+> (and default to returning false).
+
+I agree, this is an attribute, should not throw, the error should be handled internally.
+Comment on attachment 584227
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+
+Review of attachment 584227:
+-----------------------------------------------------------------
+
+We likely want a test for this.  It should ensure the sanitize process is not interrupted, maybe it could fire a topic when all items are done, and the test may ensure that it fires properly when it is invoked in the shutdown path
+
+::: toolkit/components/downloads/nsDownloadManager.cpp
+@@ +1942,5 @@
+> +    // Null statements to finalize them.
+> +    mGetIdsForURIStatement = nsnull;
+> +    mUpdateDownloadStatement = nsnull;
+> +    mozilla::DebugOnly<nsresult> rv = mDBConn->Close();
+> +    MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+(In reply to Josh Matthews [:jdm] from comment #6)
+> Is there any reason the connection needs to be closed during
+> quit-application instead of later?
+
+not specifically, but xpcom-shutdown is wrong, the later point you can use is profile-before-change, that is likely what we should use here.
+Marco, I'm unsure of how to write a test that cares about actions during shutdown. Do you have any suggestions?
+Created attachment 586854
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+(In reply to Josh Matthews [:jdm] from comment #10)
+> Marco, I'm unsure of how to write a test that cares about actions during
+> shutdown. Do you have any suggestions?
+
+hm, interesting problem, note that considered the bugs caused by this regression we may even follow-up with the test, since not having a fix is worse.
+I made this test in the past that does something similar, making another test based on it that involves downloads may be possible.
+http://mxr.mozilla.org/mozilla-central/source/browser/components/places/tests/unit/test_clearHistory_shutdown.js
+Comment on attachment 586854
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+
+Review of attachment 586854:
+-----------------------------------------------------------------
+
+In some rare case, where async notifications may arrive later than profile-before-change, this may not yet be perfect (xpcom-shutdown would not be fine as well, async things may go further, bug 687726 covers that), but making it correct is more complicated, we should probably spin the async events loop in Places shutdown to ensure all notifications are fired earlier. But this is rather for a follow-up bug.
+
+::: toolkit/components/downloads/nsDownloadManager.cpp
+@@ +899,4 @@
+>    (void)mObserverService->AddObserver(this, NS_IOSERVICE_GOING_OFFLINE_TOPIC, false);
+>    (void)mObserverService->AddObserver(this, NS_IOSERVICE_OFFLINE_STATUS_TOPIC, false);
+>    (void)mObserverService->AddObserver(this, NS_PRIVATE_BROWSING_REQUEST_TOPIC, false);
+>    (void)mObserverService->AddObserver(this, NS_PRIVATE_BROWSING_SWITCH_TOPIC, false);
+
+interesting, we never remove these observers, I wonder if there's a bug filed anywhere. On the other side this may use weak references, being a service. Please file a bug for this if one doesn't exist yet.
+
+@@ +901,5 @@
+>    (void)mObserverService->AddObserver(this, NS_PRIVATE_BROWSING_REQUEST_TOPIC, false);
+>    (void)mObserverService->AddObserver(this, NS_PRIVATE_BROWSING_SWITCH_TOPIC, false);
+>  
+>    if (history)
+>      (void)history->AddObserver(this, false);
+
+As well as this one.
+
+@@ +1944,5 @@
+>        return CancelDownload(id);
+> +  } else if (strcmp(aTopic, "profile-before-change") == 0) {
+> +    // Null statements to finalize them.
+> +    mGetIdsForURIStatement = nsnull;
+> +    mUpdateDownloadStatement = nsnull;
+
+Since bug 713140, let's ->Finalize() instead of nullifying, that will assert if some code tries to use them after, but at least shouldn't crash on dereferencing.
+(In reply to Marco Bonardo [:mak] from comment #13)
+> ::: toolkit/components/downloads/nsDownloadManager.cpp
+> @@ +899,4 @@
+> >    (void)mObserverService->AddObserver(this, NS_IOSERVICE_GOING_OFFLINE_TOPIC, false);
+> >    (void)mObserverService->AddObserver(this, NS_IOSERVICE_OFFLINE_STATUS_TOPIC, false);
+> >    (void)mObserverService->AddObserver(this, NS_PRIVATE_BROWSING_REQUEST_TOPIC, false);
+> >    (void)mObserverService->AddObserver(this, NS_PRIVATE_BROWSING_SWITCH_TOPIC, false);
+> 
+> interesting, we never remove these observers, I wonder if there's a bug
+> filed anywhere. On the other side this may use weak references, being a
+> service. Please file a bug for this if one doesn't exist yet.
+
+According to http://mxr.mozilla.org/mozilla-central/source/toolkit/components/downloads/nsDownloadManager.cpp#890, removing them is unneeded. Is it still worth filing a bug?
+http://hg.mozilla.org/integration/mozilla-inbound/rev/a1a6f5452614
+Filed bug 716603 for the test.
+(In reply to Josh Matthews [:jdm] from comment #14)
+> According to
+> http://mxr.mozilla.org/mozilla-central/source/toolkit/components/downloads/
+> nsDownloadManager.cpp#890, removing them is unneeded. Is it still worth
+> filing a bug?
+
+Well, the comment is a bit nonsense, the fact download manager is a singleton service just means it may use weak references, not that it shouldn't care about keeping others alive. Doing the cleanup or using wek refs may simplify the shutdown work for the cycle collector.
+and once this lands in central, we should get approval for Aurora
+https://hg.mozilla.org/mozilla-central/rev/a1a6f5452614
+Comment on attachment 586854
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+
+[Approval Request Comment]
+Regression caused by (bug #): bug 711536
+User impact if declined: Clear private data on shutdown is broken and may crash (bug 713140)
+Testing completed (on m-c, etc.): m-c, filed bug to investigate an automated test
+Risk to taking this patch (and alternatives if risky): low impact
+you didn't address my third comment, thus looks like we still crash.
+Comment on attachment 586854
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+
+will need a coalesced patch for approval
+Weird, I definitely made the change locally. Not quite sure what happened.
+http://hg.mozilla.org/integration/mozilla-inbound/rev/5a020d632a28
+Created attachment 587823
+Part 2: Ensure the download manager database connection isn't closed while it could still be required.
+Created attachment 587827
+Ensure the download manager database connection isn't closed while it could still be required.
+
+Actually updated. Weirdness!
+https://hg.mozilla.org/mozilla-central/rev/5a020d632a28
+Comment on attachment 587827
+Ensure the download manager database connection isn't closed while it could still be required.
+
+[Approval Request Comment]
+Regression caused by (bug #): bug 711536
+User impact if declined: Clear private data on shutdown is broken and may crash (bug 713140)
+Testing completed (on m-c, etc.): m-c, filed bug to investigate an automated test
+Risk to taking this patch (and alternatives if risky): low impact
+(In reply to Josh Matthews [:jdm] from comment #28)
+> User impact if declined: Clear private data on shutdown is broken and may
+> crash (bug 713140)
+bug 713140 is #1 top crasher in Aurora.
+also crash bug 714627 is going to be solved by this, according to crash-stats crashes by buildid (and the stack confirms a null dereference on a statement)
+This landed on Aurora but was backed out:
+https://hg.mozilla.org/releases/mozilla-aurora/rev/16b8c84705a4
+https://hg.mozilla.org/releases/mozilla-aurora/rev/3b3a05acd51d
+
+because of crashes in xpcshell tests:
+https://tbpl.mozilla.org/php/getParsedLog.php?id=8622125&tree=Mozilla-Aurora
+https://tbpl.mozilla.org/php/getParsedLog.php?id=8622493&tree=Mozilla-Aurora
+This bounced because the patch from bug 713242 is not present on mozilla-aurora. I am having trouble figuring out why we're not seeing similar failures since bug 711536 was uplifted? Marco, any ideas?
+I think the problem is the
+mozilla::DebugOnly<nsresult> rv = mDBConn->Close();
+MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+when this patch landed in central the test was already correctly finalizing statements. When the original patch landed in central the test was not sending quit-application so that code was not invoked at all. When Rafael made the test fire quit-application he found the assertion and finalized the statements.
+
+Since we don't know if there may be other tests in need of finalization after this one (well, we may use tryserver, but it's more time consuming), I think the safer way out of this is just to backout bug 711536 from Aurora, there are no negatives in doing that.
+Backed out bug 711536 in http://hg.mozilla.org/releases/mozilla-aurora/rev/cd135c7ca5af. This bug should now be resolved in all channels.
+Comment on attachment 587827
+Ensure the download manager database connection isn't closed while it could still be required.
+
+clearing a+ as this patch was backed out for problems, and the bug was resolved by backing out another bug.

@@ -1,0 +1,286 @@
+Right now the interval is hard-coded at 30 minutes. We need to add a pref. so users can change this if desired.
+
+Right now the interval is hard-coded at 30 minutes. We need to add a pref. so users can change this if desired.
+Created attachment 226468
+patch
+Created attachment 226471
+patch
+Comment on attachment 226471
+patch
+
+even though I reviewed a microsummary patch, I'm not an owner of this code...
+Comment on attachment 226471
+patch
+
+I reviewed earlier versions of this patch on pastebin.  It looks like my review comments have been taken into account, and this should work fine.
+
+Requesting sr from mconnor, since this touches preferences code outside the microsummary service, and I want to get some browser peer eyes on that.
+Comment on attachment 226471
+patch
+
+Per mconnor's blog post (http://steelgryphon.com/blog/?p=81), removing approval
+request until patch has review, has landed on the trunk, has baked, and has justification for
+landing on the branch for beta1.
+Comment on attachment 226471
+patch
+
+>@@ -749,17 +772,17 @@ MicrosummaryService.prototype = {
+>     this._setField(bookmarkID, FIELD_MICSUM_GEN_URI, microsummary.generatorURI.spec);
+> 
+>     // If the microsummary content has already been generated,
+>     // set the URI's generated title to the microsummary content
+>     // and expire the microsummary after the normal interval.
+>     if (microsummary.content) {
+>       var now = new Date().getTime();
+>       this._setField(bookmarkID, FIELD_GENERATED_TITLE, microsummary.content);
+>-      this._setField(bookmarkID, FIELD_MICSUM_EXPIRATION, now + UPDATE_INTERVAL);
+>+      this._setField(bookmarkID, FIELD_MICSUM_EXPIRATION, now + this._updateInterval);
+>     }
+> 
+>     // Otherwise, expire the microsummary and update it immediately.
+>     else {
+>       if (this._hasField(bookmarkID, FIELD_MICSUM_EXPIRATION))
+>         this._clearField(bookmarkID, FIELD_MICSUM_EXPIRATION);
+>       microsummary.addObserver(this);
+>       microsummary.update();
+
+This patch doesn't apply cleanly anymore.  It looks like the only conflict is this hunk, which conflicts with the checkin for bug 339296 but is no longer necessary.  Can you attach an updated patch without this hunk?
+
+
+>+        this._pb.getIntPref("browser.bookmarks.microsummary.updateInterval");
+
+Over in bug 343080 you add the preference browser.microsummary.log, but here you put the pref under browser.bookmarks.microsummary.  Seems like the two prefs should be in the same place.  Given that microsummaries probably won't be restricted to bookmarks in the future, it probably makes sense to call this browser.microsummary.updateInterval.
+Comment on attachment 226471
+patch
+
+>+  // Preference Service
+>+  __ps: null,
+>+  get _ps() {
+>+    if (!this.__ps)
+>+      this.__ps = Cc["@mozilla.org/preferences-service;1"].
+>+                  getService(Ci.nsIPrefBranch);
+>+    return this.__ps;
+>+  },
+
+Note that here you call the getter _ps, but later you use _pb:
+
+>+  // How often to update microsummaries, in milliseconds. Note that the pref.
+>+  // takes a time in minutes, though.
+>+  get _updateInterval() {
+>+    var mins;
+>+    try {
+>+      mins = 
+>+        this._pb.getIntPref("browser.bookmarks.microsummary.updateInterval");
+>+      // If less than 1, fall back to 30. 
+>+      if (mins < 1)
+>+        mins = 30;
+>+    } 
+>+    catch (ex) {
+>+      // Default to 30 minutes.
+>+      mins = 30;
+>+    }
+>+    return mins * 60 * 1000;
+>+  },
+It'd be great to get this into beta2.
+Created attachment 228510
+patch v2
+
+Updated to comments (and actually tested this time!).
+Comment on attachment 228510
+patch v2
+
+>+  // Preference Service
+>+  __ps: null,
+>+  get _ps() {
+>+    if (!this.__ps)
+>+      this.__ps = Cc["@mozilla.org/preferences-service;1"].
+>+                  getService(Ci.nsIPrefBranch);
+>+    return this.__ps;
+>+  },
+
+Nit: it might be easier to understand the code that uses this getter if we call the getter _prefs instead of _ps.  Then again, none of the other service getters are intuitive, either, since I optimized for brevity over descriptiveness, so no biggie.
+
+Otherwise the code looks good and works in my tests.  I only note one significant issue: when a user changes the value of the preference, the code doesn't reset the expiration time for existing microsummaries.  So for example if a user changes the pref from the default of 30 minutes to 1 minute, her microsummaries won't update the next time until up to 30 minutes later, depending on when they were last updated, even though they are now supposed to update every minute.
+
+Once each microsummary expires it'll get on the new interval, but the fact that it didn't initially is likely to perplex users and generate bug reports that modifying the preference "didn't work for a while".  To prevent that from happening, when a user updates the pref, we should reset expiration times to the current time + the new interval for microsummaries whose expiration times are farther away than the new value.
+
+Also, the fix for bug 342908 added another reference to UPDATE_INTERVAL into the code, and that reference needs to be updated as well (otherwise the microsummary service will throw an exception when trying to update summaries with this patch).
+
+Fix those two issues, and r=myk.
+
+And then I'd like a browser peer to super-review this patch, primarily because it adds a preference hierarchy (browser.microsummary.), and we should make sure it is adding it in the right place.
+mconnor asked that the minimum interval for microsummaries be consistent with the minimum interval for livemarks.  Per nsBrowserFeedHandler, it looks like the minimum for livemarks is one minute, which is the same minimum these patches are implementing for microsummaries, so that's fine:
+
+http://lxr.mozilla.org/mozilla/source/browser/components/bookmarks/src/nsBookmarksFeedHandler.cpp#285
+
+Adam: to reset expiration times, it should be possible to register the microsummary service as a pref observer for the interval pref.  Then, when the service gets notified that the pref has changed, grab the list of microsummaries (just like _updateMicrosummaries does) and iterate over them, updating their expiration times as necessary.
+
+From bug 337940 comment #12 (Myk):
+
+Note that there's work going on in bug 342044 to let users specify a global
+update interval via a preference.  That preference, like generator-specified
+intervals, takes minutes, and once both patches land, we're going to have to
+say something like:
+
+ update interval = user pref ? <user value> 
+                             : generator spec ? <generator value>
+                                              : <default value>;
+
+From bug 337940 comment #13 (myself):
+
+And as for letting the user specify an update interval: make sure not to add an
+official default value for that pref. Otherwise it might be somewhat
+counter-intuitive that specifically a pref value of 30 (which would probably be
+the default) allows authors to specify their own intervals. It might be better
+to introduce a second pref at this point:
+browser.microsummary.minimumUpdateInterval (or have that other pref behave like
+a minimum value).
+Simon, if you're willing to take this feel free to.
+Created attachment 230645
+first try
+
+That's about how I suppose it should work:
+* use browser.microsummaries.updateInterval (in minutes) if present or UPDATE_INTERVAL otherwise (which still defaults to 30 minutes).
+* if a microsummary specifies its own update intervals, use those - but make sure they're not less than b.m.updateInterval.
+
+This allows users to specify a general update interval without forcing microsummaries to update too often for those authors who prefer to keep traffic low (and where updating doesn't make sense, such as for stock when the exchange is closed).
+
+I won't ask for review (yet), since I'm not yet content with code quality. Corrective input is welcome though.
+It seems to me that we should prioritize specific settings over general ones and user settings over author settings, since specific settings contain more accurate intelligence about how often pages change, and user settings better represent what users want and expect.
+
+In practical terms, this means we should prioritize settings in the following order, from highest to lowest priority:
+
+1. specific user settings (no current implementation, but one could imagine
+   a bookmark property which allowed users to specify an update interval
+   for individual microsummarized bookmarks);
+
+2. specific author settings (the <update> tag for generated microsummaries;
+   no current implementation for plaintext microsummaries specified by sites,
+   but one could imagine an attribute to the <link rel="microsummary"> tag
+   which enabled sites to specify intervals for particular microsummaries);
+
+3. general user settings (the preference being implemented in this bug);
+
+4. general author settings (no current implementation, and probably
+   not applicable);
+
+5. the default setting (the value of the UPDATE_INTERVAL constant).
+
+Note that when it comes to font preferences, specific author settings override general user preferences (although users can disable that behavior by setting another preference).
+
+CSS also prioritizes author settings more highly than user settings by default.  But for !important rules, it reverses that prioritization, which is roughly analogous to the font behavior (an author bias by default with a mechanism for overriding that explicitly).
+
+We should make microsummaries behave the same way, with more specific author intervals overriding the general user preference being implemented in this bug.  If that later proves to give insufficient control over these intervals to users, we can add an additional preference for overriding this behavior.
+
+Created attachment 230710
+use intervals in order described by comment #15
+
+One issue I haven't managed to solve yet: microsummaries with author-specified intervals might also be updated at a pref change although otherwise that pref doesn't affect them at all.
+Comment on attachment 230710
+use intervals in order described by comment #15
+
+>+      case "nsPref:changed":
+>+        if (data == "browser.microsummaries.updateInterval") {
+>+          var oldInterval = this._updateInterval;
+>+          this._updateInterval = getPref("browser.microsummaries.updateInterval", UPDATE_INTERVAL);
+
+Other preferences (log, requestTimeout) have been added to the browser.microsummary. hierarchy.  This preference should go there, too.
+
+
+>+          // the minimum update interval is 1 minute
+>+          this._updateInterval = Math.max(this._updateInterval, 1) * 60 * 1000;
+>+          this._updateMicrosummaries(this._updateInterval - oldInterval);
+>+        }
+>+        break;
+
+Nice use of Math.max to ensure the minimum value!  I wonder if it makes sense to factor out these Math.max calls into an _updateInterval setter.
+
+
+>-  _updateMicrosummaries: function MSS__updateMicrosummaries() {
+>+  _updateMicrosummaries: function MSS__updateMicrosummaries(intervalChange) {
+
+The more I think about refreshing microsummaries when the preference changes, the more complicated it seems.  Update intervals can be determined via a variety of mechanisms (including yet another one once bug 346820 is fixed), at least one of which (a generator-specified interval) is currently higher-priority than this preference, so just because the user has reduced the value of this preference doesn't mean every microsummary should expire sooner.
+
+And if a microsummary is affected by this preference, then it should probably be affected in both directions.  In other words, microsummary updates should be delayed if a user increases the value of the pref, just as they are sped up if the user decreases the value.
+
+To do this right, we'd probably have to change the way we store update intervals so that instead of the expiration item we instead record the time we last refreshed the microsummary, its update interval, and how that interval was determined.  But doing that overcomplicates this bug significantly.
+
+So I'm inclined to say that we should just leave out this aspect of the fix and explain to the small set of power users twiddling this preference that changing the preference doesn't take effect until the next time a microsummary gets updated (including manual updates via the Reload Live Title action, for those who need to get on the new schedule immediately).
+
+What do you think?
+
+
+>-  var shouldLog = false;
+>-  try {
+>-    var pb = Cc["@mozilla.org/preferences-service;1"].
+>-             getService(Ci.nsIPrefBranch);
+>-    shouldLog = pb.getBoolPref("browser.microsummary.log");
+>-  }
+>-  catch (ex) {}
+>-  
+>-  if (shouldLog) {
+>+  if (getPref("browser.microsummary.log", false)) {
+
+Great refactoring!  This getPref method makes things much easier, especially as the number of available preferences to alter microsummary behavior grows.
+
+Note that access to the new requestTimeout preference could also be refactored.
+
+
+>+function getPref(aPrefName, aDefault) {
+
+Nit: according to Ben, the current preferred style for argument names is to not prefix them with "a", and that's the style that the rest of this file uses (modulo the sanitizeName function, oops), so the arguments to getPref should be prefName and defaultValue (the latter one can't be just "default" because that's a JS reserved word).
+Created attachment 231816
+fix
+
+(In reply to comment #17)
+> Other preferences (log, requestTimeout) have been added to the
+> browser.microsummary. hierarchy.  This preference should go there, too.
+
+Done.
+
+> I wonder if it makes sense
+> to factor out these Math.max calls into an _updateInterval setter.
+
+In this patch it definitively does. Done.
+
+> The more I think about refreshing microsummaries when the preference changes,
+> the more complicated it seems.
+
+Indeed. To get this right, more metadata would have to be stored - which I really prefer not doing for Firefox 2.
+
+> Note that access to the new requestTimeout preference could also be refactored.
+
+Done.
+
+> Nit: according to Ben, the current preferred style for argument names is to not
+> prefix them with "a", and that's the style that the rest of this file uses
+
+Although I really disagree with Ben on that one... done.
+Comment on attachment 231816
+fix
+
+This looks fine, but it doesn't seem to work for me in my testing on the trunk.  I created a browser.microsummary.updateInterval preference using about:config and set it to 1.  Then I bookmarked a page with a microsummary generated by a generator that doesn't specify its own update interval.  The page's microsummary/expiration annotation in the places database was set to 30 minutes later rather than 1 minute later.
+
+Simon, is this working for you in your testing?
+This works nicely on the latest branch nightly.
+
+Would you mind logging the value of (microsummary.updateInterval || this._updateInterval) in MSS__updateMicrosummary to see whether it's 60000 or 1800000 for the bookmark you added? In case it's 30 minutes, please verify that microsummary.updateInterval indeed returns null and that the getPref call in the _updateInterval getter indeed returns 0. Thanks.
+Comment on attachment 231816
+fix
+
+Urk, sorry, this was my fault.  When testing, I accidentally added the preference as a string rather than an integer.  After correcting that flub, the preference works as advertised on both trunk and branch.  Note that one chunk of the patch no longer applies cleanly, but the fix is trivial.  r=myk with that conflict corrected.
+Created attachment 233741
+fix (unbitrotted)
+Fix checked into the trunk.  Thanks Simon!
+Comment on attachment 233741
+fix (unbitrotted)
+
+Notes for drivers considering this approval request:
+
+This patch allows users to change the default microsummary update interval (i.e. how often microsummaries get updated; 30 minutes by default) by setting a pref.  It doesn't add the pref to the prefs dialog or all.js, so the pref isn't visible (neither in the dialog nor in about:config).
+
+About half of the patch is just factoring out pref-getting code now that we have several microsummary preferences.  The rest adds the new pref.  The code has been on the trunk since Tuesday, August 15.  It has a low risk of regression.
+Comment on attachment 233741
+fix (unbitrotted)
+
+a=beltzner on behalf of drivers for the mozilla_1_8_branch

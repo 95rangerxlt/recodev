@@ -1,0 +1,201 @@
+Implementing a tab crashed page is not very hard, and I have already done it. But we need some design for something we can put into production. Also we need to make a decision on how that tab should behave. (eg. would reloading load the old page?)
+
+Implementing a tab crashed page is not very hard, and I have already done it. But we need some design for something we can put into production. Also we need to make a decision on how that tab should behave. (eg. would reloading load the old page?)
+Madhava: Who from UX can help with this?
+
+Would be good to look at what (if anything?) Fennec used to do when it was multiprocess. Maybe FFOS too? Would also be good to see what Chrome does and any lessons they've learned over time. Oh, and our own experiences with plugin crashes.
+
+I suspect that the obvious/simple solution is something like network errors pages -- a message explaining what happened + button to try again.
+
+If you click on a background tab that has previously crashed, should we we just reload it (ala session restore), or show a message?
+
+Oh, as with plugins, we'll presumably want the ability for the user to opt to report the crash and optionally supply a comment.
+The old fennec code is here:
+http://mxr.mozilla.org/mozilla-esr17/source/mobile/xul/chrome/content/browser.js#2529
+
+attachment 482881 shows what it looked like.
+
+The code was written in bug 581335, bug 525850, bug 594847.
+
+B2G still uses this stuff:
+http://mxr.mozilla.org/mozilla-central/source/b2g/chrome/content/shell.js#1066
+
+I expect all the crashreporter bits to still work (since B2G is using them), it's just a matter of hooking up an observer for the notifications, presenting the UI, etc.
+Created attachment 783210
+b2g tab crash
+Created attachment 783212
+chrome tab crash
+Created attachment 789902
+prototype
+
+This shows a dialog that looks like about:neterror in every tab that crashed. It would be awesome if somebody from the frontend team could drive this to completion.
+Comment on attachment 789902
+prototype
+
+Review of attachment 789902:
+-----------------------------------------------------------------
+
+Thanks Tom, this is a good start. I had looked at it before and I'm still pondering on how to handle the url display for the tab (we should show the proper URL and not the about:tabcrashed page). But let me mark the feedback properly here, and I'll take the bug to figure that out.
+
+Another thing that needs to be handled is that the reload of the page should load it again in a content process and not in the parent.
+Created attachment 798057
+Make DisplayLoadError public and add case for crashed content error
+
+To properly display the error page in Firefox we need to use displayLoadError in order to preserve the currentURI being displayed in the urlbar, etc. This patch moves DisplayLoadError to the public interface to make it callable from js.
+
+I'm using the &d= (description) part of the error page URL to pass the original page title to the about:tabcrashed page. It grabs the page title from an attribute in the element.. I don't know if there's a better way to do that.
+
+The entry in appstrings.properties is necessary because if the page title is blank -> messageStr is blank -> DisplayLoadError will grab the string from that bundle.  I hope it's okay to have that entry there in appstrings.properties even if the error page itself is not gonna be implemented by neterror.xhtml 
+
+(The actual about:tabcrashed implementation is coming in a separate patch)
+Comment on attachment 798057
+Make DisplayLoadError public and add case for crashed content error
+
+I guess this is ok, but broadcasting to all tabbrowsers and then having them ignore seems like a weird API; can we get a followup about just notifying the specific browser, since I would think the frameloader would know what that is...
+Created attachment 798139
+Dispatch oop-browser-crashed as an event targeted at the <browser>
+
+Yep! I was actually already working on that as a follow-up, but I might as well merge it here. At first I just went with the notification API because that's what existed, but it is awful for the reasons you noticed. So this implements oop-browser-crashed as an event dispatched in the browser.
+
+It also means tabbrowser doesn't need to implement nsIObserve and nsIWeakRef.. And in the future when we're able to get rid of the _updateBrowserRemoteness silliness, the handler can be moved directly to browser.xml
+
+In TabParent.cpp I need to keep a ref to the element, because frameLoader->DestroyChild sets mFrameElement to null. The element doesn't really die, it's just the ref set to null. But I used a nsCOMPtr just in case..
+
+I can't get rid of the notification because b2g is using it
+Comment on attachment 798139
+Dispatch oop-browser-crashed as an event targeted at the <browser>
+
+r=me.  Much better!
+Created attachment 798140
+about:tabcrashed
+
+This implements a very simple about:tabcrashed page, which sets its title to the same title as the tab that crashed (by grabbing it from the query string).
+
+No effort went whatsoever in designing this page, it is a placeholder that should be designed properly later.. I'm reusing the basic structure + the .css file from aboutSocialError just because the page and the button look nice IMO, but of course this page should have its dedicated styling in the future.
+Created attachment 798142
+Make tab crashed work
+
+This implements the click handler for the Try Again button in the tabcrashed page, plus one sad hack to make clicking in the Refresh button work properly and reload the tab in a new remote process instead of in the main process.
+Comment on attachment 798139
+Dispatch oop-browser-crashed as an event targeted at the <browser>
+
+>-    <implementation implements="nsIDOMEventListener, nsIMessageListener, nsIObserver, nsISupportsWeakReference">
+>+    <implementation implements="nsIDOMEventListener, nsIMessageListener">
+> 
+>       <property name="tabContextMenu" readonly="true"
+>                 onget="return this.tabContainer.contextMenu;"/>
+> 
+>       <field name="tabContainer" readonly="true">
+>         document.getElementById(this.getAttribute("tabcontainer"));
+>       </field>
+>       <field name="tabs" readonly="true">
+>@@ -2915,42 +2915,16 @@
+>                               gContextMenuContentData.event.clientX,
+>                               gContextMenuContentData.event.clientY,
+>                               true, false, null);
+>               break;
+>           }
+>         ]]></body>
+>       </method>
+> 
+>-      <method name="observe">
+
+Can you please merge this with the first patch before landing it?
+Comment on attachment 798140
+about:tabcrashed
+
+Review of attachment 798140:
+-----------------------------------------------------------------
+
+::: browser/base/content/aboutTabCrashed.xhtml
+@@ +20,5 @@
+> +
+> +<html xmlns="http://www.w3.org/1999/xhtml">
+> +  <head>
+> +    <link rel="stylesheet" type="text/css" media="all"
+> +          href="chrome://browser/skin/aboutSocialError.css"/>
+
+Please make a copy of aboutSocialError. I know it may be temporary, but it seems wrong that aboutTabCrashed will reference aboutSocialError.
+
+::: browser/locales/en-US/chrome/browser/browser.dtd
+@@ +668,5 @@
+>  <!ENTITY pluginActivateAlways.label "Allow and Remember">
+>  <!ENTITY pluginBlockNow.label "Block Plugin">
+>  
+> +<!ENTITY tabCrashed.header "Tab crashed">
+> +<!ENTITY tabCrashed.message "The process where this tab was loaded has crashed.">
+
+Let's go with the B2G text for now,
+"Well, this is embarrassing. We tried to display this Web page, but it's not responding."
+Comment on attachment 798142
+Make tab crashed work
+
+Review of attachment 798142:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +2601,5 @@
+>  }
+>  
+>  function BrowserReloadWithFlags(reloadFlags) {
+> +  let url = gBrowser.currentURI.spec;
+> +  if (gBrowser._updateBrowserRemoteness(gBrowser.selectedBrowser,
+
+So does this handle the case of the user hitting the Refresh button or F5? If so, why not have onAboutTabCrashed also use gBrowser.loadURIWithFlags? (Basically, I'm not sure why there are two approaches being used to reload the page.)
+Comment on attachment 798142
+Make tab crashed work
+
+Review of attachment 798142:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +2601,5 @@
+>  }
+>  
+>  function BrowserReloadWithFlags(reloadFlags) {
+> +  let url = gBrowser.currentURI.spec;
+> +  if (gBrowser._updateBrowserRemoteness(gBrowser.selectedBrowser,
+
+Yep, this part is to handle the Refresh button/F5 case.
+
+The onAboutTabCrashed function calls openUILinkIn because the code path that that will take will automatically handle the _updateBrowserRemoteness and proper loading of the page.
+
+Here I need to call it manually to check the return value of _updateBrowserRemoteness because if it's not in the e10s transtion case we need to skip this new code and let the function work as before
+(In reply to Jared Wein [:jaws] from comment #14)
+
+> ::: browser/base/content/aboutTabCrashed.xhtml
+> @@ +20,5 @@
+> > +
+> > +<html xmlns="http://www.w3.org/1999/xhtml">
+> > +  <head>
+> > +    <link rel="stylesheet" type="text/css" media="all"
+> > +          href="chrome://browser/skin/aboutSocialError.css"/>
+> 
+> Please make a copy of aboutSocialError. I know it may be temporary, but it
+> seems wrong that aboutTabCrashed will reference aboutSocialError.
+
+Originally I didn't make a copy because it's 3 files, not just one (one for each theme). But sure, I can copy them. I also thought of just renaming it from aboutSocialError.css to aboutError.css, but I'm not sure about making that file generic like that..
+Merged the two tabbrowser patches, copied the css file to aboutTabCrashed.css, and fixed a missing return that Jared pointed out on irc.
+
+https://hg.mozilla.org/integration/fx-team/rev/04aa8c1ab6bb
+https://hg.mozilla.org/integration/fx-team/rev/7298863a7a28
+https://hg.mozilla.org/integration/fx-team/rev/7d8523c3dc57
+https://hg.mozilla.org/mozilla-central/rev/04aa8c1ab6bb
+https://hg.mozilla.org/mozilla-central/rev/7298863a7a28
+https://hg.mozilla.org/mozilla-central/rev/7d8523c3dc57
+Comment on attachment 798142
+Make tab crashed work
+
+r+ on the updated patch that landed.
+(clearing the madhava needinfo, UX discussion was moved to bug 913651)
+
+
+Tab crashed page
+
+
+
+Bug 899348 - Dispatch an event when an out-of-process browser crashes and display an error page when that occurs. r=bz 
+
+Bug 899348 - Implement about:tabcrashed page. r=jaws 
+
+Bug 899348 - Make reload of the about:tabcrashed work as expected. r=jaws 

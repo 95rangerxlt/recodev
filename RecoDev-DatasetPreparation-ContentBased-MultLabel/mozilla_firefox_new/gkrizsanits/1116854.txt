@@ -1,0 +1,99 @@
+Right now the shims are controlled by the extensions.interposition.enabled preference, which is nightly-only. Before we merge to aurora we'll need to enable this on at least aurora.
+
+This preference causes performance regressions (bug 1101182 is an example we know of), so we'll need to address those.
+
+Right now the shims are controlled by the extensions.interposition.enabled preference, which is nightly-only. Before we merge to aurora we'll need to enable this on at least aurora.
+
+This preference causes performance regressions (bug 1101182 is an example we know of), so we'll need to address those.
+Again, I'll take this for now, but I won't work on it for a bit in case evilpie wants to.
+Handing this over to Gabor.
+I've been looking into the optimization possibility we talked about earlier, where we wanted to make sure that interpose does not happen multiple times for the same operation when the wrapper/proxy iterates over the proto chain and calls interpose again and again. It seems to me that this should be very rarely the case if ever... For regular DOM objects that should not be the case, so I'm starting to think that there is something else going on. Could you give me an example where you experienced this behavior so I can debug it and see what was going on? For XPCWrappedNatives we might have this behavior but there I don't expect long proto chains...
+I noticed the prototype issue while looking into bug 1101182. I installed Web of Trust and opened a Facebook timeline. It even happens with e10s disabled I think. Then I clicked "More" as many times as I could and noticed a lot of jank. When I added printfs to the interposition code, I saw that a single property access was triggering several interposition calls.
+
+The problem is with regular DOM objects. Here's the proto chain for an <a> element:
+HTMLAnchorElementPrototype
+HTMLElementPrototype
+ElementPrototype
+NodePrototype
+EventTargetPrototype
+Object.prototype
+
+The HasPrototype flag is passed into the Wrapper constructor. For AddonWrapper, that happens here:
+http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/wrappers/AddonWrapper.h#25
+where Base is PermissiveXrayDOM, which is typedefed to xpc::XrayWrapper<js::CrossCompartmentWrapper, xpc::DOMXrayTraits>. The constructor for XrayWrapper is here:
+http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/wrappers/XrayWrapper.h#413
+It gets the HasPrototype value from DOMXrayTraits::HasPrototype, which is true:
+http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/wrappers/XrayWrapper.h#160
+Since that is true, the Wrapper code walks up the prototype chain of the wrapper and calls the property hooks on each object. Since they're all AddonWrappers, they all run the Interpose code.
+(In reply to Bill McCloskey (:billm) from comment #4)
+> I noticed the prototype issue while looking into bug 1101182. I installed
+> Web of Trust and opened a Facebook timeline. It even happens with e10s
+> disabled I think. Then I clicked "More" as many times as I could and noticed
+> a lot of jank. When I added printfs to the interposition code, I saw that a
+> single property access was triggering several interposition calls.
+
+When I try it I see the same prop access many times as well but because of
+various loops like:
+for (var i in wot_modules) {
+  if (typeof(wot_modules[i].obj.load) == "function") {
+    wot_modules[i].obj.load();
+  }
+}
+Actually there is a LOT of unneeded interposition going on for this addon because
+of some cross compartment global properties. I wonder when do we need to do interposition
+for vanilla js objects... maybe that would be the biggest win to just skip those cases.
+
+> 
+> The problem is with regular DOM objects. Here's the proto chain for an <a>
+> element:
+> HTMLAnchorElementPrototype
+> HTMLElementPrototype
+> ElementPrototype
+> NodePrototype
+> EventTargetPrototype
+> Object.prototype
+> 
+> The HasPrototype flag is passed into the Wrapper constructor. For
+> AddonWrapper, that happens here:
+> http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/wrappers/
+> AddonWrapper.h#25
+> where Base is PermissiveXrayDOM, which is typedefed to
+> xpc::XrayWrapper<js::CrossCompartmentWrapper, xpc::DOMXrayTraits>. The
+> constructor for XrayWrapper is here:
+> http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/wrappers/
+> XrayWrapper.h#413
+> It gets the HasPrototype value from DOMXrayTraits::HasPrototype, which is
+> true:
+> http://mxr.mozilla.org/mozilla-central/source/js/xpconnect/wrappers/
+> XrayWrapper.h#160
+> Since that is true, the Wrapper code walks up the prototype chain of the
+> wrapper and calls the property hooks on each object. Since they're all
+> AddonWrappers, they all run the Interpose code.
+
+Thanks a lot for this, I completely overlooked it I guess... But still I have
+problems with reproducing it. For xul stuff we should not get xrays, just transparent
+CCWs where hasProto is false.
+
+For content DOM I think we have the AddonWrapper->CCW->CPOW->Xray->content, so actually
+we get the AddonWrapper<CrossCompartmentWrapper> version instead of AddonWrapper<PermissiveXrayDOM> and the proto crawling might happen on the other side, where we don't have interposition.
+
+This is confusing stuff, so sorry if I'm overlooking something... I will try it again
+tomorrow with rested mind.
+The rest of the planned optimizations for the shims layer should happen in m7.
+This bug is about letting the shims ride the trains for 40, which we still want to do.
+We're ready to let these roll out to aurora and potentially all the way out in advance of e10s. There are a couple optimizations we still want (billm) but that shouldn't hold rolling these out. According to the triage discussion, letting these roll out involved removing some ifdef'ing, which I think this should be covered by this bug. Gabor, does this make sense to you?
+(In reply to Jim Mathies [:jimm] from comment #8)
+> We're ready to let these roll out to aurora and potentially all the way out
+> in advance of e10s. There are a couple optimizations we still want (billm)
+> but that shouldn't hold rolling these out. According to the triage
+> discussion, letting these roll out involved removing some ifdef'ing, which I
+> think this should be covered by this bug. Gabor, does this make sense to you?
+
+Right. I will file a follow up bug for the optimizations then. Bill, since I don't
+know what are these ifdef's, do you want to take this bug back? Or can you point me
+to them?
+This seems to be resolved. Flag is set on aurora and seems to work.
+
+
+[e10s] Let add-on shims ride the trains
+

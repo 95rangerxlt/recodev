@@ -1,0 +1,282 @@
+Hi folks,
+
+A considerable number of large sites on the Internet have at least one write-only location that responds with HTTP 204 ("No content") when queried directly.
+
+Unfortunately, Firefox seems to handle 204 responses in a weird way, in some cases displaying the new URL in the URL bar, but keeping the old document in place. Specifically, consider this example:
+
+-- snip! --
+<html>
+<input type=submit value="Click me now" onclick="clicked()">
+<script>
+var w;
+
+function clicked() {
+  w = window.open("https://www.google.com/csi","_blank");
+  setTimeout('w.document.body.innerHTML = "I am not https://www.google.com at all!"', 500);
+}
+</script>
+-- snip! --
+
+This, obviously, looks pretty bad.
+
+Hi folks,
+
+A considerable number of large sites on the Internet have at least one write-only location that responds with HTTP 204 ("No content") when queried directly.
+
+Unfortunately, Firefox seems to handle 204 responses in a weird way, in some cases displaying the new URL in the URL bar, but keeping the old document in place. Specifically, consider this example:
+
+-- snip! --
+<html>
+<input type=submit value="Click me now" onclick="clicked()">
+<script>
+var w;
+
+function clicked() {
+  w = window.open("https://www.google.com/csi","_blank");
+  setTimeout('w.document.body.innerHTML = "I am not https://www.google.com at all!"', 500);
+}
+</script>
+-- snip! --
+
+This, obviously, looks pretty bad.
+Yeah, the thing Firefox does with sticking the url in the url field before the document has actually loaded in the window.open case needs to also clear the url if the document load returns 204....
+Now that you mention it - this also works, sans 204:
+
+<html>
+<input type=submit value="Click here to claim your prize!" onclick="clicked()">
+<script>
+var w;
+
+function clicked() {
+  w = window.open("http://1.2.3.4/","_blank");
+  setTimeout('w.document.body.innerHTML = "I am not 1.2.3.4 at all!";w.stop();', 500);
+}
+</script>
+
+Even without the ability to call stop(), the opener could probably just navigate the window at regular intervals, slightly shorter than actual network rtt for the target site. The whole thing should probably be redesigned.
+Wild guess: seems like maybe we should just skip the "pretend the user typed this" part of addTab when called via nsBrowserAccess's loadOneTab.
+Just as a side note, the PoCs above only work if you have "open new windows in a tab instead" unchecked. But it can be easily tweaked by adding a third parameter to window.open():
+
+"toolbar=1,menubar=1"
+Oh, well then comment 3 can be ignored!
+Created attachment 436906
+testcase
+I'm pretty sure the user wants the address bar to show the "page to be loaded" as long as "nothing" is currently loaded.  That way you know what the heck is going on with that window/tab....
+Created attachment 437110
+potential patch
+
+This fixes the testcase. I haven't considered all of the potential side effects of doing this.
+Would it fix the test case without w.stop()? A spinning throbber is a pretty weak indicator of foul play, and it could probably be kept in this state indefinitely even against a responsive target, simply by retrying navigation in a loop.
+It doesn't fix the testcase without the stop().
+
+Other browsers seem to handle that case differently:
+- Chrome seems to just show about:blank until the load fails
+- Opera behaves the same way we do
+- Safari seems to somehow block the document.write, so the URL bar shows 1.2.3.4 but there's no spoofing (it also opens in a new tab)
+(In reply to comment #10)
+> - Chrome seems to just show about:blank until the load fails
+
+The document.write also doesn't appear.
+
+I'm not exactly sure how to check for JS exceptions with Safari/Chrome, so I don't know why the document.write is failing to have an effect.
+In Chrome it fails because w.document.body is undefined for about:blank; if you change it to w.document.firstChild.innerHTML, it works OK (but the URL bar does not show the destination address).
+
+Safari is vulnerable, I reported this to them as well.
+Created attachment 437176
+patch #2
+
+Maybe we should just do this, then. This doesn't regress the Ctrl+Click case, since that goes through contentAreaClick->loadOneTab which hits the "pretend" case I mentioned in comment 3.
+Hmm, this code was added in bug 254714. The addTab "pretend" code has been there since well before that (bug 231393), so I'm not sure why (or whether) it was necessary.
+Comment on attachment 437176
+patch #2
+
+This regresses bug 254714 / goes against comment 7, right?
+I wasn't able to find a scenario where loading a new page didn't show the URL in the URL bar while it was loading, but maybe I'm missing something.
+
+One example I tested was Ctrl+Shift+clicking the link on data:text/html,<a href="http://gavinsharp.com/os/slow.php?time=10&url=http://gavinsharp.com">a</a>.
+(And my reasoning for why that case isn't regressed is in comment 13/comment 14)
+I might be misreading this, but if we want to keep ctrl-click / shift-click behavior the same, and just affect window.open() pop-ups, what's stopping the attacker from doing this instead?
+
+-- snip! --
+<a href="http://1.2.3.4/" target="foo" onclick="setTimeout('pwned()',1000)">click me</a>
+
+<script>
+function pwned() {
+  var t = window.open('','foo');
+  t.document.body.innerHTML = 'Hello world!';
+  t.stop();
+}
+</script>
+-- snip! --
+(In reply to comment #16)
+> I wasn't able to find a scenario where loading a new page didn't show the URL
+> in the URL bar while it was loading, but maybe I'm missing something.
+> 
+> One example I tested was Ctrl+Shift+clicking the link on data:text/html,<a
+> href="http://gavinsharp.com/os/slow.php?time=10&url=http://gavinsharp.com">a</a>.
+
+What does http://gavinsharp.com/os/slow.php exactly do?
+
+Bug 231393 just set userTypedValue, but the code you're removing actually displays it before onLocationChange is invoked.
+slow.php is just a php script that sleep()s before returning a Location: header.
+I hit bug 254714 when opening your test URL from an external app (e.g. bugmail in Thunderbird).
+Sooooo is there any consensus on how to fix?:p
+Comment on attachment 437176
+patch #2
+
+I think comment 21 needs special treatment, maybe adding && !content.opener does the trick, maybe it can be taken care of entirely differently, or maybe we should take the first patch -- not sure if there was a real problem with that.
+Created attachment 438475
+patch v3
+
+Maybe this is what we want. Still needs testing.
+Just a gentle ping.
+Created attachment 440810
+testcase
+
+This includes the three variants.
+Comment on attachment 438475
+patch v3
+
+This works. Scenarios tested:
+
+- testcase here (3 cases) - URL doesn't appear while loading, gets reset on load failures
+- Cmd+Shift+Click link to http://gavinsharp.com/os/slow.php?time=50&url=http://nhl.com - URL appears while loading
+- Click http://gavinsharp.com/os/slow.php?time=50&url=http://nhl.com in external app - URL appears while loading
+Comment on attachment 438475
+patch v3
+
+>   endDocumentLoad: function (aRequest, aStatus) {
+>     var urlStr = aRequest.QueryInterface(Ci.nsIChannel).originalURI.spec;
+> 
+>-    var notification = Components.isSuccessCode(aStatus) ? "EndDocumentLoad" : "FailDocumentLoad";
+>+    var notification = "EndDocumentLoad";
+>+    if (!Components.isSuccessCode(aStatus)) {
+>+      notification = "FailDocumentLoad";
+>+
+>+      // The load failed, so the URL bar value set in startDocumentLoad
+>+      // shouldn't persist - update it now.
+>+      if (gURLBar)
+>+        URLBarSetURI();
+>+    }
+
+This clears the location bar when executing `firefox http://gavinsharp.com/os/slow.php?time=50` and pressing Esc. We probably need to set userTypedValue, just like with Ctrl+click on content links.
+(In reply to comment #28)
+> This clears the location bar when executing `firefox
+> http://gavinsharp.com/os/slow.php?time=50` and pressing Esc. We probably need
+> to set userTypedValue, just like with Ctrl+click on content links.
+
+The reason we don't do this currently is that we open the tab with about:blank rather than the real URI: http://hg.mozilla.org/mozilla-central/annotate/2968d19b0165/browser/base/content/browser.js#l4487
+Looks like we should add a flags argument to loadOneTab and addTab.
+(In reply to comment #29)
+> Looks like we should add a flags argument to loadOneTab and addTab.
+
+This doesn't actually work, since loadOneTab starts the load before selecting the tab, so startDocumentLoad() doesn't get called, and nothing actually updates the URL bar.
+
+I suppose we could just omit the endDocumentLoad hunk. It seemed logical to me that the URL bar should be reset in the failed load case, but I guess that's not actually the behavior we want at all, and not setting the URL bar in startDocumentLoad is sufficient to cover the cases in this bug, I think.
+Created attachment 441581
+patch, v4
+(In reply to comment #30)
+> (In reply to comment #29)
+> > Looks like we should add a flags argument to loadOneTab and addTab.
+> 
+> This doesn't actually work, since loadOneTab starts the load before selecting
+> the tab, so startDocumentLoad() doesn't get called, and nothing actually
+> updates the URL bar.
+
+Selecting the tab should update the location bar, but we seem to clear userTypedValue before this happens.
+Created attachment 441823
+patch?
+
+This seems to work, but I really don't know what I'm doing in browser.xml. The userTypedClear stuff always scared me...
+(In reply to comment #33)
+> Created an attachment (id=441823) [details]
+> patch?
+> 
+> This seems to work,
+
+and it should fix this bug:
+
+1. `firefox http://gavinsharp.com/os/slow.php?time=50`
+2. switch to a different tab
+3. switch back to the previous tab
+
+Expected result: The location bar displays http://gavinsharp.com/os/slow.php?time=50
+
+Actual result: It doesn't.
+When do you guys plan to release the fix?
+
+Certainly no rush, especially since it proved to be trickier than expected, but it would be good to be able to plan ahead.
+Not before 3.6.5/3.5.11, which are likely at least a month away (assuming normal scheduling).
+(In reply to comment #33)
+> userTypedClear stuff always scared me...
+
+Indeed. Why is that change needed? The only use of userTypedClear I can see is in mTabProgressListener's onLocationChange, where a non-zero value allows the userTypedValue to be cleared, but I don't see how that could be a problem. Presumably if we've received an onLocationChange for the tab, clearing the userTypedValue shouldn't be a problem, since we'd fall back to the currentURI which should be correct. On the other hand, I don't really understand why we bother incrementing userTypedClear around calls to loadURI(), since I don't think it can have any relevant synchronous side effects.
+
+Is there anything wrong with my patch? It seems much less risky...
+(In reply to comment #37)
+> I don't really understand why we
+> bother incrementing userTypedClear around calls to loadURI(), since I don't
+> think it can have any relevant synchronous side effects.
+See bug 302575.
+(In reply to comment #37)
+> Presumably if we've received an onLocationChange for the tab, clearing the
+> userTypedValue shouldn't be a problem, since we'd fall back to the currentURI
+> which should be correct.
+
+Right, that's my understanding as well, but something else appears to be happening...
+
+> Is there anything wrong with my patch? It seems much less risky...
+
+It expands the workaround that seems to be there only because we don't set userTypedValue and handle it correctly when loading external URIs. That's ok as an interim solution and for the branches, but in the longer term I think we should dig a little deeper.
+Comment on attachment 441823
+patch?
+
+filed bug 562649
+http://hg.mozilla.org/mozilla-central/rev/cadddabb1178
+Comment on attachment 441581
+patch, v4
+
+Approved for 1.9.2.6 and 1.9.1.11, a=dveditz for release-drivers
+http://hg.mozilla.org/releases/mozilla-1.9.2/rev/a011dbe8896f
+This is not listed as fixed in 3.6.4?
+
+http://www.mozilla.org/security/known-vulnerabilities/firefox36.html#firefox3.6.4
+Oops, sorry. Looks like you targeted this for 3.6.5.
+I unfortunately mixed this bug up with the focus() thing, fixed in 3.6.4, and posted this on my blog shortly after noticing that 3.6.4 is out:
+
+http://lcamtuf.blogspot.com/2010/06/yeah-about-that-address-bar-thing.html
+
+It's probably not feasible to pull it down at this point, as it got picked up by several sources, and the severity of this bug is not that high - but let me know if you disagree.
+
+Again, sorry for the trouble :-( Not intended.
+https://hg.mozilla.org/releases/mozilla-1.9.1/rev/8c17cad9e838
+Assigned CVE-2010-1206 to this one.
+(In reply to comment #45)
+> Oops, sorry. Looks like you targeted this for 3.6.5.
+
+Firefox 3.6.6, actually. We're skipping 3.6.5, as per http://christian.legnitto.com/blog/2010/06/09/heads-up-the-next-firefox-platform-version-is-1-9-2-6-instead-of-1-9-2-5/.
+(In reply to comment #46)
+> It's probably not feasible to pull it down at this point, as it got picked up
+> by several sources, and the severity of this bug is not that high - but let me
+> know if you disagree.
+Yea, I posted this comment after it got onto slashdot:
+http://slashdot.org/comments.pl?sid=1694932&cid=32661632
+The plan is still to include this in 3.6.6. If we have to spin a quick build off the 3.6.4 relbranch, we'll include this fix as well. We don't intend to have to do a quick build of the relbranch though.
+(In reply to comment #51)
+> The plan is still to include this in 3.6.6. If we have to spin a quick build
+> off the 3.6.4 relbranch, we'll include this fix as well. We don't intend to
+> have to do a quick build of the relbranch though.
+
+Due to the insertion of a Firefox 3.6.6 release schedule for this weekend to fix a stability issue with OOPP, this fix won't be included until Firefox 3.6.7, currently scheduled for July 20th (see https://wiki.mozilla.org/Releases for latest estimate).
+
+Michal, can you update your blog post to say 3.6.7 instead? Thanks!
+Verified for 1.9.1.11 using Gavin's testcases with Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.1.11) Gecko/20100701 Firefox/3.5.11 (.NET CLR 3.5.30729).
+
+Verified for 1.9.2.7 with Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.2.7) Gecko/20100713 Firefox/3.6.7 (.NET CLR 3.5.30729).
+
+
+Address bar spoofing possible via window.open() + HTTP 204 responses or window.stop()
+
+testcase, verified1.9.1, verified1.9.2
+
+Bug 556957 - Don't let startDocumentLoad display the target URL for content windows with openers. r=dao 

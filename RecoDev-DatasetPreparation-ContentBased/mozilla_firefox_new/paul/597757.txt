@@ -1,0 +1,125 @@
+Reloading a tab that hasn't been loaded yet due to the cascading tab loading behaviour introduced in bug 586068 leads to about:blank, not the tab's original page.
+
+Steps to reproduce:
+1. Set browser.sessionstore.max_concurrent_tabs set to a low value. 0 works well ;)
+2. Restart browser.
+3. Right click on a tab that hasn't been loaded yet and choose "Reload Tab" or even "Reload All Tabs".
+
+Observed result: Said tab or all tabs, respectively, now show about:blank.
+Expected result: The tabs' original pages should've been loaded.
+
+Reloading a tab that hasn't been loaded yet due to the cascading tab loading behaviour introduced in bug 586068 leads to about:blank, not the tab's original page.
+
+Steps to reproduce:
+1. Set browser.sessionstore.max_concurrent_tabs set to a low value. 0 works well ;)
+2. Restart browser.
+3. Right click on a tab that hasn't been loaded yet and choose "Reload Tab" or even "Reload All Tabs".
+
+Observed result: Said tab or all tabs, respectively, now show about:blank.
+Expected result: The tabs' original pages should've been loaded.
+:( probably due to not actually telling session history to load a page until later. So hitting refresh loads index 0 (or about:blank as that was the last page loaded)
+
+Might need to change how we do the delayed loading.
+this bug also exists in BarTab (which does the same as the new Minefield feature to postpone loading tabs + extra features).
+(In reply to comment #2)
+> this bug also exists in BarTab (which does the same as the new Minefield
+> feature to postpone loading tabs + extra features).
+
+Not that it matters for this bug, but this actually works in BarTab. Reloading a not-yet-loaded tab with BarTab will cause it to load.
+Took a quick look at how BarTab is doing this, and it's not something I would want to do in session restore (overwriting the browser's webnavigation, yikes!)
+
+So I think the better route will be to add to nsISHentry or nsIWebNavigation so that we can set the index without causing a load.
+
+That would mean an API rev or additional interface. Ideally this would block b7 but if we take the new interface route, we could probably get away with not blocking b7 and getting this in ASAP after.
+Make it go, Paul - gotta fix it. If you need help, holler.
+The fix in sessionstore will be trivial. I filed bug 598852 for the fix in docshell. I'm going to take a stab at it in the morning, but I may need to holler.
+Created attachment 478062
+Patch v0.1
+
+Assuming bug 598852 works like I made it, this works.
+Comment on attachment 478062
+Patch v0.1
+
+Actually, it's probably slightly more complicated than this. This certainly works, but won't clear __SS_needsRestore from those tabs, nor remove the tabs from _tabsToRestore. I think I should be able to catch that in the progress listener.
+What about back? Or forward? Do those work properly?
+Based on reading some code, those should work. But please test.
+Comment on attachment 478062
+Patch v0.1
+
+canceling, need new patch that doesn't depend on the docshell change.
+If in the progress listener, you need to distinguish reload from goBack/goForward/gotoIndex/loadURI.
+Besides reloading issue, we need to avoid throttled tabs being identified as blank tabs, thus the currentURI should be set correctly.
+In fact, when currentURI is set correctly, reload will work correctly also. And sessionHistory.index should also be set correctly for goBack/goForward to work correctly.
+
+var entry = browser.sessionHistory.getEntryAtIndex(index, true);
+browser.docShell.setCurrentURI(entry.URI);
+(In reply to comment #14)
+> In fact, when currentURI is set correctly, reload will work correctly also. And
+> sessionHistory.index should also be set correctly for goBack/goForward to work
+> correctly.
+> 
+> var entry = browser.sessionHistory.getEntryAtIndex(index, true);
+> browser.docShell.setCurrentURI(entry.URI);
+
+First off, thanks for your insight. It's helpful.
+
+Now for the real stuff... So that appears to work, however we end up hitting the assertion here: http://mxr.mozilla.org/mozilla-central/source/docshell/base/nsDocShell.cpp#9279
+
+DocShell assumes that since there's no current history entry but he have a current uri, we must be at about:blank. Of course that isn't true here but assumptions are assumptions. I don't want to do something that could alter the assumptions in DocShell. That's a messy game.
+
+I couldn't get this to work with just the progress listener. So I've gone ahead with what Olli suggested in bug 598852 comment 8. Patch forthcoming.
+Created attachment 478722
+Patch v0.2
+
+With tests.
+The concern in comment 13 is still valid. 
+If the currentURI of a throttled tab remains about:blank, we'll get wrong result when determining whether the tab is a blank tab or a duplicate tab of another one.
+Comment on attachment 478722
+Patch v0.2
+
+r=me. push comment #17 into a different bug. it doesn't sound like it blocks b7, but please correct me if you think otherwise.
+(In reply to comment #18)
+> push comment #17 into a different bug. it doesn't sound like it blocks
+> b7, but please correct me if you think otherwise.
+
+Filed bug 599909.
+Pushed http://hg.mozilla.org/mozilla-central/rev/c6034ebf7109
+Backed out due to orange http://hg.mozilla.org/mozilla-central/rev/7698a60fcabf
+So I tracked down the problem and it's not just a test problem. There's a slight problem with the logic using _resetTabRestoringState. When closing a window, we go through onTabRemove, which calls _resetTabRestoringState. When the tab still has __SS_needsRestore (as is the case in real life and tests), we end up calling restoreTab on the tab that's being removed. This will fail many times and so we end up not removing tabs from tabsToRestore and we get stuck trying to restore a bunch of destroyed tabs.
+
+The problem showed up running a test that was after browser_480148.js because 480148 opens several windows with several tabs in each, all at once, but doesn't wait for load events, just SSTabRestoring, which is good enough for it to figure out pass/fail. Then the windows are closed and we have a bunch of orphans.
+
+I have a fix & it works out locally (fixes test failures seen in builds). I'll give a more thorough workout (run whole b-c suite, on osx & windows)
+Created attachment 478895
+Patch Part 2 v0.1
+
+This applies on top of the current patch. It's pretty trivial, but fixes the behavior by allowing us to be more specific about what to do in each case.
+FWIW, this passed on try with part 2 applied (well, hit the known orange from bug 586068 and a different known orange).
+Comment on attachment 478895
+Patch Part 2 v0.1
+
+
+>-  _resetTabRestoringState: function sss__resetTabRestoringState(aTab, aShouldRestoreTab) {
+>+  _resetTabRestoringState: function sss__resetTabRestoringState(aTab, aRestoreNextTab, aRestoreThisTab) {
+
+line length
+
+r=me. however, the semantics of this are getting wackier. can you please add a comment for _resetTabRestoringState that summarizes what exactly it does and why?
+Created attachment 479112
+Patch v1.0 (for checkin)
+
+Rolled the two parts together and addressed additional comments.
+Pushed http://hg.mozilla.org/mozilla-central/rev/4d7110bb65ec
+
+
+Reloading throttled tab doesn't work correctly
+
+regression
+
+Bug 597757 - Reloading throttled tab doesn't work correctly [r=dietrich, a=blocking-b7] 
+
+Backed out changeset c6034ebf7109 (bug 597757) for orange. a=me 
+
+Merge backout of c6034ebf7109 (bug 597757) for orange. a=me 
+
+Bug 597757 - Reloading throttled tab doesn't work correctly [r=dietrich, a=blocking-b7] 

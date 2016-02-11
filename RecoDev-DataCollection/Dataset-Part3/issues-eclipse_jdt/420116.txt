@@ -1,0 +1,172 @@
+Preparing to speak about JSR 308 at ECE I see that "Add implemented methods" nicely copies old annotations, but ignores type annotations.
+
+While the implementation looks straight-forward, I'm not sure what's the plan regarding ASTProvider.SHARED_AST_LEVEL. Is it still at JLS4 because some operations are still used that only exist below JLS8?
+
+Preparing to speak about JSR 308 at ECE I see that "Add implemented methods" nicely copies old annotations, but ignores type annotations.
+
+While the implementation looks straight-forward, I'm not sure what's the plan regarding ASTProvider.SHARED_AST_LEVEL. Is it still at JLS4 because some operations are still used that only exist below JLS8?
+Created attachment 236787
+Implementation sketch
+
+This patch succeeds during smoke testing :)
+
+But as mentioned, it's probably too early to switch to JLS8, right?
+Thanks Stephan for the patch, I have applied the patch and it works in normal cases.
+
+Consider the below interface:
+
+package typeAnnotation;
+
+import java.awt.List;
+
+import org.eclipse.jdt.annotation.NonNull;
+import org.eclipse.jdt.annotation.Nullable;
+
+interface A {
+
+	int foo1(@Nullable Object[] o1, Object @Nullable [] o2);
+
+	int foo2(Object @Nullable... o1);
+
+	int foo3(Object @Nullable [] o1, @Nullable Object... o2);
+
+	void foo4(@Nullable String s1, @NonNull String... s2);
+
+	void foo5(@Nullable List l1, java.util.@NonNull List<String> l2);
+}
+
+Implementing the above interface leaves the user with multiple errors.
+@Markus/ @Stephan : Can one of you point to valid and invalid cases in the above example.
+Bug 386410 contains pre-Java-8 discussions about when to copy annotations, and bug 386410 comment 4 the current conclusion for declaration annotations.
+
+In JDT UI, we use the helper method StubUtility2#isCopyOnInheritAnnotation(..) to decide whether an annotation should be copied or not.
+
+In BETA_JAVA8, TYPE_USE annotations are now part of a method parameter's ITypeBinding. They no longer appear in IMethodBinding#getParameterAnnotations(int), and that's why StubUtility2#createParameters(..) doesn't copy them any more.
+
+I think most cases will work fine after bug 417937 is fixed. We may have to fix the special case for varargs (copy type annotations as well).
+(In reply to Manju Mathew from comment #2)
+> Implementing the above interface leaves the user with multiple errors.
+> @Markus/ @Stephan : Can one of you point to valid and invalid cases in the
+> above example.
+
+Is this still relevant? If so, please also show the implementing class. If all annotations are directly copied, I wouldn't expect any error.
+(In reply to Stephan Herrmann from comment #4)
+> Is this still relevant? If so, please also show the implementing class.
+
+import java.awt.List;
+
+import org.eclipse.jdt.annotation.NonNull;
+import org.eclipse.jdt.annotation.Nullable;
+
+public class AImplemented implements A {
+
+	@Override
+	public int foo1(Object[] o1, @Nullable Object[] o2) { //Error1: annotation not copied to right location
+		// TODO Auto-generated method stub
+		return 0;
+	}
+
+	@Override
+	public int foo2(Object... o1) { //Error2: annotation is not copied
+		// TODO Auto-generated method stub
+		return 0;
+	}
+
+	@Override
+	public int foo3(@Nullable Object[] o1, @Nullable Object... o2) { //Error3: Same as Error1
+		// TODO Auto-generated method stub
+		return 0;
+	}
+
+	@Override
+	public void foo4(@Nullable String s1, @NonNull String... s2) {
+		// TODO Auto-generated method stub
+
+	}
+
+	@Override
+	public void foo5(@Nullable List l1, @NonNull java.util.List<String> l2) { //Error4: annotation not in right location
+		// TODO Auto-generated method stub
+
+	}
+
+}
+Created attachment 239210
+Updated Patch + Testcases
+
+With the fix for bug 417937, most of the cases are taken care off with out any changes in UI code. Bug 426094 handles annotation on dimentions. As Markus mentioned, we need to explicity take care of varargs in UI. I have updated the patch and also added few testcases. For the testcase to execute properly we need org.eclipse.jdt.annotation 2.o
+Created attachment 241534
+Patch+Tests
+
+Created the patch against master. Noopur, now you should be able to apply the patch neatly.
+(In reply to Manju Mathew from comment #6)
+> Created attachment 239210 [details] [diff]
+> For the testcase to execute
+> properly we need org.eclipse.jdt.annotation 2.0
+
+This dependency is removed now.
+1. The fix does not handle the type annotations on array dimensions with varargs.
+Example - a class implementing the following interface gets incorrect annotations on the method parameter:
+
+interface A {
+	int foo2C(@NonNull Object @NonNull [] @Nullable... o2);
+}
+
+Results in:
+
+class C implements A {
+
+	@Override
+	public int foo2C(@NonNull Object[] @NonNull... o2) {
+		// TODO Auto-generated method stub
+		return 0;
+	}
+}
+-----------------------------------------------------------------------------
+
+2. When the type annotations are not compiler's null annotations, the type annotations are still copied to the methods in the implementing class except the ones on a varargs parameter, which looks wrong. Either all non-compiler type annotations (including the ones on varargs) should be copied or none.
+
+Example:
+
+@Target({ TYPE_USE }) @interface N1 { }
+@Target({ TYPE_USE }) @interface N2 { }
+
+interface A {
+	int foo2(@N1 String @N2 [] s1, @N1 String @N2... s2);
+}
+
+Results in:
+
+class C implements A {
+
+	@Override
+	public int foo2(@N1 String @N2 [] s1, String... s2) {
+		// TODO Auto-generated method stub
+		return 0;
+	}
+
+}
+Created attachment 241597
+Patch+Tests
+
+(In reply to Noopur Gupta from comment #9)
+Thanks Noopur.
+> 1. The fix does not handle the type annotations on array dimensions with
+> varargs.
+Filed bug 431963 for this as the model does not return all the annotation in this case. Added a testcase which will be red till bug 431963 is fixed.
+
+> 2. When the type annotations are not compiler's null annotations, 
+I had uploaded the wrong patch which didn't consider comment 3. While copying type use annotation we need not check StubUtility2#isCopyOnInheritAnnotation. Added a testcase for this scenario.
+
+We will wait for bug 431963 to see if anything else has to be handled in UI for this issue.
+BETA_J8 is no longer a valid target. Can we adjust/reset the target please?
+The bug in StubUtility2#createParameters(..) is that it calls getElementType() and then manually adds array dimensions again, thereby losing all type annotations on intermediate dimensions.
+
+Since type annotations on varargs are so special, we also can't simply use imports.addImport(type, ast, context) as in the normal case, because we have to copy all but the last dimension.
+
+Fixed with http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=a42a1e1d629f0534edd86fd2b249cbfbce432b77 and released Manju's tests with http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=95f8397468004b3e0efb0321ba636831af5c03a4
+
+I've extracted the fetching of the org.eclipse.jdt.annotations path into
+Java18ProjectTestSetup.getJdtAnnotations20Path(), since that may also be interesting in other tests. Fixed the implementation so that it also works when running with a 1.6 or 1.7 JRE.
+I've also added a few more annotated dimensions to testUnimplementedMethods5 and fixed a typo in testUnimplementedMethods3.
+Forgot to actually import/set the type in the "if (!is50OrHigher)" branch. This triggered bug 432132. Fixed with http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=ea49c237d51a679a569c4069eac0a514f2bc8b1f

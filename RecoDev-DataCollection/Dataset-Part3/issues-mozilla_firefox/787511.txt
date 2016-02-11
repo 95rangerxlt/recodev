@@ -1,0 +1,165 @@
+SocialProvider.port is a foot-gun, because it's shared amongst all users of the provider, and so if two people try to set its onmessage, they'll conflict and one person's onmessage will never be called.
+
+The only uses of it outside of tests appear to be null checks in Social.jsm, who want to confirm that the provider is "active". We could introduce some other API for that.
+
+SocialProvider.getWorkerPort() is the only reasonable way to get a new worker port for a provider, so it shouldn't be "-"-prefixed to suggest that it's an internal method. Indeed there are already two "external" callers: browser-social.js for the activate button, and MozSocialAPI.
+
+SocialProvider.port is a foot-gun, because it's shared amongst all users of the provider, and so if two people try to set its onmessage, they'll conflict and one person's onmessage will never be called.
+
+The only uses of it outside of tests appear to be null checks in Social.jsm, who want to confirm that the provider is "active". We could introduce some other API for that.
+
+SocialProvider.getWorkerPort() is the only reasonable way to get a new worker port for a provider, so it shouldn't be "-"-prefixed to suggest that it's an internal method. Indeed there are already two "external" callers: browser-social.js for the activate button, and MozSocialAPI.
+Created attachment 658010
+Rename _getWorker to getWorker
+
+Hopefully most of the patch is obvious, but of note:
+
+* A number of tests made the assumption that _getWorkerPort() always returned the same port - specifically, they posted a test-initialize message in the first "sub-test" and later tests relied on this same port being used.  This was bad for a few reasons, including the fact the tests then relied on a specific order of sub-tests.
+
+* Similarly to the above, the WorkerAPI object now has a "terminate" method which closes that port.
+
+* I made an effort to have each test close each port that it grabbed - nothing too bad will happen if this isn't done, but it seems a good practice.
+
+* I removed the function sendWorkerMessage() as this was only used in the same module - "less is more" and all that...
+
+* I removed the exception handler from getWorkerPort() - there are no known reasons this should fail and it may mask subtle problems - letting the exception propagate seems better and may offer more insights into an underlying problem.
+
+try run at https://tbpl.mozilla.org/?tree=Try&rev=bac6f922d396
+oops - I inserted the para "* Similarly to the above," in the wrong place - please read it as "* Similarly to the point below..."
+Comment on attachment 658010
+Rename _getWorker to getWorker
+
+>diff --git a/browser/base/content/test/browser_social_chatwindow.js b/browser/base/content/test/browser_social_chatwindow.js
+
+>   testManyChats: function(next) {
+>     // open enough chats to overflow the window, then check
+>     // if the menupopup is visible
+>-    let port = Social.provider.port;
+>+    let port = Social.provider.getWorkerPort();
+>     ok(port, "provider has a port");
+>+    port.postMessage({topic: "test-init"});
+
+I wonder whether it makes sense to have each test use a single port (i.e. call getWorkerPort() in test() and assign it to a global variable used by all sub tests), rather than having each sub-test initialize its own port. It would require less changes to tests, but maybe it would be too confusing?
+
+>diff --git a/browser/modules/Social.jsm b/browser/modules/Social.jsm
+
+>   get uiVisible() {
+>-    return this.provider && this.provider.enabled && this.provider.port;
+>+    return this.provider && this.provider.enabled;
+
+As mentioned in comment 0, I don't think we should just get rid of this check - how about introducing a provider.canGetPort property (better name ideas welcome) instead?
+
+>   sharePage: function Social_sharePage(aURI) {
+>+    // this should not be called if this.provider or the port is null
+
+Then these comments would be unnecessary (or at least, you could modify to explain why it's OK not to handle getWorkerPort() failing).
+
+>diff --git a/toolkit/components/social/WorkerAPI.jsm b/toolkit/components/social/WorkerAPI.jsm
+
+> WorkerAPI.prototype = {
+>+  terminate: function terminate() {
+>+    this._port.close();
+>+  },
+
+Why is this necessary? All ports are closed automatically when the frameworker is terminated, right?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #3)
+> >diff --git a/browser/modules/Social.jsm b/browser/modules/Social.jsm
+> 
+> >   get uiVisible() {
+> >-    return this.provider && this.provider.enabled && this.provider.port;
+> >+    return this.provider && this.provider.enabled;
+> 
+> As mentioned in comment 0, I don't think we should just get rid of this
+> check - how about introducing a provider.canGetPort property (better name
+> ideas welcome) instead?
+
+For bug 766616, we may want a way to get at the loaded state of the worker as well.  So maybe something like provider.workerState where zero is ok, otherwise a current error value.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #3)
+> Comment on attachment 658010
+
+> I wonder whether it makes sense to have each test use a single port (i.e.
+> call getWorkerPort() in test() and assign it to a global variable used by
+> all sub tests), rather than having each sub-test initialize its own port. It
+> would require less changes to tests, but maybe it would be too confusing?
+
+I'm inclined to think this would be confusing and isn't in line with the semantics we are now putting in place (ie, that each port is somewhat "local" to the code using it).  The added complexity doesn't seem that high.
+
+> 
+> >diff --git a/browser/modules/Social.jsm b/browser/modules/Social.jsm
+> 
+> >   get uiVisible() {
+> >-    return this.provider && this.provider.enabled && this.provider.port;
+> >+    return this.provider && this.provider.enabled;
+> 
+> As mentioned in comment 0, I don't think we should just get rid of this
+> check - how about introducing a provider.canGetPort property (better name
+> ideas welcome) instead?
+
+I'm wondering about providers with no worker (ie, with no workerURL - we allow for that case in many other places.)  ISTM uiVisible should return true even for such workers, and that an error state should probably set provider.enabled to be false?
+
+> >   sharePage: function Social_sharePage(aURI) {
+> >+    // this should not be called if this.provider or the port is null
+> 
+> Then these comments would be unnecessary (or at least, you could modify to
+> explain why it's OK not to handle getWorkerPort() failing).
+
+This function will only be called *after* we have previously posted a social.user-recommend prompt and got back a valid response.  If a provider has no worker then we can't get that far.  I'll update the comments accordingly.
+
+> 
+> >diff --git a/toolkit/components/social/WorkerAPI.jsm b/toolkit/components/social/WorkerAPI.jsm
+> 
+> > WorkerAPI.prototype = {
+> >+  terminate: function terminate() {
+> >+    this._port.close();
+> >+  },
+> 
+> Why is this necessary? All ports are closed automatically when the
+> frameworker is terminated, right?
+
+All ports are closed when the worker terminates, but close() kills the port and removes it from the worker dictionaries immediately.  If we keep the close() method it makes sense to me that we attempt to use it whenever possible - but if you think this should be an exception to that I'm happy to remove it.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #4)
+> (In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment
+> #3)
+> > >diff --git a/browser/modules/Social.jsm b/browser/modules/Social.jsm
+> > 
+> > >   get uiVisible() {
+> > >-    return this.provider && this.provider.enabled && this.provider.port;
+> > >+    return this.provider && this.provider.enabled;
+> > 
+> > As mentioned in comment 0, I don't think we should just get rid of this
+> > check - how about introducing a provider.canGetPort property (better name
+> > ideas welcome) instead?
+> 
+> For bug 766616, we may want a way to get at the loaded state of the worker
+> as well.  So maybe something like provider.workerState where zero is ok,
+> otherwise a current error value.
+
+As mentioned above, I'm thinking of the case where a provider has no worker specified.  Also, wouldn't it make sense to set provider.enabled to false if there is a "fatal" error that prevents us using it effectively?  I can't see a use-case for a provider having enabled=true but also state=fatally_broken?
+Comment on attachment 658010
+Rename _getWorker to getWorker
+
+Review of attachment 658010:
+-----------------------------------------------------------------
+
+r+ if you make the following changes.
+
+::: browser/modules/Social.jsm
+@@ +78,4 @@
+>    },
+>  
+>    sharePage: function Social_sharePage(aURI) {
+> +    // this should not be called if this.provider or the port is null
+
+Can you add a Cu.reportError call here so it is easier to diagnose this problem when it occurs?
+
+::: toolkit/components/social/test/browser/browser_workerAPI.js
+@@ +32,2 @@
+>      ok(port, "should be able to get a port from the provider");
+>    
+
+nit: can you remove this whitespace that's around this line?
+https://hg.mozilla.org/integration/mozilla-inbound/rev/092a8add22fd
+Backed out in https://hg.mozilla.org/integration/mozilla-inbound/rev/f496fceb64ad for xpcshell test_SocialService.js bustage.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/efb706bd057c
+https://hg.mozilla.org/mozilla-central/rev/efb706bd057c
+https://hg.mozilla.org/releases/mozilla-aurora/rev/cdeb448e18da

@@ -1,0 +1,328 @@
+On Nightly, I have had frequent child process crashes in Workday, but they do not appear in about:crashes. I noticed just now that the checkbox for reporting crashes is also not present for those crashes. I can reproduce fairly easily by just clicking around in Workday for a couple minutes.
+
+On Nightly, I have had frequent child process crashes in Workday, but they do not appear in about:crashes. I noticed just now that the checkbox for reporting crashes is also not present for those crashes. I can reproduce fairly easily by just clicking around in Workday for a couple minutes.
+STR for this particular crash:
+
+1) Set layers.progressive-paint to true and restart Nightly
+2) Move Nightly over to a Retina display
+3) Log in to Workday.com
+4) Click into any of the menus that cause the "zoom" animation
+5) Keep repeating until a content process crash.
+
+The crash itself is not important - layers.progressive-paint is not a thing we're ever likely to turn on. We should find out why the crash report isn't being generated here in this case though.
+(Not entirely sure 2 is necessary - might be reproducible on other platforms without hidpi displays as well)
+So the good news is that, like I said, I can reproduce this crash. The bad news is that I can't reproduce it with a debug build. So figuring out what's going on here has been a real pain in the butt.
+
+I've reached kind of a wall. If I understand things correctly, OnChildProcessDumpRequested in nsExceptionHandler.cpp must be called in order for a child process minidump to be correctly generated. In the case described in this bug, this function is never being called.
+
+Digging in, it looks like Breakpad is responsible for calling OnChildProcessDumpRequested... so I kind of feel slightly out of my depth now...
+
+Hey ted, any idea why OnChildProcessDumpRequested might not be being called?
+So, dug into this a bit more. It looks like the content process is receiving a SIGTERM signal (though I don't know where from... this appears to occur _before_ ContentParent::ActorDestroy is called though), and we apparently don't create crash reports for SIGTERM.
+
+Why don't we create crash reports for SIGTERM?
+While I'm waiting on that information, I'll see if I can find out what's sending that SIGTERM.
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #4)
+> So, dug into this a bit more. It looks like the content process is receiving
+> a SIGTERM signal (though I don't know where from...
+
+Probably ipc/chromium/src/base/process_util_posix.cc:
+
+  bool KillProcess(ProcessHandle process_id, int exit_code, bool wait) {
+    bool result = kill(process_id, SIGTERM) == 0;
+
+Putting a breakpoint on that might be informative.  I notice there are a few references to it in the IPC code, as well as one in the IPDL compiler.
+It looks like the compositor thread is causing us to call KillProcess on the child process. Here's the stack:
+
+* thread #25: tid = 0x630940, 0x00000001016bb474 XUL`base::KillProcess(process_id=24855, exit_code=<unavailable>, wait=false) + 20 at process_util_posix.cc:70, name = 'Compositor', stop reason = breakpoint 1.2
+  * frame #0: 0x00000001016bb474 XUL`base::KillProcess(process_id=24855, exit_code=<unavailable>, wait=false) + 20 at process_util_posix.cc:70
+    frame #1: 0x00000001016d9424 XUL`mozilla::ipc::FatalError(aProtocolName=<unavailable>, aMsg=<unavailable>, aOtherPid=<unavailable>, aIsParent=<unavailable>) + 308 at ProtocolUtils.cpp:324
+    frame #2: 0x00000001017905e8 XUL`mozilla::layers::PLayerTransactionParent::Read(this=0x0000000000000000, v__=<unavailable>, msg__=<unavailable>, iter__=0x00000001129868b8) + 216 at PLayerTransactionParent.cpp:2423
+    frame #3: 0x000000010178c15a XUL`mozilla::layers::PLayerTransactionParent::Read(this=0x00000001240d0160, v__=0x0000000112986878, msg__=0x0000000112986b20, iter__=0x00000001129868b8) + 170 at PLayerTransactionParent.cpp:4576
+    frame #4: 0x000000010178b05b XUL`mozilla::layers::PLayerTransactionParent::OnMessageReceived(this=0x00000001240d0160, msg__=0x0000000112986b20) + 1227 at PLayerTransactionParent.cpp:425
+    frame #5: 0x00000001018f7758 XUL`mozilla::layers::PCompositorParent::OnMessageReceived(this=<unavailable>, msg__=0x0000000112986b20) + 232 at PCompositorParent.cpp:509
+    frame #6: 0x00000001016d6896 XUL`mozilla::ipc::MessageChannel::DispatchAsyncMessage(this=0x000000011c20ec68, aMsg=0x0000000112986b20) + 118 at MessageChannel.cpp:1382
+    frame #7: 0x00000001016d6011 XUL`mozilla::ipc::MessageChannel::DispatchMessage(this=0x000000011c20ec68, aMsg=<unavailable>) + 241 at MessageChannel.cpp:1302
+    frame #8: 0x00000001016d2d77 XUL`mozilla::ipc::MessageChannel::OnMaybeDequeueOne(this=0x000000011c20ec68) + 167 at MessageChannel.cpp:1273
+    frame #9: 0x00000001016b4524 XUL`MessageLoop::DeferOrRunPendingTask(MessageLoop::PendingTask const&) [inlined] MessageLoop::RunTask(task=0x000000011c21f890, this=0x0000000112986d20) + 132 at message_loop.cc:364
+    frame #10: 0x00000001016b4513 XUL`MessageLoop::DeferOrRunPendingTask(this=0x0000000112986d20, pending_task=<unavailable>) + 115 at message_loop.cc:372
+    frame #11: 0x00000001016b483a XUL`MessageLoop::DoWork(this=0x0000000112986d20) + 170 at message_loop.cc:459
+    frame #12: 0x00000001016b5046 XUL`base::MessagePumpDefault::Run(this=0x0000000112ccb520, delegate=0x0000000112986d20) + 758 at message_pump_default.cc:34
+    frame #13: 0x00000001016b40ad XUL`MessageLoop::Run() [inlined] MessageLoop::RunInternal(this=<unavailable>) + 77 at message_loop.cc:234
+    frame #14: 0x00000001016b409e XUL`MessageLoop::Run() [inlined] MessageLoop::RunHandler(this=<unavailable>) at message_loop.cc:227
+    frame #15: 0x00000001016b409e XUL`MessageLoop::Run(this=<unavailable>) + 62 at message_loop.cc:201
+    frame #16: 0x00000001016bc43b XUL`base::Thread::ThreadMain(this=0x0000000112ccb430) + 187 at thread.cc:170
+    frame #17: 0x00000001016bc49a XUL`ThreadFunc(closure=<unavailable>) + 10 at platform_thread_posix.cc:39
+    frame #18: 0x00007fff8305d772 libsystem_c.dylib`_pthread_start + 327
+
+I believe that when the main thread experiences IPC message foul-ups (somebody returns false, or somebody returns a nullptr for an Alloc) we properly collect a crash report. Perhaps this is not the case for off-main-thread?
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #4)
+> Why don't we create crash reports for SIGTERM?
+
+[Summarizing IRC a little...]
+
+Normally SIGTERM means that something is explicitly requesting the process to exit immediately and (if possible) cleanly — either the user directly, or a situation like the system shutting down — so it's usually not anything we did wrong.  (See also bug 336193.)  Child processes are a little different, and I understand that we have instrumentation in ContentParent::KillHard to take a minidump of the child before killing it in that case, but the child process handling is… complicated.
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #7)
+> I believe that when the main thread experiences IPC message foul-ups
+> (somebody returns false, or somebody returns a nullptr for an Alloc) we
+> properly collect a crash report. Perhaps this is not the case for
+> off-main-thread?
+
+From a quick look at the generated code, it looks as if the only cases where mozilla::ipc::FatalError is called if there's an out-of-range IPDL union discriminant or if a ParamTraits<T>::Read (i.e., deserialization) routine fails.  Most of the reasons that can happen mean the data stream is corrupt, but one possibility is a FallibleTArray when the receiver's allocation fails.
+
+It looks like the other cases (Recv* returning false, failed Alloc* on the receive side) just return errors from the OnMessageReceived method, which is probably where we're tapping in to do the paired minidump?
+(In reply to Jed Davis [:jld] {UTC-7} from comment #9)
+> (In reply to Mike Conley (:mconley) - Needinfo me! from comment #7)
+> > I believe that when the main thread experiences IPC message foul-ups
+> > (somebody returns false, or somebody returns a nullptr for an Alloc) we
+> > properly collect a crash report. Perhaps this is not the case for
+> > off-main-thread?
+> 
+> From a quick look at the generated code, it looks as if the only cases where
+> mozilla::ipc::FatalError is called if there's an out-of-range IPDL union
+> discriminant or if a ParamTraits<T>::Read (i.e., deserialization) routine
+> fails.  Most of the reasons that can happen mean the data stream is corrupt,
+> but one possibility is a FallibleTArray when the receiver's allocation fails.
+> 
+> It looks like the other cases (Recv* returning false, failed Alloc* on the
+> receive side) just return errors from the OnMessageReceived method, which is
+> probably where we're tapping in to do the paired minidump?
+
+That sounds right.
+
+So, uh, do you know if it's possible to behave like the latter case under the before conditions? Note that I think your experience in this area far outstrips mine. :)
+We could just turn _fatalError into _protocolErrorBreakpoint (in the IPDL compiler), but I don't know if there are reasons why things are the way they are (and I can't really ask the people responsible because they're not very active these days).  Bill, any insight here?
+I suspect the logic here has to do with whether it's reasonable to recover from the error or not. If we can't deserialize some data, then we're unlikely to be able to understand future messages from the child either, so we should kill it. Things like message handlers returning false are potentially recoverable.
+
+I'd suggest we add some sort of ability for individual protocols to override the FatalError behavior. However, the default behavior if you don't implement this method would be to MOZ_CRASH() (which would definitely send us a crash report). Then we would override the FatalError behavior for CrossProcessCompositorParent to do something reasonable. Maybe it could post a message to the main thread asking it to take a minidump and kill the child. We'll need to be careful to close the CompositorParent channel right away though so that we don't get any more bad messages coming in.
+(In reply to Bill McCloskey (:billm) from comment #12)
+> I suspect the logic here has to do with whether it's reasonable to recover
+> from the error or not. If we can't deserialize some data, then we're
+> unlikely to be able to understand future messages from the child either, so
+> we should kill it. Things like message handlers returning false are
+> potentially recoverable.
+> 
+> I'd suggest we add some sort of ability for individual protocols to override
+> the FatalError behavior. However, the default behavior if you don't
+> implement this method would be to MOZ_CRASH() (which would definitely send
+> us a crash report).
+
+The FatalError code we're seeing execute, at least for the STR in this bug, is executing in the parent process. If we use MOZ_CRASH, we'll be crashing the parent process... is that really what we want here, or am I misunderstanding?
+
+> Then we would override the FatalError behavior for
+> CrossProcessCompositorParent to do something reasonable. Maybe it could post
+> a message to the main thread asking it to take a minidump and kill the
+> child. We'll need to be careful to close the CompositorParent channel right
+> away though so that we don't get any more bad messages coming in.
+
+Yes, that sounds reasonable.
+
+ni? on the MOZ_CRASH bit.
+> The FatalError code we're seeing execute, at least for the STR in this bug, is executing in
+> the parent process. If we use MOZ_CRASH, we'll be crashing the parent process... is that
+> really what we want here, or am I misunderstanding?
+
+If there were some way to always crash the child and get a crash report, then we should do that. But I think that would be pretty hard. The CompositorParent case is one example of why it would be difficult (need to deal with threads and stuff).
+
+I'm mostly concerned that we always find out when these problems happen, so that's why I think crashing the parent is the right thing to do. If we start seeing such crashes, we can modify whichever protocol it is to crash the child instead.
+The ContentProcess::KillHard stuff grabs a paired minidump from each process before killing the child. I wonder if we can use the same mechanism here.
+That seems like what we want to do, yeah. jimm spent some time making that work in some different scenarios, he might have some useful pointers.
+(In reply to Ted Mielczarek [:ted.mielczarek] from comment #16)
+> That seems like what we want to do, yeah. jimm spent some time making that
+> work in some different scenarios, he might have some useful pointers.
+
+Hey jimm, here's what I'm struggling with:
+
+I want to find a way of re-using (or abstracting out) the logic in ContentParent::KillHard which lets us gather the paired minidumps, in the event that a protocol managed by ContentParent hits a FatalError. Right now, when we hit a FatalError, we go right into here: https://dxr.mozilla.org/mozilla-central/rev/90d9b7c391d38ae118865bd87b5d011feee6dded/ipc/glue/ProtocolUtils.cpp#324, which kills the process without letting us gather the report.
+
+How do you recommend I structure this? Is there a way of having the tree of protocols echo up the FatalError up their ancestry, and if it hits a root that doesn't have a crash reporter, to just kill the process as we're currently doing - but if it finds a root that does have a crash reporter, like ContentParent, to use KillHard?
+
+After that, would we be able to go with billm's idea in comment 12 for overriding that functionality in CompositorParent so that we post a message to the main thread with information about the fatal error that occurred in the CompositorParent before KillHard'ing the content process?
+
+I won't lie - I'm feeling a bit out of my depth here. I think I've figured out the problem, but considering how much time is remaining before I go on PTO, I don't believe I'll be able to engineer a robust solution before I head out.
+Top-level protocols are all essentially independent. We do have an mOpener field that will usually point to the ContentParent or ContentChild, but it's not necessarily on the same thread.
+
+Mike, what scenario are you trying to cover here? There are a limited number of top-level protocols. These are the ones I can think of:
+- PContent and PContentBridge
+- PCompositor
+- PHangMonitor
+- PPluginModule
+- PGMP, PGMPService, PGMPContent
+
+Of these, only the PContent ones and PPluginModule run on the main thread. Also, PCompositor and the GMP stuff can link two threads in the same process.
+
+I'd really rather go with something simple here. I'm hoping it will be pretty uncommon to get these sorts of errors, so the MOZ_CRASH solution should be fine. If we need something more complex, we can address that separately.
+(In reply to Bill McCloskey (:billm) from comment #18)
+> Top-level protocols are all essentially independent. We do have an mOpener
+> field that will usually point to the ContentParent or ContentChild, but it's
+> not necessarily on the same thread.
+> 
+> Mike, what scenario are you trying to cover here? There are a limited number
+> of top-level protocols. These are the ones I can think of:
+> - PContent and PContentBridge
+> - PCompositor
+> - PHangMonitor
+> - PPluginModule
+> - PGMP, PGMPService, PGMPContent
+
+I suppose I'm perhaps exposing some of my ignorance of how all of this works.
+
+What I know is that ContentParent contains the method that KillHard's and collects the paired minidumps. I figure that the same mechanism should probably be re-used in the case of a FatalError. I guess I'm trying to find the best way of going from the latter to the former.
+(In reply to Mike Conley (:mconley) - (Going dark Aug 20 - Sept 11) from comment #19)
+> What I know is that ContentParent contains the method that KillHard's and
+> collects the paired minidumps. I figure that the same mechanism should
+> probably be re-used in the case of a FatalError. I guess I'm trying to find
+> the best way of going from the latter to the former.
+
+Right, but KillHard is a main-thread-only method. So for most of these protocols we can't use it directly. I suppose you could try to generalize the "post a KillHard event to the main thread" solution, but it will be tricky to get it right.
+
+I'd rather we just do the simple thing first and see if that works.
+(In reply to Bill McCloskey (:billm) from comment #20)
+> (In reply to Mike Conley (:mconley) - (Going dark Aug 20 - Sept 11) from
+> comment #19)
+> > What I know is that ContentParent contains the method that KillHard's and
+> > collects the paired minidumps. I figure that the same mechanism should
+> > probably be re-used in the case of a FatalError. I guess I'm trying to find
+> > the best way of going from the latter to the former.
+> 
+> Right, but KillHard is a main-thread-only method. So for most of these
+> protocols we can't use it directly. I suppose you could try to generalize
+> the "post a KillHard event to the main thread" solution, but it will be
+> tricky to get it right.
+> 
+> I'd rather we just do the simple thing first and see if that works.
+
+Just so we're clear, the simple thing that is being suggested is to crash the main process with MOZ_CRASH so as to guarantee a crash report?
+> Just so we're clear, the simple thing that is being suggested is to crash the main process
+> with MOZ_CRASH so as to guarantee a crash report?
+
+Yes. Maybe we could annotate the crash report with the name of the protocol or something. I'm not sure there's much else we can get from the crash report anyway.
+(In reply to Bill McCloskey (:billm) from comment #20)
+> (In reply to Mike Conley (:mconley) - (Going dark Aug 20 - Sept 11) from
+> comment #19)
+> > What I know is that ContentParent contains the method that KillHard's and
+> > collects the paired minidumps. I figure that the same mechanism should
+> > probably be re-used in the case of a FatalError. I guess I'm trying to find
+> > the best way of going from the latter to the former.
+> 
+> Right, but KillHard is a main-thread-only method. So for most of these
+> protocols we can't use it directly. I suppose you could try to generalize
+> the "post a KillHard event to the main thread" solution, but it will be
+> tricky to get it right.
+> 
+> I'd rather we just do the simple thing first and see if that works.
+
+Bill is right, your crash is being initiated on the compositor thread, and you would like to call code in ContentParent which needs to be called on the main thread.
+
+This said, the code in CrashReporterParent is a light wrapper around the CrashReporter apis which do most of the work, and I believe these routines are mostly multithread safe -
+
+http://mxr.mozilla.org/mozilla-central/source/dom/ipc/CrashReporterParent.h#185
+
+I think you could pull a little bit of this over into CompositorParent to accomplish what you want to do. I like Bill's idea of overriding FatalError via a handler CompositorParent implements. You'll have to muck around in lower.py which doesn't have commenting and is hard to follow, but isn't hard to hack on, to add the handler.
+(In reply to Bill McCloskey (:billm) from comment #14)
+> If there were some way to always crash the child and get a crash report,
+> then we should do that. But I think that would be pretty hard.
+
+On Unix systems you can send one of the crash signals with kill() or similar; breakpad will request a crash dump from the parent — via code that attempts to be thread-safe and async-signal-safe — and then kill the process.  (It detects that the signal is fake, but this is currently used only to determine the right way to re-raise it.)  I don't know if there's anything equivalent on Windows.
+
+The important question, I think, is what information we're trying to get out of this.  Currently we have a parent process crash, which gives us this:
+
+>    frame #2: 0x00000001017905e8 XUL`mozilla::layers::PLayerTransactionParent::Read(this=0x0000000000000000, v__=<unavailable>, msg__=<unavailable>, iter__=0x00000001129868b8) + 216 at PLayerTransactionParent.cpp:2423
+
+In my copy that's this:
+
+   2422     if ((!(Read((&((v__)->format())), msg__, iter__)))) {
+   2423         FatalError("Error deserializing 'format' (SurfaceFormat) member of 'SurfaceDescriptorShmem'");
+
+The `format` member is a `mozilla::gfx::SurfaceFormat`, which is an `enum class`, whose `ParamTraits` specialization inherits from `ContiguousEnumSerializer`, which inherits from `EnumSerializer` instantiated with a `ContiguousEnumValidator`… which, as expected, returns false from the Read() method if the value is out of range.  It's possible the value was corrupted in the child process, but in a debug build the child would MOZ_ASSERT instead of writing a bad value.  (This is all in ipc/glue/IPCMessageUtils.h.)
+
+That gets us to comment #3:
+
+> The bad news is that I can't reproduce it with a debug build.
+
+Thought #1: Maybe try reproducing that on a non-debug build with EnumSerializer changed to use a release assertion?  (But first, double-check that the PLayerTransactionParent.cpp from the stack I quoted matches the one I was looking at.)
+
+Thought #2: MOZ_CRASH()ing the parent in the case of bad input from a semi-untrusted process seems like a bad idea, but the parent stack was the one with the useful information.  If getting a paired minidump in this case is too difficult, would getting a non-fatal crash dump of just the parent be easier?
+
+Thought #3: A child process crash dump probably wouldn't help.  The child has already serialized its message, sent it asynchronously (this looks like part of a PLayerTransaction::PTexture constructor?), and moved on.  The minidump contains the thread stacks and not much else; heap corruption wouldn't be evident unless caught in the act.
+Good thoughts. Thought #3 is actually spot on - a minidump from the child is useless in the case that spawned this bug. It should be possible to FatalError in the content process though, in which case it'd be good if we could record a content process minidump.
+
+So, to be clear, we want a minidump from the process that saw FatalError. The other process is probably doing unrelated things.
+
+It's not fully symmetrical though, at least in the behaviour that (ideally) the end-user would see. In both cases, they should see a content process crash with the ability to submit a crash report.
+
+I'm also a bit hesitant to go the MOZ_CRASH route because of jld's Thought #2. Perhaps it's okay for the short term though? At least it could, theoretically, give us a sense of how bad this problem is (at the potential expense of total browser stability, unfortunately).
+Created attachment 8649457
+MozReview Request: Bug 1191976 - Intentionally crash if we hit an IPC FatalError in the parent process. r?billm
+
+Bug 1191976 - Intentionally crash non-release builds if we hit an IPC FatalError in the parent process. r?billm
+
+When the parent process has trouble deserializing an IPC message from the content
+process, it originally killed that content process. This doesn't result in us
+creating a crash report (and doing so is difficult if the FatalError is hit
+off main thread). We now crash the parent process if we hit such a FatalError
+in the parent process. This will hopefully give us an idea of how frequent
+these FatalErrors are, since up until now we've been getting no crash data
+for them.
+Comment on attachment 8649457
+MozReview Request: Bug 1191976 - Intentionally crash if we hit an IPC FatalError in the parent process. r?billm
+
+https://reviewboard.mozilla.org/r/16413/#review14717
+
+::: ipc/glue/ProtocolUtils.cpp:321
+(Diff revision 1)
+> +    MOZ_DIAGNOSTIC_ASSERT(false, "IPC FatalError in the parent process!");
+
+I'm worried we'll forget about this and not get crashes in release. Can we just MOZ_ASSERT?
+
+Also, it would be nice to include more information in the crash report. Can you do CrashReporter::AnnotateCrashReport with aMsg?
+Comment on attachment 8649457
+MozReview Request: Bug 1191976 - Intentionally crash if we hit an IPC FatalError in the parent process. r?billm
+
+Bug 1191976 - Intentionally crash if we hit an IPC FatalError in the parent process. r?billm
+
+When the parent process has trouble deserializing an IPC message from the content
+process, it originally killed that content process. This doesn't result in us
+creating a crash report (and doing so is difficult if the FatalError is hit
+off main thread). We now crash the parent process if we hit such a FatalError
+in the parent process. This will hopefully give us an idea of how frequent
+these FatalErrors are, since up until now we've been getting no crash data
+for them.
+Comment on attachment 8649457
+MozReview Request: Bug 1191976 - Intentionally crash if we hit an IPC FatalError in the parent process. r?billm
+
+Something like this?
+Comment on attachment 8649457
+MozReview Request: Bug 1191976 - Intentionally crash if we hit an IPC FatalError in the parent process. r?billm
+
+https://reviewboard.mozilla.org/r/16413/#review14729
+
+Thanks. Looks great.
+
+::: ipc/glue/ProtocolUtils.cpp:324
+(Diff revision 2)
+> -
+> +    CrashReporter::AnnotateCrashReport(NS_LITERAL_CSTRING("IPCFatalErrorProtocol"),
+
+Not sure we need this since it's in aMsg, but I guess it could be useful for automated processing.
+https://reviewboard.mozilla.org/r/16413/#review14729
+
+> Not sure we need this since it's in aMsg, but I guess it could be useful for automated processing.
+
+Yeah, I guess that's what I was going for there. I'll keep it for now.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=66a4cfc599bc
+url:        https://hg.mozilla.org/integration/mozilla-inbound/rev/5078ba83b951acef9da5eb9d7787f3ccc32dee3f
+changeset:  5078ba83b951acef9da5eb9d7787f3ccc32dee3f
+user:       Mike Conley <mconley@mozilla.com>
+date:       Tue Aug 18 15:28:01 2015 -0400
+description:
+Bug 1191976 - Intentionally crash if we hit an IPC FatalError in the parent process. r=billm
+
+When the parent process has trouble deserializing an IPC message from the content
+process, it originally killed that content process. This doesn't result in us
+creating a crash report (and doing so is difficult if the FatalError is hit
+off main thread). We now crash the parent process if we hit such a FatalError
+in the parent process. This will hopefully give us an idea of how frequent
+these FatalErrors are, since up until now we've been getting no crash data
+for them.
+https://hg.mozilla.org/mozilla-central/rev/5078ba83b951

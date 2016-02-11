@@ -1,0 +1,171 @@
+STR: 
+
+1. Install any addon that opens up its home page after installing it. As an example you can use <a href="https://addons.mozilla.org/es/firefox/addon/youtube-video-and-audio-dow/versions">YouTube Video and Audio Downloader</a>.
+2. After that, try to open the customization tab at the same time the addon opens up its own page (you have to do it quickly).
+
+Result: 
+The customization palette gets merged with the addon's page. 
+
+Note: It may not be easy to reproduce this many times, as you have to nearly perfectly synchronize the time each tab is opened.
+
+STR: 
+
+1. Install any addon that opens up its home page after installing it. As an example you can use <a href="https://addons.mozilla.org/es/firefox/addon/youtube-video-and-audio-dow/versions">YouTube Video and Audio Downloader</a>.
+2. After that, try to open the customization tab at the same time the addon opens up its own page (you have to do it quickly).
+
+Result: 
+The customization palette gets merged with the addon's page. 
+
+Note: It may not be easy to reproduce this many times, as you have to nearly perfectly synchronize the time each tab is opened.
+Created attachment 769887
+Merge conflict
+Same issue as bug 889428?
+
+But going to call this P1, since having confused tab locations sounds like a serious problem (even thought the URL bar is blank in screenshot, so not an obvious spoofing issue).
+(In reply to Justin Dolske [:Dolske] from comment #2)
+> Same issue as bug 889428?
+
+This doesn't appear to be the same issue. Bug 889428 is only concerned with the identity-block part of the location bar and won't affect anywhere else.
+
+> But going to call this P1, since having confused tab locations sounds like a
+> serious problem (even thought the URL bar is blank in screenshot, so not an
+> obvious spoofing issue).
+
+I think P1 is too high for this, as this seems to me like a very low-occurrence edge case. From comment #0, "It may not be easy to reproduce this many times, as you have to nearly perfectly synchronize the time each tab is opened."
+I've tried for a while now but I can't reproduce this. Looking at the code, I also don't see how this could happen, unless addTab's loading of stuff is racy with switchToTabHavingURI checking if the tab is blank.
+It's very concerning to me that we could have a race-condition somewhere that might allow for URL bar spoofing. But I suppose the two factors here (customization + addon install) don't involve any content-driven concerns, so it's unclear how this would be exploitable in practice.
+(In reply to :Gijs Kruitbosch from comment #4)
+> I've tried for a while now but I can't reproduce this. Looking at the code,
+> I also don't see how this could happen, unless addTab's loading of stuff is
+> racy with switchToTabHavingURI checking if the tab is blank.
+
+But actually, a quick check using the scratchpad suggests that this last bit is actually possible. Which is scary. Here's my amateurish scratchpad:
+
+myT = setInterval(function() console.log(gBrowser.selectedTab.linkedBrowser.currentURI.spec), 30);
+setTimeout(function() {
+gBrowser.addTab("chrome://browser/content/bookmarks/bookmarksPanel.xul");
+}, 1000);
+
+setTimeout(function() {
+  switchToTabHavingURI("chrome://global/content/console.xul", true);
+}, 1000);
+
+setTimeout(function() { clearTimeout(myT); }, 3000);
+
+(URLs used were pretty much random chrome URLs)
+
+Output:
+
+--
+[19:44:17.316] "about:addons" (33) (this was the current tab when I ran this)
+[19:44:18.399] "about:blank" (1)
+[19:44:18.420] "chrome://global/content/console.xul" (49)
+--
+
+So, hypothetically, if the switchToTabHavingURI fired at 19:44:18.399, that would have 'taken over' the tab, because of this block of code:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#7068
+7069   if (aOpenNew) {
+7070     if (isBrowserWindow && isTabEmpty(gBrowser.selectedTab))
+7071       gBrowser.selectedBrowser.loadURI(aURI.spec);
+
+This is bad, AFAICT. However, looking at this in the clear light of morning (I ran this yesterday and got distracted) it's actually the opposite of what happened: the tab with real content was selected, but customize mode is shown anyway.
+
+I'm guessing that to get this to happen, we enter customization mode, and then somehow don't detect the tabselect event that moves us away from the about:customizing tab, so we're not showing the tabbrowser's browser but we're showing the customization UI. Which might be because it's add-on-triggered, or maybe there's something else. I'll try and investigate more.
+see also bug 933188
+*** Bug 933188 has been marked as a duplicate of this bug. ***
+From bug 933188,
+
+Steps to reproduce:
+- Create the following tabs in this order:
+  [Normal Page] [Customize Tab] [Another Normal Page]
+- Use keyboard shortcuts (Ctrl+PgDown) to quickly switch from the first to the last tab.
+
+Expected result: last tab is selected and content area shows the matching page
+Actual result: last tab is selected but shows the customize UI in content area (see attachment 825234)
+Per comment #9, I'm upping the priority; this is pretty bad UX... :-\
+Created attachment 8359219
+Australis' customize tab gets mixed up with other tab,
+
+This fixes it for me. I've added a test as well... I'm a little bit nervous about that because it's testing a race condition, but it seems to work.
+Comment on attachment 8359219
+Australis' customize tab gets mixed up with other tab,
+
+Hrm, this seems to break session restoring customize mode...
+Created attachment 8359804
+Australis' customize tab gets mixed up with other tab,
+
+So this fixes the session restore issue as well. There is a remaining issue which is if you have [a][b][c] and [b] is customize mode, and you tab through a-b-c-b quickly in that order, and b has history in the tab, it goes out of customize mode, re-enters customize mode, and then exits again because the tab has history and we use history.goBack and that triggers an onLocationChange which triggers another call to exit. However, at least the state of things is consistent at that point, and if you go forward again you end up in customize mode again just fine. Also, not sure how to fix that remaining issue.
+Comment on attachment 8359804
+Australis' customize tab gets mixed up with other tab,
+
+Review of attachment 8359804:
+-----------------------------------------------------------------
+
+r=me with the nits below addressed.
+
+::: browser/base/content/browser.js
+@@ +3707,5 @@
+>  
+>        // Try not to instantiate gCustomizeMode as much as possible,
+>        // so don't use CustomizeMode.jsm to check for URI or customizing.
+>        let customizingURI = "about:customizing";
+> +      if (location == customizingURI) {
+
+side note, it doesn't look like we lowercase the location before comparing it here.
+
+::: browser/components/customizableui/src/CustomizeMode.jsm
+@@ +69,5 @@
+>    get panelUIContents() {
+>      return this.document.getElementById("PanelUI-contents");
+>    },
+>  
+> +  get handler() {
+
+This getter doesn't need to be public, please put a _ prefix on it.
+
+@@ +94,5 @@
+>      }
+>  
+> +    // Exiting; want to re-enter once we've done that.
+> +    if (this.handler.isExitingCustomizeMode) {
+> +      return;
+
+Please add a LOG() here and in the complimentary exit() function.
+
+@@ +326,5 @@
+> +          // problematic URL (e.g. about:idontexist)
+> +          try {
+> +            custBrowser.goBack();
+> +          } catch (ex) {
+> +            console.error(ex);
+
+We should use ERROR() here.
+
+::: browser/components/customizableui/test/browser_889120_customize_tab_merging.js
+@@ +4,5 @@
+> +
+> +"use strict";
+> +
+> +const kTestToolbarId = "test-empty-drag";
+> +Services.prefs.setBoolPref("browser.uiCustomization.skipSourceNodeCheck", true);
+
+side note, we should probably just add this to the head.js file in this directory, along with a registerCleanupFunction to revert it.
+https://hg.mozilla.org/integration/fx-team/rev/d614fa6b53b2
+https://hg.mozilla.org/mozilla-central/rev/d614fa6b53b2
+backed this fix out to see if this fix https://bugzilla.mozilla.org/show_bug.cgi?id=960389
+Green on backout.
+remote:   https://tbpl.mozilla.org/?tree=Try&rev=e6bc4af89cca
+So this patch, even without all the test changes, caused test failures on WinXP PGO only. I'll investigate tomorrow.
+(In reply to :Gijs Kruitbosch from comment #20)
+> So this patch, even without all the test changes, caused test failures on
+> WinXP PGO only. I'll investigate tomorrow.
+
+Huh, except they seem intermittent. And even after the backout, the tree hasn't been completely green. Joy.
+remote:   https://tbpl.mozilla.org/?tree=Try&rev=3d14839886a8
+
+Let's see how we're doing after the fix from bug 960389.
+Annnnnd the try run was fantastically green. Relanded:
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/e8410904d857
+https://hg.mozilla.org/mozilla-central/rev/e8410904d857

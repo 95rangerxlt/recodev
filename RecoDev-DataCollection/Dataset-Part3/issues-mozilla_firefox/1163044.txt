@@ -1,0 +1,197 @@
+Test: pointerevent_setpointercapture_inactive_button_mouse-manual.html
+
+On normal window setPointerCapture works good.
+On e10s issue: InvalidPointerId: Invalid pointer id.
+
+Test: pointerevent_setpointercapture_inactive_button_mouse-manual.html
+
+On normal window setPointerCapture works good.
+On e10s issue: InvalidPointerId: Invalid pointer id.
+Some investigation:
+There are two processes on e10s window.
+First of it [FF.exe or main process] has correct data in nsPresShell::gActivePointersIds and that data is permanent updated by PresShell::UpdateActivePointerState().
+Second process [plugin-container or content process] have no data with pointers with inactive state.
+That's why mozilla::dom::Element::SetPointerCapture() have no information about pointers.
+As result we have exception.
+Additional investigation:
+> bool TabParent::SendRealMouseEvent(WidgetMouseEvent& event)
+> {
+> ...
+>     // When we mouseenter the tab, the tab's cursor should become the current cursor.
+>     if (event.message == NS_MOUSE_ENTER_WIDGET ||
+>         event.message == NS_MOUSE_OVER) {
+> ...
+>       // We don't actually want to forward NS_MOUSE_ENTER_WIDGET messages.
+>       return true;
+> ...
+[Content process] has no correct information about inactive pointers because needed messages from [Main process] are blocked. Why?
+We don't forward those events because there is then explicit
+http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3813
+
+Are you not getting NS_MOUSE_ENTER_WIDGET on child side?
+(In reply to Olli Pettay [:smaug] from comment #3)
+> Are you not getting NS_MOUSE_ENTER_WIDGET on child side?
+[Content process] does not receive NS_MOUSE_ENTER_WIDGET.
+> We don't forward those events because there is then explicit
+> http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3813
+Unfortunately
+> EventStateManager::DispatchMouseOrPointerEvent()
+> {
+> ...
+>     if (IsRemoteTarget(aTargetContent)) {
+> ...
+>       if (aMessage == NS_MOUSE_OVER) {
+> ...
+>         CreateMouseOrPointerWidgetEvent(..., NS_MOUSE_ENTER_WIDGET, ...);
+> ...
+> }
+in e10s case IsRemoteTarget(aTargetContent) returns FALSE.
+In child process yes, it should be true on parent process.
+But indeed, do we end up calling 
+HandleCrossProcessEvent with NS_MOUSE_ENTER_WIDGET,
+which ends up calling TabParent::SendRealMouseEvent and then just does effectively nothing
+because the event type is NS_MOUSE_ENTER_WIDGET. That is buggy or at least really weird.
+
+I think we need to forward NS_MOUSE_ENTER_WIDGET to child process.
+At the time I wrote that, the event was called NS_MOUSE_ENTER_SYNTH and I probably misinterpreted how it was supposed to work.  I believe NS_MOUSE_ENTER was the event I needed to filter (as the comment says).  My patch changed its behavior in part of the ESM:
+http://hg.mozilla.org/mozilla-central/rev/9ab4b311726d#l1.61
+but I was focused on mouse events and probably missed pointer stuff.  I believe you can indeed remove the condition from TabParent::SendRealMouseEvent.
+But why we need to filter out NS_MOUSE_ENTER_WIDGET?
+NS_MOUSE_ENTER_SYNTH became NS_MOUSE_ENTER_WIDGET in bug 1158425.  I'm agreeing that, although we need to filter NS_MOUSE_ENTER, filtering NS_MOUSE_ENTER_WIDGET probably isn't needed.
+Err, I was reading that backwards.  Give me a minute to look at this.
+So, reading more closely, the events changed as:
+
+NS_MOUSE_ENTER_SYNTH -> NS_MOUSE_OVER
+NS_MOUSE_ENTER -> NS_MOUSE_ENTER_WIDGET
+
+Using the new names, the block of code I cited was intended to alert the tab when the mouse entered its region (for cursor reason) but we were not informing the Tab of the event (which was a cause of the cursor bug -- this is easily seen in the patch) so I didn't forward it in order to maintain existing behavior.  That was the only reason I had for that.
+
+(NI to smaug so he sees this.)
+Ok, so maintaining the old behavior was the old reason. Fine.
+Maksim, sounds like we need to just change that behavior and send proper event to the child process.
+Created attachment 8606251
+mouse_enter_widget_ver1.diff
+
+- Removed suppressing forvarding NS_MOUSE_ENTER_WIDGET and NS_MOUSE_OVER into [content process]
+
+Suggestions and comments and objections are very welcome.
+I would like to notify about some additional investigation:
+
+(*) Look's like, such code send unwanted NS_MOUSE_ENTER_WIDGET, at least at (**) I can see that NS_MOUSE_ENTER_WIDGET is sended twice into [content process].
+I tested some internal tests (maybe it were small samples), but I have never seen at this place (**) events except NS_MOUSE_ENTER_WIDGET and NS_MOUSE_EXIT_WIDGET. NS_MOUSE_OVER and NS_MOUSE_OUT are realy needed at this place?
+
+(*) http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3815
+(**) http://mxr.mozilla.org/mozilla-central/source/dom/ipc/TabParent.cpp#1220
+So where is the NS_MOUSE_ENTER_WIDGET coming from in case it is sent twice?
+I assume http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3815
+AND http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#2803.
+I think we should send it only from the first one.
+
+And indeed, looks like NS_MOUSE_OVER/NS_MOUSE_OUT don't need to be handled there.
+http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#1178
+(because we actually send NS_MOUSE_ENTER/EXIT_WIDGET here http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3799)
+Comment on attachment 8606251
+mouse_enter_widget_ver1.diff
+
+...but we need to fix the double NS_MOUSE_ENTER_WIDGET case before landing this.
+(In reply to Olli Pettay [:smaug] from comment #14)
+> So where is the NS_MOUSE_ENTER_WIDGET coming from in case it is sent twice?
+> I assume http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3815
+> AND http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#2803.
+> I think we should send it only from the first one.
+Look's like first event was sended from
+http://mxr.mozilla.org/mozilla-central/source/widget/windows/nsWindow.cpp#4008
+(In reply to Olli Pettay [:smaug] from comment #14)
+> And indeed, looks like NS_MOUSE_OVER/NS_MOUSE_OUT don't need to be handled there.
+> http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#1178
+Very strange that there is only NS_MOUSE_OVER event is handled. Should we remove it ?
+(In reply to Olli Pettay [:smaug] from comment #15)
+> ...but we need to fix the double NS_MOUSE_ENTER_WIDGET case before landing this.
+I would prefer remove NS_MOUSE_ENTER_WIDGET sending from that code:
+http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3815
+At least there were no such code before bug 1018639.
+(In reply to Maksim Lebedev from comment #16)
+> (In reply to Olli Pettay [:smaug] from comment #14)
+> > So where is the NS_MOUSE_ENTER_WIDGET coming from in case it is sent twice?
+> > I assume http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3815
+> > AND http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#2803.
+> > I think we should send it only from the first one.
+> Look's like first event was sended from
+> http://mxr.mozilla.org/mozilla-central/source/widget/windows/nsWindow.
+> cpp#4008
+That doesn't send the event to the child process. It just dispatches it, like a normal event dispatch.
+But ok, that is the one which ends up to http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#2803
+(In reply to Maksim Lebedev from comment #18)
+> (In reply to Olli Pettay [:smaug] from comment #15)
+> > ...but we need to fix the double NS_MOUSE_ENTER_WIDGET case before landing this.
+> I would prefer remove NS_MOUSE_ENTER_WIDGET sending from that code:
+> http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.
+> cpp#3815
+No. if you remove that code, child process doesn't get NS_MOUSE_ENTER/EXIT_WIDGET
+if you move mouse from browser chrome to be on top of the web page.
+(In reply to Olli Pettay [:smaug] from comment #20)
+> No. if you remove that code, child process doesn't get NS_MOUSE_ENTER/EXIT_WIDGET
+> if you move mouse from browser chrome to be on top of the web page.
+I agree. Look's like it needed for dispatch events in case we move mouse between XUL elements and browser contents (html page)
+(In reply to Olli Pettay [:smaug] from comment #15)
+> ...but we need to fix the double NS_MOUSE_ENTER_WIDGET case before landing this.
+In this case we can make it on such way:
+http://mxr.mozilla.org/mozilla-central/source/widget/windows/nsWindow.cpp#4000 at this point we can put mNoCrossProcessBoundaryForwarding flag to prevent event dispatching into [content process]. (Because this code does not work always).
+And http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3815 will send NS_MOUSE_ENTER_WIDGET event only one time (and always).
+Why not just not-forward the NS_MOUSE_ENTER/EXIT_WIDGET in EventStateManager?
+If we add the flag in widget/* level, one needs to remember to fix all the widget backends
+(Windows, OSX, Gtk, Qt, etc.), so I'd prefer to do it just in one place.
+
+So, you could set mNoCrossProcessBoundaryForwarding in EventStateManager::PreHandleEvent
+Created attachment 8607031
+mouse_enter_widget_ver2.diff
+
++ Add suppressing forwarding NS_MOUSE_ENTER_WIDGET from widget code.
+- Remove NS_MOUSE_OVER from CrossProcessSafeEvent()
+- Remove NS_MOUSE_OVER and NS_MOUSE_OUT from TabParent::SendRealMouseEvent()
+
+Suggestions and comments and objections are very welcome.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=b77220370e63
+Comment on attachment 8607031
+mouse_enter_widget_ver2.diff
+
+You mark only ENTER_WIDGET events with mNoCrossProcessBoundaryForwarding=true;
+Shouldn't you mark also EXIT_WIDGET events.
+(In reply to Olli Pettay [:smaug] from comment #26)
+> You mark only ENTER_WIDGET events with mNoCrossProcessBoundaryForwarding=true;
+> Shouldn't you mark also EXIT_WIDGET events.
+I have tested some tests and mouse actions, looks like NS_MOUSE_EXIT_WIDGET is sent only one time.
+In any case I put assertion into that code:
+> } else if (NS_MOUSE_EXIT_WIDGET == event.message) {
+>   MOZ_ASSERT(mTabSetsCursor);
+>   mTabSetsCursor = false;
+> }
+and that changes were pushed on try servers:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=1e6629033574
+Or adding mNoCrossProcessBoundaryForwarding into NS_MOUSE_EXIT_WIDGET is action for serenity?
+tryserver may not actually test ENTER/EXIT_WIDGET too well (given that they are rather dependent on the mouse cursor in the operating system).
+But for consistency I'd prefer both ENTER and EXIT to get mNoCrossProcessBoundaryForwarding in PreHandleEvent.
+Created attachment 8609249
+mouse_enter_widget_ver3.diff
+
++ Added mNoCrossProcessBoundaryForwarding = true at NS_MOUSE_EXIT_WIDGET event
+
+Suggestions and comments and objections are very welcome.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=3fd0546c208b
+Obvious tests shows that patch is correct and patch resolves issue discribed in current bug.
+
+But some tests shows very interesting behavior. Look's like, when we open page first time there is moment when NS_MOUSE_ENTER_WIDGET was sended into [content process], but [content process] cannot handle event correctly (maybe because its state is before full initialization). So in such case [content process] after full initialization have no information about nonactive pointers, which exist under page.
+Maybe we can land current patch and we should create new bug about such specific case?
+(In reply to Maksim Lebedev from comment #31)
+> But some tests shows very interesting behavior. Look's like, when we open
+> page first time there is moment when NS_MOUSE_ENTER_WIDGET was sended into
+> [content process], but [content process] cannot handle event correctly
+> (maybe because its state is before full initialization). So in such case
+> [content process] after full initialization have no information about
+> nonactive pointers, which exist under page.
+> Maybe we can land current patch and we should create new bug about such
+> specific case?
+Yes, a new bug for that.
+If there are no objections, I put checkin-needed flag.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f40854954ae0
+https://hg.mozilla.org/mozilla-central/rev/f40854954ae0

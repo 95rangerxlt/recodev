@@ -1,0 +1,535 @@
+can we use remote=true for the frameworker?
+
+can we use remote=true for the frameworker?
+I offered to look into this
+Created attachment 778327
+use a remote frameworker
+
+Very much a WIP, but most of the browser_frameworker test passes!  Still a lot to do, but I'm now done for the day (and thus the week!)
+Created attachment 779043
+change updateProvider in SocialService to not reference a document
+
+The remote frameworker patch will prevent the chrome process reaching directly into the frameworker's window.  The implementation of the "update manifest" thing does that - so this patch undoes that :)
+
+Shane - I'm a little concerned there was a pre-existing bug here - the patch wants to know the "installType" which it takes from what the code calls the "installOrigin" - however, best I can tell, both before and after this patch, the origin isn't the "install" origin at all, but is just the regular provider origin.  That sounds like something we need to fix, right?
+Created attachment 779044
+891218-2-cookie.get-no-document.patch
+
+This patch is on-top of bug 896312.  It stops the worker api from trying to cheat by touching the frameworker's contentwindow directly.
+Created attachment 779055
+891218-3-reload-tests-no-frame.patch
+
+Moving to a remote frameworker makes it very difficult to test the port reconnection of the "reload" feature.  In short, what the test used to do was:
+
+1) Reach into the impl and add an "unload" event listener to the frameworker's window.
+2) Trigger a reload, then *while* the unload event was firing, send a message on a port.
+3) Wait for the reload to complete, then check the message sent at (2) actually arrived.
+
+In a remote frameworker world, we can't add an unload handler.  As everything is async, it's hard to work out how we can simulate this - we really can't guarantee at what state the message at (2) would be sent (eg, if we sent a message to do the reload, then a message directly after, it's still possible the reload will be fully complete before the new message was delivered, which wouldn't actually test what we want to test.
+
+I'm looking for ideas :)  It wouldn't be the end of the world to just remove the test if we can't think of a better solution (which I can't currently)
+
+Requesting Felipe as I'm also going to ask for feedback on the following "big" patch, mainly as he has experience with both Social and e10s.  Felipe - feel free to reassign both if you are too busy - Drew might be a good choice as he's familiar with remote browsers via the thumbnails work)
+Created attachment 779056
+891218-remote-frameworker.patch
+
+This is an updated patch that uses a remote browser for the frameworker.  It in in fairly good shape - however, indexeddb doesn't work here for reasons I've started to track down but don't have a good handle on yet (short version - the code that checks if a window is a "3rd party window" before allowing access is failing for reasons I don't understand yet) - but apart from that, all tests and Facebook itself work! :) It is on-top of all previous patches.
+
+Felipe - please see previous comment for why I'm flagging you :)  Gavin, please treat this request as optional - I just wanted to make sure you noticed this patch and had the chance to offer early feedback if desired.
+(In reply to Mark Hammond (:markh) from comment #3)
+> Created attachment 779043
+> change updateProvider in SocialService to not reference a document
+> 
+> The remote frameworker patch will prevent the chrome process reaching
+> directly into the frameworker's window.  The implementation of the "update
+> manifest" thing does that - so this patch undoes that :)
+> 
+> Shane - I'm a little concerned there was a pre-existing bug here - the patch
+> wants to know the "installType" which it takes from what the code calls the
+> "installOrigin" - however, best I can tell, both before and after this
+> patch, the origin isn't the "install" origin at all, but is just the regular
+> provider origin.  That sounds like something we need to fix, right?
+
+I'm not entirely clear on what you're seeing as a bug, but I'll take a stab at explaining what I think may be related.  In the case where installType is directory, the document origin will be different during install, however that should never be the case in an update.  hmm...still not clear on what you see as a bug, perhaps we should touch base in your morning.
+Comment on attachment 779043
+change updateProvider in SocialService to not reference a document
+
+Barring the previous note on a potential bug that we need to chat about, this looks good.
+Comment on attachment 779044
+891218-2-cookie.get-no-document.patch
+
+:)  was going to mention this in the previous patch, but then saw this.
+
+An early iteration of cookies-get did this, we changed it to using the document to avoid having to think about whether there was any security implication.  I think Gavin should probably SR this since using document was a change he asked for (IIRC).
+Comment on attachment 779055
+891218-3-reload-tests-no-frame.patch
+
+When a worker is loaded it should receive a social.initialize message from chrome.  Maybe we should just have the worker send a ping when it gets social.initialize.  That wouldn't handle testing pending messages though.  Another thought is to have a flag that we can set to NOT remote the iframe so we can test some things (e.g. pending messages) more easily.
+Comment on attachment 779056
+891218-remote-frameworker.patch
+
+This all looks fine, though I cant say I'm familiar with what issues there may be with remoting the browser.  Of course we need indexeddb, I hope that isn't a deep issue.
+@markh, is it possible to do some or all of WorkerAPI.jsm in the remote process?  If so, would that let us touch contentWindow/document if necessary?
+(In reply to Shane Caraveo (:mixedpuppy) from comment #7)
+> I'm not entirely clear on what you're seeing as a bug
+
+I think I was simply wrong.  I was under the impression that the "install origin" might have been (eg) amo at install time and would be the actual provider origin at update time, which would cause potentially different things to happen. Looking closer, it seems I was wrong :)
+(In reply to Shane Caraveo (:mixedpuppy) from comment #12)
+> @markh, is it possible to do some or all of WorkerAPI.jsm in the remote
+> process?  If so, would that let us touch contentWindow/document if necessary?
+
+It would be possible, but probably more intrusive - eg, the "provider" object itself must live in the parent process, so everything in worker API that touches it would need to be change.  IOW, we'd probably need to make a choice about whether the content or the provider can't be touched.  If Gavin's happy with the cookie change, I think keeping it in the parent will be less intrusive.
+Comment on attachment 779044
+891218-2-cookie.get-no-document.patch
+
+Three high-level concerns with this:
+- The comment in http://mxr.mozilla.org/mozilla-central/source/netwerk/cookie/nsICookieService.idl#85 mentions that getCookieString won't return cookies if you don't pass in a channel and third-party cookies are disabled - is that a problem? Seems like it might be.
+
+- The nsHTMLDocument::GetCookie implementation does a couple of things differently than just calling getCookieString:
+  - returns null if mDisableCookieAccess is set. This seems to only apply to documents that are the results of cross-site XHR requests, so doesn't apply here.
+  - checks mSandboxFlags & SANDBOXED_ORIGIN. I assume this applies to documents loaded in sandboxed iframes, which I suppose won't apply here. Trying to think whether there's a way this could be abused by rogue FrameWorker scripts - I think not?
+  - is a bit more lenient when converting the return value to UTF-16 (see bug 784367) than xpconnect would be when calling getCookieString directly. This might not matter if that change in behavior for the getter was just meant as a backwards-compatibility measure (since that patch also changed the setter, and I'm not sure whether the other ways of setting cookies allow setting invalid UTF-8 values). I suppose this might be an edge case that we can live with being wrong - it only affects the getter, and makes it more restrictive about what it returns, which shouldn't cause any security issues (could lead to "broken behavior" from the FrameWorker's POV, but they're using a different API anyways so there may not be expectations here).
+
+- Is this._provider.origin guaranteed to be equal to the FrameWorker script's principal URI (i.e. what nsHTMLDocument::GetCookie passes to getCookieString) in all cases? What if the frameworker script URL redirects to another origin? It seems like that other origin would then always get cookies from the original host, which would be broken (or even a security issue if the providers shoot themselves in the foot).
+
+This last seems like the biggest issue. I assume we can fix it by somehow retrieving the principal of the actually loaded frameworker script somehow, though if we're going to do that it might be equivalent to just continuing to just use document.cookie (but in an e10s-friendly way, i.e. via messages). That would also address the third-party cookie concerns.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #15)
+> Comment on attachment 779044
+
+Yes, all very good points :)  Given this change was only really made as a convenience, and that we can stick with the previous implementation by simply adding a couple of extra message jumps, it's probably easier to add those extra message jumps than it is to make ourselves 100% sure this new implementation doesn't suffer from those problems.
+Comment on attachment 779043
+change updateProvider in SocialService to not reference a document
+
+have to change the review on this since the patch doesn't work.  getNoAppCodebasePrincipal takes an nsIURI as the parameter.  You can do:
+
+let URI = Services.io.newURI(aUpdateOrigin, null, null);
+let principal = Services.scriptSecurityManager.getNoAppCodebasePrincipal(URI);
+
+r+ with that change
+Created attachment 780665
+fix error page tests
+
+With all the patches here applied; to get these tests to pass I had to wait here for the worker to load (profile is set in our test worker during init after load).
+Comment on attachment 779056
+891218-remote-frameworker.patch
+
+Review of attachment 779056:
+-----------------------------------------------------------------
+
+It all looks sane to me! The code removal is specially nice, it's hard to believe all of that code can be gone, but I guess that is because we don't need to mess with all the sandbox stuff anymore.
+
+My only concern with this approach is how will the mozSocial api injection work with it? Or is it only injected in the social frames of the provider, but not the frameworker itself?
+
+::: toolkit/components/social/FrameWorker.jsm
+@@ +70,5 @@
+>    this.ports = new Map();
+> +  this.browserPromise = browserPromise;
+> +  browserPromise.then(browser => {
+> +    // is it necessary to remove these?  I'd guess not, as they need
+> +    // to live as long as the browser and we destroy the browser anyway.
+
+I think in theory no, but I do remember things leaking in the past when messages weren't removed from the messageManager, and I see a lot of usage of removeMessageListener in the tree. So I'm guessing it's better to play safe here and remove them, unless we get some real evidence that it's not necessary.
+
+::: toolkit/components/social/FrameWorkerContent.js
+@@ +22,5 @@
+>  
+> +function setFrameSrc(frame, src) {
+> +  // This seems insane, but the setAttribute call causes everything to fall
+> +  // apart (in fairly non-subtle ways that the tests will expose)
+> +  // frame.setAttribute("src", src);
+
+Hmm I seem to recall hitting this problem too in the past, but I don't think I ever got to the gist of it.
+
+@@ +46,1 @@
+>    this.pendingPorts = [];
+
+Could these be simplified now as only allPorts, and get rid of pendingPorts and possibly ports too?
+Each port would have it's own `pending` boolean and when previously iterating through pendingPorts we can simply skip the ones where that is false
+
+@@ +362,5 @@
+> +FrameWorkerManager.init();
+> +
+> +// XXX - is this still necessary?  Can't we just take over the entire browser?
+> +// OTOH, this might be a simple way to host many workers for the same domain
+> +// in a single process?
+
+I think this shouldn't be necessary, but we would have to find a new solution for the extra things this function do (e.g. disallowing plugins, media, etc), so it might as well be the easiest solution.
+
+That makes me wonder if using an <iframe mozbrowser> or <iframe mozapp> instead of <browser remote> would do all of these things for us (and possibly solve the APIs that were missing?).. but I don't exactly know their implementation or how they're different here
+
+@@ +393,5 @@
+>      // We will ignore all messages destined for otherType.
+>      let data = event.data;
+>      let portid = data.portId;
+>      let port;
+> +    if (!data.portFromType || data.portFromType !== "worker") {
+
+I don't fully understand this change (from client to worker).  "client" used to represent the chrome side of things, right? If so, was the comment below wrong? Hm i guess not because this is the clientMessageHandler. But why does it become "worker" now?
+Comment on attachment 779055
+891218-3-reload-tests-no-frame.patch
+
+Review of attachment 779055:
+-----------------------------------------------------------------
+
+You could reach for the <browser remote> element that is hosting the frameworker, and call .messageManager.loadScript with extra script code that you want to run in the test. That doesn't fully give you the answer, but perhaps you hadn't considered this yet..
+
+sadly I think having this test is important because IIRC it was added in response of a provider trying to use reload every few minutes and it wasn't working at the time
+> I don't fully understand this change (from client to worker).  "client" used to
+> represent the chrome side of things, right? If so, was the comment below wrong? Hm
+> i guess not because this is the clientMessageHandler. But why does it become
+> "worker" now?
+
+oh, tricky, I see.. the test changed from === "client" to !== "worker"..  carry on
+(In reply to :Felipe Gomes from comment #19)
+> It all looks sane to me! The code removal is specially nice,
+
+I think hg might have mislead you :)  Code has been split between 2 files rather than removed.
+
+> My only concern with this approach is how will the mozSocial api injection
+> work with it? Or is it only injected in the social frames of the provider,
+> but not the frameworker itself?
+
+That's correct - mozSocial is not injected into the frameworker.
+
+> I think in theory no, but I do remember things leaking in the past when
+> messages weren't removed from the messageManager, and I see a lot of usage
+> of removeMessageListener in the tree. So I'm guessing it's better to play
+> safe here and remove them, unless we get some real evidence that it's not
+> necessary.
+
+I posted this question to dev.platform (which is good, as then we can get an answer, and I'll even try to remember to update MDN with it :)
+
+> Could these be simplified now as only allPorts, and get rid of pendingPorts
+> and possibly ports too?
+> Each port would have it's own `pending` boolean and when previously
+> iterating through pendingPorts we can simply skip the ones where that is
+> false
+
+Yeah, good idea.  I can't drop pendingPorts as the order is relevant - but I did clean things up so I could drop allPorts and have a new bool flag on the port.
+
+> That makes me wonder if using an <iframe mozbrowser> or <iframe mozapp>
+> instead of <browser remote> would do all of these things for us (and
+
+Yeah, I'll be looking at that asap - we've agreed to try and drop that extra iframe and just use a mozbrowser iframe directly.
+
+> I don't fully understand this change (from client to worker).  "client" used
+> to represent the chrome side of things, right? If so, was the comment below
+> wrong? Hm i guess not because this is the clientMessageHandler. But why does
+> it become "worker" now?
+
+As you noticed, it became '!= "worker"' - and FYI, that's because we now have *3* types of ports - one in the parent ("parent"), one in the chrome of the content process ("client"), and one in the actual content window ("worker").  It'd be nice to drop that extra one, but I'm not sure we can (but I'll keep thinking about it :)
+(In reply to :Felipe Gomes from comment #20)
+
+> You could reach for the <browser remote> element that is hosting the
+> frameworker, and call .messageManager.loadScript with extra script code that
+> you want to run in the test. That doesn't fully give you the answer, but
+> perhaps you hadn't considered this yet..
+
+I hadn't considered that - great idea, and yeah, I think that will work :)
+
+Oops - I meant to say in my last comment: the feedback comments will appear in the next version of the patch I upload.
+(In reply to Mark Hammond (:markh) from comment #22)
+> Yeah, I'll be looking at that asap - we've agreed to try and drop that extra
+> iframe and just use a mozbrowser iframe directly.
+
+Hmm, why mozbrowser iframe and not just a <browser remote=true>? Maybe I misunderstood what you were proposing by "get rid of the iframe".
+Comment on attachment 779056
+891218-remote-frameworker.patch
+
+>diff --git a/toolkit/components/social/FrameWorker.jsm b/toolkit/components/social/FrameWorker.jsm
+
+>+Cu.import("resource://gre/modules/commonjs/sdk/core/promise.js");
+
+I think you should be using Promise.jsm now.
+
+>+function makeRemoteBrowser(options) {
+
+>+    // And for confusing reasons, the content script needs to wait for a load
+
+Mind elaborating on the "confusing reasons"?
+
+Reading more...
+
+>+    // For reasons that aren't clear, we need to wait for the load event to
+>+    // fire before creating the iframe - but didn't have this problem in
+>+    // Frameworker v1.0.
+>+    addEventListener("DOMContentLoaded", function onLoad() {
+
+Seems like the reason is that your version of makeHiddenFrame operates on the remote browser's document (which doesn't load right away), as opposed to the previous version which operated on the hidden window's document (which was garanteed to be loaded). So you need to wait for the content.document load before calling makeHiddenIframe (and thus |new FrameWorker|). I suppose this might change as you refactor things.
+
+>diff --git a/toolkit/components/social/FrameWorker.jsm b/toolkit/components/social/FrameWorkerContent.js
+
+>+function setFrameSrc(frame, src) {
+>+  // This seems insane, but the setAttribute call causes everything to fall
+>+  // apart (in fairly non-subtle ways that the tests will expose)
+>+  // frame.setAttribute("src", src);
+
+This does seem insane! Bug on file?
+
+>   terminate: function terminate() {
+
+>     // let pending events get delivered before actually removing the frame,
+>     // then we perform the actual cleanup in the unload handler.
+
+Hmm, is this necessary now that the frame is remote? I forget the reasoning for this.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #24)
+> (In reply to Mark Hammond (:markh) from comment #22)
+> > Yeah, I'll be looking at that asap - we've agreed to try and drop that extra
+> > iframe and just use a mozbrowser iframe directly.
+> 
+> Hmm, why mozbrowser iframe and not just a <browser remote=true>? Maybe I
+> misunderstood what you were proposing by "get rid of the iframe".
+
+Once again I get caught taking shortcuts in my explanations ;)  See 1/2 way through comment 19 where Felipe suggests using an iframe might make sense.  So I meant to say something like "either a <browser remote="true">, or investigating if an <iframe mozbrowser> or <iframe mozapp> is necessary due to our requirements"
+
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #25)
+> Comment on attachment 779056
+> >+    // And for confusing reasons, the content script needs to wait for a load
+> 
+> Mind elaborating on the "confusing reasons"?
+...
+> Seems like the reason is that your version of makeHiddenFrame operates on
+> the remote browser's document (which doesn't load right away),
+
+That sounds likely, yeah.  Like the setAttribute thing below, I just got past the immediate problem with the intention of coming back to it later (hence my explicitly calling it out in comments - although I should have added 'XXX' :)
+
+> This does seem insane! Bug on file?
+
+Not yet, but I will once the patch gets a little cleaner and I can re-verify it in a saner context.
+
+> Hmm, is this necessary now that the frame is remote? I forget the reasoning
+> for this.
+
+I'll investigate this.
+
+Thanks for checking it out!
+(In reply to Mark Hammond (:markh) from comment #22)
+> (In reply to :Felipe Gomes from comment #19)
+> > Could these be simplified now as only allPorts, and get rid of pendingPorts
+> > and possibly ports too?
+> > Each port would have it's own `pending` boolean and when previously
+> > iterating through pendingPorts we can simply skip the ones where that is
+> > false
+> 
+> Yeah, good idea.  I can't drop pendingPorts as the order is relevant - but I
+> did clean things up so I could drop allPorts and have a new bool flag on the
+> port.
+
+TIL that the harmony spec specified that Map objects can be iterated and the results will be returned in insertion order - which is exactly what we need here - and our implementation appears to do that - so maybe I *can* drop the array too!
+
+http://people.mozilla.org/~jorendorff/es6-draft.html#sec-15.14
+Created attachment 782422
+891218-remote-frameworker.patch
+
+This patch drops the iframe, which does clean things up considerably.  All tests work except for testWorkerReload, which I'm working on now using the suggestion from Felipe.  I haven't given this a final once-over, so I'm not yet asking for review or more feedback, but feedback is still welcome and/or the results of any testing with this version.
+Created attachment 784257
+891218-1-update-provider-no-document.patch
+
+Refresh of patch so updateProvider doesn't take a document as a param.  Carrying r+ forward.
+Created attachment 784261
+891218-2-remote-frameworker.patch
+
+This is the "major" patch for this change.  It's in pretty good shape so is ready for review.  However, even after all the patches here are applied there are 2 problems:
+
+* Windows almost always crashes :(
+
+0:22.45 [Child 7312] ###!!! ABORT: ActorDestroy by IPC channel failure at LayerTransactionChild: file o:/src/mm/mozilla-hg/mc-socialapi-landing/gfx/layers/ipc/LayerTransactionChild.cpp, line 84
+...
+PROCESS-CRASH | chrome://mochitests/content/browser/browser/base/content/test/social/browser_social_flyout.js | application crashed [@ ntdll.dll + 0x1f8b1]
+
+I don't believe the crash is a direct result of this patch, just some side-effect from the remote browser usage.  Bug 890840 describes the same issue and also uses a remote browser.  Not sure how to get movement on this (but at least the fact the crash is so reliable should make it simple for someone who understands this layers stuff.)
+
+* All platforms have oranges in browser/base/content/test/social - these should be fairly easy to track down and are almost certainly caused by the increased "latency" caused by the remote browser.
+
+Try at https://tbpl.mozilla.org/?tree=Try&rev=dbedecd1492b demonstrates this.
+
+Even with the above problems, I think this patch is ready for review - but given the above problems, there's no hurry as we can't land it while they exist.
+Created attachment 784262
+891218-3-cookie.get-no-document.patch
+
+Based on previous feedback, this patch has been redone using messages between the WorkerAPI and the remote frame, so the cookies still come directly from the "document" rather than via the cookie service.
+Created attachment 784264
+891218-4-testWorkerReload-framescript.patch
+
+Using Felipe's suggestion of a custom frameScript just for the test, this patch manages to keep the test, even though it's become more complex.  But see bug 899908 - this will probably end up dieing anyway.
+
+Sharing the review love, but probably only needs 1 review, so first in, best dressed!
+Shane,
+  If you have time, it would be awesome if you could apply all these patches, and see if any of the intermittent test failures in browser/base/content/test/social make sense, or are covered by any other patches you already have in your queue.
+(In reply to Mark Hammond (:markh) from comment #30)
+> * Windows almost always crashes :(
+> 
+> 0:22.45 [Child 7312] ###!!! ABORT: ActorDestroy by IPC channel failure at
+> LayerTransactionChild: file
+> o:/src/mm/mozilla-hg/mc-socialapi-landing/gfx/layers/ipc/
+> LayerTransactionChild.cpp, line 84
+> ...
+> PROCESS-CRASH |
+> chrome://mochitests/content/browser/browser/base/content/test/social/
+> browser_social_flyout.js | application crashed [@ ntdll.dll + 0x1f8b1]
+> 
+> I don't believe the crash is a direct result of this patch, just some
+> side-effect from the remote browser usage.  Bug 890840 describes the same
+> issue and also uses a remote browser.  Not sure how to get movement on this
+> (but at least the fact the crash is so reliable should make it simple for
+> someone who understands this layers stuff.)
+
+Seems like we should hang it off bug 899758, and I can try to poke some graphics people.
+Comment on attachment 784262
+891218-3-cookie.get-no-document.patch
+
+This looks fine to me, I think there is an intermittent error in the errorPage tests with this applied, but I haven't got it to happen again.  I'll keep an eye for that.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #35)
+> I think there is an intermittent error in the
+> errorPage tests with this applied,
+
+FTR, there are a number of intermittent failures, but as I mentioned in comment 30, I think they are the fault of patch 2 rather than patch 3.
+Comment on attachment 784264
+891218-4-testWorkerReload-framescript.patch
+
+r+ after verifying with mark on irc that social.initialize is not sent during unload.  That wasn't entirely clear in my initial read.  The first comment added in browser_workerAPI.js needs to be fixed.
+Created attachment 784738
+891218-2-remote-frameworker.patch
+
+This attachment fixes the bitrot caused by bug 896860 (which landed on fx-team, so should soon make it to m-c).  Everything mentioned in comment 30 still applies.
+Created attachment 789869
+intermittent-error
+
+The remote frameworker caused intermittent errors for me in the error page tests.  Essentially, sometimes frameworker load beats going offline, sometimes it doesn't.  This may have always been the case (though I could not make the failures happen without remote frameworker), and is only further aggravated by having frameworker remoted.
+
+One test was fixable here, which was a hang with the flyout error page.  When offline mode beats frameworker load, we get the incorrect error page (ie. the regular offline error page) and the test fails.
+
+The other test fails because SocialChatBar.open returns false if there is no logged in user.  When offline mode beats frameworker load, we never get the logged in user.  Thus the chat window is not opened and the test will fail.  I think we could punt on this until bug 840870 lands (removal of login requirement).
+Comment on attachment 789869
+intermittent-error
+
+Review of attachment 789869:
+-----------------------------------------------------------------
+
+I need to understand this a little more.
+
+::: browser/base/content/test/social/browser_social_errorPage.js
+@@ +146,5 @@
+>      // go offline and open a flyout.
+> +    // XXX we have a race condition here with remoted frameworker. Sometimes the
+> +    // frameworker will load in an offline condition, this
+> +    // Social.haveLoggedinUser will be false, and thus the chat window will
+> +    // never open.  This will be resolvable with bug 840870.
+
+It looks like we want to uncouple bug 840870 from this bug and get that landed first?
+
+::: browser/modules/Social.jsm
+@@ -443,5 @@
+>    },
+>  
+>    onLocationChange: function SPL_onLocationChange(aWebProgress, aRequest, aLocation, aFlags) {
+>      let failure = aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_ERROR_PAGE;
+> -    if (failure && Social.provider.errorState != "frameworker-error") {
+
+I'm trying to remember/workout why we had this logic in the first place.  For some reason we explicitly decided to not show the error page when there was "just" a frameworker-error, and we presumably did it for what we thought were good reasons.
+(In reply to Mark Hammond (:markh) from comment #40)
+> Comment on attachment 789869
+> intermittent-error
+> 
+> Review of attachment 789869:
+> -----------------------------------------------------------------
+> 
+> I need to understand this a little more.
+> 
+> ::: browser/base/content/test/social/browser_social_errorPage.js
+> @@ +146,5 @@
+> >      // go offline and open a flyout.
+> > +    // XXX we have a race condition here with remoted frameworker. Sometimes the
+> > +    // frameworker will load in an offline condition, this
+> > +    // Social.haveLoggedinUser will be false, and thus the chat window will
+> > +    // never open.  This will be resolvable with bug 840870.
+> 
+> It looks like we want to uncouple bug 840870 from this bug and get that
+> landed first?
+
+correct
+
+> ::: browser/modules/Social.jsm
+> @@ -443,5 @@
+> >    },
+> >  
+> >    onLocationChange: function SPL_onLocationChange(aWebProgress, aRequest, aLocation, aFlags) {
+> >      let failure = aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_ERROR_PAGE;
+> > -    if (failure && Social.provider.errorState != "frameworker-error") {
+> 
+> I'm trying to remember/workout why we had this logic in the first place. 
+> For some reason we explicitly decided to not show the error page when there
+> was "just" a frameworker-error, and we presumably did it for what we thought
+> were good reasons.
+
+actually, it was: if a frameworker error already occurred, we dont bother updating the panel with another error page.  The problem with that is, if the frameworker causes an error first, then you show the flyout, we dont update the flyout error panel.  Thus, the flyout shows the default error page which doesn't fit into the flyout panel.  
+
+This is what is happening in the error page test for the flyout.  The test checks to see that our custom error page is loaded, and fails.
+
+I think this is actually a long standing bug.  I have (very very rarely) seen the default error page in our panels, but could never figure out a solid STR.
+Comment on attachment 789869
+intermittent-error
+
+Yeah, ok - f+ on the error page change.
+Comment on attachment 789869
+intermittent-error
+
+this patch moved to bug 905297
+I think we should just land attachment 784257
+Comment on attachment 784738
+891218-2-remote-frameworker.patch
+
+Review of attachment 784738:
+-----------------------------------------------------------------
+
+::: toolkit/components/social/FrameWorker.jsm
+@@ +65,3 @@
+>  };
+>  
+> +// A "_Worker" is a singleton for a worker.  It's never returned directly to
+
+not sure if this fits the definition of singleton for me.. Is there ever only one instance of this class?  Or maybe it's one instance per provider? But in that case I wouldn't call it a singleton.
+
+@@ +76,5 @@
+> +    // side of the world.
+> +    mm.loadFrameScript("resource://gre/modules/FrameWorkerContent.js", true);
+> +    mm.sendAsyncMessage("frameworker:init", this.options);
+> +    mm.addMessageListener("frameworker:port-message", this._onPortMessage.bind(this));
+> +    mm.addMessageListener("frameworker:notify-worker-error", this._onNotifyError.bind(this));
+
+no real need to change this, but if more messages are added, I think it's nicer to simply pass `this` as the second param and implement a receiveMessage function in this object. It also makes it unnecessary to use bind
+
+::: toolkit/components/social/FrameWorkerContent.js
+@@ +92,4 @@
+>    },
+>  
+>    createSandbox: function createSandbox() {
+> +    let workerWindow = content
+
+missing ;  :)
+Updating title to reflect our current plan.  A recent try for this is at https://tbpl.mozilla.org/?tree=Try&rev=52745fa8758e which is a nice shade of green.  All patches are reviewed - any reason not to land this?
+Let's do it!
+Recent try: https://tbpl.mozilla.org/?tree=Try&rev=52745fa8758e
+
+Landed:
+https://hg.mozilla.org/integration/fx-team/rev/f0d7e63ddf89
+https://hg.mozilla.org/integration/fx-team/rev/e69b0fbc41ce
+https://hg.mozilla.org/integration/fx-team/rev/21020af91b32
+https://hg.mozilla.org/integration/fx-team/rev/71c12e1acfef
+https://hg.mozilla.org/mozilla-central/rev/f0d7e63ddf89
+https://hg.mozilla.org/mozilla-central/rev/e69b0fbc41ce
+https://hg.mozilla.org/mozilla-central/rev/21020af91b32
+https://hg.mozilla.org/mozilla-central/rev/71c12e1acfef
+
+
+Use <browser> and contentScript for frameworker (with remote allowed but pref'd off)
+
+
+
+Bug 891218 (part 1) - avoid using a DOM document in updateProvider - r=mixedpuppy 
+
+Bug 891218 (part 2) - host the social Frameworker in a remote browser.  r=felipe 
+
+Bug 891218 (part 3) - avoid using a DOM document in social.cookies-get message.  r=mixedpuppy 
+
+Bug 891218 (part 4) - Fix worker reload tests.  r=felipe

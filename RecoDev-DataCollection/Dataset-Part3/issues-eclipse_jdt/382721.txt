@@ -1,0 +1,1002 @@
+BETA_JAVA8
+
+(1) The following program which does not compile under 1.7-
+should now begin to compile with Java 8:
+
+// -------- 8< -----------
+
+public class X {
+  public static void main(String[] args) {
+    X x = new X() {
+      void foo() {
+        System.out.println(args);
+      }
+    };
+  }
+}
+
+The proposed amends to 8.1.3 allow for a local class including anonymous
+classes to use effectively final variables from its surrounding context.
+
+(2) Likewise, we need to also allow lambda expressions to reference effectively
+final, definitely assigned local variables, formal parameters or
+exception handler parameter from the surrounding context (in addition
+to finals)
+
+BETA_JAVA8
+
+(1) The following program which does not compile under 1.7-
+should now begin to compile with Java 8:
+
+// -------- 8< -----------
+
+public class X {
+  public static void main(String[] args) {
+    X x = new X() {
+      void foo() {
+        System.out.println(args);
+      }
+    };
+  }
+}
+
+The proposed amends to 8.1.3 allow for a local class including anonymous
+classes to use effectively final variables from its surrounding context.
+
+(2) Likewise, we need to also allow lambda expressions to reference effectively
+final, definitely assigned local variables, formal parameters or
+exception handler parameter from the surrounding context (in addition
+to finals)
+I think I can take a look at this.
+Please wait until the fix for bug 382727 becomes available. As of now
+the LambdaExpression and ReferenceExpression AST nodes are NOT part of
+the recursive AST traversal for semantic analysis and type resolution.
+I'll hook them up as a part of the fix for bug 382727.
+I think the basic mechanism for this analysis can be implemented independent of the AST for lambdas. If needed I could help here.
+Jesper - Just so we don't end up duplicating work, I'll try and clearly assign
+items to you - I think this one would be of interest to you. This has two parts:
+
+(1) Behavior changes in anonymous classes.
+(2) Semantic checks in lambda that it is not trying to access variables that
+are not final and not effectively final.
+
+See org.eclipse.jdt.internal.compiler.lookup.TagBits.IsEffectivelyFinal
+and IProblem.OuterLocalMustBeFinal.
+
+You can provide as much of LambdaExpression.resolveType implementation as
+needed to work on this problem.
+Also please add a test verifying that the following compiles fine:
+
+// ---
+interface I {
+	void foo();
+}
+interface J {
+	
+}
+class X {
+	void foo(int [] p) {
+		for (int is : p) {
+			I j = new I () {
+				public void foo() {
+					System.out.println(is);
+				};
+			};
+		}
+	}
+}
+
+// ----
+
+The above is legal code in Java 8, while illegal in Java 7.
+
+We need to test with both inner classes and lambdas. Basically
+each iteration of foreach loop is considered to have its own
+distinct version.
+Here is something else to track:
+
+According to 14.20: 
+
+"An implicitly final exception parameter is final by virtue of its declaration, while an effectively final exception parameter is (as it were) final by virtue of how it is used. An exception parameter of a multi-catch clause is implicitly final, so will never occur as the left-hand operand of an assignment operator, but is not considered effectively final."
+
+So one would expect the following code to fail to compiler:
+
+// ---
+interface I {
+	void doit();
+}
+public class X {
+	
+	void foo() {
+	try {
+		
+	} catch (NullPointerException | ArrayIndexOutOfBoundsException e) {
+		I i = () -> {
+			System.out.println(e);
+		};
+	}
+	}
+}
+// ---
+
+but 8b74 compiles it fine.
+(In reply to comment #5)
+> Also please add a test verifying that the following compiles fine:
+> 
+> // ---
+> interface I {
+> 	void foo();
+> }
+> interface J {
+> 	
+> }
+> class X {
+> 	void foo(int [] p) {
+> 		for (int is : p) {
+> 			I j = new I () {
+> 				public void foo() {
+> 					System.out.println(is);
+> 				};
+> 			};
+> 		}
+> 	}
+> }
+> 
+> // ----
+> 
+> The above is legal code in Java 8, while illegal in Java 7.
+> 
+> We need to test with both inner classes and lambdas. Basically
+> each iteration of foreach loop is considered to have its own
+> distinct version.
+
+Exactly, I'm adding a test for every distinct say of binding a variable, just in case.
+Also we should test for nested uses, i.e. effectively final local var bound in an inner class, and then passed into e.g. a lambda - useful to think of all the combinations once we get to emitting code, too.
+
+Fixing this is causing a lot of rework into old testcases, guarding for the 1.8 variation. It'll be a day or two until it's ready for review.
+Implicitly final also satisfies 'final or effectively final', so I'd expect it to compile, too. They're just saying that it's final, becayse that's easier than allowing assignment to a union typed var.
+(In reply to comment #4)
+[...]
+> See org.eclipse.jdt.internal.compiler.lookup.TagBits.IsEffectivelyFinal
+> and IProblem.OuterLocalMustBeFinal.
+
+I've found an issue which may need some design consideration: The bit for IsEffectivelyFinal is set på the resolve/resolveType traversing, but since some of the changes to the potentially effectively final variable can happen lexicographically AFTER the use, we cannot detect this in the same traversion.
+
+Example:
+
+interface I {
+	void doit();
+}
+public class X {
+  public static void main(String[] args) {
+    int var = 2;
+    I x = new I() {
+      public void doit() {
+        System.out.println(var); // Error: var is not effectively final
+      }
+    };
+    var=2;
+  }
+}
+
+I see to options:
+ 1) defer this check until the flow analysis
+ 2) Remember each assumed effectively final use of the variable and make the check when we discover that the variable is assigned to.
+
+Ideas anyone?
+(In reply to comment #9)
+> I see to options:
+>  1) defer this check until the flow analysis
+>  2) Remember each assumed effectively final use of the variable and make the
+> check when we discover that the variable is assigned to.
+> 
+> Ideas anyone?
+
+(1) is the prevailing modus operadi. See SingleNameReference#analyze* methods.
+It would be ideal to report an error at the reference site rather than at the
+assignment site. Perhaps org.eclipse.jdt.internal.compiler.ast.SingleNameReference.analyseCode(BlockScope, FlowContext, FlowInfo, boolean) would be a right place.
+
+Look at the uses of ASTNode.DepthMASK. Not sure if these come out correctly
+automatically at the moment - didn't check.
+If deferred checking is necessary, FlowContext could come to the rescue.
+LMK if you want me to propose s.t. here.
+
+Otherwise collecting info in the variable binding during resolve, and reporting problems during analyse sounds like the simplest solution (which should allow reporting against the variable declaration).
+(In reply to comment #11)
+> If deferred checking is necessary, FlowContext could come to the rescue.
+> LMK if you want me to propose s.t. here.
+> 
+> Otherwise collecting info in the variable binding during resolve, and
+> reporting problems during analyse sounds like the simplest solution (which
+> should allow reporting against the variable declaration).
+
+OK, looking more closely at the requirements I should give better advice:
+
+Already during resolve it should be possible to detect which local variables are accessed from a nested lambda body and record this fact in the variable binding using a new TagBit (this doesn't necessarily have to happen at this point, but should help performance as we can now avoid the next step in the regular case).
+
+During analyseCode we should check for each variable marked in phase 1 if it is ever assigned in a state where it was already assigned (potentially assigned is sufficient to create the error) - this part uses a flowInfo and is similar to checks done for final variables - cf. SingleNameReference.analyseAssignment. Again mark this finding in the variable binding.
+
+We may then want to defer reporting until generateCode to detect any SingleNameReference that has a binding with both bits from phase 1 & 2 set, and report against this reference that the variable is not effectively final.
+
+Does this correctly reflect the requirements?
+Created attachment 226498
+Proposed fix for this issue
+
+Proposed fix, moved the final-ness check from the resolveXxx phase (where the final/effectively final information is gathered) to the analyzeCode, as suggested.
+
+To my horror, this change hasn't caused massive test breakages, it would appear that this particular error message isn't part of any previous test. Yikes!
+(In reply to comment #12)
+
+Note that I uploaded the patch before I read your suggestions. The test may be way too simplistic if the IsEffectivelyFinal bit is not calculated using flow information, I'm gathering more test cases.
+ 
+> Already during resolve it should be possible to detect which local variables
+> are accessed from a nested lambda body and record this fact in the variable
+> binding using a new TagBit (this doesn't necessarily have to happen at this
+> point, but should help performance as we can now avoid the next step in the
+> regular case).
+> 
+> During analyseCode we should check for each variable marked in phase 1 if it
+> is ever assigned in a state where it was already assigned (potentially
+> assigned is sufficient to create the error) - this part uses a flowInfo and
+> is similar to checks done for final variables - cf.
+> SingleNameReference.analyseAssignment. Again mark this finding in the
+> variable binding.
+> 
+> We may then want to defer reporting until generateCode to detect any
+> SingleNameReference that has a binding with both bits from phase 1 & 2 set,
+> and report against this reference that the variable is not effectively final.
+>
+> Does this correctly reflect the requirements?
+
+I'm not sure if that's more complicated then needed; I need to revisit the spec to make sure. And I need to make more test cases.
+
+Thanks for your input.
+Created attachment 226500
+Simple test case showing the basics
+
+'args' is effectively final, but 'var' is not.
+
+Many more testcases needed, and error reporting site needs discussion. I hugely prefer that the point of usage is reported, since that is the hardest one to spot. Once you're there, it's easy to press F3 and see where the declaration is.
+
+Alternatively, we could report the error on assignments, rewording so that it reads 'Since <varname> is used inside a lambda or inner class method, it must be effectively final.'
+But then the user may have to look for the usage, and that's many more keystrokes / mouse moves and clicks.
+Created attachment 226646
+Patch for this issue
+
+This adds detection of references which escape a lambda expression, and supplies an error if such a reference is to a non-final local variable from an enclosing scope.
+Created attachment 226647
+Updated patch
+
+Updated tests, test various sources of local declarations.
+
+Gives same errors as javac (b74)
+
+No apparent regressions, BTW.
+To discuss the necessity of using a flowInfo consider this:
+
+interface I {
+	void doit();
+}
+public class X {
+  public static void main(String[] args) {
+    int var;
+    if (args != null)
+       var = args.length;
+    else
+       var = 2;
+    I x = new I() {
+      public void doit() {
+        System.out.println(var);
+      }
+    };
+  }
+}
+
+The summary of Part B of the spec sounds very restrictive:
+  "A variable is effectively final if it is never assigned to after its
+   initialization."
+However, 4.12.4, adds:
+  "In addition, a local variable whose declaration lacks an initializer is
+   effectively final if all of the following are true:..."
+
+What follows explicitly relates to the concept of definite assignment. Thus I believe my example should indeed be legal, and we indeed need the flowInfo, right?
+
+
+And: I support your point of reporting against the *usage* inside the
+inner class / lambda. Forget comment 11 which is superseded by comment 12.
+(In reply to comment #17)
+> Created attachment 226647 [details]
+> Updated patch
+
+Thanks, At the moment I am banging my head against bug 399773. The present
+bug has some dependencies on it, but not wholly. I'll review your patch
+within the next 3-4 days and share comments, next steps.
+
+If you want other work, Bug 399778 would be a possibility.
+(In reply to comment #19)
+> (In reply to comment #17)
+> > Created attachment 226647 [details]
+> > Updated patch
+> 
+> Thanks, At the moment I am banging my head against bug 399773. The present
+> bug has some dependencies on it, but not wholly. I'll review your patch
+> within the next 3-4 days and share comments, next steps.
+> 
+> If you want other work, Bug 399778 would be a possibility.
+
+I meant to say Bug 399778 has some dependency on bug 399773
+Created attachment 226799
+New patch which does better final-analysis
+
+New patch which deferes non-finalness detection to the generateCode stage so that the analyseCode-operations can determine EffectiveFinalness first. Obviously, code is still not generated for lambdas, but the error is now triggered correctly.
+
+No known regressions.
+
+This is as big as a patch as I can do (237 lines), so I hope it's good.
+Created attachment 226800
+Patch with tricky test from Stephan
+
+This test requires the full data-flow analysis to do its thing.
+Created attachment 226810
+Same patch combined and synched with top of branch.
+Hello Jesper, Thanks for the patch. Here are some comments to follow up:
+
+(1) Scope: Instead of inventing additional infrastructure, let us reuse
+existing ones: "Reaching into outer classes local/fields" is handled via
+the notion of "depth". See org.eclipse.jdt.internal.compiler.lookup.InvocationSite.setDepth(int).
+NameReference implements this interface. The existing code bumps
+up the depth when we leave a class scope to reach into its parent. 
+Similarly we need to bump up the depth when we leave the lambda to 
+reach into enclosing abstractions. To facilitate detection of this, 
+we could add a method say crossesOverTypes
+
+Scope#crossesOverTypes -> return false
+ClassScope#crossesOverTypes -> return true
+MethodScope#crossesOverTypes -> return true iff lambda.
+
+To detect if a method scope corresponds to a lambda expression, 
+we can introduce an alternate constructor that takes a boolean.
+
+This last sentence really is similar to the LambdaScope idea from 
+one of your patches - I don't yet see a need for a full blown class 
+even if small, yet - just a boolean in MethodScope suffices for now.
+(If possible, we want to avoid littering the code with instanceof checks)
+
+If we do this, then Scope will have to see a single line change just above
+
+scope = scope.parent;
+
+and will be --> if (scope.crossesOverTypes()) depth++. (We should get 
+rid of the bump up in class scope)
+
+(2) The tag bit IsFromOutsideLambda is problematic - You are using bit14
+which is already used for IsStrictlyAssigned for references. This would
+lead to problems - it is just that the tests you have added don't trigger
+the path where the other bit use is made. 
+
+(3) The only real use of IsFromOutsideLambda is to switch between two
+different messages - I don't see much value there. I would suggest we 
+simply punt on this and say something neutral like:
+
+"As 'x' is not final and not also effectively final, it cannot be accessed here"
+
+(4) Also note: due to incorrect check in ProblemReporter the messages
+actually come reversed. i.e for lambda we say inner classes and vice versa.
+
+"here" is good enough :)
+
+(4) The change in QNR looks suspect. Effectively final is a requirement for
+local and parameters - these cannot be referenced by qualified names. I think
+existing code is materializing a LVM in QNR#resolve* - That looks suspect
+too. Does that code ever trigger ?  It looks like mindless copy + paste on
+somebody's part in the past :) 
+
+(5) The duplicated code in Assignment and CompoundAssignment should be 
+moved and centralized into SNR.analyzeAssignment (Removing the simplistic,
+but-correct-for-java7 code from these files is the correct thing to have
+done.)
+
+(6) I know this came from copy + paste, but
+
+String[] arguments =new String[]
+
+should be 
+
+String[] arguments = new String[]
+
+(7) Finally, I don't think we should defer the error reporting to
+code generation time. Each phase gets skipped when ignore further
+investigation is set and the earlier an error is reported the better.
+Here is a scheme I propose: (this is really the same as Stephan's
+idea of collecting information in the binding see comment#11, but
+elaborated)
+
+(a) Introduce a new tag bit 'IsCapturedVariable' in local variable bindings.
+This bit need to be set to true whenever a outer local (depth > 0) is
+accessed.
+
+(b) In Resolve anytime an assignment is seen (we don't have flow data
+to tell us its definite/potential assigned state, but right now we don't
+care), if it is to a captured variable, clear its effectively final bit.
+
+(c) In analyze clear the effectively final bit on assignment to an already
+potentially assigned variable (definite assignment also sets potential 
+assigned status but not vice versa).
+
+(d) When analyzeCode is called for the lambda body, the captured variables
+must have been definitely assigned to - if not it triggers a different
+error : may be uninitialized error.
+
+(e) During analyze if we see a captured variable which is not effectively
+final, we complain.
+
+Does that sound good ?
+(In reply to comment #12)
+
+> OK, looking more closely at the requirements I should give better advice:
+> 
+> Already during resolve it should be possible to detect which local variables
+> are accessed from a nested lambda body and record this fact in the variable
+> binding using a new TagBit (this doesn't necessarily have to happen at this
+> point, but should help performance as we can now avoid the next step in the
+> regular case).
+> 
+> During analyseCode we should check for each variable marked in phase 1 if it
+> is ever assigned in a state where it was already assigned (potentially
+> assigned is sufficient to create the error) - this part uses a flowInfo and
+> is similar to checks done for final variables - cf.
+> SingleNameReference.analyseAssignment. Again mark this finding in the
+> variable binding.
+
+Ah, I should read the comments patiently, that will save me lots of typing
+time :)
+
+Jesper, what I proposed in comment#24 is the same as what Stephan has
+proposed in comment#12 but for one crucial difference. Also clearing
+the effectively final bit on assignment of captured variables even in
+the absence of flow info would allow us to pull up reporting to analyze
+and not involve code generation.
+(In reply to comment #25)
+> [...] Also clearing
+> the effectively final bit on assignment of captured variables even in
+> the absence of flow info would allow us to pull up reporting to analyze
+> and not involve code generation.
+
+I think that's in conflict with examples like in comment 18, no?
+(In reply to comment #26)
+> (In reply to comment #25)
+> > [...] Also clearing
+> > the effectively final bit on assignment of captured variables even in
+> > the absence of flow info would allow us to pull up reporting to analyze
+> > and not involve code generation.
+> 
+> I think that's in conflict with examples like in comment 18, no?
+
+No. When the statement:
+
+if (args != null)
+       var = args.length;
+    else
+       var = 2;
+
+is resolved, 'var' would NOT have been tagged as a "captured variable" yet,
+so we won't clear the effectively final bit: Unlike the effectively final
+bit which starts out as true for all locals, I am proposing the captured
+status start out at false and be set only when an outer local is seen.
+
+Does that explanation sound right ?
+(In reply to comment #27)
+
+> Does that explanation sound right ?
+
+To elaborate, a captured outer local must have been definitely assigned
+to - if not analyze will report an error at the lambda use site.
+
+Once it is tagged as captured, further assignments lexically post capture
+are monitored by resolve(). Multiple assignment ahead of capture are
+flagged by analyze(). So somebody is watching the back and someone else
+is covering the front. We should be good.
+(In reply to comment #27)
+> Does that explanation sound right ?
+
+Much clearer, thanks.
+
+But let me try again:
+
+interface I {
+	void doit();
+}
+public class X {
+  public static void main(String[] args) {
+    int var;
+    if (args != null) {
+       var = args.length;
+       I x = new I() {
+         public void doit() {
+           System.out.println(var);
+         }
+       };
+    } else {
+       var = 2; // HERE
+    }
+  }
+}
+
+Wouldn't your approach at the location HERE clear the effectively final bit?
+Resolve would think "HERE" happens after the anonymous class, but there is no "after" in parallel structures like this.
+
+I understand your motivation, but I feel that using flowInfo to determine whether a variable is effectively final is the most natural way. Any other approach will need much more mind-bending to achieve the same, and is hence more difficult to maintain.
+
+If not deferring reporting to generateCode is important, we might get away with a brief iteration of all locals in scope, similar to resource leak analysis, i.e., another action to perform whenever analyseCode leaves a Block.
+(In reply to comment #29)
+> (In reply to comment #27)
+
+> Wouldn't your approach at the location HERE clear the effectively final bit?
+> Resolve would think "HERE" happens after the anonymous class, but there is
+> no "after" in parallel structures like this.
+
+Indeed, you caught me napping there. It is post midnight in India :)
+Thanks for the new example.
+
+> If not deferring reporting to generateCode is important, 
+
+I would say it is important, but that not that important enough to bend
+over backwards.
+
+So, Jesper, let us stick to code generation time reporting for now. Could
+you reconcile/polish/clean up based on the other comments ? Thanks.
+Also if you could role the snippets in comment#5 and comment#29, that
+would be super.
+(In reply to comment #29)
+
+> I understand your motivation, but I feel that using flowInfo to determine
+> whether a variable is effectively final is the most natural way. Any other
+
+Agreed. I was also misled by some of the experiments I was doing with Java 7
+precise rethrow semantics: In the following program:
+
+import java.io.IOException;
+interface I {
+    void doit();
+}
+public class X {
+  public static void main(String[] args) throws IOException {
+
+	try {
+		throw new IOException();
+	} catch (Exception e) {
+		if (args == null) {
+			throw e;
+		} 
+                else {
+			e = null;
+		}
+	}
+  }
+}
+
+commenting out the else block will make the program compile. That was
+the simple minded Java 7 implicit final model. What is required for JSR335
+is full fledge data and control flow analysis.
+(In reply to comment #24)
+> Hello Jesper, Thanks for the patch. Here are some comments to follow up:
+> 
+> (1) Scope: Instead of inventing additional infrastructure, let us reuse
+> existing ones: "Reaching into outer classes local/fields" is handled via
+> the notion of "depth". See
+> org.eclipse.jdt.internal.compiler.lookup.InvocationSite.setDepth(int).
+> NameReference implements this interface. The existing code bumps
+> up the depth when we leave a class scope to reach into its parent. 
+> Similarly we need to bump up the depth when we leave the lambda to 
+> reach into enclosing abstractions. To facilitate detection of this, 
+> we could add a method say crossesOverTypes
+
+There's a problem with just using depth (which was my first idea): Redefinition must work differently: In a lambda it's an error, but in an inner class it is OK, but gives a warning (same behaviour in javac). This is because a lambda block is semantically NOT a method body of its own, but merely a block with some bound variables. (It should add 0.5 of depth, so to speak)
+Tricky, but the depth-dependent checks break down when you try (I tried). In a way, this becomes another case for LambdaScope? Also, al captured vars must be efficiently recorded in the context so they can be formals in the lambda$x method, that could also be handled in the scope, but it also works differently between lambdas and anon types.
+
+> Scope#crossesOverTypes -> return false
+> ClassScope#crossesOverTypes -> return true
+> MethodScope#crossesOverTypes -> return true iff lambda.
+
+A lambda doesn't cross over a type...
+
+> To detect if a method scope corresponds to a lambda expression, 
+> we can introduce an alternate constructor that takes a boolean.
+> 
+> This last sentence really is similar to the LambdaScope idea from 
+> one of your patches - I don't yet see a need for a full blown class 
+> even if small, yet - just a boolean in MethodScope suffices for now.
+> (If possible, we want to avoid littering the code with instanceof checks)
+
+True, could check Scope.kind or we'd introduce a getter as needed.
+
+> If we do this, then Scope will have to see a single line change just above
+> 
+> scope = scope.parent;
+> 
+> and will be --> if (scope.crossesOverTypes()) depth++. (We should get 
+> rid of the bump up in class scope)
+> 
+> (2) The tag bit IsFromOutsideLambda is problematic - You are using bit14
+> which is already used for IsStrictlyAssigned for references. This would
+> lead to problems - it is just that the tests you have added don't trigger
+> the path where the other bit use is made. 
+Oops! I thought I checked in the right places.
+
+> (3) The only real use of IsFromOutsideLambda is to switch between two
+> different messages - I don't see much value there. I would suggest we 
+> simply punt on this and say something neutral like:
+
+There's more than that since using the depth is problematic.
+
+As for fixing this in the patch: I've two problems: 1. The patch is becoming too big for IP rules (250 line limit) and 2. I'm away on vacation this week, more snow than 3G coverage, so I won't be able to make these fixes at the mlment. I leave it to you to decide whether to A) postpone, B) fix as desired, or C) apply as is, pending further refinements. :-)
+(In reply to comment #32)
+
+> There's a problem with just using depth (which was my first idea):
+> Redefinition must work differently: In a lambda it's an error, but in an
+> inner class it is OK, but gives a warning (same behaviour in javac). This is
+
+Can this be handled by currentScope.methodScope().isLambdaScope() ? 
+
+> > Scope#crossesOverTypes -> return false
+> > ClassScope#crossesOverTypes -> return true
+> > MethodScope#crossesOverTypes -> return true iff lambda.
+> 
+> A lambda doesn't cross over a type...
+
+That distinction is just academic ?
+
+> C) apply as is, pending further refinements. :-)
+
+Thanks, I'll opt for C. I'll make the changes along the lines that has been
+discussed and if there are any follow up issues, you can handle it upon your
+return - have a great vacation !
+(In reply to comment #33)
+> (In reply to comment #32)
+> 
+> > There's a problem with just using depth (which was my first idea):
+> > Redefinition must work differently: In a lambda it's an error, but in an
+> > inner class it is OK, but gives a warning (same behaviour in javac). This is
+> 
+> Can this be handled by currentScope.methodScope().isLambdaScope()  
+
+better yet -> currentScope.isLambdaScope() ?
+Comment on attachment 226799
+New patch which does better final-analysis
+
+Released via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=683ea9e225586815608aba47b7144305522e9131 - Thanks !
+Comment on attachment 226800
+Patch with tricky test from Stephan
+
+Released these tests after synching with branch head.
+Thanks Jesper, Thanks Stephan.
+(In reply to comment #24)
+
+> (4) Also note: due to incorrect check in ProblemReporter the messages
+> actually come reversed. i.e for lambda we say inner classes and vice versa.
+
+That's puzzling. In the IDE I see the messages coming out reversed. In the
+junit, they are as expected. I'll see why.
+
+
+(In reply to comment #32)
+
+> > Scope#crossesOverTypes -> return false
+> > ClassScope#crossesOverTypes -> return true
+> > MethodScope#crossesOverTypes -> return true iff lambda.
+> 
+> A lambda doesn't cross over a type...
+
+I'll settle for Scope.isCrossOverScope()
+We should report an error for
+
+// -
+interface I {
+	void foo();
+}
+
+class X {
+	void foo() {
+		int x = 10;
+		I i = () -> {
+			System.out.println(x++);
+		};
+	}
+}
+//
+
+presently we don't. I'll fix this.
+(In reply to comment #38)
+
+After the patch this code compiles fine: it should not:
+
+// ---
+import java.io.IOException;
+
+class X {
+	void foo(int x) throws IOException {
+		try {
+			throw new IOException();
+		} catch (Exception e) {
+			if (x == 0) {
+				throw e;
+			} else {
+				e = null;
+			}
+		}
+	}
+}
+// -----
+
+Basically removing the code from org.eclipse.jdt.internal.compiler.ast.SingleNameReference.resolveType(BlockScope)
+was wrong.
+
+Java7's notion of effectively final catch parameters was very simplistic and
+did not involve data & control flow analysis. If *any* assignment was seen at
+all it was deemed to be not effectively final.
+
+After the patch we are applying Java 8's (rigorous) definition of effective
+finality to catch parameters also - we should not.
+
+I'll include a fix in my follow up patch.
+
+Sorry that this was not caught by the test suite.
+Another test that breaks with the released code: 
+
+// -------------------
+class AJB {
+  void foo() {
+    int z = 0;
+    new Object(){
+      void bar(int x){
+        x = z;
+      }
+    };
+  }
+}
+
+This should trigger an error:
+
+"Cannot refer to a non-final variable z inside an inner class defined in a different method", but it doesn't any more.
+
+BTW, the message is broken, it should say:
+"Cannot refer to a non-final variable z in a different method inside an inner
+class"
+(In reply to comment #24)
+
+> (4) The change in QNR looks suspect. Effectively final is a requirement for
+> local and parameters - these cannot be referenced by qualified names. I think
+> existing code is materializing a LVM in QNR#resolve* - That looks suspect
+> too. Does that code ever trigger ?  It looks like mindless copy + paste on
+> somebody's part in the past :) 
+
+My code review skills post midnight are what are suspect :) This code is
+very much necessary.
+(In reply to comment #32)
+
+> There's a problem with just using depth (which was my first idea):
+> Redefinition must work differently: In a lambda it's an error, but in an
+> inner class it is OK, but gives a warning (same behaviour in javac). This is
+> because a lambda block is semantically NOT a method body of its own, but
+> merely a block with some bound variables. (It should add 0.5 of depth, so to
+> speak)
+> Tricky, but the depth-dependent checks break down when you try (I tried).
+
+OK, I tried too and I understand what you mean now :) I'll post a patch with
+fixes to all the issues soon.
+(In reply to comment #40)
+> Another test that breaks with the released code: 
+> 
+> // -------------------
+> class AJB {
+>   void foo() {
+>     int z = 0;
+>     new Object(){
+>       void bar(int x){
+>         x = z;
+>       }
+>     };
+>   }
+> }
+> 
+> This should trigger an error:
+> 
+> "Cannot refer to a non-final variable z inside an inner class defined in a
+> different method", but it doesn't any more.
+
+In earlier versions, yes, but under 1.8 it shouldn't complain.
+(In reply to comment #43)
+
+> In earlier versions, yes, but under 1.8 it shouldn't complain.
+
+Yes, per comment#0.
+(In reply to comment #44)
+> (In reply to comment #43)
+> 
+> > In earlier versions, yes, but under 1.8 it shouldn't complain.
+> 
+> Yes, per comment#0.
+
+I disagree, since there is no assignment to 'z', it is effectively final. javac doesn't complain. Did you exclude a line or something?
+(In reply to comment #45)
+> (In reply to comment #44)
+> > (In reply to comment #43)
+> > 
+> > > In earlier versions, yes, but under 1.8 it shouldn't complain.
+> > 
+> > Yes, per comment#0.
+> 
+> I disagree, since there is no assignment to 'z', it is effectively final.
+> javac doesn't complain. Did you exclude a line or something?
+
+:)
+
+I meant "Yes, we should not complain", as also pointed out by comment#0.
+Two more issues:
+
+// ---
+interface I {
+	void doit ();
+}
+class X {
+	int p;
+	void foo(int p) {
+		int i = 10;
+		X x = new X();
+		x = new X();
+		I l = () -> {
+			x.p = i++;
+		};
+	}
+}  
+// ------------
+
+This should generate two errors about x and i, but doesn't.
+Incorporated review comments, fixed issues found during testing and reported
+earlier here, polished a few things, dictatorially renamed a few symbols and
+released the implementation via:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=9966baba46edc3df548fabd09b133cadc0093ca6
+
+Additional tests released via:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=d32dbe370312bc68ef5b59c6268bfdfcda839b17
+
+Jesper, I didn't change the design or implementation, so thanks for your
+work on this capability.
+
+Stephan, thanks for the discussion, tests etc.
+335 spec v0.6.2 has introduced this new rule marked with ***
+
+A lambda expression is compatible in an assignment, invocation, or casting 
+context with type T if T is a function type (9.8) and the expression is 
+congruent with a function descriptor derived from T.
+
+A lambda expression is congruent with a function descriptor if the 
+following are true:
+
+Where the lambda parameters are assumed to have the same types as the 
+descriptor parameter types:
+
+*** There are no compile-time errors in the lambda body, except for 
+(possibly) the exception checking errors specified by 11.2.3.
+
+This is painfull. There are compile errors that we report
+during resolution (aka semantic analysis), analyze (aka control/data flow
+analysis) and *code generation* phases. 
+
+For a lambda expression in a method invocation, we are going to have to 
+resolve the lambda method possibly multiple times, analyze multiple times,
+generate code multiple times etc to figure out if there are compile 
+errors. (in the present scheme of things)
+
+These errors are issued from where they are issued from for a reason. It
+is going to be inconvenient to "pull up" the reporting.
+
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=401610#c3 has created the
+infrastructure to do multiple traversals, so the complication is not
+in implementing thus change, but in implementing it efficiently. But the
+complexity is intrinsic to the specification and we should be able to
+approach the intrinsic complexity and may be thing will wash out in the end.
+Already https://bugs.eclipse.org/bugs/show_bug.cgi?id=401939 calls
+for double analysis, but these are carefully restricted to the
+real situations where heuristics won't work and we have to fail over
+to full double analysis.
+(In reply to comment #49)
+
+> https://bugs.eclipse.org/bugs/show_bug.cgi?id=401610#c3 has created the
+> infrastructure to do multiple traversals, so the complication is not
+> in implementing thus change,
+
+I may have spoken too soon. Bug 401610 has created the infrastructure
+for multiple traversals of the lambda itself, but there is nothing to
+support multiple traversals of the enclosing context. Comment #29 type
+of cases are going to be hard to handle.
+
+Various solutions can be devised - all of them are going to require a good
+bit of work I suspect.
+(In reply to comment #49)
+> *** There are no compile-time errors in the lambda body, except for 
+> (possibly) the exception checking errors specified by 11.2.3.
+> 
+> This is painfull. There are compile errors that we report
+> during resolution (aka semantic analysis), analyze (aka control/data flow
+> analysis) and *code generation* phases. 
+
+Have you checked what kinds of problems we report during code gen?
+Are these really JLS-based errors or just ECJ warnings (which should
+not affect resolution, right?) ?
+
+I remember unused local warnings, which seem to fall into the second category.
+
+What else?
+(In reply to comment #52)
+
+> Have you checked what kinds of problems we report during code gen?
+> Are these really JLS-based errors or just ECJ warnings (which should
+> not affect resolution, right?) ?
+
+Well, most recently we added errors for non-effectively final variable
+usage inside lambda. 
+
+> What else?
+
+I had noticed earlier that noSuchEnclosingInstance which would be JLS
+required error gets reported during code generation. I don't know of
+an easy way of finding out the exhaustive list.
+
+Here perhaps is a huge silver lining: We _may_ be able to completely punt
+on this requirement after all: Errors induced by surrounding context issues
+(such as non-effective final usage) should show up irrespective of the
+descriptor type being considered for compatibility check, right ? The 
+descriptor only fills in the local blanks in the lambda (missing return
+type, elided parameter types, throws clauses) and cannot fundamentally
+alter a lambda's well formedness with respect to its context - right ?
+
+Any holes in that reasoning ?
+(In reply to comment #49)
+> 335 spec v0.6.2 has introduced this new rule marked with ***
+
+My eyes almost popped out of their sockets when I read it the first time,
+but this is a false alarm. Sorry. We _can_ punt on this requirement - If the
+lambda is FUBAR, then nothing that the descriptor of the target type from
+the context can impose on the lambda can change the ill-formedness of
+the lambda and so from a compatibility/applicability pov, any candidate method
+is as  good as or as bad as the other. 
+
+What this new rule is intended to require is to check whether the lambda
+which is otherwise well formed, gets rendered ill-formed when the descriptor
+types from the context are imposed on it - This is handled in https://bugs.eclipse.org/bugs/show_bug.cgi?id=402219.
+
+Overall, this new rule will have a salutary effect in (a) minimizing ambiguity
+in overload resolution and (b) bring the compilers closer in conformance.
+
+For example, 8b76 javac reports the call as being ambiguous in the
+following:
+
+// --
+interface I {
+	String foo(String s1, String s2);
+}
+
+interface J {
+	X foo(X x1, X x2);
+}
+
+public class X { 
+	void goo(I i) {}
+	void goo(J j) {}
+    public static void main(String [] args) {
+	new X().goo((p1, p2) -> p1 + p2);
+    }
+}  
+
+Even by 0.6.1 rules, this call is not ambiguous and eclipse was compiling
+it correctly. The new rule will force javac to conform with eclipse.
+I've aligned both problem messages with existing similar messages:
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=fb2dd37cec63b32be19be47d4358718ed4d76649
+
+- is required to be -> must be
+- variable -> local variable
+- in a different method inside an inner class -> defined in an enclosing scope
+  (reuse terminology; also correct for local variable defined in an initializer)

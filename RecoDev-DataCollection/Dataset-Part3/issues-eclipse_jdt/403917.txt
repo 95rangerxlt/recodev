@@ -1,0 +1,335 @@
+Render TYPE_USE annotations in Javadoc hover/view.
+
+Render TYPE_USE annotations in Javadoc hover/view.
+Maybe needs more support from JDT Core.
+To clarify, the element header in the Javadoc hover/view should also render annotations whose @Target meta-annotation contains ElementType.TYPE_USE.
+
+Example:
+
+package jsr308.bug403917;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+import java.util.List;
+
+public class Bug403917 {
+	@Target(ElementType.TYPE_USE)
+	static @interface NonNull { }
+
+	@NonNull List<@NonNull String> foo(@NonNull List<@NonNull String> arg) {
+		return arg;
+	}
+}
+
+
+For foo, the Javadoc header should be:
+
+@NonNull List<@NonNull String>
+jsr308.bug403917.Bug403917.foo(@NonNull List<@NonNull String> arg)
+
+Please start with the implementation for "List<@NonNull String>". The annotation on the MethodDeclaration is under discussion in bug 403816.
+Consider List<@NonNull String> foo(List<@NonNull String> arg) 
+
+To render the annotation in Javadoc view/hover we need to update JavaElementLabelComposer#appendTypeArgumentSignaturesLabel. I am not finding direct/indirect api to get the annotation of the type argument from a JavaElement. 
+
+In fact if there was an ASTNode for MethodDeclaration then using 
+1. methodDeclr#parameters()#get(0) =returns=>  SingleVariableDeclaration .
+2. singleVarDeclr#getType() should get a ParameterizedType.
+3. invoke ParameterizedType #typeArguments  =returns=> TYPE_ARGUMENTS_PROPERTY
+4  depending on the type, #annotations can be invoked to get the expected annotation, in the above case @NonNull can be retrieved.
+The above flow was explained by Jay.
+
+But I could not find any way in which we can accomplish this using a JavaElement. Markus, can you suggest the api to use to retrieve the type argument annotation from a JavaElement?
+Thanks for the investigations. Apparently, I haven't thought this through when I filed the bug. There is indeed no way to get these annotations from an IJavaElement, and the AST is the only solution. However, we don't want to write the whole JavaElementLabelComposer again based on ASTs, since that's not as efficient as using the Java model, and it only works if source is available.
+
+I'm not sure if it's worth adding special APIs to get the nested annotations from the Java model at this point. To be useful, the API would have to work for source and binary type roots, so it would probably look similar to the annotation representation in the class file.
+
+Let's take this off the plan for now. The javadoc.exe in jdk-8-ea-bin-b77 also doesn't process TYPE_USE annotations at this time.
+Better snippet than comment 2:
+
+import java.lang.annotation.*;
+import java.util.List;
+
+@Documented @Target(ElementType.TYPE_USE) @interface NonNull { }
+@Documented @Target(ElementType.TYPE_USE) @interface Nullable { }
+@Documented @interface DeclNonNull { }
+
+public class Bug403917 {
+	@NonNull List<@Nullable String> foo(
+			@NonNull List<@Nullable String> a1,
+			final @NonNull List<@Nullable String> a2) {
+		return a1;
+	}
+	@DeclNonNull List<String> bar(
+			@DeclNonNull List<String> a1,
+			final @DeclNonNull List<String> a2) {
+		return a1;
+	}
+}
+
+javadoc.exe from JDK 8u5 behaves mostly the same as the Eclipse Javadoc hover: Shows @NonNull on parameter types, but not the @Nullable on nested types.
+
+We're currently missing TYPE_USE annotations on the return type. The difference to method parameters is that method parameter type annotations are coming from ILocalVariable#getAnnotations(), but annotations on members are implemented in JavadocHover#addAnnotations(..) based on IBinding#getAnnotations() on the member. The latter don't include type annotations.
+I think the hover would be most useful if it shows even more than javadoc:
+- annotations an type arguments, bounds etc.
+- annotations propagated from generic instantiations
+
+e.g.
+
+   List<@NonNull Person> l;
+   l.get(1);
+
+I'd expect that hover over get shows:
+   @NonNull Person get(int i)
+
+For invocations of generic methods this would even include type annotations on inferred types. The compiler bindings have all this information. Is this propagated correctly into DOM, or would this need more work in JDT/Core?
+
+If users get overwhelmed, maybe the type annotations to show in hovers could be filtered, but my feeling is: if you care to place type annotations you also want to see them in hovers, everywhere.
+I agree showing all type annotations would be the best solution.
+
+The problem is that we don't want to wait for a DOM AST to show the Javadoc hovers. We get most of the header info to render the signature from IJavaElements, including annotations on method parameters. Since the IAnnotations don't contain all annotation arguments, this is not 100% complete (but good enough for parameter annotations, which usually don't have complex arguments).
+
+For annotations on the IMember, we first check the Java model. In case there are annotations, we spend some extra time to resolve the IMember's binding and then render annotations based on that information. (We currently just call IBinding#getAnnotations(), that's why type use annotations on the return type are missing.) 
+
+The type use annotations are a problem, because they don't necessarily show up as IAnnotations, and because our JavaElementLabelComposer was not built for adding extra annotations inside type arguments.
+Created attachment 251199
+binding based javadoc hover/view
+
+Here's a draft implementation of binding-based javadoc hover & view.
+
+The implementation already covers many interesting scenarios, but it is not fully complete. I'm posting this so we can discuss before M6, whether new API in JDT/Core is needed to resolve this bug. 
+
+Center piece is indeed a new label composer, formally extending JavaElementLinkedLabelComposer, but reuse is actually pretty limited. While there is a bit room for refactoring towards more reuse, this design will inevitably cause duplication of conceptually similar pieces of code.
+
+To reduce the code bloat I repeated only that functionality that is actually needed for javadoc hover & view, i.e., I don't handle each and every possible flag that the general label composer handles (e.g., post-qualification). This implies that for general usage, the old label composers will remain in place.
+
+For a naive comparison:
+- JavaElementLabelComposer = 1609 LOC
+- BindingLinkedLabelComposer = 325 LOC
+
+Bindings are a natural choice for this implementation, almost all information is handily available in a very suitable way. The exception being: names of method parameters, for which I'm still using the IMethod. Also creating of javadoc link URIs uses the IJavaElement enclosingElement as its base. I don't see this little mix as a problem.
+
+On the performance side, it didn't really feel "slow" to me, but I don't have any figures to back this claim. To do a useful comparison I should probably ask what would be the worst case scenario for computing a binding. I used several types from JRE with lots of generics plus super-imposed external annotations, and response times looked good to me.
+
+Using the patch we can actually easily compare performance, because I guarded the new implementation by a check whether null annotations are enabled :), so if you have two projects, with enabled / disabled null annotations, you can directly compare. Aside from supporting experimentation let me ask: 
+IF we observe that the new implementation is noticeably slower, do we want to make it configurable? (a) coupled to the existing option re null annotations? (b) with a new preference?
+
+I noticed an interesting semantic difference between binding-based javadoc hover and javadoc view: In the view we now see the generic declaration, with its original type parameters, whereas in the hover we see the parameterized types with actual type arguments. While this is an artifact from having / not having a current AST node as our starting point, I believe this makes a lot of sense: The view should indeed show the context independent view, whereas the hover shows the variant that is valid at the context where the hover was invoked. It even allows you to compare a generic declaration with its specific instantiation, which I consider pretty cool.
+
+The binding based implementation also works, when you open javadoc view from a class file with no source attachment (due to binding recovery).
+
+Let me call out a few unimplemented details:
+
+- I don't yet render values for MemberValuePairBindings. I hope the binding information is sufficient, but I haven't look at it in detail.
+
+- I don't specifically support polymorphic signatures. For implementing this I would propose a new API IMethodBinding#isPolymorphicSignature(), which would be trivial to implement based on the compiler binding.
+
+- Distinction of type kinds is not as fine grained in dom bindins, as it is in compiler bindings when it comes to kinds of intersection types, CaptureBinding18 and such. Completing this implementation would require to quickly revisit, which of these types we expect to show up in hovers, and to check whether all necessary information is available in the dom binding.
+
+Any comments?
+Created attachment 251569
+binding based javadoc hover/view v2
+
+(In reply to Stephan Herrmann from comment #8)
+> - I don't specifically support polymorphic signatures. For implementing this
+> I would propose a new API IMethodBinding#isPolymorphicSignature(), which
+> would be trivial to implement based on the compiler binding.
+
+Such new API may or may not make sense. For this current bug, however, I figured it easier to just ask the IMethod instead, i.e., just copy one more handful of lines from JavaElementLabelComposer.
+Sorry, I didn't find time for a proper review for M6, but I'll put it on my list for M7.
+
+The BindingLinkedLabelComposer looks a lot like BindingLabelProvider. We should try to get rid of the text rendering code in the latter.
+
+> On the performance side, it didn't really feel "slow" to me, but I don't
+> have any figures to back this claim. To do a useful comparison I should
+> probably ask what would be the worst case scenario for computing a binding.
+> I used several types from JRE with lots of generics plus super-imposed
+> external annotations, and response times looked good to me.
+
+The worst case scenario is if you
+- have a huge file (e.g. generated code, StyledText, or CompletionTests),
+- edit the file, and then quickly
+- try to show a Javadoc hover
+
+> IF we observe that the new implementation is noticeably slower, do we want
+> to make it configurable? (a) coupled to the existing option re null
+> annotations? (b) with a new preference?
+
+We'd only make it configurable if we understand where it's slow and we're sure there's no way to improve that. We wouldn't couple it to the null annotations preference.
+
+> I noticed an interesting semantic difference between binding-based javadoc
+> hover and javadoc view: In the view we now see the generic declaration, with
+> its original type parameters, whereas in the hover we see the parameterized
+> types with actual type arguments. While this is an artifact from having /
+> not having a current AST node as our starting point, I believe this makes a
+> lot of sense: The view should indeed show the context independent view,
+> whereas the hover shows the variant that is valid at the context where the
+> hover was invoked. It even allows you to compare a generic declaration with
+> its specific instantiation, which I consider pretty cool.
+
+I agree it could be interesting to see this difference, but that shouldn't be a Javadoc view vs. hover thing. The two are meant to show the same information. Some users just use one of the two features, and others use the "Show in Javadoc View" button in the hover's toolbar to read longer docs. The hover/view for a type reference should always show the type arguments used at that reference. The declaration information should be shown when you click the icon or use Open Declaration or Open Input from the toolbar. Looks like we have a bug there, since the view doesn't update automatically.
+One observation while using the patch: 
+If there is a method parameter "@NonNull List<@Nullable String> a1", hovering over "a1" shows "@NonNull List<@Nullable String> a1", but Javadoc view doesn't show the type annotations i.e. it just shows "List<String> a1".
+(In reply to Noopur Gupta from comment #11)
+> One observation while using the patch: 
+> If there is a method parameter "@NonNull List<@Nullable String> a1",
+> hovering over "a1" shows "@NonNull List<@Nullable String> a1", but Javadoc
+> view doesn't show the type annotations i.e. it just shows "List<String> a1".
+
+Good catch, thanks!
+
+I'd call this a bug in DOMFinder, see bug 463330.
+The effect is: we don't find the VariableBinding needed for binding based label composition, but fall back to the old java element based approach.
+*** Bug 366007 has been marked as a duplicate of this bug. ***
+Created attachment 252167
+binding based javadoc hover/view v3
+
+(In reply to Markus Keller from comment #10)
+> The worst case scenario is if you
+> - have a huge file (e.g. generated code, StyledText, or CompletionTests),
+> - edit the file, and then quickly
+> - try to show a Javadoc hover
+
+I've played with the patch using StyledText as my test subject. I seems my GTK2 system has a built-in delay of 500ms before showing any tooltips. I didn't succeed to change that value. On top of this delay I could not perceive any slow down.
+Next I used some poor-man's profiling to capture time spent in JavadocHover.getInfoText(IJavaElement, ITypeRoot, IRegion, boolean):
+- using sources: 
+  - first invocation per file: ~20ms
+  - 0-1ms for local (cached?) elements, 
+  - up-to 6ms for "foreign", not-cached elements
+- using class file with source attachment:
+  - 1-3ms own elements
+  - up-to 8ms foreign elements
+I'd be thoroughly surprised if any user noticed such differences.
+
+While playing with the patch, I made two small improvements, see the new attachment:
+
+- Under some circumstances I saw a SourceTypeBinding from a ClassFile with source attachment. External annotations, OTOH, are only supported as attachment to BinaryTypeBindings. I resolved this by inspecting the given ITypeRoot: only go down into SharedASTProvider.getAST() if we have a source ICompilationUnit. For IClassFile prefer ASTparser.createBindings() instead. (This seems to avoid the initial overhead "~20ms", without a significant penalty down the road).
+
+- I improved the rendering of type annotations on arrays. A full solution featuring annotations on inner dimensions will require a solution for bug 463942. But for 1-dimensional arrays labels are rendered as desired with this change.
+
+
+Let me know of any other steps I should take.
+Created attachment 252324
+evolved patch
+
+Dumping my current status with several updates over the previous patch.
+
+I included an adjusted copy of JavaElementLabelsTest to demonstrate the level of completeness. I suggest to simply compare both test classes. A few JavaElementLabels constants are not yet supported, but I believe I already support more of them than needed for javadoc (hover/view).
+Tests actually featuring type annotations will follow soon.
+
+When testing the USE_RESOLVED flag, I found what looks like a bug in org.eclipse.jdt.core.dom.CompilationUnitResolver.resolve(IJavaElement[], int, Map, IJavaProject, WorkingCopyOwner, int, IProgressMonitor), which looks very similar to the difference between javadoc hover and javadoc view discussed above.
+
+I will explain a few more details tomorrow.
+Unless I get a very positive feedback from Markus about this change, I'd like to defer it to 4.6. We only have two weeks left before feature freeze, and this is a big change to one of our crucial features.
+(In reply to Dani Megert from comment #16)
+> Unless I get a very positive feedback from Markus about this change, I'd
+> like to defer it to 4.6. We only have two weeks left before feature freeze,
+> and this is a big change to one of our crucial features.
+
+I understand. Just as a reminder why I'm pushing this forward: Without these hovers the external null annotation feature is very obscure/difficult to use.
+
+In my latest patch I tried to demonstrate completeness in comparison to JavaElementLabelComposer, which, however, isn't needed for use only by javadoc hovers/view. Would chances for a "very positive feedback" rise when I extract only those parts that are necessary for this usage?
+Let's make the rendering of labels in javadoc configurable. For 4.5 we can leave the default to use the tested JavaElementLinkedLabelComposer, but users should get a chance to opt for the new BindingLinkedLabelComposer.
+
+While normally I'm not a fan of introducing new functionality disabled-by-default, the primary use case for wanting this - null annotations - is in the realm of explicit opt-in anyway.
+
+Additionally, having different options for rendering these labels will make perfect sense even if in the future BindingLinkedLabelComposer would completely replace JavaElementLinkedLabelComposer: for null annotations it would be highly desirable to have a more compact representation, s.t. like "String?" instead of "@NonNull String".
+
+In the end we would have s.t. like this under Java > Editor > Hovers:
+
+[ ] Render type annotations
+  [ ] Compress nullness annotations as "?" / "!"
+
+Or:
+Render type annotations
+  (o) None
+  ( ) Java source syntax
+  ( ) Compress null annotations
+
+
+I briefly considered integrating these options with the existing options ("Text Hover key modifier preferences"), but I think the existing options are more coarse grain selections of content, compared to the fine tuning of rendering discussed here, hence the proposal to make it a separate option.
+
+If the general direction is accepted, I can polish the patch today, implement the preference option, and I will allocate the full weekend for incorporating any review comments.
+(In reply to Stephan Herrmann from comment #18)
+
+
+I'm not a fan of additional options. How about linking it to whether the project is set up for null analysis?
+(In reply to Dani Megert from comment #19)
+> (In reply to Stephan Herrmann from comment #18)
+> 
+> 
+> I'm not a fan of additional options. How about linking it to whether the
+> project is set up for null analysis?
+
+Fine by me (in fact the patch currently does this :) ).
+
+Apparently the story about alternative rendering (requiring an option) didn't immediately convince you. I'll bring that up for unhurried discussion in 4.6 then.
+
+Markus, have you started reviewing yet? I'll upload a more polished patch later today, OK? Any suggestions to facilitate reviewing?
+New Gerrit change created: https://git.eclipse.org/r/45833
+
+WARNING: this patchset contains 1453 new lines of code and may require a Contribution Questionnaire (CQ) if the author is not a committer on the project. Please see:https://wiki.eclipse.org/Project_Management_Infrastructure/Creating_A_Contribution_Questionnaire
+Comments on the uploaded change:
+
+I'm now supporting all options (constants from JavaElementLabels) which JavaElementLabelComposer supports. Also all relevant kinds are supported (incl. package and member-value-pairs, which were unsupported in a previous patch).
+
+Qualification / containment is rendered correctly for _most_ elements. In order to do so I had to switch this part back to IJavaElement, because containment for things like anonymous classes within initializers cannot be discovered using bindings alone.
+
+Elements within a lambda body pose a hard challenge, qualification for these is not yet correctly rendered. It seems that JDT/Core doesn't yet provide the necessary information when starting from, e.g., a VariableBinding representing a lambda argument or a local variable within a lambda body. I'll try to find a strategy for this.
+
+Similarly, the type of a multi-catch is not available, and whether/how intersection types resulting from type inference are handled also needs to be investigated. DOM bindings don't seem to surface any of this information.
+
+In BiDi environments we fall back to the old labels, simply because I only implemented the linking variant. This is somewhat in line with how the existing implementation also falls back to a simpler version when BiDi processing is required.
+
+I've already fixed a number of JDT/Core bugs that surfaced via this implementation. I do hope that I can find solutions also for the remaining issues, even though I'd consider these issues as marginal when compared to the benefit for those users using external null annotations.
+
+
+The existing strategy for simple vs. qualified names can perhaps not be copied directly, because the java element based strategy simply takes the resolved or unresolved names it finds in the element. Bindings are always resolved by definition. So we need to explicitly ignore qualifications where we don't want them.
+I heuristically imitate the original behaviour by preferring simple names when looking at a compilation unit and qualified names otherwise. In javadoc hovers this achieves pretty good equivalence. I'm not sure, though, whether signatures with lots of fully-qualified types are actually helpful for users, or if we shouldn't use simple names in more places.
+If we agree on the cu-vs-classfile strategy, the JavadocView needs a few signatures augmented in order to pass this information to where we need it.
+
+
+As mentioned before, comparing the new BindingLabelsTest with JavaElementLabelsTest should quickly give an idea about equivalence of both strategies. In fact some disabled parts should work OK by now, I just haven't found the time to adjust & enable all those. I'll also add more tests. 
+
+
+Enablement of the new implementation is controlled in org.eclipse.jdt.internal.ui.text.java.hover.JavadocHover.getHoverBinding(IJavaElement, ASTNode), where we answer null if null-annotations are disabled, and from a null binding we fall back to java element based labels.
+Created attachment 252516
+proposed patch (complete)
+
+After the hand-waving of the previous comment, I've invested additional efforts to arrive at a version of the change that can be regarded as feature-complete. All existing tests for JavaElementLabelComposer have been copied and adjusted and for all aspects relevant to this ticket the new behaviour is compatible. Tests even include checking of hyperlinks, which the old tests don't.
+
+The only remaining incompleteness regards the handling of intersection types, but it seems that this incompleteness is not specific to this current bug, but actually affects several parts of JDT.
+
+Unfortunately, this level of completeness could not be achieved with existing API from JDT/Core. In bug 429813 comment 11 I'm proposing a small but powerful new API.
+
+
+To motivate my request for exception, here's why I believe this API is needed:
+
+First, this current bug is essential for external null annotations, because the new "Annotate" command creates entries in a file that the user should not need to look at. We don't even have any affordance for navigating to that file. Only by rendering these annotations in hovers can users conveniently see the current state of annotating. Also for regular (non-external) annotations the hover is the most convenient way to learn about existing null annotations.
+
+The previous version of my patch tried to work around the lack of API, which hampered the rendering of local classes and lambda expressions - resulting in patch-work of working with DOM bindings and Java elements in a clumsy mix. DOM bindings seem to promise capability to navigate from each element to its declaring element, but for anonymous classes and lambdas this promise was never fulfilled. In this situation I could not find a consistent implementation.
+
+By just adding one interface with one method the information from DOM bindings is now essentially complete for the task at hand.
+
+
+If the API exception is granted, we should have at least 2 options to take this bug to completion:
+
+(1) I see good chances that this patch receives the "very positive feedback" mentioned in comment 16.
+
+(2) The patch applies the linking to annotation-based null analysis mentioned in comment 19, so in this form it will not affect other users.
+
+Is a review towards (1) realistic at this point in time? If we rely on (2) for risk reduction, what level of review should I count on / wait for?
+Created attachment 252659
+patch updated to match update in bug 429813
+
+This version matches the updated API in https://git.eclipse.org/r/#/c/46030/4
+
+Also contains improvements from more testing in particular inspired by the example from bug 429813 comment 13, and from more self-review.
+(In reply to Stephan Herrmann from comment #24)
+> Created attachment 252659 [details] [diff]
+> patch updated to match update in bug 429813
+
++1 for 4.5 M7. I didn't review every detail, but the general direction looks good, and I think this is a good compromise between stability and added functionality for users who opt-in to annotation-based null analysis.
+Gerrit change https://git.eclipse.org/r/45833 was merged to [master].
+Commit: http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=594ed91e555d1955d9ad67626570809adfd08aaf
+Pushed directly, since the gerrit job still cannot see the API from bug 429813.

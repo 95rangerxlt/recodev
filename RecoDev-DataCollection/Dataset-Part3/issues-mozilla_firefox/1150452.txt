@@ -1,0 +1,153 @@
+As part of bug 1146349 I've been working on making the native event synthesization functions on DOMWindowUtils asynchronous. This causes a few test failures, and I was able to fix them all except for browser/base/content/test/newtab/browser_newtab_drag_drop.js (and possibly browser_newtab_bug735987.js which also uses the synthesized drag-and-drop function from head.js). After much investigation, I discovered that the failures I was seeing with this test are pre-existing low-volume intermittents (bug 898317) but my patch make it fail more frequently. After much digging I finally figured out what was going on. My investigation was specific to OS X.
+
+On OS X, when we synthesize a native drag operation, it ends up calling nsDragService::InvokeDragSession in widget/cocoa/nsDragService.mm, which invokes NSWindow's dragImage function in AppKit. This ends up doing a recursive call back into the widget, and spins up a nested event loop to handle the drag-related events. However, it seems like OS X only keeps this nested event loop for a limited amount of time, and if "stuff" doesn't happen soon enough, it will terminate the nested event loop and unwind. I'm not sure exactly what "stuff" is, because the code for that is in the OS X libraries. However, in the cases our code is running slow for whatever reason, OS X decides to terminate the operation prematurely. This manifests as the dragdrop shim receiving a "drop" event followed by a "dragend". Since this happens before the "dragenter" listener in startAndCompleteDragOperation triggers, that function ends up hanging until the test times out and is killed.
+
+I'm attaching a backtrace from lldb which shows how starting the drag operation sets up a nested call to nsAppShell::ProcessGeckoEvents. I also have printf logs for the success and failure cases which allowed me to figure out what's going on.
+
+As part of bug 1146349 I've been working on making the native event synthesization functions on DOMWindowUtils asynchronous. This causes a few test failures, and I was able to fix them all except for browser/base/content/test/newtab/browser_newtab_drag_drop.js (and possibly browser_newtab_bug735987.js which also uses the synthesized drag-and-drop function from head.js). After much investigation, I discovered that the failures I was seeing with this test are pre-existing low-volume intermittents (bug 898317) but my patch make it fail more frequently. After much digging I finally figured out what was going on. My investigation was specific to OS X.
+
+On OS X, when we synthesize a native drag operation, it ends up calling nsDragService::InvokeDragSession in widget/cocoa/nsDragService.mm, which invokes NSWindow's dragImage function in AppKit. This ends up doing a recursive call back into the widget, and spins up a nested event loop to handle the drag-related events. However, it seems like OS X only keeps this nested event loop for a limited amount of time, and if "stuff" doesn't happen soon enough, it will terminate the nested event loop and unwind. I'm not sure exactly what "stuff" is, because the code for that is in the OS X libraries. However, in the cases our code is running slow for whatever reason, OS X decides to terminate the operation prematurely. This manifests as the dragdrop shim receiving a "drop" event followed by a "dragend". Since this happens before the "dragenter" listener in startAndCompleteDragOperation triggers, that function ends up hanging until the test times out and is killed.
+
+I'm attaching a backtrace from lldb which shows how starting the drag operation sets up a nested call to nsAppShell::ProcessGeckoEvents. I also have printf logs for the success and failure cases which allowed me to figure out what's going on.
+Do you have a suggestion on how to fix the issue you describe? :-)
+
+(also, did attaching the backtrace / printf logs not work?)
+Created attachment 8587332
+Backtrace showing nested ProcessGeckoEvents call
+
+(In reply to :Gijs Kruitbosch from comment #1)
+> Do you have a suggestion on how to fix the issue you describe? :-)
+
+Not yet. I was hoping somebody who knows more about the drag code would have ideas. Specifically if they know what "stuff" prevents the OS X drag service from timing out, or maybe if they can audit the startAndCompleteDragOperation and dropTargetShim.js code to see if there's any errors. I don't know much about this, just fumbling around.
+
+> (also, did attaching the backtrace / printf logs not work?)
+
+Whoops, forgot :p. Here's the backtrace, will attach printf logs also - those will require a bit of explanation.
+Created attachment 8587335
+printf log of test passing
+Created attachment 8587338
+printf log of test failing
+
+Here's a corresponding log of the test failing. The logs probably don't make much sense in isolation, but by comparing the two you'll see that the fail log has the shim receiving a "drop" event (line 563 in this log). In the success case however the shim keeps receiving "dragover" events until it has successfully dispatched its fake dragenter event. That fake dragenter event is the one that startAndCompleteDragOperation is listening for in order to proceed.
+Created attachment 8587339
+Patch to generate printf log
+
+For reference this is the logging that I added to generate the printf logs I posted above. This patch was applied on top of parts 1-4 on bug 1146349 (attachments 8587308, 8587309, 8587310, and 8587311).
+(In reply to Kartikaya Gupta (email:kats@mozilla.com) from comment #2)
+> Created attachment 8587332
+> Backtrace showing nested ProcessGeckoEvents call
+> 
+> (In reply to :Gijs Kruitbosch from comment #1)
+> > Do you have a suggestion on how to fix the issue you describe? :-)
+> 
+> Not yet. I was hoping somebody who knows more about the drag code would have
+> ideas. Specifically if they know what "stuff" prevents the OS X drag service
+> from timing out, or maybe if they can audit the
+> startAndCompleteDragOperation and dropTargetShim.js code to see if there's
+> any errors. I don't know much about this, just fumbling around.
+
+Me neither! Tim probably knows more here. :-)
+For the record some other things I tried were to stick a printf in [1] to see if we were somehow sending an errant mouseup event and terminating the drag. The printf didn't get hit. I also took out the call at [2], and also tried changing it to a drag rather than a move. Neither of those changes had any effect; the dropTargetShim code still get a drop event which terminated the drag.
+
+[1] http://mxr.mozilla.org/mozilla-central/source/widget/cocoa/nsChildView.mm?rev=ac4464790ec4#4474
+[2] http://mxr.mozilla.org/mozilla-central/source/browser/base/content/test/newtab/head.js?rev=9f25f9cf6ce1#514
+(In reply to :Gijs Kruitbosch from comment #6)
+> (In reply to Kartikaya Gupta (email:kats@mozilla.com) from comment #2)
+> > Not yet. I was hoping somebody who knows more about the drag code would have
+> > ideas. Specifically if they know what "stuff" prevents the OS X drag service
+> > from timing out, or maybe if they can audit the
+> > startAndCompleteDragOperation and dropTargetShim.js code to see if there's
+> > any errors. I don't know much about this, just fumbling around.
+> 
+> Me neither! Tim probably knows more here. :-)
+
+Phew, I remember trying to investigate this weeks ago. For some reason, the newtab d&d tests fail permanently on OS X 10.10, on my machine at least.
+
+It seems that NSWindow::dragImage isn't returning if it doesn't see a genuine mouse event. I have no idea how to inject such an event into the event queue so that it doesn't get stuck, if that makes sense. When running those locally I can remember that the first test run was fine, the second got always stuck (with --run-until-failure). Not sure what to make of that.
+Do you have any plans to disable or fix these tests in automation? AIUI we're moving stuff over to 10.10 so if they're failing it's going to be an issue.
+
+From my investigation (see comment 0) I think it's expected that NSWindow::dragImage doesn't return immediately, instead it spawns a nested event loop. I think that what you're seeing (first test run works, next fails) is basically the same thing I'm seeing, it's just intermittent failure based on timing. I think to properly fix it we need to make sure OS X keeps the drag operation alive until we send our synthesized "mouse up" event, rather than terminating it when it feels like it's been long enough. I don't know if Apple has documented anything relating to this - I couldn't find anything but I'm unfamiliar with OS X API documentation so maybe I was looking in the wrong place.
+(In reply to Kartikaya Gupta (email:kats@mozilla.com) from comment #9)
+> Do you have any plans to disable or fix these tests in automation? AIUI
+> we're moving stuff over to 10.10 so if they're failing it's going to be an
+> issue.
+
+Well, yes I tried :) Gave up after spending too much time on it though.
+
+> I think to properly fix it we need to make sure OS
+> X keeps the drag operation alive until we send our synthesized "mouse up"
+> event, rather than terminating it when it feels like it's been long enough.
+> I don't know if Apple has documented anything relating to this - I couldn't
+> find anything but I'm unfamiliar with OS X API documentation so maybe I was
+> looking in the wrong place.
+
+I have no deeper knowledge of OS X and its APIs. Would be great to find someone that does and see if they may have an idea.
+Created attachment 8587565
+Backtrace during normal drag operations (non-synthesized)
+
+FWIW I grabbed a backtrace during normal Firefox operation of what happens during a drag (attached). In this case there actually isn't a nested ProcessGeckoEvents call because the mouse events coming in from the hardware (i.e. non-synthesized) get delivered to nsChildView::mouseDragged directly. This makes sense, and I tried to emulate this behaviour in the synthesized code path by changing the call at [1] from sendEvent to postEvent, so that Cocoa would dispatch it to the app directly. That worked as I intended but unfortunately didn't fix the problem - OS X still terminates the drag early by calling performDragOperation which dispatches the drop event.
+
+[1] http://mxr.mozilla.org/mozilla-central/source/widget/cocoa/nsChildView.mm?rev=ac4464790ec4#1176
+mstange/smichaud, do you guys know much about the native drag and drop APIs in OS X? Or can you redirect to somebody who can? In a nutshell what I'm seeing is that after we call NSWindow::dragImage from nsDragService::InvokeDragSession to start a drag session, OS X decides to end the drag session after what seems to be a short period of time, instead of waiting for an actual mouse-up event. I'm trying to figure out why, and how we can prevent that from happening. (If you know of somewhere the relevant OS X source might be available that would help too, even if it's old source code).
+I'm not very familiar with the Gecko drag/drop code, or with its native underpinnings on OS X.  But I'm willing to spend a few hours refamiliarizing myself with that code, then reading (and re-reading) my way carefully through this bug.  It may be next week before I can do this, though.
+
+By the way, it sounds like my interpose libraries would be very useful here http://people.mozilla.org/~stmichaud/ReverseEngineering/InterposeLibraryTemplate/.
+I didn't know we were exercising native Cocoa drag&drop APIs during automated tests, and I'm surprised that it works at all!
+
+Do you have a callstack for the case where the operation is terminated prematurely? Maybe there'd be a hint to the reason in that stack. And if not, maybe it would at least point us to a place at which we can start reading the disassembly.
+
+I guess the other option would be to make the drag&drop tests only test the Gecko parts and not call out to any system APIs. I don't know how much work that would be.
+(In reply to Markus Stange [:mstange] from comment #14)
+> Do you have a callstack for the case where the operation is terminated
+> prematurely? Maybe there'd be a hint to the reason in that stack. And if
+> not, maybe it would at least point us to a place at which we can start
+> reading the disassembly.
+
+No, I wasn't able to get a callstack for this. I probably could if I tried harder and set a breakpoint in a better place. However, I think I figured out how to work around this issue for OS X at least. Once I make the synthesization functions asynchronous we actually don't need to do any of the business where we wait for dragenter events and such, so really we can just eliminate that code. Try push at https://treeherder.mozilla.org/#/jobs?repo=try&revision=64b329602989 shows the test passing on OS X. (The topmost patch in that push is where I rip out the unnecessary listeners).
+
+Unfortunately there are still failures on Linux and Windows. The Linux code in particular makes no sense to me - why is down event synthesized using the non-native codepath while the rest of the events go through the synthesized code path? And why do we use gdk_event_put for button-release but gdk_display_warp_pointer for moving the mouse?
+(In reply to Kartikaya Gupta (email:kats@mozilla.com) from comment #15)
+> in particular makes no sense to me - why is down event synthesized using the
+> non-native codepath while the rest of the events go through the synthesized
+> code path?
+
+err that should be ".. go through the native synthesized code path" (i.e. why does [1] use EventUtils on Linux?)
+
+[1] http://mxr.mozilla.org/mozilla-central/source/browser/base/content/test/newtab/head.js?rev=9f25f9cf6ce1#560
+So after some fiddling I managed to make the startAndCompleteDragOperation more robust, by modifying it to do platform-specific things for each desktop platform. This way it works around each platforms idiosyncracies, and also is easily convertible to running async. The only downside is because of how native drag/drop works on Windows it will be impossible to do a drag from a point to the same point with async events. This happens in one of the test cases, which we'll need to disable on Windows but we should be able to enable the rest everywhere. I'll clean up the patch and post it for review shortly.
+Created attachment 8590232
+Rewrite startAndCompleteDragOperation to be robust across platforms
+
+Tim is away so flagging Gijs for review. Please redirect as needed.
+
+Try push at [1] is a slightly older version of this patch, wherein I didn't disable browser_newtab_drag_drop.js unconditionally on windows; hence the Win opt oranges. Try push at [2] is the attached version of the patch, which I expect to be fully green. Try push at [3] is a test to see if this fixes the intermittent fail on OS X 10.10 as well, in which case we can re-enable the tests there too.
+
+[1] https://treeherder.mozilla.org/#/jobs?repo=try&revision=9544e61a7b64
+[2] https://treeherder.mozilla.org/#/jobs?repo=try&revision=861907efdd64
+[3] https://treeherder.mozilla.org/#/jobs?repo=try&revision=b9fc293b7d5e
+Comment on attachment 8590232
+Rewrite startAndCompleteDragOperation to be robust across platforms
+
+Review of attachment 8590232:
+-----------------------------------------------------------------
+
+I'm basically following the comments here because I am not familiar with the actual details, but the comments and the resulting code makes sense to me. r=me assuming try is indeed green when the tests have run and been retriggered.
+(In reply to Kartikaya Gupta (email:kats@mozilla.com) from comment #18)
+> Created attachment 8590232
+> Rewrite startAndCompleteDragOperation to be robust across platforms
+> 
+> Tim is away so flagging Gijs for review. Please redirect as needed.
+> 
+> Try push at [1] is a slightly older version of this patch, wherein I didn't
+> disable browser_newtab_drag_drop.js unconditionally on windows; hence the
+> Win opt oranges.
+
+Can you file a followup to fix the Windows issue in the test so we can re-enable it? (please cc me and needinfo ttaubert)
+Thanks! I filed bug 1152810 as the follow-up for Windows.
+
+The try push that I did for OS X 10.10 seems to still be failing, although it's failing in a way that I haven't seen previously (event.dataTransfer is null at chrome://global/content/bindings/browser.xml:1248). Note that the same error is showing up in other tests (e.g. browser_newtab_bug752841.js) which don't do any drag-and-drop at all, so it's likely some other problem. I'm assuming these errors are pre-existing and not a regression from my patch.
+Oh, the 10.10 failures might actually be related to my push. I did another 10.10 push with the three drag-and-drop tests disabled (same as current master) just to be safe: https://treeherder.mozilla.org/#/jobs?repo=try&revision=a91713e02abd
+Landed with the three drag-and-drop tests disabled on 10.10 (same as current master).
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/0b456166808e
+https://hg.mozilla.org/mozilla-central/rev/0b456166808e

@@ -1,0 +1,158 @@
+The protocol dialog allows the user to choose an application on linux using a filepicker, but then if you attempt to close the protocol dialog by clicking OK, nothing happens.
+
+The protocol dialog allows the user to choose an application on linux using a filepicker, but then if you attempt to close the protocol dialog by clicking OK, nothing happens.
+I used the testcase at http://people.mozilla.com/~ctalbert/test-pdf-protocol.html, and when given the popup to choose an app chose /usr/bin/evince (manually, it wasn't listed).
+
+The console was reporting a "no interface" exception being thrown in the dialog's onAccept callback. Tracing with gdb revealed that this was coming from in nsMIMEInfoBase::LaunchWithURI()...
+  * The if (mPreferredAction == useHelperApp) { } case was being executed
+  * It got down to the call to GetLocalFileFromURI()
+  * That function was trying to QI to a nsIFileURL, which was failing.
+
+Dmose suggested we need the |if (mClass == eProtocolInfo)| check like there is for the other ::LaunchWithURI() case, but I don't think that's right. We're in the right code path here -- trying to launch /usr/bin/evince with aURL. I'm not sure what the intention of GetLocalFileFromURI is, but the value of aURI at this point is "pdf://www.irs.gov/foo.pdf".
+
+I'm guessing the intended behavior is to try, in order:
+1) Convert aURI from a uri format (like file://) to a path to a local file
+2) Pass in the URL as provided in the page, and just hope the app can deal with it.
+
+I'm not sure how this was designed to work, but it seems to me that #2 is highly likely to fail if the page has registered its own protocol handler for arbitrary schemes. If I register foo:// on a page, it almost seems pointless to allow handing it off to a local application. Does registerProtocolHandler() have a way for the page to convert the foo:// urls to a "real" URL? I'm told registerProtocolHandler() isn't really working at all right now, so I'm not sure how any of this is expected to do anything but fail?
+
+
+Also, it's probably worth wrapping the call in the onAccept handler with a try/catch, so that these failures can be dealt with. I suppose by something like an alert() with an error message, and then dismiss the dialog?
+Created attachment 274119
+Draft patch, v.1
+
+This seems to fix the immediate problem on Linux, but is probably incomplete because there are some other code paths that assume a URI is going to be a file, and the platform-specific code under /uriloader/exthandler/ also has some code that looks like it has similar problems.
+
+With this code, I can select an app to load the testcase as mentioned above... Evince launches, and of course reports an error because it doesn't know what to do with "pdf://.....".
+Created attachment 274238
+patch, v2
+
+Same patch, factored slightly differently, and with Mac functionality.  Cursory testing suggests that it works on Mac & Windows.
+Note that I left off the launchWithURI calling code fix, as I think we can do that post M7.
+Created attachment 274239
+patch, v3
+
+Cleaned up some comments.
+Comment on attachment 274239
+patch, v3
+
+>Index: uriloader/exthandler/nsMIMEInfoImpl.cpp
+>+        NS_ASSERTION(mClass = eProtocolInfo,
+>+                     "nsMIMEInfoBase not a protocol 
+handler");
+
+==, please?  Unless you really want to change mClass??
+
+>+nsMIMEInfoBase::LaunchWithIProcess(nsIFile* aApp, nsCAutoString & aArg)
+
+|const nsCString&| for aArg, please.
+
+>Index: uriloader/exthandler/mac/nsMIMEInfoMac.cpp
+>+    return OpenApplicationWithURI(application.get(), spec);
+
+Why the .get()?  Please take it out; you shouldn't need it.
+
+Please document why the useSystemDefault codepath can't just use this with mDefaultApplication?
+
+>+ * so we can't depend on it here).  This code probably really wants to live
+>+ * on nsILocalFileMac.
+
+Or something.  Please file a followup; cite its number here.
+
+>+nsMIMEInfoMac::OpenApplicationWithURI(nsIFile* aApplication, 
+>+                                      const nsACString& aURI)
+
+Why not |const nsCString&|?
+
+>+  nsCOMPtr<nsILocalFileMac> lfm(do_QueryInterface(aApplication));
+
+Are you guaranteed this succeeds?  If so, please assert accordingly.
+
+>+  nsresult rv = lfm->GetCFURL(&appURL);
+
+You now own appURL.  Which means every single return point from this function (all three of them) is a leak point for it.  All should release it.
+
+>+  const nsCString spec(aURI);
+
+You wouldn't need this copy if you were actually passing in an nsCString&.
+
+Please get review from someone familiar with Mac stuff on this code.  This seems like a really cumbersome setup, but if this is how it has to be done...
+
+sr=bzbarsky with those issues addressed.
+I tested patch v3 on Linux, and it seems to be working properly...
+
+The pdf:// testcase now yields an alert that pdf:// isn't handled by anything. The webcal:// testcase prompts me to select an app, which I can do, and it's launched with the correct commandline.
+Created attachment 274249
+patch, v4
+(In reply to comment #6)
+
+> >+  nsCOMPtr<nsILocalFileMac> lfm(do_QueryInterface(aApplication));
+> 
+> Are you guaranteed this succeeds?  If so, please assert accordingly.
+
+I decided to be safe rather than sorry, and switched to the two-argument version.
+ 
+All other comments addressed as written.
+
+Comment on attachment 274249
+patch, v4
+
+OpenApplicationWithURI looks fine to me. r=me for that part of the patch.
+Comment on attachment 274249
+patch, v4
+
++    if (NS_SUCCEEDED(rv)) {
++        NS_ASSERTION(mClass == eProtocolInfo,
++                     "nsMIMEInfoBase not a protocol handler");
+
+codestyle here is 2-space indentation.
+
+also, as mentioned on IRC, the assertion is wrong in this place. I'd move it after the if, and have no assertion here.
+
++  
++  const char *string = aArg.get();
++  
+   PRUint32 pid;
+
+no trailing whitespace on the empty lines here, please
+
+
+Is there a particular reason why nsMIMEInfoBase and nsMIMEInfoMac have a different code structure here, i.e. Base has an if (NS_SUCCEEDED(rv)) and handles file handlers inside it, while mac has an NS_FAILED(rv) and handles protocol handlers there?
+(In reply to comment #11)
+
+> Is there a particular reason why nsMIMEInfoBase and nsMIMEInfoMac have a
+> different code structure here, i.e. Base has an if (NS_SUCCEEDED(rv)) and
+> handles file handlers inside it, while mac has an NS_FAILED(rv) and handles
+> protocol handlers there?
+
+I did the Mac code with NS_FAILED because it allowed me to do it while moving less code around.  I just changed the base version to also use NS_FAILED for consistency.
+
+
+Created attachment 274312
+patch, v5
+Created attachment 274313
+patch, v6
+
+Fix extraneous whitespace changes introduced in last version.
+Comment on attachment 274313
+patch, v6
+
+Carrying forward r and sr.
+Checking in uriloader/exthandler/nsMIMEInfoImpl.cpp;
+/cvsroot/mozilla/uriloader/exthandler/nsMIMEInfoImpl.cpp,v  <--  nsMIMEInfoImpl.cpp
+new revision: 1.63; previous revision: 1.62
+done
+Checking in uriloader/exthandler/nsMIMEInfoImpl.h;
+/cvsroot/mozilla/uriloader/exthandler/nsMIMEInfoImpl.h,v  <--  nsMIMEInfoImpl.h
+new revision: 1.34; previous revision: 1.33
+done
+Checking in uriloader/exthandler/mac/nsMIMEInfoMac.cpp;
+/cvsroot/mozilla/uriloader/exthandler/mac/nsMIMEInfoMac.cpp,v  <--  nsMIMEInfoMac.cpp
+new revision: 1.9; previous revision: 1.8
+done
+Checking in uriloader/exthandler/mac/nsMIMEInfoMac.h;
+/cvsroot/mozilla/uriloader/exthandler/mac/nsMIMEInfoMac.h,v  <--  nsMIMEInfoMac.h
+new revision: 1.9; previous revision: 1.8
+done
+
+Fix checked in with a=mconnor over IRC.

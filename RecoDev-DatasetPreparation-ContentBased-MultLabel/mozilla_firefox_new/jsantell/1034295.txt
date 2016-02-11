@@ -1,0 +1,451 @@
+
+
+
+Looks like a lot of the test helpers use direct access to the debuggee's document from the mochitest, like getPixel(s) and the like -- this results in CPOW wrapped objects that would normally allow slow, synchronous access to migrate into e10s, but TypedArrays are specifically disallowed because of very bad perf it looks like. A solution would be to implement a few methods to the WebGLActor on the server so we can query things like getPixel("#canvas", { x: 1, y: 10 }).then(({r,g,b,a})=>{}); without directly touching content proc from parent proc.
+
+Wanted to run this idea by you before implementing anything, Victor
+A new method on the actor would be fabulous. Since this will only be used in tests, it should be ok.
+Created attachment 8451852
+1034295-shadereditor-e10s.patch
+
+All tests are passing except browser_webgl_actor-test-16.js (There should be no cached program actors yet. - Got 1, expected 0), very strange. When --e10s is not on, all tests are passing.
+
+Core of the changes are in the test head.js, and actor -- everything else in tests is just changing to use the front instead of the window to match the `ensurePixelIs` function signature.
+
+Large change set, wanted to get this infront of you while I figure out the remaining error, very strange.
+Comment on attachment 8451852
+1034295-shadereditor-e10s.patch
+
+Review of attachment 8451852:
+-----------------------------------------------------------------
+
+r- for using IDs as unique identifiers for canvases.
+
+::: browser/devtools/shadereditor/test/browser_webgl-actor-test-18.js
+@@ +15,5 @@
+> +  is(pixel.r, 255, "correct `r` value.")
+> +  is(pixel.g, 255, "correct `g` value.")
+> +  is(pixel.b, 0, "correct `b` value.")
+> +  is(pixel.a, 255, "correct `a` value.")
+> +  
+
+Nit: trailing whitespace.
+
+::: browser/devtools/shadereditor/test/doc_simple-canvas.html
+@@ +29,5 @@
+>      </script>
+>    </head>
+>  
+>    <body>
+> +    <canvas id="canvas" width="512" height="512"></canvas>
+
+Any reason for giving ids to these canvases?
+
+::: browser/devtools/shadereditor/test/head.js
+@@ +177,5 @@
+> +  return Task.spawn(function*() {
+> +    let pixel = yield front.getPixel({ canvasID: canvasID, position: aPosition });
+> +    if (isApproxColor(pixel, aColor)) {
+> +      ok(true, "Expected pixel is shown at: " + aPosition.toSource());
+> +      return promise.resolve(null);
+
+You don't need to actually return a promise inside a task. A simple return statement is enough here.
+
+::: toolkit/devtools/server/actors/webgl.js
+@@ +327,5 @@
+> +    let windowID = ContentObserver.GetInnerWindowID(this.tabActor.window);
+> +    let { x, y } = position;
+> +    let context = this._webglObserver.for(windowID, canvasID);
+> +    let height = context.canvas.height;
+> +    let buffer = new this.tabActor.window.Uint8Array(4);
+
+Would `let buffer = new Uint8Array(4)` simply work here instead of going through the content?
+
+@@ +329,5 @@
+> +    let context = this._webglObserver.for(windowID, canvasID);
+> +    let height = context.canvas.height;
+> +    let buffer = new this.tabActor.window.Uint8Array(4);
+> +
+> +    buffer = XPCNativeWrapper.unwrap(buffer);
+
+Is this really needed?
+
+@@ +330,5 @@
+> +    let height = context.canvas.height;
+> +    let buffer = new this.tabActor.window.Uint8Array(4);
+> +
+> +    buffer = XPCNativeWrapper.unwrap(buffer);
+> +    context.readPixels(x, height - y - 1, 1, 1, context.RGBA, context.UNSIGNED_BYTE, buffer);
+
+Don't call `readPixels` on a context directly, because that may be a wrapped function. See the documentation for WebGLProxy: http://dxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webgl.js?from=webgl.js#1044
+
+@@ +431,5 @@
+>          return context;
+>        }
+>  
+>        // Create a separate state storage for this context.
+> +      observer.registerContextForWindow(id, context, this.id);
+
+Ugh... so if a canvas doesn't have an id, this won't work anymore? That's... unfortunate. See below.
+
+@@ +566,5 @@
+>     *        The id of the window containing the WebGL context.
+>     * @param WebGLRenderingContext context
+>     *        The WebGL context used in the cache and proxy instances.
+> +   * @param String canvasID
+> +   *        The `id` attribute of the canvas DOM element.
+
+Why not use a canvasSelector, so that you can use anything you want? IDs aren't guaranteed to be unique, just 256 times "stronger" than classes.
+
+@@ +608,3 @@
+>     */
+> +  for: function(context, canvasID) {
+> +    if (arguments.length === 1) {
+
+s/canvasID/canvasSelector. Why wouldn't canvasSelector === undefined work, as opposed to checking the arguments length?
+
+@@ +611,5 @@
+> +      return this._contexts.get(context);
+> +    }
+> +    let foundContext;
+> +    let windowID = context;
+> +    this._contexts.forEach(({ ownerWindow, cache, proxy, canvasID: id }, ctx) => {
+
+Ugh... this is really weird. Why not simply do:
+
+let canvas = ownerWindow.document.querySelector(canvasSelector)?
+if (canvas && canvas.context == context) {
+  return this._contexts.get(context);
+}
+
+return null;
+
+@@ +616,5 @@
+> +      if (windowID === ownerWindow && canvasID === id)
+> +        foundContext = ctx;
+> +    });
+> +
+> +    return foundContext || {};
+
+Don't || {} here, since this should be an error.
+Comment on attachment 8451852
+1034295-shadereditor-e10s.patch
+
+Review of attachment 8451852:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/actors/webgl.js
+@@ +327,5 @@
+> +    let windowID = ContentObserver.GetInnerWindowID(this.tabActor.window);
+> +    let { x, y } = position;
+> +    let context = this._webglObserver.for(windowID, canvasID);
+> +    let height = context.canvas.height;
+> +    let buffer = new this.tabActor.window.Uint8Array(4);
+
+Unfortunately not -- get a "Does not implement ArrayBufferView" when using `readPixels`
+
+@@ +329,5 @@
+> +    let context = this._webglObserver.for(windowID, canvasID);
+> +    let height = context.canvas.height;
+> +    let buffer = new this.tabActor.window.Uint8Array(4);
+> +
+> +    buffer = XPCNativeWrapper.unwrap(buffer);
+
+Yes, as in e10s, the following throws without it:
+Message: Error: Accessing TypedArray data over Xrays is slow, and forbidden in order to encourage performant code. To copy TypedArrays across origin boundaries, consider using Components.utils.cloneInto().
+
+@@ +330,5 @@
+> +    let height = context.canvas.height;
+> +    let buffer = new this.tabActor.window.Uint8Array(4);
+> +
+> +    buffer = XPCNativeWrapper.unwrap(buffer);
+> +    context.readPixels(x, height - y - 1, 1, 1, context.RGBA, context.UNSIGNED_BYTE, buffer);
+
+Good eye -- fixed
+Created attachment 8452059
+1034295-shadereditor-e10s.patch
+
+Addressed all the comments -- still having an issue with the 16th actor test but looking into it
+In browser_webgl_actor-test-16.js, we test going in the bfcache and fetching programs to ensure that the cache is empty. In normal test running, this is the order (with the window IDs adjacent)
+
+ 0:13.60 console.log: ON GLOBAL CREATE 22
+ 0:13.61 console.log: ON GLOBAL DESTROY 20
+ 0:13.64 console.log: GETPROGRAMS 22
+ 0:13.67 console.log: PROGRAM LINKED 22
+
+While running in e10s mode, the program linking occurs before the getProgram call, and appears that the test fails because the cache is not empty.
+
+ 0:09.75 console.log: ON GLOBAL CREATE 10
+ 0:09.75 console.log: ON GLOBAL DESTROY 8
+ 0:09.81 console.log: PROGRAM LINKED 10
+ 0:12.94 console.log: GETPROGRAMS 10
+
+This seems like a race condition, or a faulty test, but wanted to run it by you first before changing any test logic. What do you think?
+Comment on attachment 8452059
+1034295-shadereditor-e10s.patch
+
+Review of attachment 8452059:
+-----------------------------------------------------------------
+
+This is much cleaner!
+
+::: browser/devtools/shadereditor/test/head.js
+@@ +172,5 @@
+>      isApprox(aFirst.b, aSecond.b, aMargin) &&
+>      isApprox(aFirst.a, aSecond.a, aMargin);
+>  }
+>  
+> +function ensurePixelIs (front, aPosition, aColor, aWaitFlag = false, aSelector = "canvas") {
+
+Nit: s/front/aFront/ to stay consistent?
+
+@@ +188,3 @@
+>  
+> +    ok(false, "Expected pixel was not already shown at: " + aPosition.toSource());
+> +    return promise.reject(null);
+
+Nit: I believe it's always preferable to throw inside a task instead of returning a rejected promise.
+
+::: toolkit/devtools/server/actors/webgl.js
+@@ +314,5 @@
+> +  }),
+> +
+> +  /**
+> +   * Gets a pixel's RGBA value from a context specified by window
+> +   * and canvas ID, and the coordinates of the pixel in question.
+
+This comment needs to be updated.
+
+@@ +317,5 @@
+> +   * Gets a pixel's RGBA value from a context specified by window
+> +   * and canvas ID, and the coordinates of the pixel in question.
+> +   * Currently only used in tests.
+> +   *
+> +   * @param String selector
+
+Uber nit: lowercase 'string', since we're not necessarily expecting a String object.
+
+@@ +1320,5 @@
+>  
+>    /**
+> +   * Returns the pixel values at the position specified on the canvas.
+> +   * Proxy for the contexts `readPixels` method:
+> +   * readPixels(int x, int y, int width, int height, long format, long type, ArrayBufferView pixels);
+
+Nit: not sure if the last two lines in this function's documentation are really necessary. This whole object contains such proxies, and the `readPixels` signature can be found on the internets.
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #7)
+> In browser_webgl_actor-test-16.js, we test going in the bfcache and fetching
+> programs to ensure that the cache is empty. In normal test running, this is
+> the order (with the window IDs adjacent)
+> 
+>  0:13.60 console.log: ON GLOBAL CREATE 22
+>  0:13.61 console.log: ON GLOBAL DESTROY 20
+>  0:13.64 console.log: GETPROGRAMS 22
+>  0:13.67 console.log: PROGRAM LINKED 22
+> 
+> While running in e10s mode, the program linking occurs before the getProgram
+> call, and appears that the test fails because the cache is not empty.
+> 
+>  0:09.75 console.log: ON GLOBAL CREATE 10
+>  0:09.75 console.log: ON GLOBAL DESTROY 8
+>  0:09.81 console.log: PROGRAM LINKED 10
+>  0:12.94 console.log: GETPROGRAMS 10
+> 
+> This seems like a race condition, or a faulty test, but wanted to run it by
+> you first before changing any test logic. What do you think?
+
+This is, indeed, weird, and certainly looks like a race. However, I don't know what to make of it front the top of my head. It might be a problem on the front, where clearing the programs cache relies on inner window ids, which may be different in e10s? See `_onGlobalDestroyed`.
+Looking into this more, here's the line of offending code -- as these are running independently now, the tests were previously assuming that `getPrograms` would return before the programs were linked -- there's nothing in the code to ensure that that's the case. And not sure what we can do to test that on load there's 0 in the cache, and not sure how important this is. My suggestion is to remove the test line that checks for 0 status, and then add a program-linked listener for non e10s usage. Thoughts?
+
+  // 2. Perform a bfcache navigation.
+
+  yield navigateInHistory(target, "back");
+  let globalDestroyed = observe("inner-window-destroyed");
+  let globalCreated = observe("content-document-global-created");
+  reload(target);
+
+  yield globalDestroyed;
+  let programs = yield front.getPrograms();
+  is(programs.length, 0,
+    "There should be no cached program actors yet.");
+
+  yield globalCreated;
+  let programs = yield front.getPrograms();
+  is(programs.length, 1,
+    "There should be 1 cached program actor now.");
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #10)
+> Looking into this more, here's the line of offending code -- as these are
+> running independently now, the tests were previously assuming that
+> `getPrograms` would return before the programs were linked -- there's
+> nothing in the code to ensure that that's the case. 
+
+I don't think that's important. However,
+
+> And not sure what we can
+> do to test that on load there's 0 in the cache, and not sure how important
+> this is. 
+
+...this is important. We need to make sure the old programs are removed from the cache when a window is destroyed. Otherwise we'll probably leak, the webgl actor is storing strong references to everything. If the cache isn't invalidated on the first "inner-window-destroyed", then maybe it happens on ulterior such notifications. Otherwise, it's something e10s specific that we're not handling, thus leaking memory.
+Looks like a few things in fx-team have changed since I've tried this. After merging, some weirdness ensued, even after getting the race condition and chrome<->content communication for history navigation. Will check out later.
+Created attachment 8461114
+1034295-shadereditor-e10s.patch
+Notes for changes:
+
+* Use message manager for navigating history in e10s, direct access to content with non-e10s, use `Cu.isContentProcessWrap(content.document)`
+* Change `removeFromArray` in webgl actor -- does not correctly remove all elements from array, as removing program at `n` skips to check if the program at `n + 1` also needs to be removed due to the array length/position shift.
+* Order for e10s events: global create -> add programs -> inner window destroy
+* Order for non e10s events: global create -> inner window destroy (clear cache) -> add programs
+
+Manually testing works, but still race conditions in tests
+Created attachment 8462009
+1034295-shadereditor-e10s.patch
+try push: https://tbpl.mozilla.org/?tree=Try&rev=20ecfc263403
+
+Need to push to Holly (e10s try) http://hg.mozilla.org/projects/holly, but missing level 3 committer access to do so
+Nevermind, I misunderstood how to test e10s on try. 
+
+non-e10s: https://tbpl.mozilla.org/?tree=Try&rev=20ecfc263403
+e10s: https://tbpl.mozilla.org/?tree=Try&rev=291a7a082ae6
+non e10s: https://tbpl.mozilla.org/?tree=Try&rev=20ecfc263403
+e10s, for real, only on linux-opt builds: https://tbpl.mozilla.org/?tree=Try&rev=2890b5b43a31
+Comment on attachment 8462009
+1034295-shadereditor-e10s.patch
+
+Try is looking good on both pushes, looks like the e10s tests are either not running (for anyone), or severely backed up. These are only available on try for the linux builds, so not sure we can get a comforting thumbs up no matter what.
+
+jryans, I'm r?ing you for the protocol.js change that was in bug 1041752 that's in here now. Not sure what to do for this until we get better infrastructure, or atleast tests for protocol.js that run locally using e10s. But FWIW, all tests pass local with this.
+Comment on attachment 8462009
+1034295-shadereditor-e10s.patch
+
+Review of attachment 8462009:
+-----------------------------------------------------------------
+
+Well, I still don't know that these try pushes are telling us much, since the e10s version seems to have only run mochitest-plain, which doesn't include any DevTools tests.  It seems there's no great way currently to run this kind of test.
+
+However, you said it improves things locally, so I am okay with this.
+
+I have only reviewed "toolkit/devtools/server/main.js".
+Locally, when running e10s on other tools, their pass/failure doesn't seem to change whether or not this patch is in there or not, so that's good that it doesn't affect other things (negatively).
+
+Yeah, we should try and get the DT mochitests added for the e10s tests. It's just shooting in the dark a bit here.
+Comment on attachment 8462009
+1034295-shadereditor-e10s.patch
+
+Review of attachment 8462009:
+-----------------------------------------------------------------
+
+Thanks Jordan! Awaiting beer invoice.
+
+::: browser/devtools/shadereditor/test/browser_se_bfcache.js
+@@ +7,5 @@
+>  function ifWebGLSupported() {
+>    let [target, debuggee, panel] = yield initShaderEditor(SIMPLE_CANVAS_URL);
+>    let { gFront, $, EVENTS, ShadersListView, ShadersEditorsView } = panel.panelWin;
+>  
+> +  // Attach frame scripts if in e10s
+
+Might want to describe the reasoning behind this a bit more.
+
+::: browser/devtools/shadereditor/test/browser_webgl-actor-test-15.js
+@@ +9,5 @@
+>    let [target, debuggee, front] = yield initBackend(SIMPLE_CANVAS_URL);
+>    front.setup({ reload: false });
+>  
+> +  // Attach frame scripts if in e10s
+> +  loadFrameScripts();
+
+Ditto.
+
+::: browser/devtools/shadereditor/test/browser_webgl-actor-test-16.js
+@@ +10,5 @@
+>    let [target, debuggee, front] = yield initBackend(SIMPLE_CANVAS_URL);
+>    front.setup({ reload: false });
+>  
+> +  // Attach frame scripts if in e10s
+> +  loadFrameScripts();
+
+Ditto.
+
+@@ +38,5 @@
+>      "The second programs was correctly retrieved from the cache.");
+>    is(programs[1], thirdProgram,
+>      "The third programs was correctly retrieved from the cache.");
+>  
+> +  allPrograms = yield front._getAllPrograms();
+
+Nit: you can safely use `let` again after yielding.
+
+@@ +47,5 @@
+>  
+>    yield navigateInHistory(target, "back");
+> +  let globalDestroyed = once(front, "global-created");
+> +  let globalCreated = once(front, "global-destroyed");
+> +  let programsLinked = once(front, "program-linked");
+
+Nit: you can use front.once(...).
+
+@@ +74,3 @@
+>    reload(target);
+>  
+> +  yield promise.all([programsLinked, globalDestroyed, globalCreated]);
+
+No _getAllPrograms() check here? It should be 3 if I'm reading this correctly.
+
+::: browser/devtools/shadereditor/test/browser_webgl-actor-test-17.js
+@@ +37,5 @@
+>  
+>    yield secondProgramActor.unblackbox();
+> +  yield ensurePixelIs(front, { x: 0, y: 0 }, { r: 255, g: 255, b: 0, a: 255 }, true);
+> +  yield ensurePixelIs(front, { x: 64, y: 64 }, { r: 0, g: 255, b: 255, a: 255 }, true);
+> +  yield ensurePixelIs(front, { x: 127, y: 127 }, { r: 255, g: 255, b: 0, a: 255 }, true);
+
+I'm assuming no changes were made to `ensurePixelIs` in any test, except from passing `front` instead of `debuggee`.
+
+::: browser/devtools/shadereditor/test/browser_webgl-actor-test-18.js
+@@ +10,5 @@
+> +  front.setup({ reload: true });
+> +
+> +  yield getPrograms(front, 2);
+> +
+> +  let pixel = yield front.getPixel({ selector: "#canvas1", position: { x: 0, y: 0 }});
+
+I would also add a test for the second canvas, to make sure the correct context is queried in the actor.
+
+::: toolkit/devtools/server/actors/webgl.js
+@@ +10,3 @@
+>  const { on, once, off, emit } = events;
+>  const { method, Arg, Option, RetVal } = protocol;
+> +const { Promise: promise } = Cu.import("resource://gre/modules/Promise.jsm", {});
+
+Nit: please use const promise = require("promise") instead, move it after importing events.
+
+@@ +1390,5 @@
+> +  for (let i = 0; i < array.length;) {
+> +    if (predicate(array[i])) {
+> +      array.splice(i, 1);
+> +    }
+> +    else {
+
+Uber nit: } else {
+
+@@ +1391,5 @@
+> +    if (predicate(array[i])) {
+> +      array.splice(i, 1);
+> +    }
+> +    else {
+> +      i++;
+
+*sob*
+Created attachment 8464257
+1034295-shadereditor-e10s.patch
+
+Nits fixed.
+https://hg.mozilla.org/integration/fx-team/rev/d45e61102bfe
+https://hg.mozilla.org/mozilla-central/rev/d45e61102bfe
+
+
+Enable devtools/shadereditor tests for e10s
+
+
+
+Bug 1034295 - Add e10s support to shader editor. r=vp, r=jryans 

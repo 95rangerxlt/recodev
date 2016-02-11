@@ -1,0 +1,174 @@
+Bug 259682 added browser.bookmarks.livemark_refresh_seconds as a hidden pref to override the default one hour refresh rate (useful for testing, and for shortening the period for particular edge uses, or lengthening it for the bandwidth-challenged who would rather manually refresh); bug 317837 replaced reading the pref with a TODO to read it while porting the livemark service to Places; bug 353434 replaced the TODO with nothing but the default for the JS service.
+
+A single hidden pref for all feeds isn't as nice as the per-feed exposed prefs most feed readers offer, but at least it's cheap, and we shouldn't just abandon it without actually deciding to abandon it.
+
+Bug 259682 added browser.bookmarks.livemark_refresh_seconds as a hidden pref to override the default one hour refresh rate (useful for testing, and for shortening the period for particular edge uses, or lengthening it for the bandwidth-challenged who would rather manually refresh); bug 317837 replaced reading the pref with a TODO to read it while porting the livemark service to Places; bug 353434 replaced the TODO with nothing but the default for the JS service.
+
+A single hidden pref for all feeds isn't as nice as the per-feed exposed prefs most feed readers offer, but at least it's cheap, and we shouldn't just abandon it without actually deciding to abandon it.
+OK. Correct me if I'm wrong:
+
+ * Non-Places bookmarks C++ checks the pref
+ * Places bookmarks C++ doesn't check the pref
+ * Places bookmarks JavaScript doesn't check the pref
+Correct:
+
+Non-Places: http://lxr.mozilla.org/seamonkey/source/browser/components/bookmarks/src/nsBookmarksFeedHandler.cpp#293
+Places C++ TODO: http://lxr.mozilla.org/mozilla1.8/source/browser/components/places/src/nsBookmarksFeedHandler.cpp#250 (on the branch, since someone removed the file on the trunk)
+Places JS no-TODO: http://lxr.mozilla.org/seamonkey/source/toolkit/components/places/src/nsLivemarkService.js#581
+Created attachment 266970
+patch
+
+made sure the livemark refresh time respected the hidden pref as specified here: http://lxr.mozilla.org/mozilla1.8/source/browser/components/places/src/nsBookmarksFeedHandler.cpp#250 and fixed some arithmetic/second-to-millisecond conversions missed in the original port
+Comment on attachment 266970
+patch
+
+nice, r=sspitzer.
+
+a few comments:
+
+1)   The C++ had the comment:
+
+// TODO -- read the pref for livemark reload time and set to max of 
+// the pref value and 1 minute.
+
+Something like:  
+
++    // Reset global expiration variable to reflect hidden pref (in milliseconds)
++    // with a lower limit of 1 minute
++    gExpiration = Math.max(livemarkRefresh * 1000, 60000);
+
+2)  nice catch on the exprtime vs expiresTime problem.  
+
+We were throwing an exception each time when we did "expiresTime -= nowtime" as expiresTime was undefined.  
+
+(That exception was being caught, and so we'd always do:  "this._setResourceTTL(this._ttl);".  I confirmed with my build)
+
+3)
+
++            // set resource ttl to cache expiration time, not user-set delay
++            if (expiresTime > gExpiration)
+               this._setResourceTTL(expiresTime);
+             else
+-              this._setResourceTTL(EXPIRATION);
++              this._setResourceTTL(gExpiration);
+
+What about just:
+
+// set resource ttl to cache expiration time or the default delay
+this._setResourceTTL(Math.max(expiresTime, gExpiration));
+
+Feel free to reword that.  (But the delay is not always user-set, right?)
+
+4) can you elaborate (here, in the bug) on how you tested this?
+Created attachment 266972
+patch with tweaks
+
+In terms of testing this bug:
+
+CNN.com has a frequently updated RSS feed here: http://rss.cnn.com/rss/cnn_latest.rss, although waiting 5-10 minutes for the feed to update and be reflected in the live bookmark is often tedious.
+
+While waiting, I used an old LiveJournal account's Atom feed to test things as well, so I could control when new content was posted/the feed was updated.
+
+Both methods work fine, though testers may prefer one over the other.
+I've always found http://philringnalda.com/mtests/feedingtime.php more useful for testing refreshing than real feeds, since it tells you the time it was fetched as an item.
+christine tells me this patch might not being doing the right thing with cache expiration time, so clearing r=sspitzer until she finishes testing it.
+Created attachment 267163
+patch with tweaks #2
+
+I think the problem that was confusing me earlier was mostly that planet.mozilla.org's atom.xml, while it's supposed to have a 5-minute expiration time, often didn't reset its expiration time immediately after the last expiration. I did tweak it a little more by adding an else statement if the cache hadn't yet expired, though, to make suure that the cache expiration time was stored & used if the feed had not yet expired.
+1)
+
+I think:
+
+// set ttl to cache expiration time or default delay
+this._setResourceTTL(Math.max(nowtime - expiresTime, gExpiration));
+
+would be better.
+
+2)
+
+can you also test that things work as expected if the cache is either set to 0 MB (Tools | Options | Advanced | Network | Cache) or if you set browser.cache.disk.enable to false?
+
+3)
+
+hmm, looking at the C++ code, if we fail to QI (to nsICachingChannel or nsICacheEntryInfo, or if we don't get the cacheToken, we will fail gracefully and call "rv = SetResourceTTL(ttl);"
+
+see http://lxr.mozilla.org/mozilla1.8/source/browser/components/places/src/nsBookmarksFeedHandler.cpp#250
+
+but with the js code, we only do that on exception, in our catch.  perhaps we should do so after the catch, and add a "return;" after your two calls to this._setResourceTTL()?
+
+I just want to make sure we don't end up not calling _setResourceTTL(this._ttl);
+a few more comments:
+
+1)  let's follow the style of this file and do something like:
+
+const PS_CONTRACTID = "@mozilla.org/preferences-service;1"
+
+var prefs = Cc[PS_CONTRACTID].getService(Ci.nsIPrefBranch);
+
+2)  Line Length: 80 characters or less (for Bonsai and printing).
+
+But more importantly, I'm seeing entryInfo.expirationTime of 0 for certain feeds, like http://quality-drupal.stage.mozilla.com/rss.xml
+
+That would cause us to set the ttl to way in the future (now - 0 == lots of milliseconds).
+
+fwiw, I think the 2.0 code has this bug, too.
+I'm sorry, not the drupal feed, but http://rss.cnn.com/rss/cnn_latest.rss
+Created attachment 267498
+patch
+
+(In reply to comment #9)
+> 2)
+> 
+> can you also test that things work as expected if the cache is either set to 0
+> MB (Tools | Options | Advanced | Network | Cache) or if you set
+> browser.cache.disk.enable to false?
+
+Even if the disk cache is disabled, I noticed that the feeds were being cached in memory, so entryInfo.expirationTime is still able to return the correct value.
+
+> 3)
+> I just want to make sure we don't end up not calling
+> _setResourceTTL(this._ttl);
+
+That makes sense; I moved the fallback this._setResourceTTL(this._ttl) outside the try/catch block, and added in returns.
+
+(In reply to comment #10)
+> a few more comments:
+
+> But more importantly, I'm seeing entryInfo.expirationTime of 0 for certain
+> feeds, like http://quality-drupal.stage.mozilla.com/rss.xml
+> 
+> That would cause us to set the ttl to way in the future (now - 0 == lots of
+> milliseconds).
+
+I've never gotten that error consistently, but I see it once in awhile if I let the LOG()s go for a long enough period of time in the console. With that in mind, I changed the check inside the try/catch block to see if expiresTime > 0, and changed the logic around from the previous patch to use the absolute value of the difference between nowtime/expiresTime instead of conditionals, such that:
+
+if the expiration time has passed (nowtime > expiresTime), reset the resource ttl to either now + the difference, or now + the user-set delay, whichever is greater.
+
+if the feed has not yet expired (nowtime < expiresTime), set the resource ttl to either now + the difference (to ensure it expires on time), or now + the user-set delay, if it is about to expire.
+
+I've been sitting and checking the delays/differences that get stored with the feeds (using http://rss.cnn.com/rss/cnn_latest.rss , http://planet.mozilla.org/atom.xml ) and things seem to be working just how they should be. I'm also attaching next a patch with LOG/my console dumps included, to make it easier to test/review this patch.
+Created attachment 267499
+previous patch + console dumps for testing
+Created attachment 268022
+patch (as checked in)
+fixed.
+
+Checking in toolkit/components/places/src/nsLivemarkService.js;
+/cvsroot/mozilla/toolkit/components/places/src/nsLivemarkService.js,v  <--  nsLi
+vemarkService.js
+new revision: 1.18; previous revision: 1.17
+done
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

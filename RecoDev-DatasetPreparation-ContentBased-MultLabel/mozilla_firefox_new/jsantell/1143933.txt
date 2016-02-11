@@ -1,0 +1,727 @@
+
+
+
+Created attachment 8579145
+Frontend WIP.
+
+Needs patches from bug 1143860 applied and optimization tracking enabled.
+
+Rough draft of displaying the most frequently sampled optimization info for a
+frame in a tooltip. If a frame has any optimization information, a little "opt"
+marker pops up on that line. We should weigh the sampled optimizations and try
+to only report the important ones. As a crude first step I just display the
+percentage of the most frequently sampled optimization against the total
+samples for that frame.
+
+See the TODOshu comments in the patch to see the places I think that need
+improvement.
+
+Linux can't take screenshots properly, I'll get a screenshot up once I get a
+build on OS X.
+Created attachment 8579182
+jitcoach-alpha.png
+Oh god why is the screenshot so large
+Awesome!!
+
+* Nit: maybe s/opt/jit/ for the little button on the side?
+
+* We aggregate our samples into per-function buckets, but the JIT info seems like it really should be per-line. It seems like we expose some of that in the tooltip you have here ("15% of samples at :196:2") but I'd think you'd want line-level and percentage info for each optimization attempt, wouldn't you? Not sure if we want to do anything else to make the per-line and per-function info work better together (like stop using per function buckets or something).
+
+* As a follow up, def not needed in first shipping patch, it would be cool to have the relevant snippet of JS under each optimization attempt. Reason being that I'm familiar with the code I wrote, but not necessarily its line numbers.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #4)
+> Awesome!!
+> 
+> * Nit: maybe s/opt/jit/ for the little button on the side?
+
+I think we'll (soon) also want to display what % of samples were in what tier of the JITs, so JIT by itself is ambiguous. Maybe "ion" instead of "opt"?
+
+> 
+> * We aggregate our samples into per-function buckets, but the JIT info seems
+> like it really should be per-line. It seems like we expose some of that in
+> the tooltip you have here ("15% of samples at :196:2") but I'd think you'd
+> want line-level and percentage info for each optimization attempt, wouldn't
+> you? Not sure if we want to do anything else to make the per-line and
+> per-function info work better together (like stop using per function buckets
+> or something).
+
+I honestly don't know. I mainly want to avoid overwhelming the programmer. Maybe per-line would be too much information?
+
+> 
+> * As a follow up, def not needed in first shipping patch, it would be cool
+> to have the relevant snippet of JS under each optimization attempt. Reason
+> being that I'm familiar with the code I wrote, but not necessarily its line
+> numbers.
+
+For sure, this UI blows chunks. I wanted the line link to be clickable and drops you off in the debugger, but I couldn't figure out how to make that work.
+
+There's also more information under the hood that I also couldn't figure out how to make space to display, like type information.
+Comment on attachment 8579145
+Frontend WIP.
+
+Review of attachment 8579145:
+-----------------------------------------------------------------
+
+::: browser/devtools/performance/views/details-js-call-tree.js
+@@ +3,5 @@
+>   * You can obtain one at http://mozilla.org/MPL/2.0/. */
+>  "use strict";
+>  
+> +devtools.lazyRequireGetter(this, "Tooltip",
+> +  "devtools/shared/widgets/Tooltip", true);
+
+Move this to performance-controller.js, since all these files share the same scope and that's where we do the imports.
+
+@@ +27,5 @@
+>      this._onPrefChanged = this._onPrefChanged.bind(this);
+>      this._onLink = this._onLink.bind(this);
+> +    this._onOptimizations = this._onOptimizations.bind(this);
+> +
+> +    let document = $("#js-calltree-view > .call-tree-cells-container").ownerDocument;
+
+This isn't needed. This file is included as a xul script, so you have access to the document directly. The tree view doesn't live inside an iframe.
+
+@@ +75,5 @@
+> +    let optimization = treeItem.frame.getMostFrequentOptimizationInfo();
+> +    let data = optimization.data;
+> +
+> +    // TODOshu: make actual UI and print types and stuff too.
+> +    let attemptStrs = data.attempts.map((attempt) => attempt.strategy + "\n  └ " + attempt.outcome);
+
+Nit: no need for parens around `attempt`.
+
+@@ +77,5 @@
+> +
+> +    // TODOshu: make actual UI and print types and stuff too.
+> +    let attemptStrs = data.attempts.map((attempt) => attempt.strategy + "\n  └ " + attempt.outcome);
+> +    let percentage = optimization.samples / treeItem.frame.samples * 100;
+> +    let footer = percentage + "% of samples, at :" + data.line + ":" + data.column;
+
+This string needs to be localized.
+
+@@ +81,5 @@
+> +    let footer = percentage + "% of samples, at :" + data.line + ":" + data.column;
+> +    let msgs = [attemptStrs.join("\n"), footer];
+> +
+> +    let tooltip = this._optimizationsTooltip;
+> +    tooltip.hide();
+
+Any reason to hide the popup here?
+
+@@ +119,5 @@
+>        hidden: options.inverted,
+>        // Call trees should only auto-expand when not inverted. Passing undefined
+>        // will default to the CALL_TREE_AUTO_EXPAND depth.
+>        autoExpandDepth: options.inverted ? 0 : undefined,
+> +      optimizationsToolTip: this._optimizationsTooltip
+
+Why is the tooltip passed inside the tree view here?
+
+::: browser/devtools/shared/profiler/tree-model.js
+@@ +152,5 @@
+>    this.line = line;
+>    this.column = column;
+>    this.category = category;
+>    this.allocations = allocations || 0;
+> +  this._optsHistogram = null;
+
+Just instantiate _optsHistogram here (to a {}, or a FrameOptsHistogram, see below). I don't think it makes sense to optimize this out, and it makes the code a bit more readable in `insert`.
+
+@@ +201,5 @@
+> +      let optsHistogram = child._optsHistogram;
+> +      if (optsIndex in optsHistogram) {
+> +        optsHistogram[optsIndex].samples++;
+> +      } else {
+> +        optsHistogram[optsIndex] = { data: optimizations[optsIndex], samples: 1 };
+
+Would like to see a FrameOptsHistogram constructor, and a method that does everything here to abstract it away, but that may be premature. Your choice.
+
+@@ +281,5 @@
+> +      return this._mostFrequentOptimization;
+> +    }
+> +
+> +    // TODOshu: argmax probably isn't useful here, need to take into
+> +    // consideration the % of the frame's samples.
+
+Indeed. Maybe just multiplying it by the self-cost percentage will be enough.
+
+::: browser/devtools/shared/profiler/tree-view.js
+@@ +109,5 @@
+>  
+>    this._onUrlClick = this._onUrlClick.bind(this);
+>    this._onZoomClick = this._onZoomClick.bind(this);
+> +  if (frame._optsHistogram) {
+> +    this._onOptimizationsClick = this._onOptimizationsClick.bind(this);
+
+Nit: just always bind this, no need to optimize this behind a conditional.
+
+@@ +369,5 @@
+>      return cell;
+>    },
+> +  _createOptimizationsCell: function(mostFrequentOptimization) {
+> +    let cell = this.document.createElement("label");
+> +    cell.className = "call-tree-optimization";
+
+You probably want to add a `plain` class to this too.
+
+@@ +381,5 @@
+> +        outcome !== "DOM" &&
+> +        outcome !== "monomorphic" &&
+> +        outcome !== "polymorphic")
+> +    {
+> +      cell.className += " call-tree-optimization-bad";
+
+Use classList instead of appending strings: cell.classList.add("...").
+
+::: browser/themes/shared/devtools/performance.inc.css
+@@ +316,5 @@
+> +  -moz-user-select: none;
+> +}
+> +
+> +.call-tree-optimization-bad {
+> +  background-color: var(--theme-highlight-red);
+
+Just adding !important here is probably enough.
+
+::: js/src/octane/index.html
+@@ +35,5 @@
+>  <script type="text/javascript" src="zlib-data.js"></script>
+>  <script type="text/javascript" src="typescript.js"></script>
+>  <script type="text/javascript" src="typescript-input.js"></script>
+>  <script type="text/javascript" src="typescript-compiler.js"></script>
+> +-->
+
+No
+(In reply to Shu-yu Guo [:shu] from comment #5)
+> 
+> I think we'll (soon) also want to display what % of samples were in what
+> tier of the JITs, so JIT by itself is ambiguous. Maybe "ion" instead of
+> "opt"?
+> 
+
+"Who is this Ion?"
+Comment on attachment 8579145
+Frontend WIP.
+
+Review of attachment 8579145:
+-----------------------------------------------------------------
+
+::: browser/devtools/performance/views/details-js-call-tree.js
+@@ +77,5 @@
+> +
+> +    // TODOshu: make actual UI and print types and stuff too.
+> +    let attemptStrs = data.attempts.map((attempt) => attempt.strategy + "\n  └ " + attempt.outcome);
+> +    let percentage = optimization.samples / treeItem.frame.samples * 100;
+> +    let footer = percentage + "% of samples, at :" + data.line + ":" + data.column;
+
+Should also limit the precision of `percentage`
+
+::: browser/devtools/shared/profiler/tree-view.js
+@@ +379,5 @@
+> +    if (outcome !== "success" &&
+> +        outcome !== "inlined" &&
+> +        outcome !== "DOM" &&
+> +        outcome !== "monomorphic" &&
+> +        outcome !== "polymorphic")
+
+should add this as a constant to top of the file:
+
+const IGNORE_OPTIMIZATION_OUTCOME = ["success", "inlined", "DOM", "monomorphic", "polymorphic"];
+...
+if (!~IGNORE_OPTIMIZATION_OUTCOME.indexOf(outcome)) {
+  cell.classList.add("call-tree-optimization-bad");
+}
+This should also be behind a pref in the options widget here, I think, like `devtools.performance.ui.show-optimizations`.
+Going to work off of https://github.com/syg/gecko-dev/tree/jit-coach-gum
+(In reply to Shu-yu Guo [:shu] from comment #5)
+> I wanted the line link to be clickable and
+> drops you off in the debugger, but I couldn't figure out how to make that
+> work.
+
+The web console has code to open a location in the debugger (also scratchpad, view-source, style editor) in viewSourceInDebugger:
+
+https://dxr.mozilla.org/mozilla-central/source/browser/devtools/webconsole/hudservice.js#483
+
+It would also make sense to move these helpers to the shared ViewHelpers.jsm so that other tools could reuse them.
+viewSourceInDebugger is also duped in the performance tools -- bug 1134778 for consolidating these
+Created attachment 8582432
+patch 1 (WIP)
+Created attachment 8582433
+patch 2 (WIP)
+
+WIP on ui for this
+http://i.imgur.com/qHiqs9z.gif
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #14)
+> Created attachment 8582433
+> patch 2 (WIP)
+> 
+> WIP on ui for this
+> http://i.imgur.com/qHiqs9z.gif
+
+This looks awesome!
+
+Very awesome!
+
+Is there some middle ground between the always-visible-JIT-button from the first WIP and this hidden-away-and-never-visible context menu? My only concern is that we went from one end of the spectrum to the other.
+Current thoughts on the balance between visibility for cryptic info like this is that "JIT Coach" feature (more useful, actionable version of this data) will be pref'd on by default, showing users what frames can be (easily?) optimized (and how?), which would enable this context menu. Opening up JIT Coach is in this panel, with a tab for the "coach" stuff, and a tab for the raw data (the data shown in this patch). Another pref could enable some kind of flag/icon on each frame that has opt data (like Shu's patch), but this should be pref'd off.
+
+Thoughts?
+Created attachment 8583181
+1143933-jitcoach.patch
+
+I think this is finally ready.
+
+We'll want to wait for Fx40 for this to land.
+Created attachment 8583194
+1143933-jitcoach.patch
+
+Updated with fix so clicking root node doesn't throw, and when enabling, will render the currently selected frame if one is selected.
+Note to self, the min-width on the JIT panel should be much much smaller, especially as the profiler call tree can't be scrolled left to right
+Comment on attachment 8583194
+1143933-jitcoach.patch
+
+Review of attachment 8583194:
+-----------------------------------------------------------------
+
+Looks pretty damn sweet overall. Issues I noticed:
+
+- The location in the titlebar of the pane (the one that says "JIT Optimizations fun @file:line") always says @undefined for the filename for me.
+
+- Weird animation quirk: it looks like everything starts off expanded and then gets collapsed. Can it start already collapsed?
+
+- Is it possible to copy the raw JSON?
+@shu
+* Do you have a page where you get the @undefined in the title? I've never seen that.
+* Yeah the animation is a bit weird. Not sure why that is, but can handle in a future bug
+* Copying raw JSON would be pretty easy -- future bug!
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #21)
+> @shu
+> * Do you have a page where you get the @undefined in the title? I've never
+> seen that.
+
+I recorded a profile for the web driver version of octane http://octane-benchmark.googlecode.com/svn/latest/index.html and saw @undefined on everything.
+Created attachment 8583528
+jitcoach.gif
+
+When I go to the octane page, I see titles for all of the frames, even ones that have no optimization data... maybe it's a linux thing, or another patch?
+Created attachment 8583541
+1143933-jitcoach.patch
+
+Fixed an issue with the root node appearing when tree inverted.
+Decreased min-width for the opt view
+btw, try seems to show a problem with performance.css:
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=7c2348a66b89
+Created attachment 8584617
+1143933-jitcoach.patch
+
+changed a selector from .tree-widget-item[level=1] to .tree-widget-item[level="1"], didn't even know that we had tests for this!
+Comment on attachment 8583541
+1143933-jitcoach.patch
+
+Review of attachment 8583541:
+-----------------------------------------------------------------
+
+r+ but with many comments. Might be worth asking for another r? after addressing them.
+
+::: browser/devtools/performance/performance.xul
+@@ +168,5 @@
+>                        height="150"/>
+>                </hbox>
+>  
+> +              <hbox id="js-calltree-view" flex="1">
+> +                <vbox flex="1">
+
+I would add the js-call-tree-view id to this node, instead of the enclosing one, and rename the container to js-profile-view or something. It'll require a change in details.js, but it's going to be cleaner.
+
+::: browser/devtools/performance/test/browser_perf-jit-model-02.js
+@@ +30,5 @@
+> +  /* getAttempts */
+> +  is(first.getAttempts().length, 2, "optSite.getAttempts() has the correct amount of attempts (1)");
+> +  is(second.getAttempts().length, 5, "optSite.getAttempts() has the correct amount of attempts (2)");
+> +  is(third.getAttempts().length, 3, "optSite.getAttempts() has the correct amount of attempts (3)");
+> +  
+
+nit: ws
+
+::: browser/devtools/performance/test/browser_perf-jit-view-01.js
+@@ +8,5 @@
+> +function spawnTest () {
+> +  let { panel } = yield initPerformance(SIMPLE_URL);
+> +  let {
+> +    EVENTS, $, $$, window, PerformanceController, DetailsView, JITOptimizationsView, JsCallTreeView, RecordingsView
+> +  } = panel.panelWin;
+
+Nit: just split this into two lines if it's ugly. One for EVENTS, $, controllers etc, another for views.
+
+@@ +12,5 @@
+> +  } = panel.panelWin;
+> +
+> +  let profilerData = { threads: [{samples: gSamples, optimizations: gOpts}] };
+> +
+> +  is(Services.prefs.getBoolPref(JIT_PREF), false, "show JIT Optimizations pref off by default");
+
+Is there any reason for this check? I'd say remove it.
+
+@@ +20,5 @@
+> +  yield startRecording(panel);
+> +  yield stopRecording(panel);
+> +
+> +  yield startRecording(panel);
+> +  yield stopRecording(panel);
+
+Nit: adding a newline would decongest things.
+
+@@ +25,5 @@
+> +  yield DetailsView.selectView("js-calltree");
+> +  is($("#jit-optimizations-view").hidden, true, "JIT Optimizations panel is hidden when pref off.");
+> +
+> +  let thread = JsCallTreeView._prepareCallTree(profilerData, { startTime: 0, endTime: 20 }, {});
+> +  JsCallTreeView._populateCallTree(thread, {});
+
+Ugh, manually calling private methods is a bit weird. Why not just force a re-render, by changing the overview selection or something?
+
+@@ +81,5 @@
+> +  let select = once(PerformanceController, EVENTS.RECORDING_SELECTED);
+> +  reset = once(JITOptimizationsView, EVENTS.OPTIMIZATIONS_RESET);
+> +  RecordingsView.selectedIndex = 0;
+> +  yield Promise.all([select, reset]);
+> +  ok(true, "JITOptimizations view correctly reset when switching recordings.");
+
+Another nit: splitting this test function into a few smaller functions would also make it a bit easier to follow.
+
+::: browser/devtools/performance/views/details-js-call-tree.js
+@@ +25,5 @@
+>      this._onLink = this._onLink.bind(this);
+> +
+> +    this.container = $("#js-calltree-view .call-tree-cells-container");
+> +
+> +    yield JITOptimizationsView.initialize();
+
+Nit: the jit view init and destory aren't returning a promise now, so no real need to yield.
+
+@@ +33,5 @@
+>     * Unbinds events.
+>     */
+> +  destroy: Task.async(function *() {
+> +    this.container = null;
+> +    yield JITOptimizationsView.destroy();
+
+Ditto.
+
+@@ -37,5 @@
+>     *
+>     * @param object interval [optional]
+>     *        The { startTime, endTime }, in milliseconds.
+> -   * @param object options [optional]
+> -   *        Additional options for new the call tree.
+
+Thanks for removing this, gosh.
+
+::: browser/devtools/performance/views/jit-optimizations.js
+@@ +59,5 @@
+> +   *
+> +   * @param {FrameNode} frameNode
+> +   */
+> +
+> +  setCurrentFrame: function (frameNode) {
+
+Nit: extra newline.
+
+@@ +70,5 @@
+> +   * Returns the current frame node for this view.
+> +   *
+> +   * @return {?FrameNode}
+> +   */
+> +
+
+Ditto.
+
+@@ +80,5 @@
+> +   * Clears out data in the tree, sets to an empty state,
+> +   * and removes current frame.
+> +   */
+> +  reset: function () {
+> +    this.setCurrentFrame(null);
+
+Wouldn't `this.setCurrentFrame(null);` make more sense inside `clear`?
+
+@@ +106,5 @@
+> +   * optimizations for this frame. This view is very verbose and meant for those
+> +   * who understand JIT compilers.
+> +   */
+> +
+> +  render: function () {
+
+Nit: extra newline.
+
+@@ +109,5 @@
+> +
+> +  render: function () {
+> +    let frameNode = this.getCurrentFrame();
+> +
+> +    if (!this.isEnabled()) {
+
+This should probably be the first check shouldn't it? No reason to getCurrentFrame if disabled.
+
+@@ +123,5 @@
+> +    let frameData = frameNode.getInfo();
+> +    this._setHeaders(frameData);
+> +    this.clear();
+> +
+> +    if (!frameNode.hasOptimizations()) {
+
+Shouldn't this be in the same conditional as `if (!frameNode)` above? There's some unnecessary work happening.
+
+@@ +164,5 @@
+> +        view.add([id, `${id}-attempts`, { node }]);
+> +      }
+> +    }
+> +
+> +    this.emit(EVENTS.OPTIMIZATIONS_RENDERED, this.getCurrentFrame());
+
+I'd love it if this method was split into a few smaller ones.
+
+::: browser/devtools/shared/profiler/jit.js
+@@ +90,5 @@
+> + *
+> + * @see js/public/TrackedOptimizationInfo.h
+> + *
+> + * @type {string} strategy
+> + * @type {string} outcome
+
+MANY WORD
+
+@@ +178,5 @@
+> + */
+> +
+> +JITOptimizations.prototype.addOptimizationSite = function (optsIndex) {
+> +  let op = this._optSites[optsIndex] ||
+> +           (this._optSites[optsIndex] = new OptimizationSite(this._opts, optsIndex));
+
+Uber nit/ personal preference: meh, just keep this on a single like. We're not really respecting the 80 column rule anywhere anyway.
+
+::: browser/devtools/shared/profiler/tree-model.js
+@@ +175,5 @@
+> +  this._optimizations = null;
+> +
+> +  // Cache the parsed location data upfront so we can use it for our
+> +  // JITOptimizations; we'll need it anyway for the tree-view
+> +  this._computeInfo();
+
+This is heavy. True, we'll need it anyway in the tree-view, but lazily, when a node is displayed. I reckon doing this for each frame will slow down things a lot when initially parsing a huge profile.
+
+What was wrong with the lazy approach?
+
+@@ +212,5 @@
+>      child.samples++;
+>      child.duration += duration;
+> +    if (optimizations && frame.optsIndex != null) {
+> +      let opts = child._optimizations ||
+> +                 (child._optimizations = new JITOptimizations(child._data, optimizations));
+
+Uber nit/ same personal preference: one line.
+
+@@ +287,5 @@
+> +   *
+> +   * @return {Boolean}
+> +   */
+> +
+> +  hasOptimizations: function () {
+
+Nit: extra newline.
+
+@@ +298,5 @@
+> +   *
+> +   * @return {JITOptimizations|null}
+> +   */
+> +
+> +  getOptimizations: function () {
+
+Ditto.
+
+::: browser/themes/shared/devtools/performance.inc.css
+@@ -228,2 @@
+>    -moz-margin-start: 4px !important;
+> -  cursor: pointer;
+
+Why remove the pointer cursor?
+
+@@ +514,5 @@
+> +
+> +/* override default .tree-widget-item line-height */
+> +#jit-optimizations-raw-view .tree-widget-item {
+> +  line-height: 20px !important;
+> +  height: 18px;
+
+huh? line-height bigger than height?
+
+@@ +546,5 @@
+> +}
+> +#jit-optimizations-view .tree-widget-container {
+> +  -moz-margin-end: 0px;
+> +}
+> +#jit-optimizations-view .tree-widget-container > li, #jit-optimizations-view .tree-widget-children > li {
+
+Nit: keep these selectors on two lines.
+Comment on attachment 8583541
+1143933-jitcoach.patch
+
+Review of attachment 8583541:
+-----------------------------------------------------------------
+
+::: browser/devtools/performance/test/browser_perf-jit-view-01.js
+@@ +12,5 @@
+> +  } = panel.panelWin;
+> +
+> +  let profilerData = { threads: [{samples: gSamples, optimizations: gOpts}] };
+> +
+> +  is(Services.prefs.getBoolPref(JIT_PREF), false, "show JIT Optimizations pref off by default");
+
+To ensure that we're starting without the jit optimizations view on -- if this changed in the future, this test would fail (rather than failing later with a less obvious test message)
+
+@@ +25,5 @@
+> +  yield DetailsView.selectView("js-calltree");
+> +  is($("#jit-optimizations-view").hidden, true, "JIT Optimizations panel is hidden when pref off.");
+> +
+> +  let thread = JsCallTreeView._prepareCallTree(profilerData, { startTime: 0, endTime: 20 }, {});
+> +  JsCallTreeView._populateCallTree(thread, {});
+
++1
+
+@@ +81,5 @@
+> +  let select = once(PerformanceController, EVENTS.RECORDING_SELECTED);
+> +  reset = once(JITOptimizationsView, EVENTS.OPTIMIZATIONS_RESET);
+> +  RecordingsView.selectedIndex = 0;
+> +  yield Promise.all([select, reset]);
+> +  ok(true, "JITOptimizations view correctly reset when switching recordings.");
+
++1
+
+::: browser/devtools/performance/views/details-js-call-tree.js
+@@ +25,5 @@
+>      this._onLink = this._onLink.bind(this);
+> +
+> +    this.container = $("#js-calltree-view .call-tree-cells-container");
+> +
+> +    yield JITOptimizationsView.initialize();
+
++1
+
+::: browser/devtools/performance/views/jit-optimizations.js
+@@ +80,5 @@
+> +   * Clears out data in the tree, sets to an empty state,
+> +   * and removes current frame.
+> +   */
+> +  reset: function () {
+> +    this.setCurrentFrame(null);
+
+No; we clear out the tree during a successful render before adding the new tree elements, which would destroy the current frame reference
+
+@@ +123,5 @@
+> +    let frameData = frameNode.getInfo();
+> +    this._setHeaders(frameData);
+> +    this.clear();
+> +
+> +    if (!frameNode.hasOptimizations()) {
+
+This let's us set the header even if no opt data is found; adding comment for this
+
+@@ +164,5 @@
+> +        view.add([id, `${id}-attempts`, { node }]);
+> +      }
+> +    }
+> +
+> +    this.emit(EVENTS.OPTIMIZATIONS_RENDERED, this.getCurrentFrame());
+
+done
+
+::: browser/devtools/shared/profiler/tree-model.js
+@@ +175,5 @@
+> +  this._optimizations = null;
+> +
+> +  // Cache the parsed location data upfront so we can use it for our
+> +  // JITOptimizations; we'll need it anyway for the tree-view
+> +  this._computeInfo();
+
+You're right -- I thought since this was displayed after computing, it wouldn't matter, but there are many nodes we don't show upfront, obviously. This is for sharing data of the frame to the OptimizationSites, but they too can lazily load.
+
+And actually the view gets info from the frame itself. Should probably continue with the framenode interacting with the opts, rather than introduce a circular ref.
+
+Removing the _computeInfo upfront -- leaving the caching though, when it first lazily computes
+
+::: browser/themes/shared/devtools/performance.inc.css
+@@ -228,2 @@
+>    -moz-margin-start: 4px !important;
+> -  cursor: pointer;
+
+oops
+
+@@ +514,5 @@
+> +
+> +/* override default .tree-widget-item line-height */
+> +#jit-optimizations-raw-view .tree-widget-item {
+> +  line-height: 20px !important;
+> +  height: 18px;
+
+oops
+Created attachment 8586391
+1143933-jitcoach.patch
+
+Up for rereview -- https://treeherder.mozilla.org/#/jobs?repo=try&revision=520466767f50
+Comment on attachment 8586391
+1143933-jitcoach.patch
+
+Review of attachment 8586391:
+-----------------------------------------------------------------
+
+AMAZE
+
+::: browser/devtools/performance/views/jit-optimizations.js
+@@ +67,5 @@
+> +
+> +  /**
+> +   * Returns the current frame node for this view.
+> +   *
+> +   * @return {?FrameNode}
+
+"{?FrameNode}"
+ 
+cool.
+Comment on attachment 8586391
+1143933-jitcoach.patch
+
+Review of attachment 8586391:
+-----------------------------------------------------------------
+
+::: browser/devtools/performance/views/jit-optimizations.js
+@@ +67,5 @@
+> +
+> +  /**
+> +   * Returns the current frame node for this view.
+> +   *
+> +   * @return {?FrameNode}
+
+I got excited with jsdoc doing the optimization structure from the profiler
+Created attachment 8586585
+1143933-jitcoach.patch
+
+CSS oops https://treeherder.mozilla.org/#/jobs?repo=try&revision=42476ea511d2
+https://hg.mozilla.org/integration/fx-team/rev/7e032903ec9c
+https://hg.mozilla.org/mozilla-central/rev/7e032903ec9c
+Need some clarifications to figure out if a follow-up bug is needed.
+
+# LOCALIZATION NOTE (jit.samples):
+# This string is displayed for the unit representing thenumber of times a
+# frame is sampled.
+jit.samples=samples
+
+Besides the typo in the comment, how is this string actually used? If it's concatenated with a number it's not OK for many reasons (need proper plural form support, need possibility to display the label after the number).
+This is used to display the number of samples per frame, so "(5 samples)", so yes it should probably be pluralized. I'm guessing the label name needs to be changed as well? (jit.samples2)
+Continuing localization discussion in bug 1150733
+
+
+UI for exposing JIT information
+
+
+
+Bug 1143933 - Expose raw JIT optimization information in performance front end. r=vp,shu 

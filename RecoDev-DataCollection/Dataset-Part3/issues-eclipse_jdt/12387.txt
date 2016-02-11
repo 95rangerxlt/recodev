@@ -1,0 +1,2790 @@
+Build 20020321 stable
+Importing the file below causes an Out of Memory error in eclipse.  Here is the 
+log file:
+Log: Wed Mar 27 14:38:33 CST 2002
+1 org.eclipse.core.resources 4 Unhandled exception caught in event loop.
+Log: Wed Mar 27 14:38:33 CST 2002
+4 org.eclipse.ui 0 java.lang.OutOfMemoryError
+java.lang.OutOfMemoryError
+	<<no stack trace available>>
+
+Problem seems to be associated with parsing the file.  If I turn auto build 
+off, the error doesn't appear until I expand the package in the packages view.  
+If I turn off Show Members in Packages View it doesn't appear until I open the 
+file in the Java editor.  The file is part of the Dr Java package from Rice 
+university (http://drjava.sourceforge.net/).  It appears to be compiled with a 
+generics compliant compiler as the extends clause contains the following: 
+extends Tree.Visitor<Type,Env<AttrContext>>.
+
+As this is not valid Java, I wouldn't expect this to compile.  However, the out 
+of memory error could possibly be avoided.  I am able to recreate the problem 
+by having autobuild turned on and importing the file into an existing project.
+
+
+
+/* ************************************************************************
+ * GJC attribution phase
+ * by Martin Odersky
+ *
+ * Copyright (C) 1996-98 Martin Odersky. All rights reserved.
+ * Permission is hereby granted to use and modify this software for evaluation
+ * and research purposes. Modification and use for other purposes requires
+ * prior written permission by the author. The software, or modifications
+ * thereof may be given to third parties only with prior written permission
+ * by the author.
+ *************************************************************************/
+
+package edu.rice.cs.nextgen.compiler.comp;
+
+import edu.rice.cs.nextgen.compiler.util.*;
+import edu.rice.cs.nextgen.compiler.code.*;
+import edu.rice.cs.nextgen.compiler.tree.*;
+
+import Symbol.*;
+import Tree.*;
+import Type.*;
+
+public class Attr
+extends Tree.Visitor<Type,Env<AttrContext>>
+implements /* imports */ Flags, Kinds, TypeTags {
+
+    Log log;
+    Symtab syms;
+    Resolve rs;
+    Check chk;
+    Infer infer;
+    TreeMaker make;
+    public Enter enter;
+    public ConstFold cfolder;
+
+    public Attr(Log log, Symtab syms,
+		Resolve rs, Check chk, Infer infer,
+		TreeMaker make, Enter enter) {
+	this.log = log;
+	this.syms = syms;
+	this.rs = rs;
+	this.chk = chk;
+	this.infer = infer;
+	this.make = make;
+	this.enter = enter;
+	if (enter != null) enter.attr = this;
+	this.cfolder = new ConstFold(log, syms);
+    }
+
+    /** check kind and type of given tree against prototype
+     *  store resulting type to tree and return it.
+     *  no checks are performed if the prototype is a method type.
+     *  Its not necessary in this case since we know that kind and type
+     *  are correct.
+     */
+    Type check(Tree tree, Type owntype, int ownkind, int pkind, Type pt) {
+	if (owntype.tag != ERROR && pt.tag != METHOD) {
+	    if ((ownkind & ~pkind) == 0) {
+		if (pt.tag != NONE)
+		    owntype = chk.checkType(tree.pos, owntype, pt);
+	    } else {
+		log.error(tree.pos,
+			  Resolve.kindNames(pkind) + " required, but " +
+			  Resolve.kindName(ownkind) + " found");
+		owntype = Type.errType;
+	    }
+	}
+	tree.type = owntype;
+	return owntype;
+    }
+
+    /** is variable `v' assignable, i.e. in a scope where it may be assigned to
+     *  even if it is final?
+     */
+    static boolean finalAssignable(VarSymbol v, Env<AttrContext> env) {
+	Symbol owner = env.info.scope.owner;
+	return
+	    v.constValue == null
+	    &&
+	    (v.owner == owner
+	     ||
+	     ((owner.name == Names.init || (owner.flags() & BLOCK) != 0)
+	      &&
+	      v.owner == owner.owner
+	      &&
+	      ((v.flags() & STATIC) != 0) == (Resolve.isStatic(env))));
+    }
+
+    /** check that variable `v' can be assigned to.
+     */
+    void checkAssignable(int pos, VarSymbol v, Tree base, Env<AttrContext> env) 
+{
+	if ((v.flags() & FINAL) != 0 &&
+	    !((base == null ||
+	       (base.tag == Tree.IDENT && TreeInfo.name(base) == Names._this)) 
+&&
+	      finalAssignable(v, env))) {
+	    log.error(pos, "can't assign a value to final " + v);
+	}
+    }
+
+    /** warn about deprecated symbol if not in currently ccompiled files
+     */
+    void warnDeprecated(int pos, Symbol sym) {
+	if (!enter.compiled.contains(sym.enclClass().fullname))
+	    log.warning(pos, sym + sym.location() + " has been deprecated");
+    }
+
+    /** the current `this' symbol
+     */
+    Symbol thisSym(Env<AttrContext> env) {
+	return rs.resolveSelf(
+	    Position.NOPOS, env, env.enclClass.sym, Names._this);
+    }
+
+    /** if `site' is an inner class, prepend outer instance to argtypes
+     *  outer instance is taken to be `outer' if not null, is made up otherwise.
+     */
+    List<Type> constructorArgs(int pos, Env<AttrContext> env,
+			       Type site, Type outer, List<Type> argtypes) {
+	if (site.outer().tag == CLASS) {
+	    if (outer == null) {
+		Symbol outerthis = rs.resolveSelf(
+		    pos, env, site.outer().tsym, Names._this);
+		if (outerthis.kind == VAR) {
+/*//todo: revise this
+		    if (env.info.isSelfCall &&
+			outerthis.owner == env.enclClass.sym)
+			chk.earlyRefError(pos, outerthis);
+ */
+		    outer = outerthis.owner.type;
+		} else {
+		    outer = Type.errType;
+		}
+	    }
+	    argtypes = argtypes.prepend(outer);
+	} else if (outer != null && outer.tag == CLASS && site.tag != ERROR) {
+	    log.error(pos,
+		"illegal qualifier; " + site.tsym + " is not an inner class");
+	}
+	return argtypes;
+    }
+
+    Type attribTerm(Tree tree, Env<AttrContext> env, int pkind, Type pt) {
+	try {
+	    env.info.pkind = pkind;
+	    env.info.pt = pt;
+	    return tree.visit(this, env);
+	} catch (CompletionFailure ex) {
+	    return chk.completionError(tree.pos, ex);
+	}
+    }	
+
+    Type attribExpr(Tree tree, Env<AttrContext> env, Type pt) {
+	return attribTerm(tree, env, VAL, pt);
+    }
+
+    Type attribExpr(Tree tree, Env<AttrContext> env) {
+	return attribExpr(tree, env, Type.noType);
+    }
+
+    Type attribType(Tree tree, Env<AttrContext> env) {
+	return attribTerm(tree, env, TYP, Type.noType);
+    }
+
+    Type attribStat(Tree tree, Env<AttrContext> env) {
+	return attribTerm(tree, env, NIL, Type.noType);
+    }
+
+    List<Type> attribExprs(List<Tree> trees, Env<AttrContext> env, Type pt) {
+	ListBuffer<Type> ts = new ListBuffer<Type>();
+	for (List<Tree> l = trees; l.nonEmpty(); l = l.tail)
+	    ts.append(attribExpr(l.head, env, pt));
+	return ts.toList();
+    }
+
+    <T extends Tree> void attribStats(List<T> trees, Env<AttrContext> env) {
+	for (List<T> l = trees; l.nonEmpty(); l = l.tail)
+	    attribStat(l.head, env);
+    }
+
+    List<Type> attribArgs(List<Tree> trees, Env<AttrContext> env) {
+	ListBuffer<Type> argtypes = new ListBuffer<Type>();
+	for (List<Tree> l = trees; l.nonEmpty(); l = l.tail)
+	    argtypes.append(chk.checkNonVoid(
+		l.head.pos, attribExpr(l.head, env)));
+	return argtypes.toList();
+    }
+
+    /** attribute extended or implemented type reference
+     */
+    Type attribBase(Tree tree, Env<AttrContext> env, int interfaceFlag) {
+	Type t = chk.checkClassType(tree.pos, attribType(tree, env));
+	if ((t.tsym.flags() & INTERFACE) != interfaceFlag) {
+	    log.error(tree.pos,
+		(interfaceFlag == 0 ? "no " : "") + "interface expected here");
+	}
+	if ((t.tsym.flags() & FINAL) != 0) {
+	    log.error(tree.pos, "can't inherit from final " + t.tsym);
+	}
+	return t;
+    }
+
+/* ********************************************************************
+ * Adding miranda methods
+ *********************************************************************/
+
+    /** add an abstract method definition to class definition `cd'
+     *  for a method `m' defined in an interface
+     */
+    private void addAbstractMethod(ClassDef cd,
+				   MethodSymbol m,
+				   Env<AttrContext> env) {
+//	System.err.println("add abstract method: " + m);//DEBUG
+	Tree def = make.at(cd.pos).MethodDef(
+	    new MethodSymbol(
+		m.flags() | IPROXY, m.name, cd.sym.type.memberType(m), cd.sym),
+	    null);
+	cd.defs = cd.defs.prepend(def);
+	enter.memberEnter(def, env);
+    }
+
+    /** add abstract method definitions for all methods defined in one of
+     *  c's interfaces, provided they are not already implemented
+     *  env = the environment for the class definition of c.
+     */
+    void implementInterfaceMethods(ClassSymbol c, Env<AttrContext> env) {
+	ClassDef cd = (ClassDef)env.tree;
+	for (List<Type> l = c.type.interfaces(); l.nonEmpty(); l = l.tail) {
+	    ClassSymbol i = (ClassSymbol)l.head.tsym;
+	    for (Scope.Entry e = i.members().elems;
+		 e != null;
+		 e = e.sibling) {
+		if (e.sym.kind == MTH &&
+		    (e.sym.flags() & STATIC) == 0) // disregard <clinit>!
+		{
+		    MethodSymbol absMeth = (MethodSymbol)e.sym;
+		    MethodSymbol implMeth = absMeth.implementation(cd.sym);
+		    if (implMeth == null)
+			addAbstractMethod(cd, absMeth, env);
+		}
+	    }
+	    implementInterfaceMethods(i, env);
+	}
+    }
+
+/* ************************************************************************
+ * visitor methods
+ *************************************************************************/
+
+    public Type _case(ClassDef tree, Env<AttrContext> env) {
+	if ((env.info.scope.owner.kind & (VAR | MTH)) != 0) {
+	    enter.classEnter(tree, env);
+	} else if (tree.name.len == 0) {
+	    System.out.println(env.info.scope.owner);
+	}
+	ClassSymbol c = tree.sym;
+	if (c == null) return null;
+	c.complete();
+	attribClass(c);
+	return tree.type = c.type;
+    }
+
+    public Type _case(MethodDef tree, Env<AttrContext> env) {
+	MethodSymbol m = tree.sym;
+	chk.checkOverride(tree.pos, m);
+
+	Env<AttrContext> localEnv = enter.methodEnv((MethodDef)tree, env);
+	for (List<TypeParameter> l = tree.typarams; l.nonEmpty(); l = l.tail)
+	    localEnv.info.scope.enterIfAbsent(l.head.type.tsym);
+	for (List<VarDef> l = tree.params; l.nonEmpty(); l = l.tail)
+	    attribStat(l.head, localEnv);
+
+	chk.validateTypeParams(tree.typarams);
+	chk.validate(tree.restype);
+	for (List<Tree> l = tree.thrown; l.nonEmpty(); l = l.tail)
+	    chk.checkType(l.head.pos, l.head.type, syms.throwableType);
+	
+	ClassSymbol owner = env.enclClass.sym;
+	if (tree.body == null) {
+	    if ((owner.flags() & INTERFACE) == 0 &&
+		(tree.flags & (ABSTRACT | NATIVE)) == 0)
+		log.error(tree.pos,
+			  "missing method body, or declare as abstract");
+	} else if ((owner.flags() & INTERFACE) != 0) {
+	    log.error(tree.pos, "interface methods cannot have body");
+	} else if ((tree.flags & ABSTRACT) != 0) {
+	    log.error(tree.pos, "abstract methods cannot have body");
+	} else if ((tree.flags & NATIVE) != 0) {
+	    log.error(tree.pos, "native methods cannot have body");
+	} else {
+	    if (tree.name == Names.init && owner.type != syms.objectType) {
+		Block body = tree.body;
+		if (body.stats.isEmpty() || !isSelfCall(body.stats.head)) {
+		    body.stats = body.stats.prepend(
+			Enter.SuperCall(
+			    make.at(body.pos), VarDef.emptyList, false));
+		}
+	    }
+	    attribStat(tree.body, localEnv);
+	}
+	localEnv.info.scope.leave();
+	return tree.type = m.type;
+    }
+//where
+        private boolean isSelfCall(Tree tree) {
+	    if (tree.tag == Tree.EXEC) {
+		Exec exec = (Exec)tree;
+		if (exec.expr.tag == Tree.APPLY) {
+		    Name mname = TreeInfo.name(((Apply)exec.expr).meth);
+		    if (mname == Names._this || mname == Names._super) return 
+true;
+		}
+	    }
+	    return false;
+	}
+
+    public Type _case(VarDef tree, Env<AttrContext> env) {
+	if (env.info.scope.owner.kind == MTH) enter.memberEnter(tree, env);
+	chk.validate(tree.vartype);
+	VarSymbol v = tree.sym;
+	Base.assert(v != null, tree.name);
+	if (tree.init != null) {
+	    v.pos = Position.MAXPOS; //to catch self references
+	    Type itype = attribExpr(
+		tree.init, enter.initEnv((VarDef)tree, env), v.type);
+	    if (v.constValue instanceof Enter.EnvAttrContextBox) {
+		if (itype.constValue != null)
+		    v.constValue = cfolder.coerce(itype, v.type).constValue;
+		else
+		    v.constValue = null;
+	    }
+	    v.pos = tree.pos;
+	}
+	return tree.type = v.type;
+    }
+
+    public Type _case(Block tree, Env<AttrContext> env) {
+	Env<AttrContext> localEnv =
+	    env.dup(tree, env.info.dup(env.info.scope.dup()));
+	if (env.info.scope.owner.kind == TYP) {
+	    localEnv.info.scope.owner = new MethodSymbol(
+		tree.flags | BLOCK, Names.empty, null, env.info.scope.owner);
+	    if ((tree.flags & STATIC) != 0) localEnv.info.staticLevel++;
+	}
+	attribStats(tree.stats, localEnv);
+	localEnv.info.scope.leave();
+	return null;
+    }
+
+    public Type _case(DoLoop tree, Env<AttrContext> env) {
+	attribStat(tree.body, env.dup(tree));
+	attribExpr(tree.cond, env, Type.booleanType);
+	return null;
+    }
+
+    public Type _case(WhileLoop tree, Env<AttrContext> env) {
+	attribExpr(tree.cond, env, Type.booleanType);
+	attribStat(tree.body, env.dup(tree));
+	return null;
+    }
+
+    public Type _case(ForLoop tree, Env<AttrContext> env) {
+	Env<AttrContext> loopEnv =
+	    env.dup(env.tree, env.info.dup(env.info.scope.dup()));
+	attribStats(tree.init, loopEnv);
+	if (tree.cond != null) attribExpr(tree.cond, loopEnv, Type.booleanType);
+	loopEnv.tree = tree; // before, we were not in loop!
+	attribStats(tree.step, loopEnv);
+	attribStat(tree.body, loopEnv);
+	loopEnv.info.scope.leave();
+	return null;
+    }
+
+    public Type _case(Labelled tree, Env<AttrContext> env) {
+	attribStat(tree.body, env.dup(tree));
+	return null;
+    }
+
+    public Type _case(Switch tree, Env<AttrContext> env) {
+	Type seltype = attribExpr(tree.selector, env, Type.intType);
+	Env<AttrContext> switchEnv =
+	    env.dup(tree, env.info.dup(env.info.scope.dup()));
+
+	Set<Object> tags = Set.make();
+	boolean hasDefault = false;
+	for (List<Case> l = tree.cases; l.nonEmpty(); l = l.tail) {
+	    Case c = l.head;
+	    if (c.pat != null) {
+		Type pattype = attribExpr(c.pat, switchEnv, Type.intType);
+		if (pattype.tag != ERROR) {
+		    if (pattype.constValue == null)
+			log.error(c.pat.pos, "constant expression required");
+		    else if (tags.contains(pattype.constValue))
+			log.error(c.pos, "duplicate case label");
+		    else
+			tags.put(pattype.constValue);
+		}
+	    } else if (hasDefault) {
+		log.error(c.pos, "duplicate default label");
+	    } else {
+		hasDefault = true;
+	    }
+	    attribStats(c.stats, switchEnv);
+	}
+	switchEnv.info.scope.leave();
+	return null;
+    }
+
+    public Type _case(Synchronized tree, Env<AttrContext> env) {
+	attribExpr(tree.lock, env, syms.objectType);
+	attribStat(tree.body, env);
+	return null;
+    }
+
+    public Type _case(Try tree, Env<AttrContext> env) {
+	Env<AttrContext> tryEnv = env.dup(tree, env.info.dup());
+	for (List<Catch> l = tree.catchers; l.nonEmpty(); l = l.tail) {
+	    Catch c = l.head;
+	    Env<AttrContext> catchEnv =
+		env.dup(c, env.info.dup(env.info.scope.dup()));
+	    Type ctype = attribStat(c.param, catchEnv);
+	    chk.checkType(c.param.vartype.pos, ctype, syms.throwableType);
+	    attribStat(c.body, catchEnv);
+	    ClassSymbol exc = (ClassSymbol)ctype.tsym;
+	    catchEnv.info.scope.leave();
+	}
+	attribStat(tree.body, tryEnv);
+	if (tree.finalizer != null) attribStat(tree.finalizer, env);
+	return null;
+    }
+
+    public Type _case(Conditional tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	attribExpr(tree.cond, env, Type.booleanType);
+	attribExpr(tree.thenpart, env, pt);
+	if (tree.elsepart != null) attribExpr(tree.elsepart, env, pt);
+	if (tree.tag == Tree.CONDSTAT)
+	    return null;
+	else
+	    return check(
+		tree,
+		condType(
+		    tree.pos,
+		    tree.cond.type, tree.thenpart.type, tree.elsepart.type),
+		VAL, pkind, pt);
+    }
+//where
+        private Type condType(int pos, Type condtype, Type thentype, Type 
+elsetype) {
+	    if (condtype.constValue != null &&
+		thentype.constValue != null &&
+		elsetype.constValue != null)
+		return (((Number)condtype.constValue).intValue() != 0)
+		    ? thentype
+		    : elsetype;
+	    else if (thentype.tag < INT && elsetype.tag == INT &&
+		elsetype.assignable(thentype))
+		return thentype;
+	    else if (elsetype.tag < INT && thentype.tag == INT &&
+		     thentype.assignable(elsetype))
+		return elsetype;
+	    else if (thentype.tag <= DOUBLE && elsetype.tag <= DOUBLE) {
+		for (int i = BYTE; i <= DOUBLE; i++) {
+		    Type candidate = Type.typeOfTag[i];
+		    if (thentype.subType(candidate) &&
+			elsetype.subType(candidate)) return candidate;
+		}
+	    }
+	    if (thentype.tsym == syms.stringType.tsym &&
+		elsetype.tsym == syms.stringType.tsym) {
+		return syms.stringType;
+	    } else if (thentype.subType(elsetype)) {
+		return elsetype;
+	    } else {
+		chk.checkType(pos, elsetype, thentype);
+		return thentype;
+	    }
+	}
+
+    public Type _case(Exec tree, Env<AttrContext> env) {
+	attribExpr(tree.expr, env);
+	return null;
+    }
+
+    public Type _case(Break tree, Env<AttrContext> env) {
+	tree.target = findJumpTarget(tree.pos, tree.tag, tree.label, env);
+	return null;
+    }
+
+    public Type _case(Continue tree, Env<AttrContext> env) {
+	tree.target = findJumpTarget(tree.pos, tree.tag, tree.label, env);
+	return null;
+    }
+//where
+        private Tree findJumpTarget(int pos,
+				    int tag,
+				    Name label,
+				    Env<AttrContext> env) {
+	    Env<AttrContext> env1 = env;
+	    while (env1 != null) {
+		switch (env1.tree.tag) {
+		case Tree.LABELLED:
+		    Labelled labelled = (Labelled)env1.tree;
+		    if (label == labelled.label) {
+			Tree target = labelled.body;
+			while (target.tag == Tree.LABELLED) {
+			    target = ((Labelled)target).body;
+			}
+			if (tag == Tree.CONTINUE &&
+			    target.tag != Tree.DOLOOP &&
+			    target.tag != Tree.WHILELOOP &&
+			    target.tag != Tree.FORLOOP)
+			    log.error(pos, "not a loop label: " + label);
+			return target;
+		    }
+		    break;
+		case Tree.DOLOOP:
+		case Tree.WHILELOOP:
+		case Tree.FORLOOP:
+		    if (label == null) return env1.tree;
+		    break;
+		case Tree.SWITCH:
+		    if (label == null && tag == Tree.BREAK) return env1.tree;
+		    break;
+		default:
+		}
+		env1 = env1.next;
+	    }
+	    if (label != null)
+		log.error(pos, "undefined label: " + label);
+	    else if (tag == Tree.CONTINUE)
+		log.error(pos, "continue outside of loop");
+	    else
+		log.error(pos, "break outside switch or loop");
+	    return null;
+	}
+
+    public Type _case(Return tree, Env<AttrContext> env) {
+	if (env.enclMethod == null ||
+	    env.enclClass.sym.owner == env.enclMethod.sym) {
+	    log.error(tree.pos, "return outside method");
+	} else {
+	    Symbol m = env.enclMethod.sym;
+	    if (m.type.restype().tag == VOID) {
+		if (tree.expr != null)
+		    log.error(
+			tree.expr.pos, "can't return a value from method " +
+			"whose result type is void");
+	    } else if (tree.expr == null) {
+		log.error(tree.pos, "missing return value");
+	    } else {
+		attribExpr(tree.expr, env, m.type.restype());
+	    }
+	}
+	return null;
+    }
+
+    public Type _case(Throw tree, Env<AttrContext> env) {
+	Type t = attribExpr(tree.expr, env, syms.throwableType);
+	return null;
+    }
+
+    public Type _case(Apply tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	Env<AttrContext> localEnv = env;
+	List<Type> argtypes;
+	Name methName = TreeInfo.name(tree.meth);
+	boolean isConstructorCall =
+	    methName == Names._this || methName == Names._super;
+	if (isConstructorCall && checkFirstConstructorStat(tree, env)) {
+	    localEnv = env.dup(env.tree, env.info.dup());
+	    localEnv.info.isSelfCall = true;
+	    argtypes = attribArgs(tree.args, localEnv);
+	    Type site = env.enclClass.sym.type;
+	    if (methName == Names._super) site = site.supertype();
+	    Type encltype = (tree.meth.tag == Tree.SELECT)
+		? attribExpr(((Select)tree.meth).selected, env)
+		: null;
+	    argtypes = constructorArgs(
+		tree.meth.pos, localEnv, site, encltype, argtypes);
+	} else {
+	    argtypes = attribArgs(tree.args, localEnv);
+	}
+
+	List<MethodType> saved = methTemplateSupply.elems;
+	Type mpt = newMethTemplate(argtypes);
+	// optimization, was ... = new MethodType(argtypes, null, null);
+
+	owntype = attribExpr(tree.meth, localEnv, mpt);
+
+	methTemplateSupply.elems = saved; // optimization
+
+	if (isConstructorCall) {
+	    Symbol called = TreeInfo.symbol(tree.meth);
+	    if (called == env.enclMethod.sym)
+		log.error(tree.pos, "recursive constructor invocation");
+//todo: handle indirect recursion as well
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+//where
+        private boolean checkFirstConstructorStat(Apply tree, Env<AttrContext> 
+env) {
+	    MethodDef enclMethod = env.enclMethod;
+	    if (enclMethod != null && enclMethod.name == Names.init) {
+		Block body = (Block)enclMethod.body;
+		if (body.stats.head.tag == Tree.EXEC &&
+		    ((Exec)body.stats.head).expr == tree)
+		    return true;
+	    }
+	    log.error(tree.pos, "call to " + TreeInfo.name(tree.meth) +
+		      " must be first statement in constructor");
+	    return false;
+	}
+
+        /** optimization: To save allocating a new methodtype for every apply,
+	 *  we use a reservoir.
+	 */
+        ListBuffer<MethodType> methTemplateSupply = new ListBuffer<MethodType>
+();
+
+        public Type newMethTemplate(List<Type> argtypes) {
+	    if (methTemplateSupply.elems == methTemplateSupply.last)
+		methTemplateSupply.append(new MethodType(null, null, null));
+	    MethodType mt = methTemplateSupply.elems.head;
+	    methTemplateSupply.elems = methTemplateSupply.elems.tail;
+	    mt.argtypes = argtypes;
+	    return mt;
+	}
+
+    public Type _case(NewClass tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	ClassDef cdef = tree.def;
+
+	// if enclosing class is given, attribute it, and
+	// complete class name to be fully qualified
+	Type encltype = null;
+	Tree clazz = tree.clazz;
+	if (tree.encl != null) {
+	    encltype = attribExpr(tree.encl, env);
+	    if (encltype.tag == CLASS) {
+		clazz = make.at(clazz.pos).Select(
+		    make.Type(encltype), ((Ident)tree.clazz).name);
+//		new Pretty().printExpr(clazz);//DEBUG
+	    }
+	}
+
+	// attribute clazz and store symbol + type back into tree
+	Type clazztype = chk.checkClassType(
+	    tree.clazz.pos, attribType(clazz, env));
+	chk.validate(clazz);	
+	if (tree.encl != null) {
+	    tree.clazz.type = clazztype;
+	    ((Ident)tree.clazz).sym = TreeInfo.symbol(clazz);
+	}
+
+	// attribute arguments;
+	List<Type> rawArgtypes = attribArgs(tree.args, env);
+	List<Type> argtypes = rawArgtypes;
+
+	if (clazztype.tag == CLASS) {
+	    Type site = clazztype.tsym.type;
+	    List<Type> typarams = clazztype.typarams();
+
+	    // resolve constructor, if not abstract
+	    if (cdef == null &&
+		(clazztype.tsym.flags() & (ABSTRACT | INTERFACE)) != 0) {
+		log.error(tree.pos,
+		    clazztype.tsym + " is abstract; cannot be instantiated");
+	    } else if (cdef != null &&
+		       (clazztype.tsym.flags() & INTERFACE) != 0) {
+		if (rawArgtypes.nonEmpty()) {
+		    log.error(tree.pos,
+			      "anonymous class implements interface; " +
+			      "cannot have arguments");
+		    rawArgtypes = argtypes = Type.emptyList;
+		} else if (tree.encl != null) {
+		    log.error(tree.pos,
+			      "anonymous class implements interface; " +
+			      "cannot have qualifier for new");
+		}
+	    } else {
+		argtypes = constructorArgs(
+		    tree.pos, env, site, encltype, rawArgtypes);
+		boolean selectSuperPrev = env.info.selectSuper;
+		if (cdef != null) env.info.selectSuper = true;
+		tree.constructor = rs.resolveConstructor(
+		    tree.pos, env, site, typarams, argtypes);
+		env.info.selectSuper = selectSuperPrev;
+	    }
+
+	    // if it's an anonymous class...
+	    if (cdef != null) {
+
+		// complete class definition with extends/implements clause
+	        // and enter + attribute it.
+		if (Resolve.isStatic(env)) cdef.flags |= STATIC;
+
+		Tree clazz1 = make.at(cdef.pos).Type(clazztype);
+		if ((clazztype.tsym.flags() & INTERFACE) != 0) {
+		    cdef.implementing = List.make(clazz1);
+		} else {
+		    cdef.extending = clazz1;
+		}
+		attribStat(cdef, env.dup(tree));
+//	        new Pretty().printStat(cdef);//DEBUG
+
+		// if enclosing class is given,
+		// add it to constructor arguments
+		if (tree.encl != null) {
+		    tree.args = tree.args.prepend(tree.encl);
+		    rawArgtypes = rawArgtypes.prepend(encltype);
+		    tree.encl = null;
+		    encltype = null;
+		}
+
+		// reassign site, typarams and recompute constructor
+		site = cdef.sym.type;
+		typarams = Type.emptyList;
+		argtypes = constructorArgs(
+		    tree.pos, env, site, encltype, rawArgtypes);
+		tree.constructor = rs.resolveConstructor(
+		    tree.pos, env, site, typarams, argtypes);
+	    }
+	    if (tree.constructor != null && tree.constructor.kind == MTH) {
+		owntype = rs.instantiate(
+		    site, tree.constructor, typarams, argtypes);
+		if (owntype == null) {//debug
+		    log.error(
+			tree.pos, "internal error; cannot instantiate " +
+			tree.constructor + " to (" + argtypes + ")");
+		}
+	    }
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(NewArray tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	Type elemtype;
+	if (tree.elemtype != null) {
+	    elemtype = attribType(tree.elemtype, env);
+	    if (elemtype.tag == TYPEVAR) {
+		log.warning(tree.pos, "unchecked generic array creation");
+	    }
+	    chk.validate(tree.elemtype);
+	    owntype = elemtype;
+	    for (List<Tree> l = tree.dims; l.nonEmpty(); l = l.tail) {
+		attribExpr(l.head, env, Type.intType);
+		owntype = new ArrayType(owntype);
+	    }
+	} else {
+	    if (pt.tag == ARRAY) {
+		elemtype = pt.elemtype();
+	    } else {
+		if (pt.tag != ERROR) {
+		    log.error(tree.pos, "illegal initializer for " + pt);
+		}
+		elemtype = Type.errType;
+	    }
+	}
+	if (tree.elems != null) {
+	    attribExprs(tree.elems, env, elemtype);
+	    owntype = new ArrayType(elemtype);
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(Assign tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = attribTerm(tree.lhs, env.dup(tree), VAR, pt);
+	attribExpr(tree.rhs, env, owntype);
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(Assignop tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	List<Type> argtypes = List.make(
+	    attribTerm(tree.lhs, env, VAR, Type.noType),
+	    attribExpr(tree.rhs, env));
+	Symbol operator = tree.operator = rs.resolveOperator(
+	    tree.pos, tree.tag - Tree.ASGOffset, env, argtypes);
+	Type owntype = argtypes.head;
+	if (operator.kind == MTH) {
+	    if (owntype.tag <= DOUBLE)
+		chk.checkCastable(
+		    tree.rhs.pos, operator.type.restype(), owntype);
+	    else
+		chk.checkType(
+		    tree.rhs.pos, operator.type.restype(), owntype);
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(Operation tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	List<Type> argtypes;
+	if (Tree.PREINC <= tree.tag && tree.tag <= Tree.POSTDEC)
+	    argtypes = Type.emptyList.prepend(
+		attribTerm(tree.args.head, env, VAR, Type.noType));
+	else
+	    argtypes = attribArgs(tree.args, env);
+	Symbol operator = tree.operator = rs.resolveOperator(
+	    tree.pos, tree.tag, env, argtypes);
+	Type owntype = Type.errType;
+	if (operator.kind == MTH) {
+	    owntype = operator.type.restype();
+	    int opc = ((OperatorSymbol)operator).opcode;
+	    List<Type> l = argtypes;
+	    while (l.nonEmpty() && l.head.constValue != null) l = l.tail;
+	    if (l.isEmpty()) {
+		Type ctype = cfolder.fold(tree.pos, opc, argtypes);
+		if (ctype != null) owntype = cfolder.coerce(ctype, owntype);
+	    }
+	    if ((opc == ByteCodes.if_acmpeq || opc == ByteCodes.if_acmpne) &&
+		!argtypes.head.castableTo(argtypes.tail.head.erasure()) &&
+		!argtypes.tail.head.castableTo(argtypes.head.erasure())) {
+		log.error(
+		    tree.pos, "incomparable types: " +
+		    argtypes.head + " and " + argtypes.tail.head);
+	    }
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(TypeCast tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type clazztype = attribType(tree.clazz, env);
+	Type exprtype = attribExpr(tree.expr, env);
+	Type owntype = chk.checkCastable(tree.expr.pos, exprtype, clazztype);
+	if (exprtype.constValue != null)
+	    owntype = cfolder.coerce(exprtype, owntype);
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(TypeTest tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type exprtype = attribExpr(tree.expr, env);
+
+        // The following check is correct for GJ but not for NextGen  Corky 
+6/28/00
+	/* Type clazztype = chk.checkClassOrArrayType(
+	   tree.clazz.pos, attribType(tree.clazz, env)); */
+        // In the following invocation, attribType(tree.clazz,env) replaces 
+clazztype, which is consistent with successful return from checkClassOrArrayType
+	chk.checkCastable(tree.expr.pos, exprtype, attribType
+(tree.clazz,env));  
+	return check(tree, Type.booleanType, VAL, pkind, pt);
+    }
+
+    public Type _case(Indexed tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	Type atype = attribExpr(tree.indexed, env);
+	attribExpr(tree.index, env, Type.intType);
+	if (atype.tag == ARRAY)
+	    owntype = atype.elemtype();
+	else if (atype.tag != ERROR)
+	    log.error(tree.pos, "array required, but " + atype + " found");
+	return check(tree, owntype, VAR, pkind, pt);
+    }
+
+    public Type _case(Ident tree, Env<AttrContext> env) {
+	int pkind = env.info.pkind;
+	Type pt = env.info.pt;
+	Symbol sym;
+	
+	// find symbol
+	if (pt.tag == METHOD) {
+	    if (tree.name == Names._super || tree.name == Names._this) {
+		sym = rs.resolveSelfConstructor(
+		    tree.pos, env, tree.name, pt.argtypes());
+	    } else {
+		sym = rs.resolveMethod(
+		    tree.pos, env, tree.name, Type.emptyList, pt.argtypes());
+	    }
+	} else {
+	    sym = rs.resolveIdent(tree.pos, env, tree.name, pkind);
+	}
+	tree.sym = sym;
+
+	//check that symbol does not hide identifier in outer class
+	if (env.enclClass.sym.owner.kind != PCK &&
+	    (sym.kind & (VAR | MTH)) != 0 && 	
+	    sym.owner.kind == TYP &&
+	    tree.name != Names._super && tree.name != Names._this) {
+	    Env<AttrContext> env1 = env;
+	    while (env1.outer != null && !env1.enclClass.sym.subclass
+(sym.owner))
+		env1 = env1.outer;
+	    if (env1 != null && env1.enclClass.sym != sym.owner) {
+		do {
+		    env1 = env1.outer;
+		} while (env1 != null &&
+		       (env1.info.scope == null ||
+			checkNotHiding(tree.pos, sym, env1.info.scope)) &&
+		       (env1.enclClass == null ||
+			checkNotHiding(tree.pos, sym, env1.enclClass.sym.members
+())));
+	    }
+	}
+		
+	// if symbol is a variable, evaluate its initializer, if it has one
+	// if it is a local variable accessed from an embedded inner class,
+	// mark it as captured, and check that it is final.
+	if (sym.kind == VAR) {
+	    VarSymbol v = (VarSymbol)sym;
+	    checkInit(tree, env, v);
+	    if (v.owner.kind == MTH &&
+		v.owner != env.info.scope.owner &&
+		(v.flags_field & CAPTURED) == 0) {
+		v.flags_field |= CAPTURED;
+		if ((v.flags_field & FINAL) == 0) {
+		    log.error(
+			tree.pos, "local " + v +
+			" is accessed from within inner class; " +
+			" needs to be declared final");
+		}
+	    }
+	    if (pkind == VAR)
+		checkAssignable(tree.pos, v, null, env);
+	}
+
+	// in constructor body:
+        // if symbol is a field or instance method, check that it is not 
+accessed
+        // before supertype constructor is called.
+	if (env.info.isSelfCall &&
+	    sym.owner != null && sym.owner.kind == TYP &&
+	    (sym.flags() & STATIC) == 0 &&
+	    env.enclClass.sym.subclass(sym.owner) &&
+	    sym.name != Names.init)
+	    chk.earlyRefError(tree.pos, sym.kind == VAR ? sym : thisSym(env));
+
+	return checkId(tree, env.enclClass.sym.type, sym, pkind, pt);
+    }
+
+    public Type _case(Select tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	int skind = 0;
+	if (tree.name == Names._this || tree.name == Names._class) {
+	    skind = TYP;
+	} else {
+	    if ((pkind & PCK) != 0) skind = skind | PCK;
+	    if ((pkind & TYP) != 0) skind = skind | TYP | PCK;
+	    if ((pkind & (VAL | MTH)) != 0) skind = skind | VAL | TYP;
+	}
+	Type site = attribTerm(tree.selected, env, skind, Type.noType);
+	Symbol sitesym = TreeInfo.symbol(tree.selected);
+	
+	boolean selectSuperPrev = env.info.selectSuper;
+	env.info.selectSuper =
+	    sitesym != null &&
+	    (sitesym.name == Names._super || sitesym.kind == TYP);
+
+	Symbol sym = selectSym(tree, site, env, pt, pkind);
+	tree.sym = sym;
+
+	if (sym.kind == VAR) {
+	    VarSymbol v = (VarSymbol)sym;
+	    evalInit(v, env);
+	    if (pkind == VAR)
+		checkAssignable(tree.pos, v, tree.selected, env);
+	}
+
+	if (env.info.selectSuper) {
+	    if ((sym.flags() & STATIC) == 0 &&
+		sym.name != Names._this && sym.name != Names._super) {
+		if (sitesym.name == Names._super) {
+		    rs.checkNonAbstract(tree.pos, sym);
+		} else if (sym.kind == VAR || sym.kind == MTH) {
+		    rs.access(new Resolve.StaticError(sym),
+			      tree.pos, site, sym.name);
+		}
+		if (env.info.isSelfCall &&
+		    sym.name != Names.init &&
+		    tree.name == Names._this &&
+		    site.tsym == env.enclClass.sym) {
+		    chk.earlyRefError(tree.pos, sym);
+		}
+		Type site1 = env.enclClass.sym.type.asSuper(site.tsym);
+		if (site1 != null) site = site1;
+	    }
+	    env.info.selectSuper = selectSuperPrev;
+	}
+	return checkId(tree, site, sym, pkind, pt);
+    }
+//where
+        /** determine symbol referenced by a Select expression,
+	 *  @param pos    position for error reporting
+	 *  @param site   the type of the selected expression
+	 *  @param name   the selector name
+	 *  @param env    the current environment
+	 *  @param pt     the current prototype
+	 *  @param pkind  the expected kind(s) of the Select expression
+	 */
+        private Symbol selectSym(Select tree, Type site,
+				 Env<AttrContext> env, Type pt, int pkind) {
+	    int pos = tree.pos;
+	    Name name = tree.name;
+	    switch (site.tag) {
+	    case PACKAGE:
+		return rs.access(
+		    rs.findIdentInPackage(env, site.tsym, name, pkind),
+		    pos, site, name);
+	    case ARRAY:
+	    case CLASS:
+		if (pt.tag == METHOD) {
+		    if (name == Names._super) {
+			return rs.resolveSelfConstructor(
+			    pos, env, name, pt.argtypes());
+		    } else {
+			return rs.resolveQualifiedMethod(
+			    pos, env, site, name, Type.emptyList, pt.argtypes
+());
+		    }
+		} else if (name == Names._this) {
+		    return rs.resolveSelf(pos, env, site.tsym, name);
+		} else if (name == Names._class) {
+		    return new VarSymbol(
+			STATIC | PUBLIC, Names._class, syms.classType, 
+site.tsym);
+		} else {
+		    Symbol sym = rs.findIdentInType(env, site, name, pkind);
+		    if (sym.kind >= rs.AMBIGUOUS) {
+			if ((pkind & (TYP | PCK)) != 0) {
+			    Name pname = TreeInfo.fullName(tree.selected);
+			    if (pname != null) {
+				PackageSymbol p = syms.reader.enterPackage
+(pname);
+				Symbol sym1 = rs.findIdentInPackage(
+				    env, p, name, pkind);
+				if (sym1.kind < sym.kind) sym = sym1;
+			    }
+			}
+			sym = rs.access(sym, pos, site, name);
+		    }
+		    return sym;
+		}
+	    case TYPEVAR:
+		return selectSym(tree, site.bound(), env, pt, pkind);
+	    case ERROR:
+		return Symbol.errSymbol;
+	    default:
+		if (name == Names._class) {
+		    return new VarSymbol(
+			STATIC | PUBLIC, Names._class, syms.classType, 
+site.tsym);
+		} else {	
+		    log.error(pos, site + " cannot be dereferenced");
+		}
+		return Symbol.errSymbol;
+	    }
+	}
+
+        /** determine type of identifier or select expression and check that
+	 *  (1) the referenced symbol is not deprecated
+	 *  (2) the symbol type is safe (@see checkSafe)
+	 *  (3) if symbol is a variable, check that its type and kind are
+	 *      compatible with the prototype and protokind.
+	 *  (4) if symbol is a field of a raw type, which is being assigned to,
+	 *      issue a warning if its type changes under erasure.
+	 *  (5) if symbol is a method of a raw type, issue a warning if
+	 *      its argument types change under erasure.
+	 *  if checks succeed
+	 *    if symbol is a constant return its constant type
+	 *    else if symbol is a method return its result type
+	 *    otherwise return its type
+	 *  else return errType
+	 */
+        Type checkId(Tree tree, Type site, Symbol sym, int pkind, Type pt) {
+	    if ((sym.flags() & DEPRECATED) != 0) warnDeprecated(tree.pos, sym);
+	    Type owntype;
+	    switch (sym.kind) {
+	    case TYP:
+		owntype = sym.type;
+		if (owntype.tag == CLASS && owntype.typarams().nonEmpty()) {
+		    owntype = new ClassType(
+			owntype.outer(), Type.emptyList, owntype.tsym);
+		}
+		break;
+	    case VAR:
+		VarSymbol v = (VarSymbol)sym;
+		if (!chk.unchecked &&
+		    pkind == VAR &&
+		    v.owner.kind == TYP &&
+		    (v.flags() & STATIC) == 0 &&
+		    site.tag == CLASS) {
+		    Type s = site.asOuterSuper(v.owner);
+		    if (s != null &&
+			s.isRaw() &&
+			!v.type.sameType(v.erasure())) {
+			log.warning(
+			    tree.pos,
+			    "unchecked assignment to " + v + " of raw type " + 
+site);
+		    }
+		}
+		owntype = (sym.owner.kind == TYP)
+		    ? site.memberType(sym)
+		    : sym.type;
+		if (v.constValue != null) owntype = owntype.constType
+(v.constValue);
+		break;
+	    case MTH:
+//todo: find out why this can be false
+//		Base.assert(site.asOuterSuper(sym.owner) != null,
+//			    sym + " " + site + " " + sym.owner);//DEBUG
+		if (!chk.unchecked &&
+		    (sym.flags() & STATIC) == 0 &&
+		    site.tag == CLASS) {
+		    Type s= site.asOuterSuper(sym.owner);
+		    if (s != null &&
+			s.isRaw() &&
+			sym.name != Names.init &&
+			!Type.sameTypes(
+			    sym.type.argtypes(), sym.erasure().argtypes())) {
+			log.warning(
+			    tree.pos,
+			    "unchecked call to " + sym + " of raw type " + 
+site);
+		    }
+		}
+		if (sym.name == Names.init) {
+		    owntype = Type.voidType;
+		} else {
+		    owntype = rs.instantiate(
+			site, sym, Type.emptyList, pt.argtypes());
+		    if (owntype == null) {//debug
+			log.error(
+			    tree.pos, "internal error; cannot instantiate " +
+			    sym + " at " + site + " to (" + pt.argtypes() 
++ ")");
+		    }
+		}
+		break;
+	    case PCK: case ERR:
+		owntype = sym.type;
+		break;
+	    default:
+		new Pretty().printExpr(tree);//debug
+		throw new InternalError("unexpected kind: " + sym.kind);
+	    }
+	    infer.checkSafe(tree.pos, owntype, sym);
+	    return check(tree, owntype, sym.kind, pkind, pt);
+	}
+
+        /** check that variable is initialized and evaluate the variable's
+	 *  initializer, if not yet done
+	 */
+	private void checkInit(Tree tree, Env<AttrContext> env, VarSymbol v) {
+//	    System.err.println(v + " " + ((v.flags() & STATIC) != 0) + " " +
+//			       tree.pos + " " + v.pos + " " +
+//			       (env.info.staticLevel > 
+env.outer.info.staticLevel));//DEBUG
+	    if (v.pos > tree.pos &&
+		(v.owner.kind == MTH ||
+		 (v.owner.kind == TYP &&
+		  v.owner == env.info.scope.owner &&
+		  ((v.flags() & STATIC) != 0) == Resolve.isStatic(env))) &&
+		(env.tree.tag != Tree.ASSIGN || tree != ((Assign)env.tree).lhs))
+		log.error(tree.pos, "illegal forward reference");
+	    evalInit(v, env);
+	}
+
+	/** evaluate a final variable's initializer
+	 *  and set variable's constValue
+	 */
+	void evalInit(VarSymbol v, Env<AttrContext> env) {
+	    if (v.constValue instanceof Enter.EnvAttrContextBox) {
+		Env<AttrContext> evalEnv =
+		    ((Enter.EnvAttrContextBox)v.constValue).env;
+		Name prev = log.useSource(evalEnv.toplevel.sourcefile);
+		v.constValue = null;
+		Type itype = attribExpr(
+		    ((VarDef)evalEnv.tree).init, evalEnv, v.type);
+		if (itype.constValue != null)
+		    v.constValue = cfolder.coerce(itype, v.type).constValue;
+		log.useSource(prev);
+	    }
+	}
+
+        /** check that `sym' does not hide any symbols of the same name and
+	 *  kind in `scope'
+	 */
+        boolean checkNotHiding(int pos, Symbol sym, Scope scope) {
+	    Scope.Entry e = scope.lookup(sym.name);
+	    while (e.scope != null) {
+		if (e.sym.owner != sym.owner &&
+		    e.sym.kind == sym.kind &&
+		    e.sym.owner == scope.owner) {
+		    log.error(
+			pos, sym + " is inherited from " + sym.owner +
+			" and hides a " + Resolve.kindName(sym.kind) +
+			" of the same name" + e.sym.location() +
+			". An explicit `this' qualifier must be used to select 
+the desired instance  ");
+		    return false;
+		}
+		e = e.next();
+	    }
+	    return true;
+	}
+
+    public Type _case(Literal tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	return check(
+	    tree, litType(tree.typetag).constType(tree.value), VAL, pkind, pt);
+    }
+//where
+        Type litType(int tag) {
+	    return (tag == CLASS) ? syms.stringType : Type.typeOfTag[tag];
+	}
+
+    public Type _case(TypeIdent tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	return check(tree, Type.typeOfTag[tree.typetag], TYP, pkind, pt);
+    }
+
+    public Type _case(TypeArray tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type etype = attribType(tree.elemtype, env);
+	return check(tree, new ArrayType(etype), TYP, pkind, pt);
+    }
+
+    /** attribute type application.
+     *  bound checking is left until later, since types are attributed
+     *  before supertype structure is completely known
+     */
+    public Type _case(TypeApply tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+
+	Type clazztype = chk.checkClassType(
+	    tree.clazz.pos, attribType(tree.clazz, env));
+
+	ListBuffer<Type> actbuf = new ListBuffer<Type>();
+	for (List<Tree> l = tree.arguments; l.nonEmpty(); l = l.tail)
+	    actbuf.append(chk.checkRefType(l.head.pos, attribType(l.head, 
+env)));
+	List<Type> actuals = actbuf.toList();
+
+	if (clazztype.tag == CLASS) {
+	    List<Type> formals = clazztype.tsym.type.typarams();
+	    if (actuals.length() == formals.length()) {
+		owntype = new ClassType(
+		    clazztype.tsym.type.outer(), actuals, clazztype.tsym);
+	    } else {
+		log.error(
+		    tree.pos,
+		    (formals.length() != 0)
+		        ? "wrong number of type arguments; required: " +
+		          formals.length()
+		        : "type " + clazztype + " does not take parameters");
+		owntype = Type.errType;
+	    }
+	}
+	return check(tree, owntype, TYP, pkind, pt);
+    }
+
+    public Type _case(TypeParameter tree, Env<AttrContext> env) {
+	TypeVar a = (TypeVar)tree.type;
+	if (tree.extBound != null)
+	    a.bound = attribBase(tree.extBound, env, 0);
+	else if (tree.implBound != null)
+	    a.bound = attribBase(tree.implBound, env, INTERFACE);
+	else
+	    a.bound = syms.objectType;
+	return a;
+    }
+
+    public Type _case(Erroneous tree, Env<AttrContext> env) {
+	return tree.type = Type.errType;
+    }
+
+    public Type _case(Tree tree, Env<AttrContext> env) {
+	throw new InternalError();
+    }
+
+    /** main method: attribute class definition associated given class symbol
+     */
+    public void attribClass(ClassSymbol c) {
+	Type st = c.type.supertype();
+	if (st.tag == CLASS) attribClass((ClassSymbol)st.tsym);
+	if (c.owner.kind == TYP) attribClass((ClassSymbol)c.owner);
+	
+	if ((c.flags_field & UNFINISHED) != 0) {
+	    Name prev = log.useSource(c.sourcefile);
+	    c.flags_field &= ~UNFINISHED;
+
+	    Env<AttrContext> env = enter.classEnvs.get(c);
+	    enter.classEnvs.remove(c);
+
+	    ClassDef tree = (ClassDef)env.tree;
+	
+	    implementInterfaceMethods(c, env);
+	    chk.validateTypeParams(tree.typarams);
+	    chk.validate(tree.extending);
+	    chk.validate(tree.implementing);
+	    if ((c.flags() & (ABSTRACT | INTERFACE)) == 0)
+		chk.checkAllDefined(tree.pos, c);
+	    chk.checkClassBounds(tree.pos, c);
+	
+	    if (tree.typarams.length() != 0 && c.subclass
+(syms.throwableType.tsym))
+		log.error(tree.pos,
+			  "subtypes of java.lang.Throwable cannot have 
+arguments");
+	    tree.type = c.type;
+	
+	    for (List<TypeParameter> l = tree.typarams; l.nonEmpty(); l = 
+l.tail)
+		env.info.scope.enterIfAbsent(l.head.type.tsym);
+	
+	    if ((c.flags() & INTERFACE) == 0) {
+		VarSymbol thisSym = new VarSymbol(FINAL, Names._this, c.type, 
+c);
+		thisSym.pos = Position.FIRSTPOS;
+		env.info.scope.enter(thisSym);
+		if (st.tag == CLASS) {
+		    VarSymbol superSym = new VarSymbol(FINAL, Names._super, st, 
+c);
+		    superSym.pos = Position.FIRSTPOS;
+		    env.info.scope.enter(superSym);
+		}
+		chk.checkImplementations(tree.pos, c);
+	    } else {
+		c.members_field = c.members_field.dup();
+		implementInterfaceMethods(c, env);
+		chk.checkImplementations(tree.pos, c);
+		c.members_field = c.members_field.leave();
+	    }
+	
+	    attribStats(tree.defs, env);
+//	    checkConstructorsNonCyclic(tree.defs, env);
+	    tree.type = c.type;
+
+	    log.useSource(prev);
+	}
+    }
+}
+
+Build 20020321 stable
+Importing the file below causes an Out of Memory error in eclipse.  Here is the 
+log file:
+Log: Wed Mar 27 14:38:33 CST 2002
+1 org.eclipse.core.resources 4 Unhandled exception caught in event loop.
+Log: Wed Mar 27 14:38:33 CST 2002
+4 org.eclipse.ui 0 java.lang.OutOfMemoryError
+java.lang.OutOfMemoryError
+	<<no stack trace available>>
+
+Problem seems to be associated with parsing the file.  If I turn auto build 
+off, the error doesn't appear until I expand the package in the packages view.  
+If I turn off Show Members in Packages View it doesn't appear until I open the 
+file in the Java editor.  The file is part of the Dr Java package from Rice 
+university (http://drjava.sourceforge.net/).  It appears to be compiled with a 
+generics compliant compiler as the extends clause contains the following: 
+extends Tree.Visitor<Type,Env<AttrContext>>.
+
+As this is not valid Java, I wouldn't expect this to compile.  However, the out 
+of memory error could possibly be avoided.  I am able to recreate the problem 
+by having autobuild turned on and importing the file into an existing project.
+
+
+
+/* ************************************************************************
+ * GJC attribution phase
+ * by Martin Odersky
+ *
+ * Copyright (C) 1996-98 Martin Odersky. All rights reserved.
+ * Permission is hereby granted to use and modify this software for evaluation
+ * and research purposes. Modification and use for other purposes requires
+ * prior written permission by the author. The software, or modifications
+ * thereof may be given to third parties only with prior written permission
+ * by the author.
+ *************************************************************************/
+
+package edu.rice.cs.nextgen.compiler.comp;
+
+import edu.rice.cs.nextgen.compiler.util.*;
+import edu.rice.cs.nextgen.compiler.code.*;
+import edu.rice.cs.nextgen.compiler.tree.*;
+
+import Symbol.*;
+import Tree.*;
+import Type.*;
+
+public class Attr
+extends Tree.Visitor<Type,Env<AttrContext>>
+implements /* imports */ Flags, Kinds, TypeTags {
+
+    Log log;
+    Symtab syms;
+    Resolve rs;
+    Check chk;
+    Infer infer;
+    TreeMaker make;
+    public Enter enter;
+    public ConstFold cfolder;
+
+    public Attr(Log log, Symtab syms,
+		Resolve rs, Check chk, Infer infer,
+		TreeMaker make, Enter enter) {
+	this.log = log;
+	this.syms = syms;
+	this.rs = rs;
+	this.chk = chk;
+	this.infer = infer;
+	this.make = make;
+	this.enter = enter;
+	if (enter != null) enter.attr = this;
+	this.cfolder = new ConstFold(log, syms);
+    }
+
+    /** check kind and type of given tree against prototype
+     *  store resulting type to tree and return it.
+     *  no checks are performed if the prototype is a method type.
+     *  Its not necessary in this case since we know that kind and type
+     *  are correct.
+     */
+    Type check(Tree tree, Type owntype, int ownkind, int pkind, Type pt) {
+	if (owntype.tag != ERROR && pt.tag != METHOD) {
+	    if ((ownkind & ~pkind) == 0) {
+		if (pt.tag != NONE)
+		    owntype = chk.checkType(tree.pos, owntype, pt);
+	    } else {
+		log.error(tree.pos,
+			  Resolve.kindNames(pkind) + " required, but " +
+			  Resolve.kindName(ownkind) + " found");
+		owntype = Type.errType;
+	    }
+	}
+	tree.type = owntype;
+	return owntype;
+    }
+
+    /** is variable `v' assignable, i.e. in a scope where it may be assigned to
+     *  even if it is final?
+     */
+    static boolean finalAssignable(VarSymbol v, Env<AttrContext> env) {
+	Symbol owner = env.info.scope.owner;
+	return
+	    v.constValue == null
+	    &&
+	    (v.owner == owner
+	     ||
+	     ((owner.name == Names.init || (owner.flags() & BLOCK) != 0)
+	      &&
+	      v.owner == owner.owner
+	      &&
+	      ((v.flags() & STATIC) != 0) == (Resolve.isStatic(env))));
+    }
+
+    /** check that variable `v' can be assigned to.
+     */
+    void checkAssignable(int pos, VarSymbol v, Tree base, Env<AttrContext> env) 
+{
+	if ((v.flags() & FINAL) != 0 &&
+	    !((base == null ||
+	       (base.tag == Tree.IDENT && TreeInfo.name(base) == Names._this)) 
+&&
+	      finalAssignable(v, env))) {
+	    log.error(pos, "can't assign a value to final " + v);
+	}
+    }
+
+    /** warn about deprecated symbol if not in currently ccompiled files
+     */
+    void warnDeprecated(int pos, Symbol sym) {
+	if (!enter.compiled.contains(sym.enclClass().fullname))
+	    log.warning(pos, sym + sym.location() + " has been deprecated");
+    }
+
+    /** the current `this' symbol
+     */
+    Symbol thisSym(Env<AttrContext> env) {
+	return rs.resolveSelf(
+	    Position.NOPOS, env, env.enclClass.sym, Names._this);
+    }
+
+    /** if `site' is an inner class, prepend outer instance to argtypes
+     *  outer instance is taken to be `outer' if not null, is made up otherwise.
+     */
+    List<Type> constructorArgs(int pos, Env<AttrContext> env,
+			       Type site, Type outer, List<Type> argtypes) {
+	if (site.outer().tag == CLASS) {
+	    if (outer == null) {
+		Symbol outerthis = rs.resolveSelf(
+		    pos, env, site.outer().tsym, Names._this);
+		if (outerthis.kind == VAR) {
+/*//todo: revise this
+		    if (env.info.isSelfCall &&
+			outerthis.owner == env.enclClass.sym)
+			chk.earlyRefError(pos, outerthis);
+ */
+		    outer = outerthis.owner.type;
+		} else {
+		    outer = Type.errType;
+		}
+	    }
+	    argtypes = argtypes.prepend(outer);
+	} else if (outer != null && outer.tag == CLASS && site.tag != ERROR) {
+	    log.error(pos,
+		"illegal qualifier; " + site.tsym + " is not an inner class");
+	}
+	return argtypes;
+    }
+
+    Type attribTerm(Tree tree, Env<AttrContext> env, int pkind, Type pt) {
+	try {
+	    env.info.pkind = pkind;
+	    env.info.pt = pt;
+	    return tree.visit(this, env);
+	} catch (CompletionFailure ex) {
+	    return chk.completionError(tree.pos, ex);
+	}
+    }	
+
+    Type attribExpr(Tree tree, Env<AttrContext> env, Type pt) {
+	return attribTerm(tree, env, VAL, pt);
+    }
+
+    Type attribExpr(Tree tree, Env<AttrContext> env) {
+	return attribExpr(tree, env, Type.noType);
+    }
+
+    Type attribType(Tree tree, Env<AttrContext> env) {
+	return attribTerm(tree, env, TYP, Type.noType);
+    }
+
+    Type attribStat(Tree tree, Env<AttrContext> env) {
+	return attribTerm(tree, env, NIL, Type.noType);
+    }
+
+    List<Type> attribExprs(List<Tree> trees, Env<AttrContext> env, Type pt) {
+	ListBuffer<Type> ts = new ListBuffer<Type>();
+	for (List<Tree> l = trees; l.nonEmpty(); l = l.tail)
+	    ts.append(attribExpr(l.head, env, pt));
+	return ts.toList();
+    }
+
+    <T extends Tree> void attribStats(List<T> trees, Env<AttrContext> env) {
+	for (List<T> l = trees; l.nonEmpty(); l = l.tail)
+	    attribStat(l.head, env);
+    }
+
+    List<Type> attribArgs(List<Tree> trees, Env<AttrContext> env) {
+	ListBuffer<Type> argtypes = new ListBuffer<Type>();
+	for (List<Tree> l = trees; l.nonEmpty(); l = l.tail)
+	    argtypes.append(chk.checkNonVoid(
+		l.head.pos, attribExpr(l.head, env)));
+	return argtypes.toList();
+    }
+
+    /** attribute extended or implemented type reference
+     */
+    Type attribBase(Tree tree, Env<AttrContext> env, int interfaceFlag) {
+	Type t = chk.checkClassType(tree.pos, attribType(tree, env));
+	if ((t.tsym.flags() & INTERFACE) != interfaceFlag) {
+	    log.error(tree.pos,
+		(interfaceFlag == 0 ? "no " : "") + "interface expected here");
+	}
+	if ((t.tsym.flags() & FINAL) != 0) {
+	    log.error(tree.pos, "can't inherit from final " + t.tsym);
+	}
+	return t;
+    }
+
+/* ********************************************************************
+ * Adding miranda methods
+ *********************************************************************/
+
+    /** add an abstract method definition to class definition `cd'
+     *  for a method `m' defined in an interface
+     */
+    private void addAbstractMethod(ClassDef cd,
+				   MethodSymbol m,
+				   Env<AttrContext> env) {
+//	System.err.println("add abstract method: " + m);//DEBUG
+	Tree def = make.at(cd.pos).MethodDef(
+	    new MethodSymbol(
+		m.flags() | IPROXY, m.name, cd.sym.type.memberType(m), cd.sym),
+	    null);
+	cd.defs = cd.defs.prepend(def);
+	enter.memberEnter(def, env);
+    }
+
+    /** add abstract method definitions for all methods defined in one of
+     *  c's interfaces, provided they are not already implemented
+     *  env = the environment for the class definition of c.
+     */
+    void implementInterfaceMethods(ClassSymbol c, Env<AttrContext> env) {
+	ClassDef cd = (ClassDef)env.tree;
+	for (List<Type> l = c.type.interfaces(); l.nonEmpty(); l = l.tail) {
+	    ClassSymbol i = (ClassSymbol)l.head.tsym;
+	    for (Scope.Entry e = i.members().elems;
+		 e != null;
+		 e = e.sibling) {
+		if (e.sym.kind == MTH &&
+		    (e.sym.flags() & STATIC) == 0) // disregard <clinit>!
+		{
+		    MethodSymbol absMeth = (MethodSymbol)e.sym;
+		    MethodSymbol implMeth = absMeth.implementation(cd.sym);
+		    if (implMeth == null)
+			addAbstractMethod(cd, absMeth, env);
+		}
+	    }
+	    implementInterfaceMethods(i, env);
+	}
+    }
+
+/* ************************************************************************
+ * visitor methods
+ *************************************************************************/
+
+    public Type _case(ClassDef tree, Env<AttrContext> env) {
+	if ((env.info.scope.owner.kind & (VAR | MTH)) != 0) {
+	    enter.classEnter(tree, env);
+	} else if (tree.name.len == 0) {
+	    System.out.println(env.info.scope.owner);
+	}
+	ClassSymbol c = tree.sym;
+	if (c == null) return null;
+	c.complete();
+	attribClass(c);
+	return tree.type = c.type;
+    }
+
+    public Type _case(MethodDef tree, Env<AttrContext> env) {
+	MethodSymbol m = tree.sym;
+	chk.checkOverride(tree.pos, m);
+
+	Env<AttrContext> localEnv = enter.methodEnv((MethodDef)tree, env);
+	for (List<TypeParameter> l = tree.typarams; l.nonEmpty(); l = l.tail)
+	    localEnv.info.scope.enterIfAbsent(l.head.type.tsym);
+	for (List<VarDef> l = tree.params; l.nonEmpty(); l = l.tail)
+	    attribStat(l.head, localEnv);
+
+	chk.validateTypeParams(tree.typarams);
+	chk.validate(tree.restype);
+	for (List<Tree> l = tree.thrown; l.nonEmpty(); l = l.tail)
+	    chk.checkType(l.head.pos, l.head.type, syms.throwableType);
+	
+	ClassSymbol owner = env.enclClass.sym;
+	if (tree.body == null) {
+	    if ((owner.flags() & INTERFACE) == 0 &&
+		(tree.flags & (ABSTRACT | NATIVE)) == 0)
+		log.error(tree.pos,
+			  "missing method body, or declare as abstract");
+	} else if ((owner.flags() & INTERFACE) != 0) {
+	    log.error(tree.pos, "interface methods cannot have body");
+	} else if ((tree.flags & ABSTRACT) != 0) {
+	    log.error(tree.pos, "abstract methods cannot have body");
+	} else if ((tree.flags & NATIVE) != 0) {
+	    log.error(tree.pos, "native methods cannot have body");
+	} else {
+	    if (tree.name == Names.init && owner.type != syms.objectType) {
+		Block body = tree.body;
+		if (body.stats.isEmpty() || !isSelfCall(body.stats.head)) {
+		    body.stats = body.stats.prepend(
+			Enter.SuperCall(
+			    make.at(body.pos), VarDef.emptyList, false));
+		}
+	    }
+	    attribStat(tree.body, localEnv);
+	}
+	localEnv.info.scope.leave();
+	return tree.type = m.type;
+    }
+//where
+        private boolean isSelfCall(Tree tree) {
+	    if (tree.tag == Tree.EXEC) {
+		Exec exec = (Exec)tree;
+		if (exec.expr.tag == Tree.APPLY) {
+		    Name mname = TreeInfo.name(((Apply)exec.expr).meth);
+		    if (mname == Names._this || mname == Names._super) return 
+true;
+		}
+	    }
+	    return false;
+	}
+
+    public Type _case(VarDef tree, Env<AttrContext> env) {
+	if (env.info.scope.owner.kind == MTH) enter.memberEnter(tree, env);
+	chk.validate(tree.vartype);
+	VarSymbol v = tree.sym;
+	Base.assert(v != null, tree.name);
+	if (tree.init != null) {
+	    v.pos = Position.MAXPOS; //to catch self references
+	    Type itype = attribExpr(
+		tree.init, enter.initEnv((VarDef)tree, env), v.type);
+	    if (v.constValue instanceof Enter.EnvAttrContextBox) {
+		if (itype.constValue != null)
+		    v.constValue = cfolder.coerce(itype, v.type).constValue;
+		else
+		    v.constValue = null;
+	    }
+	    v.pos = tree.pos;
+	}
+	return tree.type = v.type;
+    }
+
+    public Type _case(Block tree, Env<AttrContext> env) {
+	Env<AttrContext> localEnv =
+	    env.dup(tree, env.info.dup(env.info.scope.dup()));
+	if (env.info.scope.owner.kind == TYP) {
+	    localEnv.info.scope.owner = new MethodSymbol(
+		tree.flags | BLOCK, Names.empty, null, env.info.scope.owner);
+	    if ((tree.flags & STATIC) != 0) localEnv.info.staticLevel++;
+	}
+	attribStats(tree.stats, localEnv);
+	localEnv.info.scope.leave();
+	return null;
+    }
+
+    public Type _case(DoLoop tree, Env<AttrContext> env) {
+	attribStat(tree.body, env.dup(tree));
+	attribExpr(tree.cond, env, Type.booleanType);
+	return null;
+    }
+
+    public Type _case(WhileLoop tree, Env<AttrContext> env) {
+	attribExpr(tree.cond, env, Type.booleanType);
+	attribStat(tree.body, env.dup(tree));
+	return null;
+    }
+
+    public Type _case(ForLoop tree, Env<AttrContext> env) {
+	Env<AttrContext> loopEnv =
+	    env.dup(env.tree, env.info.dup(env.info.scope.dup()));
+	attribStats(tree.init, loopEnv);
+	if (tree.cond != null) attribExpr(tree.cond, loopEnv, Type.booleanType);
+	loopEnv.tree = tree; // before, we were not in loop!
+	attribStats(tree.step, loopEnv);
+	attribStat(tree.body, loopEnv);
+	loopEnv.info.scope.leave();
+	return null;
+    }
+
+    public Type _case(Labelled tree, Env<AttrContext> env) {
+	attribStat(tree.body, env.dup(tree));
+	return null;
+    }
+
+    public Type _case(Switch tree, Env<AttrContext> env) {
+	Type seltype = attribExpr(tree.selector, env, Type.intType);
+	Env<AttrContext> switchEnv =
+	    env.dup(tree, env.info.dup(env.info.scope.dup()));
+
+	Set<Object> tags = Set.make();
+	boolean hasDefault = false;
+	for (List<Case> l = tree.cases; l.nonEmpty(); l = l.tail) {
+	    Case c = l.head;
+	    if (c.pat != null) {
+		Type pattype = attribExpr(c.pat, switchEnv, Type.intType);
+		if (pattype.tag != ERROR) {
+		    if (pattype.constValue == null)
+			log.error(c.pat.pos, "constant expression required");
+		    else if (tags.contains(pattype.constValue))
+			log.error(c.pos, "duplicate case label");
+		    else
+			tags.put(pattype.constValue);
+		}
+	    } else if (hasDefault) {
+		log.error(c.pos, "duplicate default label");
+	    } else {
+		hasDefault = true;
+	    }
+	    attribStats(c.stats, switchEnv);
+	}
+	switchEnv.info.scope.leave();
+	return null;
+    }
+
+    public Type _case(Synchronized tree, Env<AttrContext> env) {
+	attribExpr(tree.lock, env, syms.objectType);
+	attribStat(tree.body, env);
+	return null;
+    }
+
+    public Type _case(Try tree, Env<AttrContext> env) {
+	Env<AttrContext> tryEnv = env.dup(tree, env.info.dup());
+	for (List<Catch> l = tree.catchers; l.nonEmpty(); l = l.tail) {
+	    Catch c = l.head;
+	    Env<AttrContext> catchEnv =
+		env.dup(c, env.info.dup(env.info.scope.dup()));
+	    Type ctype = attribStat(c.param, catchEnv);
+	    chk.checkType(c.param.vartype.pos, ctype, syms.throwableType);
+	    attribStat(c.body, catchEnv);
+	    ClassSymbol exc = (ClassSymbol)ctype.tsym;
+	    catchEnv.info.scope.leave();
+	}
+	attribStat(tree.body, tryEnv);
+	if (tree.finalizer != null) attribStat(tree.finalizer, env);
+	return null;
+    }
+
+    public Type _case(Conditional tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	attribExpr(tree.cond, env, Type.booleanType);
+	attribExpr(tree.thenpart, env, pt);
+	if (tree.elsepart != null) attribExpr(tree.elsepart, env, pt);
+	if (tree.tag == Tree.CONDSTAT)
+	    return null;
+	else
+	    return check(
+		tree,
+		condType(
+		    tree.pos,
+		    tree.cond.type, tree.thenpart.type, tree.elsepart.type),
+		VAL, pkind, pt);
+    }
+//where
+        private Type condType(int pos, Type condtype, Type thentype, Type 
+elsetype) {
+	    if (condtype.constValue != null &&
+		thentype.constValue != null &&
+		elsetype.constValue != null)
+		return (((Number)condtype.constValue).intValue() != 0)
+		    ? thentype
+		    : elsetype;
+	    else if (thentype.tag < INT && elsetype.tag == INT &&
+		elsetype.assignable(thentype))
+		return thentype;
+	    else if (elsetype.tag < INT && thentype.tag == INT &&
+		     thentype.assignable(elsetype))
+		return elsetype;
+	    else if (thentype.tag <= DOUBLE && elsetype.tag <= DOUBLE) {
+		for (int i = BYTE; i <= DOUBLE; i++) {
+		    Type candidate = Type.typeOfTag[i];
+		    if (thentype.subType(candidate) &&
+			elsetype.subType(candidate)) return candidate;
+		}
+	    }
+	    if (thentype.tsym == syms.stringType.tsym &&
+		elsetype.tsym == syms.stringType.tsym) {
+		return syms.stringType;
+	    } else if (thentype.subType(elsetype)) {
+		return elsetype;
+	    } else {
+		chk.checkType(pos, elsetype, thentype);
+		return thentype;
+	    }
+	}
+
+    public Type _case(Exec tree, Env<AttrContext> env) {
+	attribExpr(tree.expr, env);
+	return null;
+    }
+
+    public Type _case(Break tree, Env<AttrContext> env) {
+	tree.target = findJumpTarget(tree.pos, tree.tag, tree.label, env);
+	return null;
+    }
+
+    public Type _case(Continue tree, Env<AttrContext> env) {
+	tree.target = findJumpTarget(tree.pos, tree.tag, tree.label, env);
+	return null;
+    }
+//where
+        private Tree findJumpTarget(int pos,
+				    int tag,
+				    Name label,
+				    Env<AttrContext> env) {
+	    Env<AttrContext> env1 = env;
+	    while (env1 != null) {
+		switch (env1.tree.tag) {
+		case Tree.LABELLED:
+		    Labelled labelled = (Labelled)env1.tree;
+		    if (label == labelled.label) {
+			Tree target = labelled.body;
+			while (target.tag == Tree.LABELLED) {
+			    target = ((Labelled)target).body;
+			}
+			if (tag == Tree.CONTINUE &&
+			    target.tag != Tree.DOLOOP &&
+			    target.tag != Tree.WHILELOOP &&
+			    target.tag != Tree.FORLOOP)
+			    log.error(pos, "not a loop label: " + label);
+			return target;
+		    }
+		    break;
+		case Tree.DOLOOP:
+		case Tree.WHILELOOP:
+		case Tree.FORLOOP:
+		    if (label == null) return env1.tree;
+		    break;
+		case Tree.SWITCH:
+		    if (label == null && tag == Tree.BREAK) return env1.tree;
+		    break;
+		default:
+		}
+		env1 = env1.next;
+	    }
+	    if (label != null)
+		log.error(pos, "undefined label: " + label);
+	    else if (tag == Tree.CONTINUE)
+		log.error(pos, "continue outside of loop");
+	    else
+		log.error(pos, "break outside switch or loop");
+	    return null;
+	}
+
+    public Type _case(Return tree, Env<AttrContext> env) {
+	if (env.enclMethod == null ||
+	    env.enclClass.sym.owner == env.enclMethod.sym) {
+	    log.error(tree.pos, "return outside method");
+	} else {
+	    Symbol m = env.enclMethod.sym;
+	    if (m.type.restype().tag == VOID) {
+		if (tree.expr != null)
+		    log.error(
+			tree.expr.pos, "can't return a value from method " +
+			"whose result type is void");
+	    } else if (tree.expr == null) {
+		log.error(tree.pos, "missing return value");
+	    } else {
+		attribExpr(tree.expr, env, m.type.restype());
+	    }
+	}
+	return null;
+    }
+
+    public Type _case(Throw tree, Env<AttrContext> env) {
+	Type t = attribExpr(tree.expr, env, syms.throwableType);
+	return null;
+    }
+
+    public Type _case(Apply tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	Env<AttrContext> localEnv = env;
+	List<Type> argtypes;
+	Name methName = TreeInfo.name(tree.meth);
+	boolean isConstructorCall =
+	    methName == Names._this || methName == Names._super;
+	if (isConstructorCall && checkFirstConstructorStat(tree, env)) {
+	    localEnv = env.dup(env.tree, env.info.dup());
+	    localEnv.info.isSelfCall = true;
+	    argtypes = attribArgs(tree.args, localEnv);
+	    Type site = env.enclClass.sym.type;
+	    if (methName == Names._super) site = site.supertype();
+	    Type encltype = (tree.meth.tag == Tree.SELECT)
+		? attribExpr(((Select)tree.meth).selected, env)
+		: null;
+	    argtypes = constructorArgs(
+		tree.meth.pos, localEnv, site, encltype, argtypes);
+	} else {
+	    argtypes = attribArgs(tree.args, localEnv);
+	}
+
+	List<MethodType> saved = methTemplateSupply.elems;
+	Type mpt = newMethTemplate(argtypes);
+	// optimization, was ... = new MethodType(argtypes, null, null);
+
+	owntype = attribExpr(tree.meth, localEnv, mpt);
+
+	methTemplateSupply.elems = saved; // optimization
+
+	if (isConstructorCall) {
+	    Symbol called = TreeInfo.symbol(tree.meth);
+	    if (called == env.enclMethod.sym)
+		log.error(tree.pos, "recursive constructor invocation");
+//todo: handle indirect recursion as well
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+//where
+        private boolean checkFirstConstructorStat(Apply tree, Env<AttrContext> 
+env) {
+	    MethodDef enclMethod = env.enclMethod;
+	    if (enclMethod != null && enclMethod.name == Names.init) {
+		Block body = (Block)enclMethod.body;
+		if (body.stats.head.tag == Tree.EXEC &&
+		    ((Exec)body.stats.head).expr == tree)
+		    return true;
+	    }
+	    log.error(tree.pos, "call to " + TreeInfo.name(tree.meth) +
+		      " must be first statement in constructor");
+	    return false;
+	}
+
+        /** optimization: To save allocating a new methodtype for every apply,
+	 *  we use a reservoir.
+	 */
+        ListBuffer<MethodType> methTemplateSupply = new ListBuffer<MethodType>
+();
+
+        public Type newMethTemplate(List<Type> argtypes) {
+	    if (methTemplateSupply.elems == methTemplateSupply.last)
+		methTemplateSupply.append(new MethodType(null, null, null));
+	    MethodType mt = methTemplateSupply.elems.head;
+	    methTemplateSupply.elems = methTemplateSupply.elems.tail;
+	    mt.argtypes = argtypes;
+	    return mt;
+	}
+
+    public Type _case(NewClass tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	ClassDef cdef = tree.def;
+
+	// if enclosing class is given, attribute it, and
+	// complete class name to be fully qualified
+	Type encltype = null;
+	Tree clazz = tree.clazz;
+	if (tree.encl != null) {
+	    encltype = attribExpr(tree.encl, env);
+	    if (encltype.tag == CLASS) {
+		clazz = make.at(clazz.pos).Select(
+		    make.Type(encltype), ((Ident)tree.clazz).name);
+//		new Pretty().printExpr(clazz);//DEBUG
+	    }
+	}
+
+	// attribute clazz and store symbol + type back into tree
+	Type clazztype = chk.checkClassType(
+	    tree.clazz.pos, attribType(clazz, env));
+	chk.validate(clazz);	
+	if (tree.encl != null) {
+	    tree.clazz.type = clazztype;
+	    ((Ident)tree.clazz).sym = TreeInfo.symbol(clazz);
+	}
+
+	// attribute arguments;
+	List<Type> rawArgtypes = attribArgs(tree.args, env);
+	List<Type> argtypes = rawArgtypes;
+
+	if (clazztype.tag == CLASS) {
+	    Type site = clazztype.tsym.type;
+	    List<Type> typarams = clazztype.typarams();
+
+	    // resolve constructor, if not abstract
+	    if (cdef == null &&
+		(clazztype.tsym.flags() & (ABSTRACT | INTERFACE)) != 0) {
+		log.error(tree.pos,
+		    clazztype.tsym + " is abstract; cannot be instantiated");
+	    } else if (cdef != null &&
+		       (clazztype.tsym.flags() & INTERFACE) != 0) {
+		if (rawArgtypes.nonEmpty()) {
+		    log.error(tree.pos,
+			      "anonymous class implements interface; " +
+			      "cannot have arguments");
+		    rawArgtypes = argtypes = Type.emptyList;
+		} else if (tree.encl != null) {
+		    log.error(tree.pos,
+			      "anonymous class implements interface; " +
+			      "cannot have qualifier for new");
+		}
+	    } else {
+		argtypes = constructorArgs(
+		    tree.pos, env, site, encltype, rawArgtypes);
+		boolean selectSuperPrev = env.info.selectSuper;
+		if (cdef != null) env.info.selectSuper = true;
+		tree.constructor = rs.resolveConstructor(
+		    tree.pos, env, site, typarams, argtypes);
+		env.info.selectSuper = selectSuperPrev;
+	    }
+
+	    // if it's an anonymous class...
+	    if (cdef != null) {
+
+		// complete class definition with extends/implements clause
+	        // and enter + attribute it.
+		if (Resolve.isStatic(env)) cdef.flags |= STATIC;
+
+		Tree clazz1 = make.at(cdef.pos).Type(clazztype);
+		if ((clazztype.tsym.flags() & INTERFACE) != 0) {
+		    cdef.implementing = List.make(clazz1);
+		} else {
+		    cdef.extending = clazz1;
+		}
+		attribStat(cdef, env.dup(tree));
+//	        new Pretty().printStat(cdef);//DEBUG
+
+		// if enclosing class is given,
+		// add it to constructor arguments
+		if (tree.encl != null) {
+		    tree.args = tree.args.prepend(tree.encl);
+		    rawArgtypes = rawArgtypes.prepend(encltype);
+		    tree.encl = null;
+		    encltype = null;
+		}
+
+		// reassign site, typarams and recompute constructor
+		site = cdef.sym.type;
+		typarams = Type.emptyList;
+		argtypes = constructorArgs(
+		    tree.pos, env, site, encltype, rawArgtypes);
+		tree.constructor = rs.resolveConstructor(
+		    tree.pos, env, site, typarams, argtypes);
+	    }
+	    if (tree.constructor != null && tree.constructor.kind == MTH) {
+		owntype = rs.instantiate(
+		    site, tree.constructor, typarams, argtypes);
+		if (owntype == null) {//debug
+		    log.error(
+			tree.pos, "internal error; cannot instantiate " +
+			tree.constructor + " to (" + argtypes + ")");
+		}
+	    }
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(NewArray tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	Type elemtype;
+	if (tree.elemtype != null) {
+	    elemtype = attribType(tree.elemtype, env);
+	    if (elemtype.tag == TYPEVAR) {
+		log.warning(tree.pos, "unchecked generic array creation");
+	    }
+	    chk.validate(tree.elemtype);
+	    owntype = elemtype;
+	    for (List<Tree> l = tree.dims; l.nonEmpty(); l = l.tail) {
+		attribExpr(l.head, env, Type.intType);
+		owntype = new ArrayType(owntype);
+	    }
+	} else {
+	    if (pt.tag == ARRAY) {
+		elemtype = pt.elemtype();
+	    } else {
+		if (pt.tag != ERROR) {
+		    log.error(tree.pos, "illegal initializer for " + pt);
+		}
+		elemtype = Type.errType;
+	    }
+	}
+	if (tree.elems != null) {
+	    attribExprs(tree.elems, env, elemtype);
+	    owntype = new ArrayType(elemtype);
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(Assign tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = attribTerm(tree.lhs, env.dup(tree), VAR, pt);
+	attribExpr(tree.rhs, env, owntype);
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(Assignop tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	List<Type> argtypes = List.make(
+	    attribTerm(tree.lhs, env, VAR, Type.noType),
+	    attribExpr(tree.rhs, env));
+	Symbol operator = tree.operator = rs.resolveOperator(
+	    tree.pos, tree.tag - Tree.ASGOffset, env, argtypes);
+	Type owntype = argtypes.head;
+	if (operator.kind == MTH) {
+	    if (owntype.tag <= DOUBLE)
+		chk.checkCastable(
+		    tree.rhs.pos, operator.type.restype(), owntype);
+	    else
+		chk.checkType(
+		    tree.rhs.pos, operator.type.restype(), owntype);
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(Operation tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	List<Type> argtypes;
+	if (Tree.PREINC <= tree.tag && tree.tag <= Tree.POSTDEC)
+	    argtypes = Type.emptyList.prepend(
+		attribTerm(tree.args.head, env, VAR, Type.noType));
+	else
+	    argtypes = attribArgs(tree.args, env);
+	Symbol operator = tree.operator = rs.resolveOperator(
+	    tree.pos, tree.tag, env, argtypes);
+	Type owntype = Type.errType;
+	if (operator.kind == MTH) {
+	    owntype = operator.type.restype();
+	    int opc = ((OperatorSymbol)operator).opcode;
+	    List<Type> l = argtypes;
+	    while (l.nonEmpty() && l.head.constValue != null) l = l.tail;
+	    if (l.isEmpty()) {
+		Type ctype = cfolder.fold(tree.pos, opc, argtypes);
+		if (ctype != null) owntype = cfolder.coerce(ctype, owntype);
+	    }
+	    if ((opc == ByteCodes.if_acmpeq || opc == ByteCodes.if_acmpne) &&
+		!argtypes.head.castableTo(argtypes.tail.head.erasure()) &&
+		!argtypes.tail.head.castableTo(argtypes.head.erasure())) {
+		log.error(
+		    tree.pos, "incomparable types: " +
+		    argtypes.head + " and " + argtypes.tail.head);
+	    }
+	}
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(TypeCast tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type clazztype = attribType(tree.clazz, env);
+	Type exprtype = attribExpr(tree.expr, env);
+	Type owntype = chk.checkCastable(tree.expr.pos, exprtype, clazztype);
+	if (exprtype.constValue != null)
+	    owntype = cfolder.coerce(exprtype, owntype);
+	return check(tree, owntype, VAL, pkind, pt);
+    }
+
+    public Type _case(TypeTest tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type exprtype = attribExpr(tree.expr, env);
+
+        // The following check is correct for GJ but not for NextGen  Corky 
+6/28/00
+	/* Type clazztype = chk.checkClassOrArrayType(
+	   tree.clazz.pos, attribType(tree.clazz, env)); */
+        // In the following invocation, attribType(tree.clazz,env) replaces 
+clazztype, which is consistent with successful return from checkClassOrArrayType
+	chk.checkCastable(tree.expr.pos, exprtype, attribType
+(tree.clazz,env));  
+	return check(tree, Type.booleanType, VAL, pkind, pt);
+    }
+
+    public Type _case(Indexed tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+	Type atype = attribExpr(tree.indexed, env);
+	attribExpr(tree.index, env, Type.intType);
+	if (atype.tag == ARRAY)
+	    owntype = atype.elemtype();
+	else if (atype.tag != ERROR)
+	    log.error(tree.pos, "array required, but " + atype + " found");
+	return check(tree, owntype, VAR, pkind, pt);
+    }
+
+    public Type _case(Ident tree, Env<AttrContext> env) {
+	int pkind = env.info.pkind;
+	Type pt = env.info.pt;
+	Symbol sym;
+	
+	// find symbol
+	if (pt.tag == METHOD) {
+	    if (tree.name == Names._super || tree.name == Names._this) {
+		sym = rs.resolveSelfConstructor(
+		    tree.pos, env, tree.name, pt.argtypes());
+	    } else {
+		sym = rs.resolveMethod(
+		    tree.pos, env, tree.name, Type.emptyList, pt.argtypes());
+	    }
+	} else {
+	    sym = rs.resolveIdent(tree.pos, env, tree.name, pkind);
+	}
+	tree.sym = sym;
+
+	//check that symbol does not hide identifier in outer class
+	if (env.enclClass.sym.owner.kind != PCK &&
+	    (sym.kind & (VAR | MTH)) != 0 && 	
+	    sym.owner.kind == TYP &&
+	    tree.name != Names._super && tree.name != Names._this) {
+	    Env<AttrContext> env1 = env;
+	    while (env1.outer != null && !env1.enclClass.sym.subclass
+(sym.owner))
+		env1 = env1.outer;
+	    if (env1 != null && env1.enclClass.sym != sym.owner) {
+		do {
+		    env1 = env1.outer;
+		} while (env1 != null &&
+		       (env1.info.scope == null ||
+			checkNotHiding(tree.pos, sym, env1.info.scope)) &&
+		       (env1.enclClass == null ||
+			checkNotHiding(tree.pos, sym, env1.enclClass.sym.members
+())));
+	    }
+	}
+		
+	// if symbol is a variable, evaluate its initializer, if it has one
+	// if it is a local variable accessed from an embedded inner class,
+	// mark it as captured, and check that it is final.
+	if (sym.kind == VAR) {
+	    VarSymbol v = (VarSymbol)sym;
+	    checkInit(tree, env, v);
+	    if (v.owner.kind == MTH &&
+		v.owner != env.info.scope.owner &&
+		(v.flags_field & CAPTURED) == 0) {
+		v.flags_field |= CAPTURED;
+		if ((v.flags_field & FINAL) == 0) {
+		    log.error(
+			tree.pos, "local " + v +
+			" is accessed from within inner class; " +
+			" needs to be declared final");
+		}
+	    }
+	    if (pkind == VAR)
+		checkAssignable(tree.pos, v, null, env);
+	}
+
+	// in constructor body:
+        // if symbol is a field or instance method, check that it is not 
+accessed
+        // before supertype constructor is called.
+	if (env.info.isSelfCall &&
+	    sym.owner != null && sym.owner.kind == TYP &&
+	    (sym.flags() & STATIC) == 0 &&
+	    env.enclClass.sym.subclass(sym.owner) &&
+	    sym.name != Names.init)
+	    chk.earlyRefError(tree.pos, sym.kind == VAR ? sym : thisSym(env));
+
+	return checkId(tree, env.enclClass.sym.type, sym, pkind, pt);
+    }
+
+    public Type _case(Select tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	int skind = 0;
+	if (tree.name == Names._this || tree.name == Names._class) {
+	    skind = TYP;
+	} else {
+	    if ((pkind & PCK) != 0) skind = skind | PCK;
+	    if ((pkind & TYP) != 0) skind = skind | TYP | PCK;
+	    if ((pkind & (VAL | MTH)) != 0) skind = skind | VAL | TYP;
+	}
+	Type site = attribTerm(tree.selected, env, skind, Type.noType);
+	Symbol sitesym = TreeInfo.symbol(tree.selected);
+	
+	boolean selectSuperPrev = env.info.selectSuper;
+	env.info.selectSuper =
+	    sitesym != null &&
+	    (sitesym.name == Names._super || sitesym.kind == TYP);
+
+	Symbol sym = selectSym(tree, site, env, pt, pkind);
+	tree.sym = sym;
+
+	if (sym.kind == VAR) {
+	    VarSymbol v = (VarSymbol)sym;
+	    evalInit(v, env);
+	    if (pkind == VAR)
+		checkAssignable(tree.pos, v, tree.selected, env);
+	}
+
+	if (env.info.selectSuper) {
+	    if ((sym.flags() & STATIC) == 0 &&
+		sym.name != Names._this && sym.name != Names._super) {
+		if (sitesym.name == Names._super) {
+		    rs.checkNonAbstract(tree.pos, sym);
+		} else if (sym.kind == VAR || sym.kind == MTH) {
+		    rs.access(new Resolve.StaticError(sym),
+			      tree.pos, site, sym.name);
+		}
+		if (env.info.isSelfCall &&
+		    sym.name != Names.init &&
+		    tree.name == Names._this &&
+		    site.tsym == env.enclClass.sym) {
+		    chk.earlyRefError(tree.pos, sym);
+		}
+		Type site1 = env.enclClass.sym.type.asSuper(site.tsym);
+		if (site1 != null) site = site1;
+	    }
+	    env.info.selectSuper = selectSuperPrev;
+	}
+	return checkId(tree, site, sym, pkind, pt);
+    }
+//where
+        /** determine symbol referenced by a Select expression,
+	 *  @param pos    position for error reporting
+	 *  @param site   the type of the selected expression
+	 *  @param name   the selector name
+	 *  @param env    the current environment
+	 *  @param pt     the current prototype
+	 *  @param pkind  the expected kind(s) of the Select expression
+	 */
+        private Symbol selectSym(Select tree, Type site,
+				 Env<AttrContext> env, Type pt, int pkind) {
+	    int pos = tree.pos;
+	    Name name = tree.name;
+	    switch (site.tag) {
+	    case PACKAGE:
+		return rs.access(
+		    rs.findIdentInPackage(env, site.tsym, name, pkind),
+		    pos, site, name);
+	    case ARRAY:
+	    case CLASS:
+		if (pt.tag == METHOD) {
+		    if (name == Names._super) {
+			return rs.resolveSelfConstructor(
+			    pos, env, name, pt.argtypes());
+		    } else {
+			return rs.resolveQualifiedMethod(
+			    pos, env, site, name, Type.emptyList, pt.argtypes
+());
+		    }
+		} else if (name == Names._this) {
+		    return rs.resolveSelf(pos, env, site.tsym, name);
+		} else if (name == Names._class) {
+		    return new VarSymbol(
+			STATIC | PUBLIC, Names._class, syms.classType, 
+site.tsym);
+		} else {
+		    Symbol sym = rs.findIdentInType(env, site, name, pkind);
+		    if (sym.kind >= rs.AMBIGUOUS) {
+			if ((pkind & (TYP | PCK)) != 0) {
+			    Name pname = TreeInfo.fullName(tree.selected);
+			    if (pname != null) {
+				PackageSymbol p = syms.reader.enterPackage
+(pname);
+				Symbol sym1 = rs.findIdentInPackage(
+				    env, p, name, pkind);
+				if (sym1.kind < sym.kind) sym = sym1;
+			    }
+			}
+			sym = rs.access(sym, pos, site, name);
+		    }
+		    return sym;
+		}
+	    case TYPEVAR:
+		return selectSym(tree, site.bound(), env, pt, pkind);
+	    case ERROR:
+		return Symbol.errSymbol;
+	    default:
+		if (name == Names._class) {
+		    return new VarSymbol(
+			STATIC | PUBLIC, Names._class, syms.classType, 
+site.tsym);
+		} else {	
+		    log.error(pos, site + " cannot be dereferenced");
+		}
+		return Symbol.errSymbol;
+	    }
+	}
+
+        /** determine type of identifier or select expression and check that
+	 *  (1) the referenced symbol is not deprecated
+	 *  (2) the symbol type is safe (@see checkSafe)
+	 *  (3) if symbol is a variable, check that its type and kind are
+	 *      compatible with the prototype and protokind.
+	 *  (4) if symbol is a field of a raw type, which is being assigned to,
+	 *      issue a warning if its type changes under erasure.
+	 *  (5) if symbol is a method of a raw type, issue a warning if
+	 *      its argument types change under erasure.
+	 *  if checks succeed
+	 *    if symbol is a constant return its constant type
+	 *    else if symbol is a method return its result type
+	 *    otherwise return its type
+	 *  else return errType
+	 */
+        Type checkId(Tree tree, Type site, Symbol sym, int pkind, Type pt) {
+	    if ((sym.flags() & DEPRECATED) != 0) warnDeprecated(tree.pos, sym);
+	    Type owntype;
+	    switch (sym.kind) {
+	    case TYP:
+		owntype = sym.type;
+		if (owntype.tag == CLASS && owntype.typarams().nonEmpty()) {
+		    owntype = new ClassType(
+			owntype.outer(), Type.emptyList, owntype.tsym);
+		}
+		break;
+	    case VAR:
+		VarSymbol v = (VarSymbol)sym;
+		if (!chk.unchecked &&
+		    pkind == VAR &&
+		    v.owner.kind == TYP &&
+		    (v.flags() & STATIC) == 0 &&
+		    site.tag == CLASS) {
+		    Type s = site.asOuterSuper(v.owner);
+		    if (s != null &&
+			s.isRaw() &&
+			!v.type.sameType(v.erasure())) {
+			log.warning(
+			    tree.pos,
+			    "unchecked assignment to " + v + " of raw type " + 
+site);
+		    }
+		}
+		owntype = (sym.owner.kind == TYP)
+		    ? site.memberType(sym)
+		    : sym.type;
+		if (v.constValue != null) owntype = owntype.constType
+(v.constValue);
+		break;
+	    case MTH:
+//todo: find out why this can be false
+//		Base.assert(site.asOuterSuper(sym.owner) != null,
+//			    sym + " " + site + " " + sym.owner);//DEBUG
+		if (!chk.unchecked &&
+		    (sym.flags() & STATIC) == 0 &&
+		    site.tag == CLASS) {
+		    Type s= site.asOuterSuper(sym.owner);
+		    if (s != null &&
+			s.isRaw() &&
+			sym.name != Names.init &&
+			!Type.sameTypes(
+			    sym.type.argtypes(), sym.erasure().argtypes())) {
+			log.warning(
+			    tree.pos,
+			    "unchecked call to " + sym + " of raw type " + 
+site);
+		    }
+		}
+		if (sym.name == Names.init) {
+		    owntype = Type.voidType;
+		} else {
+		    owntype = rs.instantiate(
+			site, sym, Type.emptyList, pt.argtypes());
+		    if (owntype == null) {//debug
+			log.error(
+			    tree.pos, "internal error; cannot instantiate " +
+			    sym + " at " + site + " to (" + pt.argtypes() 
++ ")");
+		    }
+		}
+		break;
+	    case PCK: case ERR:
+		owntype = sym.type;
+		break;
+	    default:
+		new Pretty().printExpr(tree);//debug
+		throw new InternalError("unexpected kind: " + sym.kind);
+	    }
+	    infer.checkSafe(tree.pos, owntype, sym);
+	    return check(tree, owntype, sym.kind, pkind, pt);
+	}
+
+        /** check that variable is initialized and evaluate the variable's
+	 *  initializer, if not yet done
+	 */
+	private void checkInit(Tree tree, Env<AttrContext> env, VarSymbol v) {
+//	    System.err.println(v + " " + ((v.flags() & STATIC) != 0) + " " +
+//			       tree.pos + " " + v.pos + " " +
+//			       (env.info.staticLevel > 
+env.outer.info.staticLevel));//DEBUG
+	    if (v.pos > tree.pos &&
+		(v.owner.kind == MTH ||
+		 (v.owner.kind == TYP &&
+		  v.owner == env.info.scope.owner &&
+		  ((v.flags() & STATIC) != 0) == Resolve.isStatic(env))) &&
+		(env.tree.tag != Tree.ASSIGN || tree != ((Assign)env.tree).lhs))
+		log.error(tree.pos, "illegal forward reference");
+	    evalInit(v, env);
+	}
+
+	/** evaluate a final variable's initializer
+	 *  and set variable's constValue
+	 */
+	void evalInit(VarSymbol v, Env<AttrContext> env) {
+	    if (v.constValue instanceof Enter.EnvAttrContextBox) {
+		Env<AttrContext> evalEnv =
+		    ((Enter.EnvAttrContextBox)v.constValue).env;
+		Name prev = log.useSource(evalEnv.toplevel.sourcefile);
+		v.constValue = null;
+		Type itype = attribExpr(
+		    ((VarDef)evalEnv.tree).init, evalEnv, v.type);
+		if (itype.constValue != null)
+		    v.constValue = cfolder.coerce(itype, v.type).constValue;
+		log.useSource(prev);
+	    }
+	}
+
+        /** check that `sym' does not hide any symbols of the same name and
+	 *  kind in `scope'
+	 */
+        boolean checkNotHiding(int pos, Symbol sym, Scope scope) {
+	    Scope.Entry e = scope.lookup(sym.name);
+	    while (e.scope != null) {
+		if (e.sym.owner != sym.owner &&
+		    e.sym.kind == sym.kind &&
+		    e.sym.owner == scope.owner) {
+		    log.error(
+			pos, sym + " is inherited from " + sym.owner +
+			" and hides a " + Resolve.kindName(sym.kind) +
+			" of the same name" + e.sym.location() +
+			". An explicit `this' qualifier must be used to select 
+the desired instance  ");
+		    return false;
+		}
+		e = e.next();
+	    }
+	    return true;
+	}
+
+    public Type _case(Literal tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	return check(
+	    tree, litType(tree.typetag).constType(tree.value), VAL, pkind, pt);
+    }
+//where
+        Type litType(int tag) {
+	    return (tag == CLASS) ? syms.stringType : Type.typeOfTag[tag];
+	}
+
+    public Type _case(TypeIdent tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	return check(tree, Type.typeOfTag[tree.typetag], TYP, pkind, pt);
+    }
+
+    public Type _case(TypeArray tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type etype = attribType(tree.elemtype, env);
+	return check(tree, new ArrayType(etype), TYP, pkind, pt);
+    }
+
+    /** attribute type application.
+     *  bound checking is left until later, since types are attributed
+     *  before supertype structure is completely known
+     */
+    public Type _case(TypeApply tree, Env<AttrContext> env) {
+	Type pt = env.info.pt;
+	int pkind = env.info.pkind;
+	Type owntype = Type.errType;
+
+	Type clazztype = chk.checkClassType(
+	    tree.clazz.pos, attribType(tree.clazz, env));
+
+	ListBuffer<Type> actbuf = new ListBuffer<Type>();
+	for (List<Tree> l = tree.arguments; l.nonEmpty(); l = l.tail)
+	    actbuf.append(chk.checkRefType(l.head.pos, attribType(l.head, 
+env)));
+	List<Type> actuals = actbuf.toList();
+
+	if (clazztype.tag == CLASS) {
+	    List<Type> formals = clazztype.tsym.type.typarams();
+	    if (actuals.length() == formals.length()) {
+		owntype = new ClassType(
+		    clazztype.tsym.type.outer(), actuals, clazztype.tsym);
+	    } else {
+		log.error(
+		    tree.pos,
+		    (formals.length() != 0)
+		        ? "wrong number of type arguments; required: " +
+		          formals.length()
+		        : "type " + clazztype + " does not take parameters");
+		owntype = Type.errType;
+	    }
+	}
+	return check(tree, owntype, TYP, pkind, pt);
+    }
+
+    public Type _case(TypeParameter tree, Env<AttrContext> env) {
+	TypeVar a = (TypeVar)tree.type;
+	if (tree.extBound != null)
+	    a.bound = attribBase(tree.extBound, env, 0);
+	else if (tree.implBound != null)
+	    a.bound = attribBase(tree.implBound, env, INTERFACE);
+	else
+	    a.bound = syms.objectType;
+	return a;
+    }
+
+    public Type _case(Erroneous tree, Env<AttrContext> env) {
+	return tree.type = Type.errType;
+    }
+
+    public Type _case(Tree tree, Env<AttrContext> env) {
+	throw new InternalError();
+    }
+
+    /** main method: attribute class definition associated given class symbol
+     */
+    public void attribClass(ClassSymbol c) {
+	Type st = c.type.supertype();
+	if (st.tag == CLASS) attribClass((ClassSymbol)st.tsym);
+	if (c.owner.kind == TYP) attribClass((ClassSymbol)c.owner);
+	
+	if ((c.flags_field & UNFINISHED) != 0) {
+	    Name prev = log.useSource(c.sourcefile);
+	    c.flags_field &= ~UNFINISHED;
+
+	    Env<AttrContext> env = enter.classEnvs.get(c);
+	    enter.classEnvs.remove(c);
+
+	    ClassDef tree = (ClassDef)env.tree;
+	
+	    implementInterfaceMethods(c, env);
+	    chk.validateTypeParams(tree.typarams);
+	    chk.validate(tree.extending);
+	    chk.validate(tree.implementing);
+	    if ((c.flags() & (ABSTRACT | INTERFACE)) == 0)
+		chk.checkAllDefined(tree.pos, c);
+	    chk.checkClassBounds(tree.pos, c);
+	
+	    if (tree.typarams.length() != 0 && c.subclass
+(syms.throwableType.tsym))
+		log.error(tree.pos,
+			  "subtypes of java.lang.Throwable cannot have 
+arguments");
+	    tree.type = c.type;
+	
+	    for (List<TypeParameter> l = tree.typarams; l.nonEmpty(); l = 
+l.tail)
+		env.info.scope.enterIfAbsent(l.head.type.tsym);
+	
+	    if ((c.flags() & INTERFACE) == 0) {
+		VarSymbol thisSym = new VarSymbol(FINAL, Names._this, c.type, 
+c);
+		thisSym.pos = Position.FIRSTPOS;
+		env.info.scope.enter(thisSym);
+		if (st.tag == CLASS) {
+		    VarSymbol superSym = new VarSymbol(FINAL, Names._super, st, 
+c);
+		    superSym.pos = Position.FIRSTPOS;
+		    env.info.scope.enter(superSym);
+		}
+		chk.checkImplementations(tree.pos, c);
+	    } else {
+		c.members_field = c.members_field.dup();
+		implementInterfaceMethods(c, env);
+		chk.checkImplementations(tree.pos, c);
+		c.members_field = c.members_field.leave();
+	    }
+	
+	    attribStats(tree.defs, env);
+//	    checkConstructorsNonCyclic(tree.defs, env);
+	    tree.type = c.type;
+
+	    log.useSource(prev);
+	}
+    }
+}
+The selection parser seems to be in a infinite loop in the recovery mode. If it is not infinite, it is 
+too long anyway.
+Simpler test case:
+[public class X {
+    Object foo(Stack<X> s) {
+    }
+    List<T> bar(int pos, T x1, T x2, List<T> l) {
+    }
+}
+]
+Offending method is #bar, due to the combination of invalid return type and 
+invalid last argument type. The recovery loops because it is branching back at 
+the last closing parenthesis (not considering the one from #bar end of 
+signature.
+
+The forced argument reduction in case of recovery 
+(RecoveredMethod#updateFromParserState) did not fix up the parser RParenPos, 
+used then to update the next checkpoint. In this case, there is no right 
+parenthesis consumed at this point yet.
+
+Fixed.

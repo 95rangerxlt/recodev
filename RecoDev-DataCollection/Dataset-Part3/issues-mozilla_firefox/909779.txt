@@ -1,0 +1,272 @@
+Created attachment 796053
+Clipped Toolbar Item
+
+Currently when items start moving into overflow it is possible for an item to be partially clipped. The overflow chevron should only gobble up whole items.
+
+Created attachment 796053
+Clipped Toolbar Item
+
+Currently when items start moving into overflow it is possible for an item to be partially clipped. The overflow chevron should only gobble up whole items.
+I can't reproduce this on Win7 using the 8-26-2013 UX Nightly build.
+Stephen has showed me that it can also happen on Win8.
+I'm struggling to reproduce this on OS X. Do either of you have STR?
+I can't reproduce it anymore either. Maybe fixed by something else?
+I can't reproduce the case where the overflow button is showing *and* items are being clipped.
+
+However, I can reproduce a case where toolbar items are clipped and there is no overflow button. To do so, open the browser and resize it so that items are overflowing. Then restart it, which will open the browser in the smaller sized window. The items will be overflowed but our OverflowableToolbar code isn't handling this case apparently.
+Morphing per comment #5, and taking.
+Created attachment 817936
+actually check for overflow instead of relying on the event
+
+As far as I can tell, overflow events now don't fire on startup anymore. So I just wrote code to actually check if we're overflowing. Unfortunately, I expect that this might regress tpaint/ts_paint. We'd want to keep a close eye on it. (but this patch fixes the bug and passes tests for me locally)
+Comment on attachment 817936
+actually check for overflow instead of relying on the event
+
+Review of attachment 817936:
+-----------------------------------------------------------------
+
+Let's monitor Talos when this patch lands to see how much we regress by checking scrollLeftMax on startup.
+
+We should standardize on using the newer scrollLeftMax property.
+
+> while (child && this._target.clientWidth < this._target.scrollWidth) {
+>   let prevChild = child.previousSibling;
+
+This code can be changed to:
+> while (child && this._target.scrollLeftMax > 0) {
+>   let prevChild = child.previousSibling;
+
+And any other places that compare clientWidth with scrollWidth.
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +2312,5 @@
+>  
+>      this._initialized = true;
+>  
+>      // The 'overflow' event may have been fired before init was called.
+> +    if (this._target.clientWidth < this._target.scrollWidth) {
+
+We should just be able to check that this._target.scrollLeftMax > 0 here.
+https://hg.mozilla.org/projects/ux/rev/3ad4bd967735
+Nevermind tpaint/ts_paint, this broke ALL the window-open reflow tests. :-(
+
+Backed out: https://hg.mozilla.org/projects/ux/rev/ca36658a939c
+
+In the meantime, I wonder if us no longer getting this event is a bug in core.
+(In reply to :Gijs Kruitbosch from comment #10)
+> In the meantime, I wonder if us no longer getting this event is a bug in
+> core.
+
+Either a bug in core or a change in how our ordering works so that we add the event listener too late now.
+Created attachment 818635
+PoC Patch
+
+This patch fixes the bug while still using overflow events. I just want to clean it up a bit before requesting a "review". We could either merge the two overflow properties or remove one of them. If we removed the current "_forceOnOverflow" property, we can keep the other overflowed property and only use the value of it if the toolbar is overflowable.
+Comment on attachment 818635
+PoC Patch
+
+Review of attachment 818635:
+-----------------------------------------------------------------
+
+Generally, I like the idea of this, especially if this fixes the issue.
+
+On the other hand... for completeness, I'd ideally like to know how this changed, and whether that's intentional or whether it's really a core regression that's likely to change back and then regress the thing this bug was originally filed about, or something.
+
+::: browser/components/customizableui/content/toolbar.xml
+@@ +23,5 @@
+>  
+>        <constructor><![CDATA[
+> +          // Add an early overflow event listener that will mark if the
+> +          // toolbar overflowed during construction.
+> +          this.addEventListener("overflow", this);
+
+Are we sure this won't fire when flex elements are in there and have to resize (i.e. overflow followed by underflow)?
+
+@@ +75,5 @@
+> +        <parameter name="aEvent"/>
+> +        <body><![CDATA[
+> +          if (aEvent.type == "overflow" && aEvent.detail > 0) {
+> +            this._overflowedDuringConstruction = true;
+> +          }
+
+You should probably remove the event listener "somewhere". (Maybe in the overflowable toolbar's init, when we check this value? Might be tricky with XBL inner/outer values or whatever, or maybe not. Not sure)
+
+Alternatively, you could make this do something like:
+
+if (this.overflowable && this.overflowable.initialized) {
+  this.overflowable._onOverflow();
+}
+
+and get rid of the listener in OverflowableToolbar. I'm not sure which of these I prefer - neither is very elegant. But having two listeners is not useful.
+
+If we're keeping this one, please verify this doesn't leak (which used to be the case with mutation observers bound to the XBL binding - at least, I ran into that with the add-on bar stuff).
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +310,5 @@
+>  
+> +    if (areaProperties.has("overflowable")) {
+> +      aToolbar.overflowable = new OverflowableToolbar(aToolbar);
+> +    }
+> +
+
+Why was it necessary to move this?
+Credit where credit is due... :-)
+Created attachment 819069
+Patch
+
+(In reply to :Gijs Kruitbosch from comment #13)
+> ::: browser/components/customizableui/content/toolbar.xml
+> @@ +23,5 @@
+> >  
+> >        <constructor><![CDATA[
+> > +          // Add an early overflow event listener that will mark if the
+> > +          // toolbar overflowed during construction.
+> > +          this.addEventListener("overflow", this);
+> 
+> Are we sure this won't fire when flex elements are in there and have to
+> resize (i.e. overflow followed by underflow)?
+
+I'm not sure about this, but I haven't seen anything that looks like this is happening.
+ 
+> ::: browser/components/customizableui/src/CustomizableUI.jsm
+> @@ +310,5 @@
+> >  
+> > +    if (areaProperties.has("overflowable")) {
+> > +      aToolbar.overflowable = new OverflowableToolbar(aToolbar);
+> > +    }
+> > +
+> 
+> Why was it necessary to move this?
+
+This wasn't necessary, I thought I had undone the change before uploading.
+Comment on attachment 819069
+Patch
+
+Review of attachment 819069:
+-----------------------------------------------------------------
+
+Looks good to me. Some suggestions below, but I trust your judgment in either applying them or deciding it's not necessary.
+
+Also... can we have a test? Could be a followup bug. Simple way to do it would be: resize the existing window to 450px, wait for the toolbar to overflow, open a new window (which will take the same size), wait for the new window's toolbar to overflow, resize the new window back to normal, wait for it to stop overflowing. Clean up function: close the extra window if it exists, resize the original window back to its original size, wait for it to no longer overflow.
+
+(as far as I'm concerned this could be a followup patch/bug)
+
+::: browser/components/customizableui/content/toolbar.xml
+@@ +75,5 @@
+> +      <method name="handleEvent">
+> +        <parameter name="aEvent"/>
+> +        <body><![CDATA[
+> +          if (aEvent.type == "overflow" && aEvent.detail > 0) {
+> +            if (this.overflowable && this.overflowable._initialized) {
+
+Maybe we should make this property public or add a public getter? Having it reach into implementation details like this makes the code feel icky.
+
+@@ +76,5 @@
+> +        <parameter name="aEvent"/>
+> +        <body><![CDATA[
+> +          if (aEvent.type == "overflow" && aEvent.detail > 0) {
+> +            if (this.overflowable && this.overflowable._initialized) {
+> +              this.overflowable._onOverflow(aEvent);
+
+Ditto.
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +2367,5 @@
+>  
+>      CustomizableUI.addListener(this);
+>  
+> +    // The 'overflow' event may have been fired before init was called.
+> +    if (this._toolbar._overflowedDuringConstruction) {
+
+And this is 'private' as well. Or maybe we decide that it's OK as it's only the toolbar and it's overflowable handler stuff...
+I added a test in the patch that I checked in.
+
+https://hg.mozilla.org/projects/ux/rev/c198907c6ba6
+
+Filed bug 928565 to move the OverflowableToolbar code to the toolbar.xml binding.
+Backed out for failing browser/base/content/test/general/browser_windowopen_reflows.js
+
+https://hg.mozilla.org/projects/ux/rev/dd567c98f03e
+(In reply to Jared Wein [:jaws] from comment #18)
+> Backed out for failing
+> browser/base/content/test/general/browser_windowopen_reflows.js
+> 
+> https://hg.mozilla.org/projects/ux/rev/dd567c98f03e
+
+So this time we only broke Linux and Windows reflow checks... I'd be really interested to figure out *why* though... Because AFAICT the stacks in that code imply that when the window opens, we're in an overflown state. That's bad. :-(
+I tried adding an underflow event handler as well, that seemed to help for me locally, but when I ran all the tests I strangely ran into an issue where mochitests would just hang in some kind of infinite loop (the underflow handler only set a field to null, so not sure what was going on there). Then I tried to clobber, and now I'm stuck because of bug 928929.
+I added a dump line in the toolbar.xml overflow handler and saw that even the toolbar-menubar was getting an overflow event, so maybe something in the Windows (and derived Linux) theme is setting visibility to something other than visible really early on.
+I'd like to back out the patch for bug 908326 and also land the test that was introduced in the patch I tried landing in this bug.
+Created attachment 820079
+Backout of bug 908326
+Created attachment 820080
+Test for overflowed windows
+Try push with patch: https://tbpl.mozilla.org/?tree=Try&rev=af26613ee85b
+Baseline push: https://tbpl.mozilla.org/?tree=Try&rev=7a0e0d788d79
+Comment on attachment 820079
+Backout of bug 908326
+
+r- for now:
+
+(In reply to Jared Wein [:jaws] from comment #25)
+> Try push with patch: https://tbpl.mozilla.org/?tree=Try&rev=af26613ee85b
+> Baseline push: https://tbpl.mozilla.org/?tree=Try&rev=7a0e0d788d79
+
+This does substantially regress tpaint and ts_paint:
+http://perf.snarkfest.net/compare-talos/index.html?oldRevs=7a0e0d788d79&newRev=af26613ee85b&submit=true
+
+I'd really really rather not back it out just because we don't get this event as early as we like. Why can't we fix the patch that's here to not trigger reflows when it shouldn't?
+Created attachment 820322
+Toolbar Overflow isn't initialized correctly on newly opened windows.
+
+This passes all tests for me, including the new test in the patch I reviewed.
+*curses bzexport*
+Comment on attachment 820322
+Toolbar Overflow isn't initialized correctly on newly opened windows.
+
+Review of attachment 820322:
+-----------------------------------------------------------------
+
+r=me with the nits below addressed.
+
+::: browser/components/customizableui/content/toolbar.xml
+@@ +82,5 @@
+> +              this.overflowedDuringConstruction = aEvent;
+> +            }
+> +          } else if (aEvent.type == "underflow" && aEvent.detail > 0) {
+> +            this.overflowedDuringConstruction = null;
+> +            this.removeEventListener("underflow", this);
+
+I don't think we should remove the underflow event listener after the event has happened once.
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +329,5 @@
+>  
+>      if (areaProperties.has("overflowable")) {
+>        aToolbar.overflowable = new OverflowableToolbar(aToolbar);
+> +    } else {
+> +      aToolbar.removeEventListener("overflow", aToolbar);
+
+The overflow event listener is only added if the area is overflowable, so this looks to be not necessary anymore.
+
+@@ +2381,4 @@
+>    },
+>  
+>    uninit: function() {
+> +    this._toolbar.removeEventListener("overflow", this._toolbar);
+
+The "underflow" event listener needs to be removed also.
+https://hg.mozilla.org/projects/ux/rev/2a533e65593b
+https://hg.mozilla.org/mozilla-central/rev/2a533e65593b
+I still have no overflow chevron on the menubar even with many icons 
+pushed off. 
+
+Mozilla/5.0 (X11; Linux i686; rv:29.0) Gecko/20100101 Firefox/29.0 ID:20140121063910 CSet: 1b52aa569ced
+(In reply to Charles Evans from comment #32)
+> I still have no overflow chevron on the menubar even with many icons 
+> pushed off. 
+> 
+> Mozilla/5.0 (X11; Linux i686; rv:29.0) Gecko/20100101 Firefox/29.0
+> ID:20140121063910 CSet: 1b52aa569ced
+
+Leaving a comment like this on a 3-month old bug that's marked as FIXED isn't helpful. Please file a new bug and provide steps to reproduce based on a clean profile.

@@ -1,0 +1,221 @@
+STR:
+ 1. View attached testcase.
+ 2. Right-click the blue div and pick "inspect"
+ 3. Look at the overlay that shows the div's dimensions, or the "box model" view.
+
+EXPECTED RESULTS: div's width should be reported as 100px (or 100.01px)
+ACTUAL RESULTS: div's width is reported as 101px
+
+The div has a specified width of "100.01px". The devtools UI makes it look like we're rounding that up to 101px, but we're not (in layout/rendering).
+
+STR:
+ 1. View attached testcase.
+ 2. Right-click the blue div and pick "inspect"
+ 3. Look at the overlay that shows the div's dimensions, or the "box model" view.
+
+EXPECTED RESULTS: div's width should be reported as 100px (or 100.01px)
+ACTUAL RESULTS: div's width is reported as 101px
+
+The div has a specified width of "100.01px". The devtools UI makes it look like we're rounding that up to 101px, but we're not (in layout/rendering).
+Created attachment 8539443
+test.html
+(apologies for the poorly-edited descriptive text in the testcase. It gets the point across, anyway.)
+FWIW: I discovered this bug after investigating a report from a web developer, who thought we had a rounding bug in layout, due to the information that devtools was presenting:
+ https://twitter.com/cwrightdesign/status/545882429664149504
+(In reply to Daniel Holbert [:dholbert] from comment #0)
+> STR:
+>  1. View attached testcase.
+>  2. Right-click the blue div and pick "inspect"
+>  3. Look at the overlay that shows the div's dimensions, or the "box model"
+> view.
+> 
+> EXPECTED RESULTS: div's width should be reported as 100px (or 100.01px)
+> ACTUAL RESULTS: div's width is reported as 101px
+> 
+> The div has a specified width of "100.01px". The devtools UI makes it look
+> like we're rounding that up to 101px, but we're not (in layout/rendering).
+
+Looking at the table on cruft.io/posts/percentage-calculations-in-ie/ it seems like we should truncate to 3 decimal places.
+(In reply to Michael Ratcliffe [:miker] [:mratcliffe] from comment #4)
+> Looking at the table on cruft.io/posts/percentage-calculations-in-ie/ it
+> seems like we should truncate to 3 decimal places.
+
+I disagree.
+
+I assume you're saying that because the table there says Firefox truncates percentages to 3 decimal places.   But, I don't think the table is actually accurate on this (see note at bottom for why), and even if it were, I don't think it matters for the purposes of this bug.
+
+I suspect that the table is trying to describe values that come out of getComputedStyle, which I think is what the devtools UI *starts with* here. So, if we wanted to match what that table is trying to describe, then presumably devtools just doesn't need to do any truncation at all.
+
+(RE the table not being accurate -- I'm not aware of any "truncate to 3 decimal places" rule in gecko.  What we *actually* do is format the number with 6 digits of precision, via nsTSubstring_CharT::AppendFloat's call to FormatWithoutTrailingZeros.
+https://mxr.mozilla.org/mozilla-central/source/xpcom/string/nsTSubstring.cpp?rev=2cedc0acd40b#948
+
+My local experiments confirm this -- I tried setting "document.documentElement.style.strokeWidth" to various long decimal values, and then displaying its value (via .style or getComputedStyle). It's consistently displayed with 6 digits of precision.)
+(FWIW, I tweeted to the author of that cruft.io post -- I'm assuming his twitter nick matches his github nick -- to let him know about the error:
+https://twitter.com/CodingExon/status/551475442390032384
+https://twitter.com/CodingExon/status/551476618971975680
+To fix this bug, you'll want to edit http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/styles.js#779 to change from using parseInt to using parseFloat.
+
+We'll probably also want a test for this. It looks like you can update http://mxr.mozilla.org/mozilla-central/source/browser/devtools/layoutview/test/browser_layoutview.js.
+@jaws I think that edit didn't workout so I digged my self a little deep and found this ceil is what rounding the value to next place. 
+
+let dim = Math.ceil(rect.width) + " \u00D7 " + Math.ceil(rect.height);
+
+http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/highlighter.js#1321
+
+Shall I use Math.round or Math.floor()
+(In reply to Anush [:bmx] from comment #8)
+
+Based on the above notes from :dholbert, it looks like we don't want either Math.round() or Math.floor(), as they'll report back values that are inconsistent with the used values.
+
+However, it's not also as simple as just using the raw value here, as a value like 96.1px will actually be represented as 96.10000610351562 due to floating point arithmetic. This value comes from element.getBoundingClientRect().
+
+It looks like we might not want to use getBoundingClientRect() here, since it is showing this floating point arithmetic inaccuracies. @Mike & @Daniel, how do you propose that Anush proceeds here?
+
+We could use getComputedStyle, but that will also need to be combined with element.scrollWidth/element.scrollHeight since getComputedStyle can return "auto" and other non-numeric values.
+So I think we're just talking about how to format numbers as strings here, right? (w/ numbers coming out of getBoundingClientRect()) I don't know JS particularly well (and in particular JS string-formatting), so I may not be the best source of information here, but here are my thoughts:
+
+POSSIBLE STRATEGY 1: Try to approximately match our getComputedStyle behavior, for consistency. Specifically, try to format the number with 6 decimal places of precision, and strip trailing zeroes-after-the-decimal-point. It seems like this almost works...
+>  var num = 96.10000610351562;
+>  var numAsStr = (new Number(num)).toPrecision(6);
+...except that this has trailing zeroes.  I'll bet there's some way in JS to remove those -- or if not, we could conceivably hack one up here.
+
+POSSIBLE STRATEGY 2: Just use ".toFixed(1)" to always format with a single digit after the decimal point, and then (optionally) check if we've got ".0" at the end of our string, and if so, strip that off, so we get e.g. "1234.0" --> "1234", but "1234.1" stays as "1234.1".  I think a single digit of fractional-pixel may be enough information here (and it's definitely better than what we've got now).
+
+POSSIBLE STRATEGY 3: Some hybrid... e.g. if our number is over 6 digits (> 100,000), format with toPrecision(6), and be confident that we won't have any after-the-decimal-point junk; otherwise, format with .toFixed(1) and strip trailing ".0" if present.
+Thanks for the feedback Daniel.
+
+Anush, you should be able to proceed here.
+
+We can replicate the getComputedStyle behavior by doing the following:
+
+let num = 96.10000610351562;
+let truncatedNum = parseFloat(num.toPrecision(6));
+// truncatedNum is now `96.1`
+
+Note that the code you pointed to in comment #8 is for the highlighter. We'll also want to fix the layout view.
+
+You'll need to update quite a few files to hit all the places that this is used:
+browser/devtools/layoutview/view.js
+toolkit/devtools/server/actors/highlighter.js
+toolkit/devtools/server/actors/styles.js
+
+In each of the above files there exists code that either does a `parseInt`, Number to String coercion (which will need to be truncated), and Math.ceil (as you found above).
+
+@Mike, should we worry about values over 6 digits (> 100,000)? With this approach 10000000.125 will be formatted as 1.00000e+7 for example.
+(In reply to Jared Wein [:jaws] (please needinfo? me) from comment #11)
+> 
+> @Mike, should we worry about values over 6 digits (> 100,000)? With this
+> approach 10000000.125 will be formatted as 1.00000e+7 for example.
+
+As long as it rarely occurs I think we should be fine.
+I have changed all the properties( not only height) to show floating points if they are floating point number.
+
+Screen shot : http://i.imgur.com/77XLunm.png
+
+I have updated the following in test case 
+
+let res1 = [
+      {selector: "#element-size",              value: "160" + "\u00D7" + "160"},
+      {selector: ".size > span",               value: "100" + "\u00D7" + "100.117"},
+      {selector: ".margin.top > span",         value: 30},
+      {selector: ".margin.left > span",        value: "auto"},
+      {selector: ".margin.bottom > span",      value: 30},
+      {selector: ".margin.right > span",       value: "auto"},
+      {selector: ".padding.top > span",        value: 20},
+      {selector: ".padding.left > span",       value: 20},
+      {selector: ".padding.bottom > span",     value: 20},
+      {selector: ".padding.right > span",      value: 20},
+      {selector: ".border.top > span",         value: 10},
+      {selector: ".border.left > span",        value: 10},
+      {selector: ".border.bottom > span",      value: 10},
+      {selector: ".border.right > span",       value: 10},
+];
+
+and 
+
+  let style = "div { position: absolute; top: 42px; left: 42px; height: 100.111px; width: 100px; border: 10px solid black; padding: 20px; margin: 30px auto;}";
+
+is that fine or do I have to add another testcase. If so need help
+Need help with ^^^^^
+Created attachment 8566493
+bug1113761.patch
+Comment on attachment 8566493
+bug1113761.patch
+
+Review of attachment 8566493:
+-----------------------------------------------------------------
+
+Looks good to me.
+Comment on attachment 8566493
+bug1113761.patch
+
+Review of attachment 8566493:
+-----------------------------------------------------------------
+
+The text in the center of the layout view's box is created in view.js with:
+> let newValue = width + "\u00D7" + height;
+
+Both width and height here are calculated by subtracting the border values, and can end up with values that exceed 6 decimal places.
+Created attachment 8566700
+bug1113761.patch
+
+Added jaws find here.
+I pushed your patch to our tryserver, which will build your patch on Linux, Windows, and OSX. It will then run all of the automated tests with your changes and we can make sure that no tests will fail with your changes. If everything looks good, then we can get this checked in.
+
+You can view the progress of your build at the following URL:
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=16e136a24a22
+Comment on attachment 8566700
+bug1113761.patch
+
+Michael, can you review this as well? I'm not sure if I have enough proper DevTools review-cred :)
+Created attachment 8567511
+bug1113761.patch
+
+updated the test ...
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=be282e0daecf
+The try run in comment 22 is green, awesome work Anush.
+
+I have added the checkin-needed keyword so it should land soon.
+Can we get this patch formatted in the proper style[1], or just post what the commit message should be?
+
+1: https://developer.mozilla.org/en-US/docs/Mercurial_FAQ#How_can_I_generate_a_patch_for_somebody_else_to_check-in_for_me.3F
+Anush, can you make the necessary changes and add the new patch?
+
+The top of the diff should look something like this:
+```
+# HG changeset patch
+# Parent c9ef2c9434b550b371ac7c2b6906d86eec7e2848
+# User Michael Ratcliffe <mratcliffe@mozilla.com>
+# Date 1411984543 -3600
+Bug 1061904 - "[e10s] Fix e10s tests for Web Audio Editor" []
+
+diff --git ...
+```
+
+Here are the relevant parts of my .hgrc to help you creating the patch:
+```
+cat ~/.hgrc
+[defaults]
+diff = -U 8 -p
+annotate = --user --date --quiet --number --line-number
+
+[ui]
+username = Michael Ratcliffe <mratcliffe@mozilla.com>
+
+[diff]
+git = 1
+showfunc = 1
+unified = 8
+nodates = 1
+```
+Created attachment 8568503
+bug1113761.patch
+
+Added the required block :)
+Mercurial doesn't like this patch.
+abort: invalid date: '24 Feb 2015'
+Created attachment 8568624
+1113761.patch
+https://hg.mozilla.org/integration/fx-team/rev/ef110d0b3479
+https://hg.mozilla.org/mozilla-central/rev/ef110d0b3479
+For info, I just filed bug 1143675 as a follow up (regression?) because the nodeinfobar now jumps/flickers rapidly for animated nodes.

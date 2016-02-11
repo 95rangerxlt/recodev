@@ -1,0 +1,1110 @@
+TypeAheadFind expects a non-null docShell to attach to, and it was disabled in e10s-compat mode in bug 663042.
+
+TypeAheadFind expects a non-null docShell to attach to, and it was disabled in e10s-compat mode in bug 663042.
+This work was basically done two years ago. There's even a frontend patch that I wrote at one point which I can resurrect if you'd like.
+
+*** This bug has been marked as a duplicate of bug 514925 ***
+I'm going to repurpose this for the frontend patch.
+Created attachment 554331
+Make findbar results asynchronous and e10s ready.
+
+Here's the WIP. The first search in a remote tab correctly highlights results and properly updates the findbar ui, but it quickly degenerates and stops working.
+does this depend on bug 514925?
+Ah, yes.
+So I just rebased this and the patch in Bug 514925. It looks like the highlight function is going to be painful to get working with the current setup. Is there any reason the have this complicated setup for IPC, instead of just using a content script and sending some messages from findbar.xml?
+Not that I can see. That's the same direction that XUL Fennec took, too. Back in my day, we didn't have these content scripts you speak of :)
+I have been working on the alternative solution that uses content scripts. It's looking quite good and all the obvious features work. The only very noticeable problem is related to focus. In normal Firefox it's possible to scroll even when the findbar's search box is in focus. I need to figure out how this works. Some other stuff related to editors and link search also needs more work.
+
+http://hg.mozilla.org/projects/larch/rev/a7554f323b5d
+http://hg.mozilla.org/projects/larch/rev/054115623a05
+http://hg.mozilla.org/projects/larch/rev/baa848b6ff26
+Created attachment 774679
+WIP
+
+This WIP is rebased on top of current mozilla-inbound. This fails some test, but I will look at fixing them today.
+Created attachment 774683
+WIP
+
+Forgot to hg add the files.
+Comment on attachment 774683
+WIP
+
+Review of attachment 774683:
+-----------------------------------------------------------------
+
+feedback+ as it all seems to be going in the right direction here. I have some implementation details questions that I still need to go over a second pass here and then I'll ask about them on IRC.
+There's still some stuff missing though, right? I mean, not to make it complete, but to make it work? I don't see the content-side script handling the messages from RemoteFinder here
+forgot to add: Though I hope the idea is to use Finder.jsm in the content-script as well to unify code for e10s/non-e10s
+Created attachment 779213
+more complete wip
+
+This was indeed the way I implemented it, I just forgot to apply these changes when creating the patch based on m-c.
+Tom, I think there are some parts missing in this patch. There aren't any uses of RemoteFinder, for example.
+
+To help the review process, it would also be good to split the patch into a refactoring part that just moves stuff out of findbar.xml, and another part that adds remote capabilities.
+Created attachment 796730
+Findbar refcatoring.
+
+I am sorry, this is a massive patch, but most of it is just refactoring.  The end result of this patch is actually quite nice from my point of view. What happens is that now findbar.xml mostly just contains the UI logic and otherwise is pretty dumb about what actually happens once it calls "find", "findAgain" etc. Because it still needs to indicate the find result like "found" or "not found", the findbar now registers an onFindResult listener, which gets called by Finder.jsm. I removed the changes that made the actual searching "asynchronous" (actually it was just delayed to the next tick), because it made it very hard to pass tests. I will rewrite these tests soonish, but this patch is big enough as it is. This patch should basically support every feature was supported by the old implementation, if not than it is an oversight.
+Try push: https://tbpl.mozilla.org/?tree=Try&rev=d21dad6e898b
+Comment on attachment 796730
+Findbar refcatoring.
+
+Review of attachment 796730:
+-----------------------------------------------------------------
+
+Tom, this looks very exciting! Since you're refactoring this piece of the toolkit anyway, I'd like to see if we can push it just a wee bit further.
+
+Granting f+ because this is definitely almost there. It also makes adding features in the near future a lot easier!
+
+Also, I just did a code-pass... I did not apply the patch locally. I will do that later today and check out the various pieces of functionality.
+
+::: toolkit/components/typeaheadfind/nsTypeAheadFind.cpp
+@@ +923,5 @@
+>      nsCOMPtr<nsIDocShell> ds (do_QueryReferent(mDocShell));
+>      NS_ENSURE_TRUE(ds, NS_ERROR_FAILURE);
+>  
+>      presShell = ds->GetPresShell();
+> +    NS_ENSURE_TRUE(presShell, NS_ERROR_FAILURE);
+
+Out of curiosity, what's your intent for this assertion?
+
+::: toolkit/content/widgets/findbar.xml
+@@ +376,5 @@
+>              for (var x = this._editors.length - 1; x >= 0; --x)
+>                this._unhookListenersAtIndex(x);
+>            }
+>  
+> +          //this.browser = null;
+
+please remove this line if it's not used anymore.
+
+@@ +663,5 @@
+>            // changed by a mouse event which is dispatched by a scroll event.
+>            // Thus we should change it only after the mouse event is dispatched.
+> +          if (this._findMode != this.FIND_NORMAL) {
+> +            setTimeout(() => {
+> +                this._xulBrowserWindow.setOverLink(aFoundURL || "", null);
+
+could you explain a little bit here what this does? Also, does the comment above still apply re. updating the status bar text?
+
+@@ +717,5 @@
+>            if (aEvent.ctrlKey || aEvent.altKey || aEvent.metaKey ||
+>                aEvent.defaultPrevented)
+>              return false;
+>  
+> +          // This still uses CPOWs, but this is okay for now.
+
+I don't know what CPOWs are (yet)... I'm afraid that might be forgotten in the future. Could you explain that in this comment?
+
+@@ +1117,5 @@
+>            this.open(aMode);
+>  
+>            if (this._flashFindBar) {
+>              this._flashFindBarTimeout =
+> +              setInterval(() => this._flash(), 500, this);
+
+`this` can be removed
+
+@@ +1158,5 @@
+>          -->
+>        <method name="onFindAgainCommand">
+>          <parameter name="aFindPrevious"/>
+>          <body><![CDATA[
+> +          var findString = this._browser.finder.searchString || this._findField.value;
+
+Since you're refactoring things, could you make sure to use modern JS throughout this file? Like, use `let` everywhere, for example.
+
+Already <3 the use of fat-arrow functions everywhere. Did you replace all occurrences using bind() or setTimeout argument-passing?
+
+@@ +1188,5 @@
+> +        - This handles all the result changes for both
+> +        - type-ahead-find and highlighting.
+> +        - @param aResult
+> +        -   One of the nsITypeAheadFind.FIND_* constants
+> +        -   indicating the result of a search operation.
+
+I think it makes sense to document all params, innit?
+
+::: toolkit/modules/Finder.jsm
+@@ +1,1 @@
+> +// -*- Mode: javascript; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+
+why tab-width 8? Maybe it's just best to remove this editor hint.
+
+@@ +6,5 @@
+> +this.EXPORTED_SYMBOLS = ["Finder"];
+> +
+> +const Ci = Components.interfaces;
+> +const Cc = Components.classes;
+> +const Cu = Components.utils;
+
+I'm a fan of
+```js
+const {Ci: interfaces, Cc: classes, Cu: utils} = Components;
+```
+
+Your pick!
+
+@@ +12,5 @@
+> +Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> +const Services = Cu.import("resource://gre/modules/Services.jsm").Services;
+> +
+> +function Finder(docShell) {
+> +    this._fastFind = Cc["@mozilla.org/typeaheadfind;1"].createInstance(Ci.nsITypeAheadFind);
+
+nit: 4-space indentation
+
+@@ +25,5 @@
+> +}
+> +
+> +Finder.prototype = {
+> +  addResultListener: function (aListener) {
+> +    this._listeners.push(aListener);
+
+perhaps add a duplicate check?
+```js
+if (this._listeners.indexOf(aListener) == -1)
+  this._listeners.push(aListener);
+```
+
+@@ +29,5 @@
+> +    this._listeners.push(aListener);
+> +  },
+> +
+> +  removeResultListener: function (aListener) {
+> +    this._listeners = this._listeners.filter(function (l) l != aListener);
+
+this might 'look' better as
+```js
+this._listeners = this._listeners.filter(l => l != aListener);
+```
+or
+```js
+let idx = this._listeners.indexOf(aListener);
+if (idx == -1)
+  return;
+this._listeners.splice(idx, 1);
+```
+
+I don't feel strongly about either, just throwing it up there!
+
+@@ +51,5 @@
+> +
+> +      linkURL = this._textToSubURIService.unEscapeURIForUI(docCharset, foundLink.href);
+> +    }
+> +
+> +    for (var l of this._listeners) {
+
+no 'let'?
+
+@@ +102,5 @@
+> +  focusContent: function() {
+> +    let fastFind = this._fastFind;
+> +
+> +    try {
+> +        // Try to find the best possible match that should recieve focus.
+
+nit: 4-space indent
+
+@@ +112,5 @@
+> +        } else {
+> +          this._getWindow().focus()
+> +        }
+> +    } catch (e) {}
+> +
+
+nit: I think you can remove this newline
+
+@@ +119,5 @@
+> +  keyPress: function (aEvent) {
+> +    let controller = this._getSelectionController(this._getWindow());
+> +
+> +    switch (aEvent.keyCode) {
+> +    case Ci.nsIDOMKeyEvent.DOM_VK_RETURN:
+
+nit: please indent the 'case' statements one level deeper than 'switch'
+
+@@ +179,5 @@
+> +    this._previousLink = foundLink;
+> +  },
+> +
+> +  _highlight: function (aHighlight, aWord, aWindow) {
+> +    var win = aWindow || this._getWindow();
+
+no 'let'? Please check this throughout this file.
+
+@@ +201,5 @@
+> +               doc.body : doc.documentElement;
+> +
+> +    if (aHighlight) {
+> +      var searchRange = doc.createRange();
+> +       searchRange.selectNodeContents(body);
+
+nit: accidental indentation
+
+@@ +211,5 @@
+> +      endPt.collapse(false);
+> +
+> +      var retRange = null;
+> +      var finder = Cc["@mozilla.org/embedcomp/rangefind;1"]
+> +                             .createInstance()
+
+nit: indentation/ alignment issue
+
+@@ +299,5 @@
+> +  _getEditableNode: function (aNode) {
+> +    while (aNode) {
+> +      if (aNode instanceof Components.interfaces.nsIDOMNSEditableElement) {
+> +        return aNode.editor ? aNode : null;
+> +      }
+
+nit: no braces strictly necessary
+
+@@ +318,5 @@
+> +    this._editors[aIndex]
+> +        .removeDocumentStateListener(this._stateListeners[aIndex]);
+> +    this._editors.splice(aIndex, 1);
+> +    this._stateListeners.splice(aIndex, 1);
+> +    if (this._editors.length == 0) {
+
+I think !this._editors.length would suffice here.
+
+@@ +335,5 @@
+> +    // aEditor is an editor that we listen to, so therefore must be
+> +    // cached. Find the index of this editor
+> +    var idx = 0;
+> +    while (this._editors[idx] != aEditor)
+> +      idx++;
+
+why not turn this into
+```js
+let idx = this._editors.indexOf(aEditor);
+if (idx == -1)
+  return;
+```
+
+This code might accidentally remove listeners for editor 0, while that is not in fact the subject editor.
+
+@@ +358,5 @@
+> +   *
+> +   * @param aSelectionRange the range from the selection to check
+> +   * @param aFindRange the highlighted range to check against
+> +   * @returns true if they intersect, false otherwise
+> +  */
+
+nit: indentation
+
+@@ +424,5 @@
+> +    if (range) {
+> +      // Don't remove the highlighting if the deleted text is at the
+> +      // end of the range
+> +      if (aTextNode != range.endContainer ||
+> +          aOffset != range.endOffset) {
+
+nit: I think this will fit on one line
+
+@@ +428,5 @@
+> +          aOffset != range.endOffset) {
+> +        // Text within the highlight is being removed - the text can
+> +        // no longer be a match, so remove the highlighting
+> +        fSelection.removeRange(range);
+> +        if (fSelection.rangeCount == 0)
+
+please use `===` when checking for 0
+
+@@ +444,5 @@
+> +    if (range) {
+> +      // If the text was inserted before the highlight
+> +      // adjust the highlight's bounds accordingly
+> +      if (aTextNode == range.startContainer &&
+> +                 aOffset == range.startOffset)
+
+please enclose in `{` and `}` when the block doesn't fit on one line
+
+@@ +453,5 @@
+> +        // The edit occurred within the highlight - any addition of text
+> +        // will result in the text no longer being a match,
+> +        // so remove the highlighting
+> +        fSelection.removeRange(range);
+> +        if (fSelection.rangeCount == 0)
+
+please use `===` when checking for 0
+
+@@ +481,5 @@
+> +      shouldDelete[fIndex] = false;
+> +      var fRange = fSelection.getRangeAt(fIndex);
+> +
+> +      for (var index = 0; index < aSelection.rangeCount; index++) {
+> +        if (!shouldDelete[fIndex]) {
+
+perhaps flattening this with
+```js
+if (shouldDelete[fIndex])
+  continue;
+let selRange...
+```
+is nize?
+
+@@ +494,5 @@
+> +    }
+> +
+> +    // OK, so now we know what matches (if any) are in the selection
+> +    // that is being deleted. Time to remove them.
+> +    if (numberOfDeletedSelections == 0)
+
+please use `===` when checking for 0
+
+@@ +500,5 @@
+> +
+> +    for (var i = numberOfMatches - 1; i >= 0; i--) {
+> +      if (shouldDelete[i]) {
+> +        var r = fSelection.getRangeAt(i);
+> +        fSelection.removeRange(r);
+
+Hmm, I think these two statements can be collapsed into one.
+
+@@ +505,5 @@
+> +      }
+> +    }
+> +
+> +    // Remove listeners if no more highlights left
+> +    if (fSelection.rangeCount == 0)
+
+please use `===` when checking for 0
+
+@@ +553,5 @@
+> +    this._unhookListenersAtIndex(idx);
+> +  },
+> +
+> +  /*
+> +  * Creates a unique document state listener for an editor.
+
+nit: indentation
+
+@@ +583,5 @@
+> +      notifyDocumentStateChanged: function(aDirty) {}
+> +    });
+> +  }
+> +
+> +}
+
+Missing semicolon.
+
+nit: no newline at the end of file
+Comment on attachment 796730
+Findbar refcatoring.
+
+Hmm, since you already received the feedback-badge from Felipe, I'm going to have to stick with r-, I'm afraid!
+(In reply to Mike de Boer [:mikedeboer] from comment #16)
+> please use `===` when checking for 0
+
+Why?
+(In reply to Dão Gottwald [:dao] from comment #18)
+> > please use `===` when checking for 0
+> Why?
+
+Good question :) It's more of a thing etched into my memory - http://stackoverflow.com/questions/359494/does-it-matter-which-equals-operator-vs-i-use-in-javascript-comparisons?answertab=votes#359509
+
+But it's mainly general advice. Since we know what we're doing here, it's not absolutely necessary. Please ignore it if you want.
+(In reply to Mike de Boer [:mikedeboer] from comment #16)
+> Comment on attachment 796730
+> Findbar refcatoring.
+> 
+> Review of attachment 796730:
+> -----------------------------------------------------------------
+> 
+> Tom, this looks very exciting! Since you're refactoring this piece of the
+> toolkit anyway, I'd like to see if we can push it just a wee bit further.
+> 
+> Granting f+ because this is definitely almost there. It also makes adding
+> features in the near future a lot easier!
+> 
+> Also, I just did a code-pass... I did not apply the patch locally. I will do
+> that later today and check out the various pieces of functionality.
+> 
+Thank you very much for looking at this after one day!
+> ::: toolkit/components/typeaheadfind/nsTypeAheadFind.cpp
+> @@ +923,5 @@
+> >      nsCOMPtr<nsIDocShell> ds (do_QueryReferent(mDocShell));
+> >      NS_ENSURE_TRUE(ds, NS_ERROR_FAILURE);
+> >  
+> >      presShell = ds->GetPresShell();
+> > +    NS_ENSURE_TRUE(presShell, NS_ERROR_FAILURE);
+> 
+> Out of curiosity, what's your intent for this assertion?
+> 
+Oh this is a left over from a previous version, but still good to have. When you try to use .find after the document is already destroyed we would crash.
+> ::: toolkit/content/widgets/findbar.xml
+> @@ +376,5 @@
+> >              for (var x = this._editors.length - 1; x >= 0; --x)
+> >                this._unhookListenersAtIndex(x);
+> >            }
+> >  
+> > +          //this.browser = null;
+> 
+> please remove this line if it's not used anymore.
+> 
+I am actually not terrible sure about the new browser/result listener stuff, could you please have a careful look at that?
+> @@ +663,5 @@
+> >            // changed by a mouse event which is dispatched by a scroll event.
+> >            // Thus we should change it only after the mouse event is dispatched.
+> > +          if (this._findMode != this.FIND_NORMAL) {
+> > +            setTimeout(() => {
+> > +                this._xulBrowserWindow.setOverLink(aFoundURL || "", null);
+> 
+> could you explain a little bit here what this does? Also, does the comment
+> above still apply re. updating the status bar text?
+> 
+I am not sure if the timeout is still necessary, I will test this. To what this does, the idea is when you search for a link, you also want to see the full url. So when you are in link search mode and we found a link we would show the url in a tooltip at the bottom left.
+> @@ +717,5 @@
+> >            if (aEvent.ctrlKey || aEvent.altKey || aEvent.metaKey ||
+> >                aEvent.defaultPrevented)
+> >              return false;
+> >  
+> > +          // This still uses CPOWs, but this is okay for now.
+> 
+> I don't know what CPOWs are (yet)... I'm afraid that might be forgotten in
+> the future. Could you explain that in this comment?
+> 
+Actually this comment is just wrong, there are no CPOWs involved. CPOWs have been document in various places like https://developer.mozilla.org/en-US/docs/Cross_Process_Object_Wrappers.
+> @@ +1117,5 @@
+> >            this.open(aMode);
+> >  
+> >            if (this._flashFindBar) {
+> >              this._flashFindBarTimeout =
+> > +              setInterval(() => this._flash(), 500, this);
+> 
+> `this` can be removed
+> 
+> @@ +1158,5 @@
+> >          -->
+> >        <method name="onFindAgainCommand">
+> >          <parameter name="aFindPrevious"/>
+> >          <body><![CDATA[
+> > +          var findString = this._browser.finder.searchString || this._findField.value;
+> 
+> Since you're refactoring things, could you make sure to use modern JS
+> throughout this file? Like, use `let` everywhere, for example.
+> 
+Sure.
+> Already <3 the use of fat-arrow functions everywhere. Did you replace all
+> occurrences using bind() or setTimeout argument-passing?
+> 
+I didn't really search for them, just did it in various places where I had to change some code anyway. But I can make sure to fix this properly.
+> @@ +1188,5 @@
+> > +        - This handles all the result changes for both
+> > +        - type-ahead-find and highlighting.
+> > +        - @param aResult
+> > +        -   One of the nsITypeAheadFind.FIND_* constants
+> > +        -   indicating the result of a search operation.
+> 
+> I think it makes sense to document all params, innit?
+Sorry, this is indeed important to fix. The comment was written before I added more parameters.
+> ::: toolkit/modules/Finder.jsm
+> @@ +1,1 @@
+> > +// -*- Mode: javascript; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+> 
+> why tab-width 8? Maybe it's just best to remove this editor hint.
+> 
+Copy-pasted that.
+> @@ +6,5 @@
+> > +this.EXPORTED_SYMBOLS = ["Finder"];
+> > +
+> > +const Ci = Components.interfaces;
+> > +const Cc = Components.classes;
+> > +const Cu = Components.utils;
+> 
+> I'm a fan of
+> ```js
+> const {Ci: interfaces, Cc: classes, Cu: utils} = Components;
+> ```
+> 
+> Your pick!
+> 
+> @@ +12,5 @@
+> > +Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> > +const Services = Cu.import("resource://gre/modules/Services.jsm").Services;
+> > +
+> > +function Finder(docShell) {
+> > +    this._fastFind = Cc["@mozilla.org/typeaheadfind;1"].createInstance(Ci.nsITypeAheadFind);
+> 
+> nit: 4-space indentation
+> 
+> @@ +25,5 @@
+> > +}
+> > +
+> > +Finder.prototype = {
+> > +  addResultListener: function (aListener) {
+> > +    this._listeners.push(aListener);
+> 
+> perhaps add a duplicate check?
+> ```js
+> if (this._listeners.indexOf(aListener) == -1)
+>   this._listeners.push(aListener);
+> ```
+> 
+> @@ +29,5 @@
+> > +    this._listeners.push(aListener);
+> > +  },
+> > +
+> > +  removeResultListener: function (aListener) {
+> > +    this._listeners = this._listeners.filter(function (l) l != aListener);
+> 
+> this might 'look' better as
+> ```js
+> this._listeners = this._listeners.filter(l => l != aListener);
+> ```
+> or
+> ```js
+> let idx = this._listeners.indexOf(aListener);
+> if (idx == -1)
+>   return;
+> this._listeners.splice(idx, 1);
+> ```
+> 
+> I don't feel strongly about either, just throwing it up there!
+> 
+> @@ +51,5 @@
+> > +
+> > +      linkURL = this._textToSubURIService.unEscapeURIForUI(docCharset, foundLink.href);
+> > +    }
+> > +
+> > +    for (var l of this._listeners) {
+> 
+> no 'let'?
+> 
+> @@ +102,5 @@
+> > +  focusContent: function() {
+> > +    let fastFind = this._fastFind;
+> > +
+> > +    try {
+> > +        // Try to find the best possible match that should recieve focus.
+> 
+> nit: 4-space indent
+> 
+> @@ +112,5 @@
+> > +        } else {
+> > +          this._getWindow().focus()
+> > +        }
+> > +    } catch (e) {}
+> > +
+> 
+> nit: I think you can remove this newline
+> 
+> @@ +119,5 @@
+> > +  keyPress: function (aEvent) {
+> > +    let controller = this._getSelectionController(this._getWindow());
+> > +
+> > +    switch (aEvent.keyCode) {
+> > +    case Ci.nsIDOMKeyEvent.DOM_VK_RETURN:
+> 
+> nit: please indent the 'case' statements one level deeper than 'switch'
+> 
+> @@ +179,5 @@
+> > +    this._previousLink = foundLink;
+> > +  },
+> > +
+> > +  _highlight: function (aHighlight, aWord, aWindow) {
+> > +    var win = aWindow || this._getWindow();
+> 
+> no 'let'? Please check this throughout this file.
+> 
+> @@ +201,5 @@
+> > +               doc.body : doc.documentElement;
+> > +
+> > +    if (aHighlight) {
+> > +      var searchRange = doc.createRange();
+> > +       searchRange.selectNodeContents(body);
+> 
+> nit: accidental indentation
+> 
+> @@ +211,5 @@
+> > +      endPt.collapse(false);
+> > +
+> > +      var retRange = null;
+> > +      var finder = Cc["@mozilla.org/embedcomp/rangefind;1"]
+> > +                             .createInstance()
+> 
+> nit: indentation/ alignment issue
+> 
+> @@ +299,5 @@
+> > +  _getEditableNode: function (aNode) {
+> > +    while (aNode) {
+> > +      if (aNode instanceof Components.interfaces.nsIDOMNSEditableElement) {
+> > +        return aNode.editor ? aNode : null;
+> > +      }
+> 
+> nit: no braces strictly necessary
+> 
+> @@ +318,5 @@
+> > +    this._editors[aIndex]
+> > +        .removeDocumentStateListener(this._stateListeners[aIndex]);
+> > +    this._editors.splice(aIndex, 1);
+> > +    this._stateListeners.splice(aIndex, 1);
+> > +    if (this._editors.length == 0) {
+> 
+> I think !this._editors.length would suffice here.
+> 
+> @@ +335,5 @@
+> > +    // aEditor is an editor that we listen to, so therefore must be
+> > +    // cached. Find the index of this editor
+> > +    var idx = 0;
+> > +    while (this._editors[idx] != aEditor)
+> > +      idx++;
+> 
+> why not turn this into
+> ```js
+> let idx = this._editors.indexOf(aEditor);
+> if (idx == -1)
+>   return;
+> ```
+> 
+> This code might accidentally remove listeners for editor 0, while that is
+> not in fact the subject editor.
+> 
+> @@ +358,5 @@
+> > +   *
+> > +   * @param aSelectionRange the range from the selection to check
+> > +   * @param aFindRange the highlighted range to check against
+> > +   * @returns true if they intersect, false otherwise
+> > +  */
+> 
+> nit: indentation
+> 
+> @@ +424,5 @@
+> > +    if (range) {
+> > +      // Don't remove the highlighting if the deleted text is at the
+> > +      // end of the range
+> > +      if (aTextNode != range.endContainer ||
+> > +          aOffset != range.endOffset) {
+> 
+> nit: I think this will fit on one line
+> 
+> @@ +428,5 @@
+> > +          aOffset != range.endOffset) {
+> > +        // Text within the highlight is being removed - the text can
+> > +        // no longer be a match, so remove the highlighting
+> > +        fSelection.removeRange(range);
+> > +        if (fSelection.rangeCount == 0)
+> 
+> please use `===` when checking for 0
+> 
+> @@ +444,5 @@
+> > +    if (range) {
+> > +      // If the text was inserted before the highlight
+> > +      // adjust the highlight's bounds accordingly
+> > +      if (aTextNode == range.startContainer &&
+> > +                 aOffset == range.startOffset)
+> 
+> please enclose in `{` and `}` when the block doesn't fit on one line
+> 
+> @@ +453,5 @@
+> > +        // The edit occurred within the highlight - any addition of text
+> > +        // will result in the text no longer being a match,
+> > +        // so remove the highlighting
+> > +        fSelection.removeRange(range);
+> > +        if (fSelection.rangeCount == 0)
+> 
+> please use `===` when checking for 0
+> 
+> @@ +481,5 @@
+> > +      shouldDelete[fIndex] = false;
+> > +      var fRange = fSelection.getRangeAt(fIndex);
+> > +
+> > +      for (var index = 0; index < aSelection.rangeCount; index++) {
+> > +        if (!shouldDelete[fIndex]) {
+> 
+> perhaps flattening this with
+> ```js
+> if (shouldDelete[fIndex])
+>   continue;
+> let selRange...
+> ```
+> is nize?
+> 
+> @@ +494,5 @@
+> > +    }
+> > +
+> > +    // OK, so now we know what matches (if any) are in the selection
+> > +    // that is being deleted. Time to remove them.
+> > +    if (numberOfDeletedSelections == 0)
+> 
+> please use `===` when checking for 0
+> 
+> @@ +500,5 @@
+> > +
+> > +    for (var i = numberOfMatches - 1; i >= 0; i--) {
+> > +      if (shouldDelete[i]) {
+> > +        var r = fSelection.getRangeAt(i);
+> > +        fSelection.removeRange(r);
+> 
+> Hmm, I think these two statements can be collapsed into one.
+> 
+> @@ +505,5 @@
+> > +      }
+> > +    }
+> > +
+> > +    // Remove listeners if no more highlights left
+> > +    if (fSelection.rangeCount == 0)
+> 
+> please use `===` when checking for 0
+> 
+> @@ +553,5 @@
+> > +    this._unhookListenersAtIndex(idx);
+> > +  },
+> > +
+> > +  /*
+> > +  * Creates a unique document state listener for an editor.
+> 
+> nit: indentation
+> 
+> @@ +583,5 @@
+> > +      notifyDocumentStateChanged: function(aDirty) {}
+> > +    });
+> > +  }
+> > +
+> > +}
+> 
+> Missing semicolon.
+> 
+> nit: no newline at the end of file
+Thanks for the rest, I will fix them. (Just note that some of them are copy pasted)
+Comment on attachment 796730
+Findbar refcatoring.
+
+Review of attachment 796730:
+-----------------------------------------------------------------
+
+::: toolkit/content/widgets/browser.xml
+@@ +315,3 @@
+>  
+> +              let Finder = Components.utils.import("resource://gre/modules/Finder.jsm", {}).Finder;
+> +              this._finder = new Finder(this.docShell);
+
+let's help the cycle collector and set this to null in the destroy() function
+Created attachment 797557
+findbar refactoring v2
+
+This passes almost every tests, but one little test case. For some reason when we drag a tab to make it a new window, that window doesn't inherit the findbar value. I am not sure how to fix this.
+
+The biggest addition in this patch is saner handling of search strings and the highlight state that gets cached per tab. Basically I know store both in browser. The old way of requesting them from fastFind is not really valid anymore.
+(In reply to Tom Schuster [:evilpie] from comment #22)
+> Created attachment 797557
+> findbar refactoring v2
+> 
+> This passes almost every tests, but one little test case. For some reason
+> when we drag a tab to make it a new window, that window doesn't inherit the
+> findbar value. I am not sure how to fix this.
+
+fyi, this is the code that is called when detaching a tab to create a new window, and is supposed to move the findbar data:
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/tabbrowser.xml#2165
+Comment on attachment 797557
+findbar refactoring v2
+
+felipe told me how to fix the test issue. I will create a new patch tomorrow.
+Yaay, almost got it, for some reason the subtest added by Bug 891638 now fails. But for some reason manually testing this, I can verify that the highlight state persists. :/ I will just attach my patch and maybe we can figure out what is going wrong with that test together. I hope to get something landed here otherwise I am just working against every little change.
+Created attachment 798916
+findbar refactoring v3
+Comment on attachment 798916
+findbar refactoring v3
+
+>--- a/browser/base/content/tabbrowser.xml
+>+++ b/browser/base/content/tabbrowser.xml
+>@@ -1020,16 +1020,22 @@
+>               this.selectedTab.lastAccessed = Date.now();
+> 
+>               let oldFindBar = oldTab._findBar;
+>               if (oldFindBar &&
+>                   oldFindBar.findMode == oldFindBar.FIND_NORMAL &&
+>                   !oldFindBar.hidden)
+>                 this._lastFindValue = oldFindBar._findField.value;
+> 
+>+              if (gFindBarInitialized) {
+>+                this.mCurrentBrowser.finder.addResultListener(gFindBar);
+>+                oldBrowser.finder.removeResultListener(gFindBar);
+>+                gFindBar.browser = newBrowser;
+>+              }
+
+Why do we need to call addResultListener/removeResultListener and set gFindBar.browser when switching tabs? gFindBar should already be tab-specific as of bug 537013; each findbar's 'browser' should never change.
+
+>-            // Handle findbar data (if any)
+>+
+>             let otherFindBar = aOtherTab._findBar;
+>+            let value, hidden = true;
+>             if (otherFindBar &&
+>                 otherFindBar.findMode == otherFindBar.FIND_NORMAL) {
+>-              let ourFindBar = this.getFindBar(aOurTab);
+>-              ourFindBar._findField.value = otherFindBar._findField.value;
+>-              if (!otherFindBar.hidden)
+>-                ourFindBar.onFindCommand();
+>+              value = otherFindBar._findField.value;
+>+              hidden = otherFindBar.hidden;
+>             }
+> 
+>             // Finish tearing down the tab that's going away.
+>             remoteBrowser._endRemoveTab(aOtherTab);
+> 
+>             if (isBusy)
+>               this.setTabTitleLoading(aOurTab);
+>             else
+>               this.setTabTitle(aOurTab);
+> 
+>             // If the tab was already selected (this happpens in the scenario
+>             // of replaceTabWithWindow), notify onLocationChange, etc.
+>             if (aOurTab.selected)
+>               this.updateCurrentBrowser(true);
+>+
+>+            // Handle findbar data (if any)
+>+            let ourFindBar = this.getFindBar(aOurTab);
+>+            if (value) {
+>+              ourFindBar._findField.value = value;
+>+            }
+>+            if (!hidden) {
+>+              // Disable prefil based on selection, so that we use the
+>+              // old search string.
+>+              let old = ourFindBar.prefillWithSelection;
+>+              ourFindBar.prefillWithSelection = false;
+>+              ourFindBar.onFindCommand();
+>+              ourFindBar.prefillWithSelection = old;
+>+            }
+
+Why did this code need to move?
+
+Why did you have to add the prefillWithSelection stuff when it wasn't necessary before? Is this due to a behavior change of the findbar binding?
+Created attachment 799093
+findbar v3.1
+
+Dao, thank you very much! I don't even remember why I made these changes, turns out they cause the known test failure. I am so happy right now :) (Still running through try, hopefully no other issues creep up)
+Comment on attachment 799093
+findbar v3.1
+
+Ups, that's not the clean version...
+Created attachment 799212
+findbar v3.2
+Created attachment 799219
+findbar v3.2
+
+https://tbpl.mozilla.org/?tree=Try&rev=5cd03a271fa3 Try run is looking good, the one "is-checked" test stil fails locally, but whatever.
+Tom, I don't see a try run that looks good :P Most (if not all) of the findbar tests are in bc and that block failed in the try run you posted. In the log I do see a bunch of findbar test passes, but are you sure that's all of them?
+I tried reproducing browser_405664.js before and was unsuccessful, the rest seems to be unrelated?
+I think browser/base/content/test/browser_zbug569342.js might not close the last tab with the findbar, which could cause the other test to fail.
+I have so far been unlucky in finding out what causes the actual problem, and having to run the whole mochitest-chrome suit every time makes this a very slow process.
+Created attachment 803914
+findbar v3.3
+
+Success fixed the test to always close the findbar:
+https://tbpl.mozilla.org/?tree=Try&rev=0db2c9d11b54
+Comment on attachment 803914
+findbar v3.3
+
+Review of attachment 803914:
+-----------------------------------------------------------------
+
+r=me with last small nits addressed.
+
+::: browser/base/content/test/browser_bug537013.js
+@@ +21,5 @@
+>    gFindBar.open();
+>    gFindBar._findField.select();
+>    EventUtils.sendString(aString);
+>    is(gFindBar._findField.value, aString, "Set the field correctly!");
+> +
+
+nit: superfluous newline
+
+::: browser/base/content/test/browser_zbug569342.js
+@@ +44,5 @@
+> +    testFindEnabled("about:blank", function () {
+> +      EventUtils.synthesizeKey("VK_ESCAPE", { });
+> +      ok(gFindBar.hidden, "Find bar should now be hidden");
+> +      finish();
+> +    });
+
+Glad you found+fixed this! ;)
+
+::: toolkit/content/widgets/browser.xml
+@@ +298,5 @@
+>  
+> +      <field name="_finder">null</field>
+> +
+> +      <property name="finder"
+> +                readonly="true">
+
+nit: please put this on one line.
+
+@@ +315,3 @@
+>        <field name="_fastFind">null</field>
+>        <property name="fastFind"
+> +                 readonly="true">
+
+nit: align with `name` attribute. You know what, let's put this on one line.
+
+@@ +323,5 @@
+>              var tabBrowser = this.getTabBrowser();
+>              if (tabBrowser && "fastFind" in tabBrowser)
+>                return this._fastFind = tabBrowser.fastFind;
+>  
+> +
+
+nit: superfluous newline
+
+::: toolkit/modules/Finder.jsm
+@@ +41,5 @@
+> +    let foundLink = this._fastFind.foundLink;
+> +    let linkURL = null;
+> +    if (aLinksOnly && foundLink) {
+> +      let docCharset = null;
+> +      let ownerDoc =  foundLink.ownerDocument;
+
+nit: one space too many
+
+@@ +108,5 @@
+> +      } else {
+> +        this._getWindow().focus()
+> +      }
+> +    } catch (e) {}
+> +
+
+nit: superfluous newline
+
+@@ +158,5 @@
+> +    }
+> +
+> +    this._drewOutline = (foundLink && aLinksOnly);
+> +    if (this._drewOutline) {
+> +      // backup original outline
+
+nit: missing uppercase 'Backup'
+
+@@ +162,5 @@
+> +      // backup original outline
+> +      this._tmpOutline = foundLink.style.outline;
+> +      this._tmpOutlineOffset = foundLink.style.outlineOffset;
+> +
+> +      // draw pseudo focus rect
+
+nit: missing uppercase 'Draw'
+
+@@ +208,5 @@
+> +
+> +      let retRange = null;
+> +      let finder = Cc["@mozilla.org/embedcomp/rangefind;1"]
+> +                             .createInstance()
+> +                             .QueryInterface(Ci.nsIFind);
+
+nit: please align with `Cc[`
+
+@@ +438,5 @@
+> +    if (range) {
+> +      // If the text was inserted before the highlight
+> +      // adjust the highlight's bounds accordingly
+> +      if (aTextNode == range.startContainer &&
+> +                 aOffset == range.startOffset) {
+
+nit: please align this with `aTextNode`
+
+@@ +442,5 @@
+> +                 aOffset == range.startOffset) {
+> +        range.setStart(range.startContainer,
+> +                       range.startOffset+aString.length);
+> +      } else if (aTextNode != range.endContainer ||
+> +               aOffset != range.endOffset) {
+
+nit: please align with `aTextNode`
+Comment on attachment 803914
+findbar v3.3
+
+>           if (!this._fastFind) {
+>             if (!("@mozilla.org/typeaheadfind;1" in Components.classes))
+>               return null;
+> 
+>             var tabBrowser = this.getTabBrowser();
+>             if (tabBrowser && "fastFind" in tabBrowser)
+>               return this._fastFind = tabBrowser.fastFind;
+> 
+>-            if (!this.docShell)
+>-              return null;
+>+
+>+             if (!this.docShell)
+>+               return null;
+
+This was indented correctly, now it isn't...
+
+>           return this._fastFind;
+>-        ]]>
+>-        </getter>
+>-      </property>
+>+        ]]></getter>
+>+       </property>
+
+Same for </property> here.
+Created attachment 804067
+RemoteFinder
+
+Thanks to the refactoring I did in the previous patch, this is basically just a Proxy forwarding calls and messages between content/chrome. :)
+https://hg.mozilla.org/integration/mozilla-inbound/rev/3734bebc9bfb
+Landed, hope it sticks :)
+Sorry for the super weak commit message, I was on a call and not paying the right attention.
+Created attachment 804498
+findbar v3.3 nit fixed
+
+Backed out the previous commit, here is the patch with the nits fixed.
+http://hg.mozilla.org/integration/mozilla-inbound/rev/32b0c06568e9
+Comment on attachment 804498
+findbar v3.3 nit fixed
+
+Carrying over r=mikedeboer
+Relanded
+http://hg.mozilla.org/integration/mozilla-inbound/rev/295578d99074
+Comment on attachment 804067
+RemoteFinder
+
+Review of attachment 804067:
+-----------------------------------------------------------------
+
+Nice, very simple patch!
+
+But there's something that we should change.  Remember that content.js runs in every tab by currently released code, even with e10s off.  So this means that there's a lot of code being parsed/run that will be unused most of the time.  Ideally, even in the non-e10s case, these messages added in content.js would be used, instead of having two separate code paths.  But if that's not possible, then most of that code should go to browser-child.js.
+
+In any case, most of those message listeners and the FinderListener obj shouldn't exist from the get go. Only one start message should be listened by default (that the "finder" getter would fire), and that would trigger importing the .jsm and adding the other listeners.
+
+To avoid having to create another jsm, you can add the FinderListener object into the Finder or RemoteFinder jsm, whatever makes the most sense.
+
+::: browser/base/content/content.js
+@@ +197,5 @@
+> +                                      });
+> +  },
+> +
+> +  receiveMessage: function (aMessage) {
+> +    let json = aMessage.json;
+
+let data = aMessage.data;
+
+::: toolkit/modules/RemoteFinder.jsm
+@@ +43,5 @@
+> +  },
+> +
+> +  set caseSensitive(aSensitive) {
+> +    this._browser.messageManager.sendAsyncMessage("Finder:CaseSensitive",
+> +        {caseSensitive: aSensitive});
+
+nit: indentation is inconsistent throughout this file, there are places with 4-spaces indent..  And here and other instances below, align the params below each other, like:
+
+>  this._browser.messageManager.sendAsyncMessage("Finder:CaseSensitive",
+>                                                {caseSensitive: aSensitive});
+https://hg.mozilla.org/mozilla-central/rev/295578d99074
+Created attachment 804750
+RemoteFinder v2
+Thank you both! http://hg.mozilla.org/integration/mozilla-inbound/rev/f2f92034bfb2
+https://hg.mozilla.org/mozilla-central/rev/f2f92034bfb2
+I noticed you left method "_getEditableNode()" in the find bar element while also porting it to the Finder.jsm module. Was this an overlook or is it needed there by something else?
+Created attachment 832373
+Minor followup: remove dead code from findbar.xml
+
+Not worth spawning a new bug for this. Spotted a fragment of code in findbar.xml which has moved to Finder, but not been deleted from the original location. (It is harmless though: the if predicate never holds).
+Comment on attachment 832373
+Minor followup: remove dead code from findbar.xml
+
+Bugs don't cost a thing. Filed as bug 938717.

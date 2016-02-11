@@ -1,0 +1,200 @@
+See bug 932867 for more context.
+
+(In reply to Shane Caraveo (:mixedpuppy) from comment #19)
+> using v3...
+> 
+> the final leaks are:
+> 
+> browser_share.js
+> - it doesn't remove the iframe for share at shutdown
+> - sidebar unloading sets the sidebar frame to about:blank
+> 
+> browser_social_window.js
+> - sidebar unloading sets the sidebar frame to about:blank
+> 
+> The sidebar is not a dynamically added frame, and hasn't been since it was
+> added in fx17.  I feel like that is a false positive.
+> 
+> We could remove the share frame when the window is closed.
+
+See bug 932867 for more context.
+
+(In reply to Shane Caraveo (:mixedpuppy) from comment #19)
+> using v3...
+> 
+> the final leaks are:
+> 
+> browser_share.js
+> - it doesn't remove the iframe for share at shutdown
+> - sidebar unloading sets the sidebar frame to about:blank
+> 
+> browser_social_window.js
+> - sidebar unloading sets the sidebar frame to about:blank
+> 
+> The sidebar is not a dynamically added frame, and hasn't been since it was
+> added in fx17.  I feel like that is a false positive.
+> 
+> We could remove the share frame when the window is closed.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #17)
+> (In reply to Tim Taubert [:ttaubert] from comment #16)
+> > With the pushed patch applied and the new/old leak detection from bug 932898
+> > there still are a few leaks left:
+> > 
+> > http://pastebin.mozilla.org/3388446
+> > 
+> > browser_blocklist.js doesn't actually leak, that's the
+> > BrowserNewTabPreloader. browser_share.js also doesn't look like a leak
+> > because browser-social.js doesn't destroy the iframe when the share thingy
+> > becomes hidden. It looks like there's some code to create the iframe lazily
+> > so I wonder if it's maybe better to actually remove it on hide?
+> 
+> Other than browser_share.js and browser_social_window.js, the tests are
+> leaking because they are setting a pref that causes Frameworker to set
+> remote=true.  If I remove that specific code in Frameworker.jsm, the tests
+> no longer leak.  Odd thing is, some other tests that are not leaking also
+> set this pref.  Still investigating but maybe markh will have some thoughts
+> on this.
+Not a blocker at this point imo.
+Created attachment 825655
+browser_share.js
+
+Untested with the new leak analyzer (i'll test in a moment), but this should do the trick for the remaining leak that Shane mentioned.
+
+How should I mark the other two false positives?
+Created attachment 825845
+0004-Bug-933551-Let-SocialUI.init-remove-iframes.patch
+
+I think it's better for the test harness to call SocialUI.uninit() to remove all the iframes it added dynamically and that are intentionally kept alive until shutdown.
+With that last patch applied I still see 22 DOMWindows and 9 DocShells leaked when running browser/base/content/test/social/ mochitests.
+Created attachment 825849
+0004-Bug-933551-Let-SocialUI.init-remove-iframes.patch
+
+We should track whether SocialUI was initialized or not. Otherwise we'll get failures when trying to remove an observer twice.
+Comment on attachment 825849
+0004-Bug-933551-Let-SocialUI.init-remove-iframes.patch
+
+Review of attachment 825849:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser-social.js
+@@ +101,5 @@
+>      Services.prefs.removeObserver("social.sidebar.open", this);
+>      Services.prefs.removeObserver("social.toast-notifications.enabled", this);
+> +
+> +    SocialShare.uninit();
+> +    SocialFlyout.unload();
+
+I think the extra clean-up here is unnecessary work during a normal window shutdown, because these references are all self contained in the window and will go away when it closes. So even though it's less clean I think it's better to have the test harness call these individually instead of adding more work during a normal window close.
+
+Thoughts?
+Sure, that works as well. I just figured out that the test harness should also call SocialSidebar.unloadSidebar() to get rid of another false positive.
+Created attachment 825863
+0004-Bug-933551-Add-SocialShare.uninit-to-unload-iframe.patch
+(In reply to Tim Taubert [:ttaubert] from comment #8)
+> Sure, that works as well. I just figured out that the test harness should
+> also call SocialSidebar.unloadSidebar() to get rid of another false positive.
+
+That did not fix the false positive for me, we still leak about:blank.
+
+I also feel better about avoiding the additional unload stuff.
+
+(In reply to Tim Taubert [:ttaubert] from comment #5)
+> With that last patch applied I still see 22 DOMWindows and 9 DocShells
+> leaked when running browser/base/content/test/social/ mochitests.
+
+Frameworker is still leaking.  I've been playing with that off and on today.  We create an [host] iframe attached to the hidden window, and attach the remote iframe to that.  The remote iframe is removed, but no code actually removes the host iframe.  My attempts to remove the host iframe have only produced errors, which I haven't understood yet.  The background thumbnails does something very similar.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #10)
+> (In reply to Tim Taubert [:ttaubert] from comment #8)
+> > Sure, that works as well. I just figured out that the test harness should
+> > also call SocialSidebar.unloadSidebar() to get rid of another false positive.
+> 
+> That did not fix the false positive for me, we still leak about:blank.
+
+I'm not convinced it is a false positive then. Or we're not cleaning up properly.
+Shane, is that what was fixed in bug 932867?
+(In reply to Tim Taubert [:ttaubert] from comment #11)
+> (In reply to Shane Caraveo (:mixedpuppy) from comment #10)
+> > (In reply to Tim Taubert [:ttaubert] from comment #8)
+> > > Sure, that works as well. I just figured out that the test harness should
+> > > also call SocialSidebar.unloadSidebar() to get rid of another false positive.
+> > 
+> > That did not fix the false positive for me, we still leak about:blank.
+> 
+> I'm not convinced it is a false positive then. Or we're not cleaning up
+> properly.
+
+unloadSidebar simply sets the iframe src to about:blank.  That is what we leak.  To make sure about that, I changed unloadSidebar to set src to "data:text/plain;charset=utf8,sidebar-unload" which makes it very obvious in the output.  We've done this since fx17 and never had any leak issues there (unless the leak testing has been broken that long), thus my reasoning that it could be a false positive.  The sidebar is the only item that doesn't dynamically create its iframe (probably should change that).
+Comment on attachment 825863
+0004-Bug-933551-Add-SocialShare.uninit-to-unload-iframe.patch
+
+Review of attachment 825863:
+-----------------------------------------------------------------
+
+Is the patch missing the addition to browser-test.js to call the unload functions? In any case, r+ for that too
+
+I believe this makes the patch I posted unnecessary, but if it's still needed feel free to review it too
+(In reply to :Felipe Gomes from comment #12)
+> Shane, is that what was fixed in bug 932867?
+
+bug 932867 did not entirely fix the leaks there, or we're getting false positives.  If I comment out the line in Frameworker.jsm that sets remote=true, I get no leaks (other than sidebar and share).  Once I allow remote=true to be used, I get leaks (e.g. running only browser_social_marks.js):
+
+0:58.59 TEST-UNEXPECTED-FAIL | ShutdownLeaks | leaked 6 DOMWindow(s) and 5 DocShell(s) until shutdown
+ 0:58.59 TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_marks.js | leaked 2 window(s) until shutdown [url = about:blank]
+ 0:58.59 TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_marks.js | leaked 1 window(s) until shutdown [url = chrome://browser/content/hiddenWindow.xul]
+ 0:58.59 TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_marks.js | leaked 1 window(s) until shutdown [url = chrome://browser/content/browser.xul]
+ 0:58.59 TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_marks.js | leaked 1 window(s) until shutdown [url = data:text/plain;charset=utf8,sidebar-unload]
+ 0:58.59 TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_marks.js | leaked 1 window(s) until shutdown [url = chrome://mochikit/content/browser-harness.xul]
+ 0:58.59 TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_marks.js | leaked 5 docShell(s) until shutdown
+
+I don't know where the two about:blank windows come from, since I explicitly set text for the sidebar.
+
+I started comparing against the background thumbnail code since it is the closest I am aware of to what we're doing.  The only obvious difference is that the thumbnail code removes both the host frame and the remote frame.  I however suspect remote frames are doing something that is not obvious to me.
+(In reply to :Felipe Gomes from comment #14)
+> Is the patch missing the addition to browser-test.js to call the unload
+> functions? In any case, r+ for that too
+
+I'll add those calls in bug 932898 as they will have to be made by the harness.
+https://hg.mozilla.org/integration/fx-team/rev/175650f296fb
+FTR, the background thumbnail tests seem to have a very similar leak pattern:
+
+https://tbpl.mozilla.org/php/getParsedLog.php?id=29988508&tree=Try&full=1#error1
+Oh, wow. That took me a long time to figure out. The test harness is misreporting leaks due to '++/--DOMWINDOW' lines being sent by the remote process. So that means we actually have a lot less leaks, yay.
+With the id collisions fixed the only leaks left are:
+
+TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_window.js | leaked 1 window(s) until shutdown [url = about:blank]
+TEST-UNEXPECTED-FAIL | browser/base/content/test/social/browser_social_workercrash.js | leaked 1 window(s) until shutdown [url = about:blank]
+Both of the remaining leaks are tied to the social sidebar. For some reason the test harness doesn't succeed in overwriting the sidebar's document like we do for the other sidebar. socialSidebarBrowser.remove() works but that's a little harsh.
+https://hg.mozilla.org/mozilla-central/rev/175650f296fb
+(In reply to Tim Taubert [:ttaubert] from comment #19)
+> Oh, wow. That took me a long time to figure out. The test harness is
+> misreporting leaks due to '++/--DOMWINDOW' lines being sent by the remote
+> process. So that means we actually have a lot less leaks, yay.
+
+\o/
+
+(In reply to Tim Taubert [:ttaubert] from comment #21)
+> Both of the remaining leaks are tied to the social sidebar. For some reason
+> the test harness doesn't succeed in overwriting the sidebar's document like
+> we do for the other sidebar. socialSidebarBrowser.remove() works but that's
+> a little harsh.
+
+Yeah it's a bit harsh.. Is it about:blank that remains in the sidebar or a non-blank document loaded by some test? If it's just about:blank I think it's expected behavior that the sidebar will contain about:blank until the end of the test run. How does the harness not complain about the last blank tab at the end? 
+
+But if we can reland the leak detection soon I think it's fine to do sidebar.remove() to land it and continue investigating in a new bug
+(In reply to Tim Taubert [:ttaubert] from comment #19)
+> Oh, wow. That took me a long time to figure out. The test harness is
+> misreporting leaks due to '++/--DOMWINDOW' lines being sent by the remote
+> process. So that means we actually have a lot less leaks, yay.
+
+Yeah, I noticed that when I was doing some TBPL log analysis.  The heuristic I used was, if you see a window with a serial number much smaller than the last one you saw, it is probably not a window on the main process.
+Should we add the pid to the start of each DOMWINDOW message?  (Should we add the pid to the start of every line of debugging info?  Time for some generalized logging code...)
+See bug 934091.  My bigger annoyance with multiprocess and logging is when lines from multiple processes get interleaved.
+That can't really be avoided.  So, perhaps need better tools to display messages in a more user friendly way.
+We don't track meta bugs that are this open-ended. For any remaining leaks to be fixed please nominate low risk patches for uplift consideration.
+It looks like the frameworker leaks were false-positives caused by the fact multiple processes were writing to the log, so clearing needinfo.  I'll continue to look at this on (my) Wednesday - Tuesday is a public holiday here so I'm unlikely to get much done tomorrow.
+Ok I'm sure we can close this. I have a green try run of bug 932898. After clearing out the social sidebar a little more thoroughly the leaks are gone.
+
+Just FTR, the social sidebar itself does a good job of cleaning up, but we need to really create a new docShell after all tests have been run to make sure we discard any leftover docShell to eliminate false positives.
+ttaubert, please nominate these for backporting to Aurora and Beta.  Thanks!
+This patch itself doesn't fix any leaks, it just helps the leak detector ignoring false positives. There's really no win in uplifting this other than in combination with the leak detector.
+Ok, thanks!

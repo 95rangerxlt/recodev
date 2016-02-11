@@ -1,0 +1,112 @@
+workers don't have access to document.cookie, but providers need cookie access.  This patch notifies the worker of cookie updates for its domain, and provides a port api for it to fetch its cookies.  This aids the worker in dealing with changes caused in browser tab content (e.g. login/logout)
+
+workers don't have access to document.cookie, but providers need cookie access.  This patch notifies the worker of cookie updates for its domain, and provides a port api for it to fetch its cookies.  This aids the worker in dealing with changes caused in browser tab content (e.g. login/logout)
+Created attachment 642290
+cookie API patch
+Comment on attachment 642290
+cookie API patch
+
+I'd much rather just expose document.cookie, rather than re-implement it using a message (way too easy to get some security aspect wrong and end up leaking information we shouldn't to the provider).
+
+But that alone wouldn't be sufficient, we also need "social.cookie-changed". That is at least a simpler addition. But it still makes me nervous and would require careful security review.
+
+Longer term, I wonder whether a "cookie observer" web-exposed API might be the best solution.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #2)
+> Comment on attachment 642290
+> cookie API patch
+> 
+> I'd much rather just expose document.cookie, rather than re-implement it
+> using a message (way too easy to get some security aspect wrong and end up
+> leaking information we shouldn't to the provider).
+
+Up until now we have managed to only expose functionality found in a real DOM worker to the FrameWorker - everything else is exposed via a message API.  So while we probably could use document.cookie as the implementation, it doesn't make sense (to me) to invent a new attribute/object in the Worker's global for this functionality as we might struggle to mirror that in a real worker.
+
+The only "problem" with using document.worker as the implementation is that it means we need to let the "worker window" (or document) escape from FrameWorker.jsm, and the implementation using cookieMananger.getCookiesFromHost() seems fairly simple and hard to get wrong.  The "cookie changed" code is much more hairy and I agree it would be nice to do that better - but we probably need something like this very soon, so maybe the best step forward is just to ask for an explicit sec-review on this?  Another alternative if cookie-get survives is that the provider starts a timer and polls for cookie changes, but that sounds a little like sucking noises
+(In reply to Mark Hammond (:markh) from comment #3)
+> (In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment
+> #2)
+> > Comment on attachment 642290
+> > cookie API patch
+> > 
+> > I'd much rather just expose document.cookie, rather than re-implement it
+> > using a message (way too easy to get some security aspect wrong and end up
+> > leaking information we shouldn't to the provider).
+> 
+> Up until now we have managed to only expose functionality found in a real
+> DOM worker to the FrameWorker - everything else is exposed via a message
+> API.  
+
+There are a few APIs that we expose that are not part of the W3C worker api; BlobBuilder, FileReader, Blob, and I'm not sure about localstorage.
+FWIW, the initial implementation did just expose document.cookie, and it was usable with polling, but I do think a notification is better than polling.
+localstorage is already in Gecko's worker.  I asked about the others on #content and was told that as they intend exposing WebSocket, the others you mention will also exist.
+Created attachment 642634
+updated patch, no code changes
+Created attachment 643455
+updated patch, no code changes
+Created attachment 645123
+updated patch
+Comment on attachment 645123
+updated patch
+
+We discussed some changes to this in person:
+- use frameworker window to retrieve cookies, rather than getting them directly via nsICookieManager2
+- remove cookie-changed notification for the moment, file a followup to implement with Gecko backend support
+Created attachment 645361
+using document.cookie and fake message
+
+I'm waiting for a build to finish before I run the test, but thought I'd post this for any feedback.
+Created attachment 645398
+using document.cookie and fake message
+Created attachment 645874
+move message handling back to worker code, use document from worker
+Comment on attachment 645874
+move message handling back to worker code, use document from worker
+
+Thanks, this looks a lot cleaner!
+
+>diff --git a/toolkit/components/social/WorkerAPI.jsm b/toolkit/components/social/WorkerAPI.jsm
+
+>+    "social.cookies-get": function(data) {
+
+>+      cookies.forEach(function(aCookie) {
+>+        let [name, value] = aCookie.split("=");
+>+        results.push({name: unescape(name.trim()),
+>+                      value: unescape(value.trim())});
+
+Is unescape() really what we want here? Compared to, say, decodeURIComponent?
+
+>diff --git a/toolkit/components/social/test/browser/browser_workerAPI.js b/toolkit/components/social
+
+>+XPCOMUtils.defineLazyServiceGetter(Services, "cookies",
+>+                                   "@mozilla.org/cookieService;1",
+>+                                   "nsICookieService");
+>+XPCOMUtils.defineLazyServiceGetter(Services, "cookiemgr",
+>+                                   "@mozilla.org/cookiemanager;1",
+>+                                   "nsICookieManager2");
+
+Services.cookies already exists, and seems to be equivalent to the "cookiemgr" you define here. No need to import Services.jsm either, you can just assume it's been imported already for browser chrome tests.
+
+>+XPCOMUtils.defineLazyGetter(this, "Social", function() {
+
+This, and the runSocialTestWithProvider function that depends on it, is a browser-specific, so you can't rely on it from a toolkit test. Is it necessary to make these changes to the test?
+
+>+  testCookies: function(next) {
+>+    let provider = Social.provider;
+>+    //let port = provider.workerAPI._port;
+
+delete this
+
+>+    Services.cookiemgr.remove('https://example.com', '/', 'cheez', false);
+
+Why remove before you've added?
+
+>+    Services.cookies.setCookieStringFromHttp(uri, null, null, "cheez=burger; max-age=1000", null, null);
+
+You should be able to use  Services.cookies.add() for this?
+Created attachment 645906
+updated patch
+Comment on attachment 645906
+updated patch
+
+looks great!
+https://hg.mozilla.org/mozilla-central/rev/677cdab1da6a

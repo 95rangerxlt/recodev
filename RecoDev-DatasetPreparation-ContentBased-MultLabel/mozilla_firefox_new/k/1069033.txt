@@ -1,0 +1,110 @@
+Created attachment 8491154
+0001-Bug-XXXXXXX-Make-devtool-s-TabTarget-be-e10s-friendl.patch
+
+When run in e10s, the browser_target_events test times out, due to it not receiving a 'will-navigate' message.  It turns out this is because the TabWebProgressListener.onStateChange() method fails in the comparison 'if (this.target && this.target.window == progress.DOMWindow) {' - because the .window getter is returning null - because e10s tabs don't have a |contentWindow| property.
+
+Changing this .window getter to be:
+
+  get window() {
+    // Be extra careful here, since this may be called by HS_getHudByWindow
+    // during shutdown.
+    if (this._tab && this._tab.linkedBrowser) {
+      let browser = this._tab.linkedBrowser;
+      return browser.isRemoteBrowser ? browser.contentWindowAsCPOW : browser.contentWindow;
+    }
+    return null;
+  },
+
+allows this test - and most other tests in browser/devtools/framework pass.
+
+To repro:
+
+% ./mach mochitest-devtools --e10s browser/devtools/framework/test/browser_target_events.js
+
+It times out without this patch but passes with it.
+
+Created attachment 8491154
+0001-Bug-XXXXXXX-Make-devtool-s-TabTarget-be-e10s-friendl.patch
+
+When run in e10s, the browser_target_events test times out, due to it not receiving a 'will-navigate' message.  It turns out this is because the TabWebProgressListener.onStateChange() method fails in the comparison 'if (this.target && this.target.window == progress.DOMWindow) {' - because the .window getter is returning null - because e10s tabs don't have a |contentWindow| property.
+
+Changing this .window getter to be:
+
+  get window() {
+    // Be extra careful here, since this may be called by HS_getHudByWindow
+    // during shutdown.
+    if (this._tab && this._tab.linkedBrowser) {
+      let browser = this._tab.linkedBrowser;
+      return browser.isRemoteBrowser ? browser.contentWindowAsCPOW : browser.contentWindow;
+    }
+    return null;
+  },
+
+allows this test - and most other tests in browser/devtools/framework pass.
+
+To repro:
+
+% ./mach mochitest-devtools --e10s browser/devtools/framework/test/browser_target_events.js
+
+It times out without this patch but passes with it.
+Created attachment 8491162
+0001-Bug-XXXXXXX-Make-devtool-s-TabTarget-be-e10s-friendl.patch
+
+Zombie educated me that contentWindowAsCPOW also works for non-remote browsers...
+Comment on attachment 8491162
+0001-Bug-XXXXXXX-Make-devtool-s-TabTarget-be-e10s-friendl.patch
+
+Review of attachment 8491162:
+-----------------------------------------------------------------
+
+I'm fine with that, but if I am not mistaken billm said in another bug that he wanted to avoid introducing CPOWs to devtools code. I might be wrong about that, so asking for feedback for my own education, too.
+There are only 2 .window consumers in target itself - one is involved in making the child-process-tab "remote" and the other is simply comparing it to another window (which is the part this bug needs).  Panos, how viable is it to *drop* the window getter and replace it with non-cpowey things?
+We have an isTopLevel attribute on nsIWebProgress for this purpose:
+http://mxr.mozilla.org/mozilla-central/source/uriloader/base/nsIWebProgress.idl#140
+
+I think we should be able to change |if (this.target && this.target.window == progress.DOMWindow)| to |if (progress.isTopLevel)|.
+
+It would be great to get rid of the .window getter entirely. It's really a foot-gun in e10s. The other use is already semi-broken in e10s, but it's harder to fix. Mark, it would be great if you could add some sort of warning above it at least.
+Created attachment 8492889
+0001-Bug-1069033-Make-devtool-s-TabTarget-be-e10s-friendl.patch
+
+This patch implements Bill's suggestion: it uses |progress.isTopLevel| in the progress listener, and issues a warning in the .message getter.  This warning is fairly dumb:
+
++    // XXX - this is a footgun for e10s - there .contentWindow will be null,
++    // and even though .contentWindowAsCPOW *might* work, it will not work
++    // in all contexts.  Consumers of .window need to be refactored to not
++    // rely on this.
++    if (Services.appinfo.processType != Ci.nsIXULRuntime.PROCESS_TYPE_DEFAULT) {
++      Cu.reportError("The .window getter on devtools' |target| object isn't e10s friendly!\n"
++                     + new Error().stack + "\n");
++    }
+
+ie, it uses Cu.reportError, but is only issued when e10s is enabled - I'm worried about console spew otherwise.  Another possibility was to keep a boolean and only issue the warning once, but that seems overkill.
+Comment on attachment 8492889
+0001-Bug-1069033-Make-devtool-s-TabTarget-be-e10s-friendl.patch
+
+Review of attachment 8492889:
+-----------------------------------------------------------------
+
+I don't mind replacing the .window getter with something else, but I don't know off the top of my head what that would entail. A quick search for target.window in browser/devtools shows only a few uses in the console and in various test headers. Aren't we likely to be hitting these paths in some of the devtools tests that are already failing in e10s? If so, that warning won't be long-lived.
+
+::: browser/devtools/framework/target.js
+@@ +225,5 @@
+> +    // in all contexts.  Consumers of .window need to be refactored to not
+> +    // rely on this.
+> +    if (Services.appinfo.processType != Ci.nsIXULRuntime.PROCESS_TYPE_DEFAULT) {
+> +      Cu.reportError("The .window getter on devtools' |target| object isn't e10s friendly!\n"
+> +                     + new Error().stack + "\n");
+
+Nit: in case you care about that sort of thing, "Error().stack" is even shorter. Also, I think Error().stack always ends with a newline, so you could omit the extra one.
+Thanks!
+
+https://hg.mozilla.org/integration/fx-team/rev/8a37303c15ca
+https://hg.mozilla.org/mozilla-central/rev/8a37303c15ca
+
+
+TabTarget doesn't return a window in e10s
+
+
+
+Bug 1069033 - Make devtool's TabTarget be e10s friendly. r=past 

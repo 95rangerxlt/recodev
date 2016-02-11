@@ -1,0 +1,267 @@
+Created attachment 8523668
+0009-Bug-XXXXXXX-prevent-SessionStore-from-clobbering-the.patch
+
+STR:
+
+* Open about:accounts and some other tab.  Leave the other tab selected and restart the browser.
+* From a "browser" scratchpad execute:
+  Services.wm.getMostRecentWindow("navigator:browser").switchToTabHavingURI("about:accounts?b=c", true, {ignoreFragment: true, replaceQueryString: true});
+
+(Note you can use any other URLs you like, so long as different query strings or fragments are used)
+
+The browser switches to the background tab, but keeps about:accounts loaded - the requested URL isn't loaded.
+
+The problem is that switchToTabHavingURI calls loadURI *before* the session restore attempts to restore the tab contents.  This also explains part of bug 1025719 - it uses the same function.
+
+This is a problem for Sync, which uses this function to open various about:accounts variations, causing the user to see the an unexpected page that doesn't let them do what they expect (eg, they click a button to "reauthenticate", but a page opens that doesn't actually allow them to reauth)
+
+To prove this is actually the case, the attached patch fixes the above repro.  It:
+
+* Changes browser.js to call loadURI before selecting the tab to be current.
+* Changes tabbrowser.xml so that loadURIWithFlags() calls SessionStore.resetLocalTabRestoringState with the tab so SessionStore no longer attempts to restore state for the tab.
+* Makes SessionStore.resetLocalTabRestoringState() a global, delegating to the existing internal _resetLocalTabRestoringState() function.
+
+SessionStore.resetLocalTabRestoringState probably isn't a great public name (maybe resetTabState is better?) or there might be another way to approach this.
+
+Requesting feedback from Paolo and Tim as I'm not sure who has the bandwidth to look into this.
+
+Created attachment 8523668
+0009-Bug-XXXXXXX-prevent-SessionStore-from-clobbering-the.patch
+
+STR:
+
+* Open about:accounts and some other tab.  Leave the other tab selected and restart the browser.
+* From a "browser" scratchpad execute:
+  Services.wm.getMostRecentWindow("navigator:browser").switchToTabHavingURI("about:accounts?b=c", true, {ignoreFragment: true, replaceQueryString: true});
+
+(Note you can use any other URLs you like, so long as different query strings or fragments are used)
+
+The browser switches to the background tab, but keeps about:accounts loaded - the requested URL isn't loaded.
+
+The problem is that switchToTabHavingURI calls loadURI *before* the session restore attempts to restore the tab contents.  This also explains part of bug 1025719 - it uses the same function.
+
+This is a problem for Sync, which uses this function to open various about:accounts variations, causing the user to see the an unexpected page that doesn't let them do what they expect (eg, they click a button to "reauthenticate", but a page opens that doesn't actually allow them to reauth)
+
+To prove this is actually the case, the attached patch fixes the above repro.  It:
+
+* Changes browser.js to call loadURI before selecting the tab to be current.
+* Changes tabbrowser.xml so that loadURIWithFlags() calls SessionStore.resetLocalTabRestoringState with the tab so SessionStore no longer attempts to restore state for the tab.
+* Makes SessionStore.resetLocalTabRestoringState() a global, delegating to the existing internal _resetLocalTabRestoringState() function.
+
+SessionStore.resetLocalTabRestoringState probably isn't a great public name (maybe resetTabState is better?) or there might be another way to approach this.
+
+Requesting feedback from Paolo and Tim as I'm not sure who has the bandwidth to look into this.
+Comment on attachment 8523668
+0009-Bug-XXXXXXX-prevent-SessionStore-from-clobbering-the.patch
+
+Unfortunately this area of the code is unfamiliar to me. Tim or David would probably understand the change with much less effort, but if they can't get to it then just re-request feedback from me and I'll see what I can do.
+Comment on attachment 8523668
+0009-Bug-XXXXXXX-prevent-SessionStore-from-clobbering-the.patch
+
+Review of attachment 8523668:
+-----------------------------------------------------------------
+
+Looks good to me, with more doc.
+
+::: browser/base/content/browser.js
+@@ +7387,5 @@
+>            browser.loadURI(spec);
+>          }
+> +        // must load before selecting, else SessionRestore might clobber
+> +        // the URL we are requesting.
+> +        aWindow.gBrowser.tabContainer.selectedIndex = i;
+
+Looks like the comment should be a few lines above.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +289,5 @@
+>    reviveCrashedTab(aTab) {
+>      return SessionStoreInternal.reviveCrashedTab(aTab);
+>    },
+>  
+> +  resetLocalTabRestoringState: function(aTab) {
+
+Documentation sorely needed (in particular since "reset" is a very overloaded word).
+Comment on attachment 8523668
+0009-Bug-XXXXXXX-prevent-SessionStore-from-clobbering-the.patch
+
+Review of attachment 8523668:
+-----------------------------------------------------------------
+
+One way to make this work could be to make _loadURIWithFlags() *not* call loadURI() when |browser.pending == true|. It should call LoadInOtherProcess() which in turn calls _restoreTabAndLoad(). It would probably work but I don't like this too much because I still hope we can get rid of _loadURIWithFlags() and _restoreTabAndLoad() before shipping e10s.
+
+A better solution would be to listen for STATE_START in content-sessionStore.jsm (or ContentRestore.jsm). When a new load starts we should immediately call restoreTabContent() but pass it a new URL to actually load instead of the last history entry. We should then probably send a message to the parent to clean up the restoring state, etc.
+
+Ideally, code shouldn't know too much about how sessionstore works or try to work around restore-on-demand functionality.
+Thanks Tim.  Can you please clarify:
+
+(In reply to Tim Taubert [:ttaubert] from comment #3)
+
+> A better solution would be to listen for STATE_START in
+> content-sessionStore.jsm (or ContentRestore.jsm). When a new load starts we
+> should immediately call restoreTabContent() but pass it a new URL to
+> actually load instead of the last history entry.
+
+I'm not with you here (ie, how the STATE_START listener would know the URL to use instead of the history entry)
+The second argument for nsIWebProgressListener.onStateChange() is a nsIRequest. It should be possible to find the target URI through aRequest.URI with that.
+
+OTOH, just looking at the code again - ContentRestore.restoreTabContent() doesn't do much else than calling webNav.loadURI(). If the last history entry doesn't get overriden, maybe we don't need to do much else than just clearing the restore state?
+(In reply to Tim Taubert [:ttaubert] from comment #5)
+> OTOH, just looking at the code again - ContentRestore.restoreTabContent()
+> doesn't do much else than calling webNav.loadURI(). If the last history
+> entry doesn't get overriden, maybe we don't need to do much else than just
+> clearing the restore state?
+
+Exactly!  Which is roughly what my patch was trying to do (although I just uses the closest existing method rather than creating a new minimal version).  However, earlier you said:
+
+(In reply to Tim Taubert [:ttaubert] from comment #3)
+> Ideally, code shouldn't know too much about how sessionstore works or try to
+> work around restore-on-demand functionality.
+
+So I'm not sure how to reconcile that (as clearing the restore state is precisely to work around restore-on-demand)
+(In reply to Mark Hammond [:markh] from comment #6)
+> (In reply to Tim Taubert [:ttaubert] from comment #5)
+> > OTOH, just looking at the code again - ContentRestore.restoreTabContent()
+> > doesn't do much else than calling webNav.loadURI(). If the last history
+> > entry doesn't get overriden, maybe we don't need to do much else than just
+> > clearing the restore state?
+> 
+> Exactly!  Which is roughly what my patch was trying to do (although I just
+> uses the closest existing method rather than creating a new minimal
+> version).
+
+Yeah that is indeed a description of your patch, only that your code makes the tabbrowser do it. I think this could just be handled by sessionstore's frame script. As soon as a load is detected while a tab's prepared to being restored, we should just throw away the restoration data and act is if we kicked off the load ourselves? Given that as said before hopefully the last history entry is retained.
+Tim, would you be able to implement your suggestion in comment #7 in the near future? This is one of the blockers for shipping in-content prefs, so we're trying to figure out how to get it done, and it doesn't seem like a great candidate for mentorship to us. :-)
+Created attachment 8567697
+0001-Bug-1100223-switchToTabHavingURI-should-load-a-new-U.patch
+
+This is stolen from Mark's patch. We need switchToTabHavingURI() call loadURI() before selecting the target tab.
+Created attachment 8567698
+0002-Bug-1100223-Add-test-to-ensure-loadURI-on-pending-ta.patch
+
+Adds a test to ensure calling browser.loadURI() on pending tabs works as expected.
+Thought this was estimated already. Assigning 5 points retrospectively, took me some time to find an acceptable solution.
+Created attachment 8567701
+0003-Bug-1100223-Make-calling-loadURI-on-pending-tabs-wor.patch
+
+Re-using the ProgessListener now to catch STATE_START for pending tabs.
+
+Took the chance to rewrite receiveMessage() and put message handling in separate methods.
+
+Got rid of "SessionStore:reloadPendingTab", we can save a round-trip by simply kicking off the load and letting the parent know via "restoreTabContentStarted".
+
+I wish we could get rid off the HistoryListener used to catch reloads and just handle it like we call loadURI() calls now. It looks like the docShell's shistory entry isn't up-to-date and we thus end up loading "about:blank" all the time. Could be a follow-up.
+(In reply to Tim Taubert [:ttaubert] from comment #12)
+> just handle it like we call loadURI() calls now.
+
+Should be: "just handle it like we handle loadURI() calls now."
+Comment on attachment 8567698
+0002-Bug-1100223-Add-test-to-ensure-loadURI-on-pending-ta.patch
+
+Review of attachment 8567698:
+-----------------------------------------------------------------
+
+AIUI this only tests one of the 2 branches you've updated... add another one for the other branch, please? :-)
+
+::: browser/components/sessionstore/test/browser_attributes.js
+@@ -60,5 @@
+>    // Clean up.
+>    gBrowser.removeTab(tab);
+>  });
+> -
+> -function promiseTabRestoring(tab) {
+
+/browser/components/sessionstore/test/browser_label_and_icon.js has also cargo-culted this, so you can remove this fn there too.
+
+::: browser/components/sessionstore/test/browser_replace_load.js
+@@ +1,2 @@
+> +/* Any copyright is dedicated to the Public Domain.
+> + * http://creativecommons.org/publicdomain/zero/1.0/ */
+
+You don't need this header anymore because of:
+
+http://blog.gerv.net/2014/09/licensing-policy-change-tests-are-now-public-domain/
+
+(in particular "which does not carry an explicit license header")
+Comment on attachment 8567701
+0003-Bug-1100223-Make-calling-loadURI-on-pending-tabs-wor.patch
+
+Review of attachment 8567701:
+-----------------------------------------------------------------
+
+How does reloading trigger restoreTabContentStarted in the parent? Do we get a STATE_START notification somehow? That should be explained in a comment. From the code it looks like we only get restartTabContentComplete.
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +675,5 @@
+>            // enter yet, then we just need to write that value to the URL bar without
+>            // loading anything. This must happen after the load, since it will clear
+>            // userTypedValue.
+>            let tabData = browser.__SS_data;
+>            if (tabData.userTypedValue && !tabData.userTypedClear) {
+
+I'm a little worried about what this code will do if someone triggers a random loadURI when the tab is in the NEEDS_RESTORE state. Couldn't this code mess up the URL bar?
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +118,5 @@
+>    receiveMessage: function ({name, data}) {
+> +    // Remove "SessionStore:" from the beginning of the
+> +    // message to call the right function to process it.
+> +    const index = "SessionStore:".length;
+> +    this[name.slice(index)](data);
+
+Could you maybe use a hash or something to dispatch these? My only concern is that people searching for the full message name (which I frequently do) won't find this code.
+(In reply to Bill McCloskey (:billm) from comment #15)
+> How does reloading trigger restoreTabContentStarted in the parent? Do we get
+> a STATE_START notification somehow? That should be explained in a comment.
+> From the code it looks like we only get restartTabContentComplete.
+
+Yes, we receive a STATE_START notification. I put the original reloadPendingTab message and code back in. I think it would be better to handle this in a separate patch or follow-up. It would be great actually to maybe try to fix browser.reload() and get rid of the HistoryListener altogether as hinted in the above comment.
+
+> >            // enter yet, then we just need to write that value to the URL bar without
+> >            // loading anything. This must happen after the load, since it will clear
+> >            // userTypedValue.
+> >            let tabData = browser.__SS_data;
+> >            if (tabData.userTypedValue && !tabData.userTypedClear) {
+> 
+> I'm a little worried about what this code will do if someone triggers a
+> random loadURI when the tab is in the NEEDS_RESTORE state. Couldn't this
+> code mess up the URL bar?
+
+Yeah, that's a good point. We shouldn't touch the URL bar when loadURI() triggers a "restoration". I will simply make it the else branch.
+
+> >    receiveMessage: function ({name, data}) {
+> > +    // Remove "SessionStore:" from the beginning of the
+> > +    // message to call the right function to process it.
+> > +    const index = "SessionStore:".length;
+> > +    this[name.slice(index)](data);
+> 
+> Could you maybe use a hash or something to dispatch these? My only concern
+> is that people searching for the full message name (which I frequently do)
+> won't find this code.
+
+Yeah, that code is a little too clever, didn't think about search. Reverted to a switch statement that calls these new functions.
+Created attachment 8568875
+0003-Bug-1100223-Make-calling-loadURI-on-pending-tabs-wor.patch
+Created attachment 8568899
+0002-Bug-1100223-Add-test-to-ensure-loadURI-on-pending-ta.patch, v2
+
+(In reply to :Gijs Kruitbosch from comment #14)
+> AIUI this only tests one of the 2 branches you've updated... add another one
+> for the other branch, please? :-)
+
+Great catch, this actually revealed a problem with anchor navigation. Thanks!
+Created attachment 8568904
+0004-Bug-1100223-Interdiff-to-fix-loadURI-calls-with-URLs.patch
+
+Turns out the using webNav.setCurrentURI() makes the webNav believe it already is on the page, which is bad when doing anchor navigation as it thinks it doesn't need to load a new document.
+
+This patch on top of 0003 passes the test in 0002.
+https://hg.mozilla.org/integration/fx-team/rev/5caac8cff808
+https://hg.mozilla.org/integration/fx-team/rev/a04ffab62bd3
+https://hg.mozilla.org/integration/fx-team/rev/ecd376f25829
+https://hg.mozilla.org/mozilla-central/rev/5caac8cff808
+https://hg.mozilla.org/mozilla-central/rev/a04ffab62bd3
+https://hg.mozilla.org/mozilla-central/rev/ecd376f25829
+This seems to have automated tests. Tim, do you think manual testing is still needed? If yes can you give us some details on what you think the manual QA should cover for this?
+Yeah, this is covered by tests. As long as bug 1025719 was verified manually it should be fine.
+Thank you Tim!

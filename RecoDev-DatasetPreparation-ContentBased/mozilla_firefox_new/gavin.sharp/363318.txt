@@ -1,0 +1,176 @@
+Mozilla/5.0 (Windows; U; Windows NT 5.0; en-US; rv:1.9a1) Gecko/20061208 Minefield/3.0a1 ID:2006120812 [cairo]
+
+1. create a live bookmark using the url
+2. rightclick -> reload live bookmark.
+
+result:
+the bookmark is instantly loaded
+
+3.open the url in a tab
+
+result:
+the feed is displayed fairly quickly, but the loadbar hangs for 4 seconds.
+During the loadbar hangtime FF is totally unresponsive.
+
+expected:
+the live bookmark and feedpage should load equally fast
+
+it has nothing to do with the type feed (in this case RSS version 0.91) or the server.
+
+Mozilla/5.0 (Windows; U; Windows NT 5.0; en-US; rv:1.9a1) Gecko/20061208 Minefield/3.0a1 ID:2006120812 [cairo]
+
+1. create a live bookmark using the url
+2. rightclick -> reload live bookmark.
+
+result:
+the bookmark is instantly loaded
+
+3.open the url in a tab
+
+result:
+the feed is displayed fairly quickly, but the loadbar hangs for 4 seconds.
+During the loadbar hangtime FF is totally unresponsive.
+
+expected:
+the live bookmark and feedpage should load equally fast
+
+it has nothing to do with the type feed (in this case RSS version 0.91) or the server.
+> the feed is displayed fairly quickly, but the loadbar hangs for 4 seconds.
+
+I see this too. Looks like layout to me. Lots of this assertion:
+
+###!!! ASSERTION: Allowed only one anonymous view between frames: 'ancestorView == view->GetParent()->GetParent()', file /Users/sayrer/firefox/mozilla/layout/generic/nsContainerFrame.cpp, line 264
+
+regressionwindow
+
+works in firefox-3.0a1.en-US.win32_20061103_1449
+fails in firefox-3.0a1.en-US.win32_20061104_0142
+
+http://bonsai.mozilla.org/cvsquery.cgi?treeid=default&module=PhoenixTinderbox&branch=HEAD&branchtype=match&dir=&file=&filetype=match&who=&whotype=match&sortby=Date&hours=2&date=explicit&mindate=2006-11-03+11%3A00%3A00&maxdate=2006-11-04+01%3A42%3A00&cvsroot=%2Fcvsroot
+
+I'm gambling: Bug 318592
+So.... please file a separate bug on the layout assertions and cc me, ok?
+
+As for this bug, shark says that 84% of the time is spent under array_splice, called from under an HTTP OnStopRequest.  So I blame the checkin for bug 358878 which landed in the cited regression range and added a splice() call.  Or rather in this case around 7 * 2000 / 3 splice() calls (7 entries, all with the mozillazine favicon, 2000 bytes for the favicon).
+
+Of course the second problem is that splicing stuff out from the beginning of an array like this is O(N) in the length of the array, because you have to renumber all the remaining elements.  So we actually end up with order of 1,200,000 calls each to GetArrayElement and SetOrDeleteArray element, which is where the time in this testcase is spent.  Profile report coming up.
+Created attachment 248290
+Profile report
+See bug 358878 comment #23.
+
+/be
+Created attachment 248294
+patch
+
+Don't use splice() unnecessarily, and reduces string concatenation.
+Created attachment 248295
+tests
+Created attachment 248297
+patch
+
+Use the native btoa() from our element's window when possible.
+Created attachment 248298
+branch patch (feeds only)
+
+The optimization of the search service version isn't really needed on the branch.
+Comment on attachment 248297
+patch
+
+r=mano
+mozilla/browser/components/feeds/src/FeedWriter.js 	1.30
+mozilla/browser/components/search/nsSearchService.js 	1.92
+Comment on attachment 248297
+patch
+
+What's wrong with iterating over the array and modifying the array only once?
+
+>   for (i = 0; i < aBytes.length - 2; i += 3) {
+>     bits = 0;
+>     for (j = 0; j < 3; j++) {
+>       bits <<= 8;
+>       bits |= aBytes[i + j];
+>     }
+>     for (j = 18; j >= 0; j -= 6)
+>       out += B64_CHARS[(bits>>j) & 0x3F];
+>   }
+>   aBytes = aBytes.slice(i);
+(In reply to comment #12)
+> (From update of attachment 248297 [edit])
+> What's wrong with iterating over the array and modifying the array only once?
+
+Nothing -- I didn't review the patch, wasn't asked to, but I'd agree and avoid the nested function altogether (inline expand it and optimize away temporaries).  But what I proposed in bug 358878 comment #23 was actually avoiding the temporary Array object garbage from all the slices, by using indexes into the array.  That will perform even better.
+
+/be
+(In reply to comment #12)
+> (From update of attachment 248297 [edit])
+> What's wrong with iterating over the array and modifying the array only once?
+
+The current code doesn't modify the array at all (slice() is an accessor method). Your code would work too, and is perhaps more performant (no function call overhead or temporary array), but I think it's harder to understand.
+(In reply to comment #14)
+> (In reply to comment #12)
+> > (From update of attachment 248297 [edit] [edit])
+> > What's wrong with iterating over the array and modifying the array only once?
+> 
+> The current code doesn't modify the array at all (slice() is an accessor
+> method). Your code would work too, and is perhaps more performant (no function
+> call overhead or temporary array), but I think it's harder to understand.
+
+You could be generating *a lot* of temporary arrays.  I think it's worth trying Simon's code (hoist the loop-invariant aBytes.length - 2 from the condition) and measuring.
+
+/be
+
+
+Sure, I'm not opposed to using Simon's approach. Simon, do you want to attach your change as a patch?
+Created attachment 248303
+remove s(p)licing
+Comment on attachment 248303
+remove s(p)licing
+
+Why not unroll the short loop and eliminate redundant assignments?  Instead of:
+
+    var bits = 0;
+    for (j = 0; j < 3; j++) {
+      bits <<= 8;
+      bits |= aBytes[i+j];
+    }
+
+use this:
+
+    var bits = (aBytes[i] << 16) | (aBytes[i+1] << 8) | aBytes[i+2];
+
+(and declare var j in the bit loop)?
+
+/be
+Comment on attachment 248303
+remove s(p)licing
+
+>Index: browser/components/search/nsSearchService.js
+
+>+  switch (aBytes.length % 3) {
+
+(aBytes.length - i) would be equivalent in all cases, but I guess this is more expressive.
+
+>-      out += B64_CHARS[(bytes[0]>>2) & 0x3F] +
+>-             B64_CHARS[((bytes[0] & 0x03) << 4) | ((bytes[1] >> 4) & 0x0F)] +
+>-             B64_CHARS[((bytes[1] & 0x0F) << 2)] +
+>+      out += B64_CHARS[(aBytes[i]>>2) & 0x3F] +
+>+             B64_CHARS[((aBytes[i] & 0x03) << 4) | ((aBytes[i] >> 4) & 0x0F)] +
+>+             B64_CHARS[((aBytes[i+1] & 0x0F) << 2)] +
+
+Replacement error here, the third index should be i+1. This makes this fail for the string "aaabz", for example.
+
+This is a good improvement, but the patch that Mano just posted in bug 326854 will remove the need for this implementation anyways, so we should probably just hold off until then. I'll file a new bug on removing this code in the search service, blocked by 326854, so this bug can be left for the Feed Preview case specifically.
+wrt comment 3 / comment 1, i filed bug 364506
+Comment on attachment 248298
+branch patch (feeds only)
+
+Approved for 1.8 branch, a=jay for drivers.
+mozilla/browser/components/feeds/src/FeedWriter.js 	1.2.2.27
+v.fixed with Mozilla/5.0 (Macintosh; U; Intel Mac OS X; en-US; rv:1.8.1.2pre) Gecko/20070208 BonEcho/2.0.0.2pre, using Gavin's original steps in comment #0: no lag when loading the feed URL, live bookmark refresh and page load are both pretty quick, no hang.
+
+
+loading a simple feed in Firefox feedreader is extremely slow compared to loading the same feed as live bookmark
+
+regression, verified1.8.1.2
+
+Bug 363318: don't show home page when automatically restarting after an update, r=zeniko, r=mano 

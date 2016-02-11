@@ -1,0 +1,742 @@
+
+
+
+I've quickly asked :smaug about this and it seems all events are being dispatched by EventDispatcher::Dispatch (http://mxr.mozilla.org/mozilla-central/source/dom/events/EventDispatcher.cpp#388).
+Start/End timeline markers can be added there, but for this to make sense, we should only add markers if the event is actually handled by script.
+Created attachment 8470812
+bug1050501-record-event-handling-in-timeline WIP.patch
+
+Here's how this could work. This is still a work in progress patch. 2 major problems persist:
+
+- an event marker will be recorded for any event that is dispatched as long as the node has a listener, even if that listener is for another event type.
+- there might be a potential memory leak.
+Created attachment 8491828
+add timeline marker from EventDispatcher::Dispatch
+
+WIP patch.
+Comment on attachment 8491828
+add timeline marker from EventDispatcher::Dispatch
+
+>@@ -596,26 +597,38 @@ EventDispatcher::Dispatch(nsISupports* aTarget,
+>     if (NS_SUCCEEDED(rv)) {
+>       if (aTargets) {
+>         aTargets->Clear();
+>         aTargets->SetCapacity(chain.Length());
+>         for (uint32_t i = 0; i < chain.Length(); ++i) {
+>           aTargets->AppendObject(chain[i].CurrentTarget()->GetTargetForDOMEvent());
+>         }
+>       } else {
+>+        nsDocShell* docShell = nullptr;
+>+        if (aPresContext) {
+>+          docShell = static_cast<nsDocShell*>(aPresContext->GetDocShell());
+>+        }
+>+        if (docShell) {
+>+          docShell->AddProfileTimelineMarker("DOMEvent", TRACING_INTERVAL_START);
+>+        }
+Could you add a comment here that AddProfileTimelineMarker is no-op if recording/profiling on the docshell isn't enabled.
+... but.
+You don't always have a prescontext. Like web page creating a data document and dispatching events there.
+(document.implementation.createHTMLDocument()).
+Or what about XHR, WebSockets or EventSource?
+It might be, depending on what the use case here is, to use the docshell from the Window object of the DOMEvent, 
+see mozilla::dom::Event::GetParentObject in Event.h.
+Also, note, DOMEvent is created on demand from Event http://mxr.mozilla.org/mozilla-central/source/dom/events/EventListenerManager.cpp?rev=df6ba75a47bd#994
+
+mozilla::dom::Event::GetParentObject  will not give you any main thread thing when the Event is in Worker, but keep anyway in mind that
+the exact same code is used for Events in Workers as in the main thread.
+(In reply to Olli Pettay [:smaug] from comment #4)
+
+> Could you add a comment here that AddProfileTimelineMarker is no-op if
+> recording/profiling on the docshell isn't enabled.
+
+No problem.
+
+> ... but.
+> You don't always have a prescontext. Like web page creating a data document
+> and dispatching events there.
+> (document.implementation.createHTMLDocument()).
+> Or what about XHR, WebSockets or EventSource?]
+
+On irc Paul said that we can ignore this for the moment and add it later if need be.
+
+At the moment I don't understand if this is filtering out enough events.
+My understanding is that the intent is to try to filter out events
+that do not have a handler.  But when I run with this patch included,
+I see timeline events for mouse motion, clicks, etc -- even on a completely
+empty page.  But I don't know enough yet to know whether this is wrong or not.
+(In reply to Tom Tromey :tromey from comment #5)
+> At the moment I don't understand if this is filtering out enough events.
+> My understanding is that the intent is to try to filter out events
+> that do not have a handler.  But when I run with this patch included,
+> I see timeline events for mouse motion, clicks, etc -- even on a completely
+> empty page.  But I don't know enough yet to know whether this is wrong or
+> not.
+
+On an empty page, we don't want to see any event markers. We should be showing a marker only if there is a listener (which will eventually trigger a runScript).
+
+Testing this patch, I see markers even if there's no listeners. So 2 options:
+- your patch doesn't filter out events with no listeners;
+- there are listeners on these events we don't know about. Maybe the devtools add listeners to the page.
+Moving the timeline notification to EventListenerManager helped somewhat.
+There I can examine the listener to distinguish JS handlers from others.
+With this I get something more expected -- but still not quite perfect.
+For example on a page with a simple "click" handler, I still see a rogue
+event.  Debugging indicates it is a mousedown event installed by
+toolkit/content/browser-content.js (or maybe browser/base/content/content.js).
+I'm still looking for how to distinguish this handler from the ordinary one.
+(In reply to Tom Tromey :tromey from comment #5)
+> At the moment I don't understand if this is filtering out enough events.
+> My understanding is that the intent is to try to filter out events
+> that do not have a handler.  But when I run with this patch included,
+> I see timeline events for mouse motion, clicks, etc -- even on a completely
+> empty page.  But I don't know enough yet to know whether this is wrong or
+> not.
+Events are, in general, dispatched whether or not there are listeners for it
+(because just dispatching is in common case faster than checking whether there are listeners in that particular event target chain).
+
+
+
+
+(In reply to Tom Tromey :tromey from comment #7)
+> Moving the timeline notification to EventListenerManager helped somewhat.
+> There I can examine the listener to distinguish JS handlers from others.
+> With this I get something more expected -- but still not quite perfect.
+> For example on a page with a simple "click" handler, I still see a rogue
+> event.  Debugging indicates it is a mousedown event installed by
+> toolkit/content/browser-content.js (or maybe
+> browser/base/content/content.js).
+> I'm still looking for how to distinguish this handler from the ordinary one.
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/content.js does indeed add a click event listener, but it is added
+to TabChildGlobal, not to some element in the page, nor document nor window object. So if you want to filter out stuff, you may
+want to check to which event target (mTarget) EventListenerManager is attached to.
+> http://mxr.mozilla.org/mozilla-central/source/browser/base/content/content.
+> js does indeed add a click event listener, but it is added
+> to TabChildGlobal, not to some element in the page, nor document nor window
+> object. So if you want to filter out stuff, you may
+> want to check to which event target (mTarget) EventListenerManager is
+> attached to.
+
+Thanks very much!  This is quite helpful.  I was doing vaguely the right thing
+at least, looking for a way to differentiate the cases in EventListenerManager.
+However I still don't know the "principled" way to distinguish the cases.
+
+If I debug the spot where I've inserted the timeline marker I can see these types
+for mTarget:
+
+$35 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+$36 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+$37 = (nsGlobalWindow *) 0x7fa8a4183400
+$38 = (nsGlobalWindow *) 0x7fa8a4183400
+$39 = (nsXULElement *) 0x7fa8aea8be50
+$40 = (nsXULElement *) 0x7fa8aea8be50
+$41 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+$42 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+
+I think I want to exclude the nsInProcessTabChildGlobal objects but include
+the others.
+
+I have another test I'm running that puts a couple of click handlers on
+window, like:
+
+    window.addEventListener("click",function(ev) {
+      w+=10;
+      document.body.style.border = w + "px solid black";
+    }, true);
+    window.addEventListener("click",function(ev) {
+      w+=10;
+      document.body.style.border = w + "px solid black";
+    }, false);
+
+When I look at this with the timeline and click exactly once, I get three
+events.  However examining the types in gdb gives:
+
+$73 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+$74 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+$75 = (nsXULElement *) 0x7fa8aea8be50
+$76 = (nsXULElement *) 0x7fa8aea8be50
+$77 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+$78 = (nsInProcessTabChildGlobal *) 0x7fa8a77a7c60
+
+... but I don't understand this at all :-(
+I think that 3rd event is the phase 3 click event, but I don't
+understand why the target would be nsInProcessTabChildGlobal here.
+(In reply to Tom Tromey :tromey from comment #9)
+> I think I want to exclude the nsInProcessTabChildGlobal objects but include
+> the others.
+Don't know why you'd want to exclude nsInProcessTabChildGlobal, but include other chrome stuff, like the XULElement.
+
+
+> ... but I don't understand this at all :-(
+> I think that 3rd event is the phase 3 click event, but I don't
+> understand why the target would be nsInProcessTabChildGlobal here.
+It is not quite clear to me what you're doing here...
+(In reply to Olli Pettay [:smaug] from comment #10)
+> (In reply to Tom Tromey :tromey from comment #9)
+> > I think I want to exclude the nsInProcessTabChildGlobal objects but include
+> > the others.
+> Don't know why you'd want to exclude nsInProcessTabChildGlobal, but include
+> other chrome stuff, like the XULElement.
+
+This was very helpful, thank you.
+I will try to figure out why I'm off on the wrong track here.
+Event propagation in non-e10s-FF is:
+  (capture phase) WindowRoot
+                  chrome window
+                  chrome document
+                  ancestor elements of the xul:browser
+                  xul:browser
+                  InProcessTabChildGlobal
+                  web page's window
+                  web page's document
+                  ancestor elements of the event target
+
+  (target phase)  target node
+  
+  (bubble phase)  [the objects in capture phase in reversed order].
+Created attachment 8500630
+add timeline marker from EventDispatcher::Dispatch
+
+Here's a patch that seems to work when I try various things.
+
+I'm not at all sure that the filtering logic in HandleEventInternal is
+correct.
+
+Note that with this patch in place, it's possible (even easy) to see
+nested markers in PopProfileTimelineMarkers.  This will happen
+whenever an event handler itself calls dispatchEvent.
+
+It's simple to see the problem by adding this to
+nsDocShell::PopProfileTimelineMarkers:
+
+        NS_ASSERTION(!(isSameMarkerType && endPayload->GetMetaData() == TRACING_INTERVAL_START),
+                     "nested markers");
+
+I think there are a few ways to fix the problem.
+
+The simplest way would be to first wait for bug 1071056 to land, since
+this would clear up how memory management of
+InternalProfileTimelineMarker is going to work.  Then, arrange for
+PopProfileTimelineMarkers to remove nested markers.
+
+Other, more efficient, methods are possible as well, though my
+understanding is that this code isn't expected to deal with too many
+objects.
+Comment on attachment 8500630
+add timeline marker from EventDispatcher::Dispatch
+
+>+  // Prepare to notify the timeline of event dispatch.  Only bother
+>+  // when the docshell is recording.
+>+  nsDocShell* docShell = nullptr;
+Using a raw pointer here would lead to a security bug since if there are several listeners for the same event, the first listener may end up doing something
+which deletes the docshell object and then right before the next event listener call we access docshell, yet it points to a deleted object.
+
+>+  if (aPresContext) {
+Nothing really guarantees we have a prescontext here, even for those events which are dispatched to a dom node in an
+active browsing context. Perhaps check first if timeline is enabled at all, then QI mTarget to nsINode or nsPIDOMWindow and get
+docshell from those.
+(In reply to Olli Pettay [:smaug] from comment #14)
+
+> >+  if (aPresContext) {
+> Nothing really guarantees we have a prescontext here, even for those events
+> which are dispatched to a dom node in an
+> active browsing context. Perhaps check first if timeline is enabled at all,
+> then QI mTarget to nsINode or nsPIDOMWindow and get
+> docshell from those.
+
+First I wanted to say that I wasn't consciously ignoring what you said in comment #4.
+I was under the impression that it was ok due to comment #5.  But now I see what
+you mean.  Thanks for being patient.
+
+I suppose this code could check nsDocShell::gProfileTimelineRecordingsCount,
+like nsRefreshDriver does.  I will try it out and also try to come up with a
+test showing the problem.
+
+Did the filtering code in HandleEventInternal look correct to you?  I was
+uncertain about it.
++        if (docShell && listener->mListenerType != Listener::eNativeListener) {
++          nsCOMPtr<nsINode> node(do_QueryInterface(mTarget));
++          nsCOMPtr<nsIDocument> doc;
++
++          if (node) {
++            doc = node->OwnerDoc();
++          } else {
++            nsCOMPtr<nsPIDOMWindow> window(GetTargetAsInnerWindow());
++            if (window) {
++              doc = window->GetExtantDoc();
++            }
++          }
+
+This part looks ok, assuming we want record only events dispatched to a document in a browsing context.
+We just need to get the docshell in a different way.
+
+(I do assume we'll want to record also other events, like XHR's load event and its progress events etc., but perhaps that
+all can happen in a followup bug.)
+> Did the filtering code in HandleEventInternal look correct to you?  I was
+> uncertain about it.
+
+Replying to myself...
+With the new approach filtering isn't really needed in the same way.
+We don't need to filter out chrome event handlers because their docShell will
+simply not be recording.  I think this should allow everything to continue
+to work when debugging chrome as well.
+
+The new approach seems to work fine (thanks again!) and I'll upload it once
+I've written a new test.
+(In reply to Olli Pettay [:smaug] from comment #4)
+
+> It might be, depending on what the use case here is, to use the docshell
+> from the Window object of the DOMEvent, 
+> see mozilla::dom::Event::GetParentObject in Event.h.
+> Also, note, DOMEvent is created on demand from Event
+> http://mxr.mozilla.org/mozilla-central/source/dom/events/
+> EventListenerManager.cpp?rev=df6ba75a47bd#994
+
+I tried this, and I think this isn't exactly what we want.
+
+Specifically (... since there's a high probability I did it wrong ...)
+I tried something like:
+
+          nsCOMPtr<nsPIDOMWindow> window
+            = do_QueryInterface((*aDOMEvent)->InternalDOMEvent()->GetParentObject());
+          docShell = window->GetDocShell();
+
+... then used this docShell to report timeline markers.
+
+This yields way too many events in the timeline, so even without debugging
+I can tell it's not filtering properly.
+
+I think the problem here is that we want to differentiate based on the current
+listener.  But since the DOMEvent is just created once we end up differentiating
+based on something else.
+
+Looking at mTarget (this is all in EventListenerManager::HandleEventInternal)
+seems to work ok.  But before sending this I think we need a resolution of
+bug 1071056, per comment #13.
+
+Also I'm having some difficulty understanding a test case using
+document.implementation.createHTMLDocument.  This seems to create a new docShell
+but at the moment I don't understand how to discover this in the test case itself,
+to enable marker recording on it.
+(In reply to Tom Tromey :tromey from comment #18)
+> Also I'm having some difficulty understanding a test case using
+> document.implementation.createHTMLDocument.  This seems to create a new
+> docShell
+No. docShell is for active browsing contexts only.
+document.implementation.createHTMLDocument just creates a document.
+(In reply to Olli Pettay [:smaug] from comment #19)
+> (In reply to Tom Tromey :tromey from comment #18)
+> > Also I'm having some difficulty understanding a test case using
+> > document.implementation.createHTMLDocument.  This seems to create a new
+> > docShell
+> No. docShell is for active browsing contexts only.
+> document.implementation.createHTMLDocument just creates a document.
+
+You're right, of course, but I'm confused about something else as well.
+
+The test looks like this:
+
+    let doc = content.document.implementation.createHTMLDocument("doc");
+    let p = doc.createElement("p");
+    p.innerHTML = "inside";
+    doc.body.appendChild(p);
+
+    p.addEventListener("zebra", function(e) {console.log("hi");});
+    p.dispatchEvent(new CustomEvent("zebra", {"detail":{"coat":"stripey"}}));
+
+Using gdb I believe I can see a new docshell made when evaluating
+the appendChild.
+
+However when dispatching the "zebra" event I see that my current logic
+in HandleEventInternal indeed does not find a docshell -- earlier I hadn't
+checked this and was working on the theory that the new docshell instance
+was simply not recording.
+See bug 1080013 for the string change.
+Created attachment 8502039
+add timeline marker from EventDispatcher::Dispatch
+
+Here's another revision of the patch.  It's been rebased.
+
+This one reports XMLHttpRequest events and also events on objects
+created by createHTMLDocument.
+
+I split the "find the docShell" code into a helper function since it
+seemed unwieldy inside HandleEventInternal.
+
+This version still doesn't have tests exercising all the paths in
+GetDocShellForTarget.  I tried a bit to consolidate some of the cases
+but my experiments failed.  It still seems a bit ugly to me though.
+
+This version also still needs a fix for the nested marker problem, as
+mentioned earlier.
+(In reply to Tom Tromey :tromey from comment #22)
+> This version also still needs a fix for the nested marker problem, as
+> mentioned earlier.
+
+How do you plan to handle that? Add a unique id to the marker?
+(In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from comment #23)
+> (In reply to Tom Tromey :tromey from comment #22)
+> > This version also still needs a fix for the nested marker problem, as
+> > mentioned earlier.
+> 
+> How do you plan to handle that? Add a unique id to the marker?
+
+I was planning to notice nested markers of the same name and then just drop
+the inner ones.  This can be done in the inner loop in PopProfileTimelineMarkers.
+
+But first I was going to rebase onto whichever patch from bug 1071056 is chosen.
+This is needed because it makes dealing with the marker memory management
+simpler.
+First, writing real tests reveals that I was testing the XMLHttpRequest
+code incorrectly, and so this isn't working yet after all.  But that's ok
+because there's a bigger issue to sort out.
+
+> I was planning to notice nested markers of the same name and then just drop
+> the inner ones.  This can be done in the inner loop in
+> PopProfileTimelineMarkers.
+
+After looking at it more seriously, I think it won't really work well.
+We may see any number of unterminated nested markers, so we'd need to keep
+a stack of start markers somehow.
+
+Instead it seems simpler to just keep track of the most recent start marker
+and "start depth".  Then we can just discard new start markers when they are added.
+
+The bigger issue is that I think the DOM event code will interact with the code
+to generate script markers.  In particular I think the nesting fix will suppress
+script markers originating with events.  While this might be fine right now, it will
+probably not be what we want longer term.  For instance, the script marker will
+carry some metadata that we'd like to preserve -- metadata not available on the
+enclosing dom event marker.
+
+One idea might be to only suppress nested markers of the same name.
+That way nested DOM Event markers would be ignored, but a DOM Event surrounding
+a script marker would still generate two markers.
+Paul, could you please provide some guidance on how you want me to 
+deal with nested markers?
+Created attachment 8506148
+add timeline marker from EventListenerManager
+
+Here's a version of the patch that handles XMLHttpRequest and
+createHTMLDocument.  It includes tests.  It's been rebased onto
+fx-team; though note that it will require a further update once the
+patch for bug 1070089 goes in.
+
+This version suppresses nested DOM event markers.  These can occur
+when an event listener calls dispatchEvent.  Note that it is careful
+not to suppress other kinds of nested markers.  In particular it is ok
+to have a sync reflow nested inside a DOM event.
+
+I'm not super happy with the "strcmp" approach to detecting DOM event
+markers.  I'd be more inclined to use an enum to represent marker
+types; but I left it as-is to keep the change minimal.  Also, there's
+existing code in PopProfileTimelineMarkers that takes this approach.
+
+An earlier version of the patch got the placement of the start marker
+emission slightly wrong and could theoretically have emitted a "start"
+marker without an "end".  I'd prefer to use an RAII-based approach
+here instead to avoid this possibility; but again, the current
+approach keeps the patch smaller.
+
+Finally, EventListenerManager::GetDocShellForTarget needs extra review.
+It seems pretty ugly to me, but at the same time all the cases seemed
+necessary.  One thought I had was to move the logic out into virtual
+methods on EventTarget subclasses; but I didn't try this and am unsure
+if it would make the patch substantially cleaner.
+Created attachment 8509677
+add timeline marker from EventListenerManager
+
+This version has been rebased onto today's fx-team, which includes the
+patch for bug 1070089.
+Comment on attachment 8509677
+add timeline marker from EventListenerManager
+
+>+++ b/browser/devtools/timeline/widgets/global.js
+>@@ -38,14 +38,20 @@ const TIMELINE_BLUEPRINT = {
+>     stroke: "hsl(104,57%,51%)",
+>     label: L10N.getStr("timeline.label.reflow")
+>   },
+>   "Paint": {
+>     group: 1,
+>     fill: "hsl(39,82%,69%)",
+>     stroke: "hsl(39,82%,49%)",
+>     label: L10N.getStr("timeline.label.paint")
+>+  },
+>+  "DOMEvent": {
+>+    group: 3,
+>+    fill: "hsl(219,82%,69%)",
+>+    stroke: "hsl(219,82%,69%)",
+>+    label: L10N.getStr("timeline.label.domevent")
+>   }
+Someone else needs to review this.
+
+
+> nsDocShell::AddProfileTimelineMarker(const char* aName,
+>                                      TracingMetadata aMetaData)
+> {
+> #ifdef MOZ_ENABLE_PROFILER_SPS
+>   if (mProfileTimelineRecording) {
+>+    // Do not let DOM events nest.  However, note that we do let other
+>+    // marker types nest, so that we can still see, e.g., a sync
+>+    // reflow coming from a DOM event handler.
+>+    if (strcmp(aName, "DOMEvent") == 0) {
+>+      if (aMetaData == TRACING_INTERVAL_START) {
+>+        ++mProfileTimelineDOMStartDepth;
+>+        // Only emit the outermost marker.
+>+        if (mProfileTimelineDOMStartDepth > 1) {
+>+          return;
+>+        }
+>+      } else if (aMetaData == TRACING_INTERVAL_END) {
+>+        --mProfileTimelineDOMStartDepth;
+>+        if (mProfileTimelineDOMStartDepth > 0) {
+>+          return;
+>+        }
+>+      }
+>+    }
+So this is going to miss all sort of cases. Do we have plans how to not have this mProfileTimelineDOMStartDepth limitation?
+I'd prefer if the limitation would be moved to js-side, and then it would be up to devtools to deal with the nested DOM events
+
+>diff --git a/docshell/test/browser/browser_timelineMarkers-03.js b/docshell/test/browser/browser_timelineMarkers-03.js
+>new file mode 100644
+>index 0000000..049d4de
+>--- /dev/null
+>+++ b/docshell/test/browser/browser_timelineMarkers-03.js
+>@@ -0,0 +1,139 @@
+>+/* Any copyright is dedicated to the Public Domain.
+>+   http://creativecommons.org/publicdomain/zero/1.0/ */
+>+
+>+"use strict";
+>+
+>+// Test that the docShell profile timeline API returns the right
+>+// markers for DOM events.
+>+
+>+let TESTS = [{
+>+  desc: "Event dispatch with single handler",
+>+  setup: function() {
+>+    content.document.body.addEventListener("dog",
+>+                                           function(e) { console.log("hi"); },
+>+                                           true);
+>+    content.document.body.dispatchEvent(new CustomEvent("dog",
+>+                                                        {"detail":{"name":"maude"}}));
+I have no idea why you're using CustomEvent here and elsewhere. Event is just fine.
+
+
+>+nsIDocShell*
+>+EventListenerManager::GetDocShellForTarget()
+>+{
+>+  nsCOMPtr<nsINode> node(do_QueryInterface(mTarget));
+>+  nsCOMPtr<nsIDocument> doc;
+This can be nsIDocument* doc;
+
+>+  nsIDocShell* docShell = nullptr;
+>+
+>+  if (node) {
+>+    doc = node->OwnerDoc();
+>+    if (doc && !doc->GetDocShell()) {
+No need for 'doc &&'. OwnerDoc() returns always non-null value.
+
+>+      // This is needed for events on a document.
+>+      bool ignore;
+>+      nsCOMPtr<nsPIDOMWindow> window
+>+        = do_QueryInterface(doc->GetScriptHandlingObject(ignore));
+= to the previous line.
+
+>+  if (!doc || !doc->GetDocShell()) {
+>+    // This handles XMLHttpRequest events.
+Well, not only XHR, but pretty much all the other event targets.
+(this is missing only nsWindowRoot and TabChildGlobal, but those aren't in any way relevant to web page JS.)
+
+>+    nsCOMPtr<DOMEventTargetHelper> helper(do_QueryInterface(mTarget));
+>+    if (helper) {
+>+      nsCOMPtr<nsPIDOMWindow> window(helper->GetOwner());
+You don't need nsCOMPtr here. nsPIDOMWindow* is just fine.
+
+>@@ -1002,20 +1046,37 @@ EventListenerManager::HandleEventInternal(nsPresContext* aPresContext,
+>         if (*aDOMEvent) {
+>           if (!aEvent->currentTarget) {
+>             aEvent->currentTarget = aCurrentTarget->GetTargetForDOMEvent();
+>             if (!aEvent->currentTarget) {
+>               break;
+>             }
+>           }
+> 
+>+          // Maybe add a marker to the docshell's timeline, but only
+>+          // bother with all the logic if some docshell is recording.
+>+          nsCOMPtr<nsIDocShell> docShell;
+>+          if (nsDocShell::gProfileTimelineRecordingsCount > 0
+>+              && listener->mListenerType != Listener::eNativeListener) {
+Nit, could you move && to be at the end of the previous line.
+And you really don't want to do this all in non-main-thread event listener managers.
+So please add mIsMainThreadELM check.
+(I have no idea how this all will have handled in workers, since I'm not at all familiar with our devtool support for worker, but I assume that will happen in some other bug.)
+
+>+          if (docShell) {
+>+            nsDocShell* ds = static_cast<nsDocShell*>(docShell.get());
+>+            ds->AddProfileTimelineMarker("DOMEvent", TRACING_INTERVAL_END);
+>+          }
+So we report events on those docshells where we have event target which has listener for the event.
+I guess that is ok.
+
+Nothing major here, but could take another look.
+(In reply to Olli Pettay [:smaug] from comment #29)
+> Comment on attachment 8509677
+> add timeline marker from EventListenerManager
+> 
+> >+++ b/browser/devtools/timeline/widgets/global.js
+> >@@ -38,14 +38,20 @@ const TIMELINE_BLUEPRINT = {
+> >     stroke: "hsl(104,57%,51%)",
+> >     label: L10N.getStr("timeline.label.reflow")
+> >   },
+> >   "Paint": {
+> >     group: 1,
+> >     fill: "hsl(39,82%,69%)",
+> >     stroke: "hsl(39,82%,49%)",
+> >     label: L10N.getStr("timeline.label.paint")
+> >+  },
+> >+  "DOMEvent": {
+> >+    group: 3,
+> >+    fill: "hsl(219,82%,69%)",
+> >+    stroke: "hsl(219,82%,69%)",
+> >+    label: L10N.getStr("timeline.label.domevent")
+> >   }
+> Someone else needs to review this.
+
+I will.
+
+> >@@ -1002,20 +1046,37 @@ EventListenerManager::HandleEventInternal(nsPresContext* aPresContext,
+> >         if (*aDOMEvent) {
+> >           if (!aEvent->currentTarget) {
+> >             aEvent->currentTarget = aCurrentTarget->GetTargetForDOMEvent();
+> >             if (!aEvent->currentTarget) {
+> >               break;
+> >             }
+> >           }
+> > 
+> >+          // Maybe add a marker to the docshell's timeline, but only
+> >+          // bother with all the logic if some docshell is recording.
+> >+          nsCOMPtr<nsIDocShell> docShell;
+> >+          if (nsDocShell::gProfileTimelineRecordingsCount > 0
+> >+              && listener->mListenerType != Listener::eNativeListener) {
+> Nit, could you move && to be at the end of the previous line.
+> And you really don't want to do this all in non-main-thread event listener
+> managers.
+> So please add mIsMainThreadELM check.
+> (I have no idea how this all will have handled in workers, since I'm not at
+> all familiar with our devtool support for worker, but I assume that will
+> happen in some other bug.)
+
+We are only instrumenting the main thread for now. No plan to instrument any worker thread (only compositing thread at some point).
+(In reply to Paul Rouget [:paul] (slow to respond. Ping me on IRC) from comment #30)
+> We are only instrumenting the main thread for now. No plan to instrument any
+> worker thread (only compositing thread at some point).
+But this code runs in workers threads too whenever there is a DOM Event there.
+So just add mIsMainThreadELM to the 'if()' before nsDocShell::gProfileTimelineRecordingsCount.
+(talked to Tom on IRC. We want to support nested markers)
+Created attachment 8511266
+add timeline marker from EventListenerManager
+
+I think this version addresses all the review comments.
+
+Nested markers are handled by an additional bit of logic in
+PopProfileTimelineMarkers.  This part of the patch looks messy but is
+mostly just reindenting.
+Comment on attachment 8511266
+add timeline marker from EventListenerManager
+
+>@@ -2897,30 +2902,36 @@ nsDocShell::PopProfileTimelineMarkers(JSContext* aCx,
+>         if (strcmp(endMarkerName, "Layer") == 0) {
+>           hasSeenPaintedLayer = true;
+>         }
+> 
+>         bool isSameMarkerType = strcmp(startMarkerName, endMarkerName) == 0;
+>         bool isPaint = strcmp(startMarkerName, "Paint") == 0;
+> 
+>         // Pair start and end markers.
+>-        if (endPayload->GetMetaData() == TRACING_INTERVAL_END && isSameMarkerType) {
+>-          // But ignore paint start/end if no layer has been painted.
+>-          if (!isPaint || (isPaint && hasSeenPaintedLayer)) {
+>-            mozilla::dom::ProfileTimelineMarker marker;
+>-            marker.mName = NS_ConvertUTF8toUTF16(startMarkerName);
+>-            marker.mStart = mProfileTimelineMarkers[i]->mTime;
+>-            marker.mEnd = mProfileTimelineMarkers[j]->mTime;
+>-            profileTimelineMarkers.AppendElement(marker);
+>+        if (endPayload->GetMetaData() == TRACING_INTERVAL_START && isSameMarkerType) {
+>+          ++markerDepth;
+>+        } else if (endPayload->GetMetaData() == TRACING_INTERVAL_END && isSameMarkerType) {
+Couldn't you have
+if (strcmp(startMarkerName, endMarkerName) != 0) {
+  continue;
+}
+before the if-else and not have isSameMarkerType variable at all.
+
+>+EventListenerManager::GetDocShellForTarget()
+>+{
+>+  nsCOMPtr<nsINode> node(do_QueryInterface(mTarget));
+>+  nsIDocument* doc = nullptr;
+>+  nsIDocShell* docShell = nullptr;
+>+
+>+  if (node) {
+>+    doc = node->OwnerDoc();
+>+    if (!doc->GetDocShell()) {
+>+      // This is needed for events on a document.
+Odd comment. Just drop it.
+
+>+  if (!doc || !doc->GetDocShell()) {
+drop ' || !doc->GetDocShell()'
+Comment on attachment 8511266
+add timeline marker from EventListenerManager
+
+Review of attachment 8511266:
+-----------------------------------------------------------------
+
+::: browser/devtools/timeline/widgets/global.js
+@@ +58,1 @@
+>    }
+
+ConsoleTime needs to be at the end. So DOMEvent 3, and ConsoleTime 4.
+
+::: docshell/test/browser/browser_timelineMarkers-03.js
+@@ +133,5 @@
+> +      result.push(marker);
+> +    }
+> +  }
+> +  return result;
+> +}
+
+A shorter version of justDOMEVents: let newarray = markers.filter(m => m.name == "DOMEvent");
+https://tbpl.mozilla.org/?tree=Try&rev=8454152d5602
+Created attachment 8512032
+add timeline marker from EventListenerManager
+
+I believe this addresses all the review comments.
+https://tbpl.mozilla.org/?tree=Try&rev=f24791fc5ed9
+1130 INFO TEST-UNEXPECTED-FAIL | chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_635418.js | leaked until shutdown [nsGlobalWindow #1720 inner chrome://browser/content/tabview.html chrome://browser/content/tabview.html] - expected PASS
+I looked into these failures a bit and concluded that some are
+dups of bug 1087109.  The others appear to be intermittent as well,
+since I re-did the try and don't see them: https://tbpl.mozilla.org/?tree=Try&rev=87935a291ebd
+
+I did have to make one tiny change to make the patch build everywhere.
+I'll upload the final patch shortly.
+I think it is good to go.
+Created attachment 8512920
+add timeline marker from EventListenerManager
+
+The patch required one trivial change to compile everywhere:
+
++#include "mozilla/DOMEventTargetHelper.h"
+
+This is included in EventListenerManager.cpp by some route (I didn't
+investigate) on some platforms but not all.
+https://hg.mozilla.org/integration/fx-team/rev/41055bc926cd
+https://hg.mozilla.org/mozilla-central/rev/41055bc926cd
+Setting qe-verify- for this fix since it seems to be covered by automated testing. Tom, if you think there's something manual QA can look at here, please flip this flag and offer some guidance.
+Sorry for the spam. Moving bugs to Firefox :: Developer Tools: Performance Tools (Profiler/Timeline).
+
+dkl
+
+
+[timeline] record DOM events propagation
+
+
+
+Bug 1050501 - add timeline marker from EventListenerManager. r=smaug r=paul 

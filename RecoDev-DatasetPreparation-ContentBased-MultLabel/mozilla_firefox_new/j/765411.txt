@@ -1,0 +1,458 @@
+On my machine in debug builds off a cold start, I can watch as the icons get loaded for the launcher area and the various graphics come in to play.
+
+We need to profile the loading of this page and see what various perf improvements can be made.
+
+One off the top of my head could be switching to using data URIs for the graphics and inlining the styles on the page. These can both be done during build time for maintenance reasons.
+
+It is very important that this page load with the same amount of speed as about:blank since this is the page that many of our users see when the browser starts up.
+
+On my machine in debug builds off a cold start, I can watch as the icons get loaded for the launcher area and the various graphics come in to play.
+
+We need to profile the loading of this page and see what various perf improvements can be made.
+
+One off the top of my head could be switching to using data URIs for the graphics and inlining the styles on the page. These can both be done during build time for maintenance reasons.
+
+It is very important that this page load with the same amount of speed as about:blank since this is the page that many of our users see when the browser starts up.
+The graphics might also cause reflows due to the lack of proper width/height attributes on the buttons.
+Using one image instead of several comes to mind, too.
+I was able to generate some kind of load times for about:home.
+
+1,302,306 ns (cold start)
+726,164 ns
+469,801 ns
+616,128 ns
+469,017 ns
+
+For the begin of the pageload, I got a timestamp with QueryPerformanceCounter at AboutRedirector::NewChannel.
+
+For the end of the pageload, I put a window.dump statement at the end of aboutHome.js::fitToWidth. Within the implementation of window.dump, I made another call to QueryPerformanceCounter and then calculated the delta between the two counters.
+
+More granular measurements will help to narrow down the exact slow parts, but there are already some obvious parts that can be fixed and measured against. Either way, we should never be seeing a page like about:home take > 400ms to finish loading.
+Created attachment 633954
+potential patch
+
+This patch does three things:
+
+1) sets the width/height on the images within the page (except the mozilla link in the top right).
+
+2) it adds some styles to the CSS so that the search field will have the focused appearance before autofocus actually focuses the #searchText element. this helps when the page is loaded to stop a flicker from showing the #searchText unfocused styling then transitioning to the focused styling. (perceived performance)
+
+3) it moves the <script> tag to the bottom of the page.
+
+using |window.performance.timing.loadEventEnd - performance.timing.navigationStart| I was unable to tell a difference between m-c and the results of this patch, but I think that is because the timing of these events isn't representative of layout/painting.
+(In reply to Jared Wein [:jaws] from comment #4)
+> 1) sets the width/height on the images within the page (except the mozilla
+> link in the top right).
+
+We can't do this, because the launch buttons aren't all the same width in many locales, and it's not maintainable to have each localizer calculate this.
+
+I would prefer inlining images if that helps.
+
+> 2) it adds some styles to the CSS so that the search field will have the
+> focused appearance before autofocus actually focuses the #searchText
+> element. this helps when the page is loaded to stop a flicker from showing
+> the #searchText unfocused styling then transitioning to the focused styling.
+> (perceived performance)
+
+This is a good idea.
+If we add the autofocus attribute without modifying the CSS, do we get the same benefits?
+
+> 3) it moves the <script> tag to the bottom of the page.
+
+I'm not sure how much this helps. We still need to run the script to figure out which search engine to load, which triggers another reflow. :/
+(In reply to Frank Yan (:fryn) from comment #5)
+> (In reply to Jared Wein [:jaws] from comment #4)
+> > 1) sets the width/height on the images within the page (except the mozilla
+> > link in the top right).
+> 
+> We can't do this, because the launch buttons aren't all the same width in
+> many locales, and it's not maintainable to have each localizer calculate
+> this.
+> 
+> I would prefer inlining images if that helps.
+
+I'm not sure what you mean by inlining images. If we set the image using a data URI then we will still have lag while the image is being decoded and the size of the image is computed. Maybe we some different markup that allows us to explicitly set height/width for the images since those shouldn't be changing based on locale.
+ 
+> > 2) it adds some styles to the CSS so that the search field will have the
+> > focused appearance before autofocus actually focuses the #searchText
+> > element. this helps when the page is loaded to stop a flicker from showing
+> > the #searchText unfocused styling then transitioning to the focused styling.
+> > (perceived performance)
+> 
+> This is a good idea.
+> If we add the autofocus attribute without modifying the CSS, do we get the
+> same benefits?
+
+The [autofocus] attribute is already present. This just applies the styling before autofocus works its magic. autofocus might not be applying until the load event.
+
+> > 3) it moves the <script> tag to the bottom of the page.
+> 
+> I'm not sure how much this helps. We still need to run the script to figure
+> out which search engine to load, which triggers another reflow. :/
+
+Yes, we still need to run the script to figure out which search engine to load, but that is already set to run on DOMContentLoaded. In fact, moving the script to this location would allow us to remove that event handler and just run the JS for this immediately.
+
+This, in theory, should be faster than having script at the top of the page since it has the potential to stop parallel http requests. I'm unable to measure the performance improvement here.
+(In reply to Jared Wein [:jaws] from comment #6)
+> Maybe we some different markup that
+> allows us to explicitly set height/width for the images since those
+> shouldn't be changing based on locale.
+
+You can set the height and width for the images in the markup.
+.launchButton::before {
+  width: ...;
+  height: ...;
+}
+
+#restorePreviousSession::before {
+  width: ...;
+  height: ...;
+}
+
+In your patch, you're trying to set the width and height for the buttons, which have variable labels, so of course their dimensions are variable.
+
+> The [autofocus] attribute is already present. This just applies the styling
+> before autofocus works its magic. autofocus might not be applying until the
+> load event.
+
+I see.
+
+> > > 3) it moves the <script> tag to the bottom of the page.
+> 
+> This, in theory, should be faster than having script at the top of the page
+> since it has the potential to stop parallel http requests. I'm unable to
+> measure the performance improvement here.
+
+I see. I'm not sure if assuming that it is Google in the markup and changing it as needed in the JS would be an improvement.
+(In reply to Frank Yan (:fryn) from comment #7)
+> > > > 3) it moves the <script> tag to the bottom of the page.
+> > 
+> > This, in theory, should be faster than having script at the top of the page
+> > since it has the potential to stop parallel http requests. I'm unable to
+> > measure the performance improvement here.
+> 
+> I see. I'm not sure if assuming that it is Google in the markup and changing
+> it as needed in the JS would be an improvement.
+
+I don't remember proposing this, although there are only two search engines that about:home could potentially show (and only one after bug 765750 is fixed). So if there is only one search engine possible, how could this not be an improvement?
+(In reply to Jared Wein [:jaws] from comment #8)
+> (In reply to Frank Yan (:fryn) from comment #7)
+> > > > > 3) it moves the <script> tag to the bottom of the page.
+> > > 
+> > > This, in theory, should be faster than having script at the top of the page
+> > > since it has the potential to stop parallel http requests. I'm unable to
+> > > measure the performance improvement here.
+> > 
+> > I see. I'm not sure if assuming that it is Google in the markup and changing
+> > it as needed in the JS would be an improvement.
+> 
+> I don't remember proposing this, although there are only two search engines
+> that about:home could potentially show (and only one after bug 765750 is
+> fixed). So if there is only one search engine possible, how could this not
+> be an improvement?
+
+I was unclear. I should have made that two paragraphs. I meant that moving the script tag probably makes sense, and I additionally proposed assuming that Google is the default in the markup and immediately questioned the effectiveness of my own proposal. On second thought, I think it will be an improvement, but I need to better understand how localStorage['search-engine'] gets set.
+Created attachment 634307
+Patch for bug
+
+This patch now sets the width/height on the pseudo-elements instead of the button.
+
+There is now zero movement of elements when holding down Refresh on about:home. This was the best way that I could reliably simulate a poor loading scenario.
+
+I didn't go with setting Google as the default search engine in the markup, although that is a good idea.
+I forgot to mention, I also ran some basic performance comparison between Trunk and this patch. I did
+> performance.timing.loadEventEnd - performance.timing.navigationStart
+
+On trunk:
+75,83,86,72,75,76,78 (mean: 77.85, median: 76, mode: 75)
+With patch:
+56,60,57,55,56,58,60 (mean: 57.42, median: 57, mode: 56)
+
+It sure isn't respectable by a statistician, but this shows a pretty good improvement on load times. This shows an average improvement of 35%.
+Comment on attachment 634307
+Patch for bug
+
+> #defaultSnippet2 {
+>   display: block;
+>   min-height: 38px;
+>   background: 30px center no-repeat;
+>   padding: 6px 0;
+>   -moz-padding-start: 79px;
+> }
+> 
+>+#snippetContainer[snippetLoading] {
+>+  min-height: 74px;
+>+}
+
+Where does this number come from?
+
+> #aboutMozilla::before {
+>   content: url("chrome://browser/content/abouthome/mozilla.png");
+>   display: block;
+>   position: absolute;
+>   top: 12px;
+>   right: 12px;
+>+  height: 19px;
+>+  width: 69px;
+
+This is unlikely to help, since the image positioned absolutely.
+
+>+  let searchText = document.getElementById("searchText");
+>+  searchText.addEventListener("blur", function searchText_onBlur(e) {
+>+    searchText.removeEventListener("blur", searchText_onBlur, false);
+>+    e.target.removeAttribute("autofocus");
+>+  }, false);
+
+Document why you're doing this.
+
+nit: remove the third add/removeEventListener argument
+
+>+<!ENTITY abouthome.brandLogo.height "154px">
+>+<!ENTITY abouthome.brandLogo.width "154px">
+>+<!ENTITY abouthome.searchEngineLogo.height "28px">
+>+<!ENTITY abouthome.searchEngineLogo.width "70px">
+
+This doesn't belong in locales.
+Created attachment 634314
+Patch for bug v2
+
+(In reply to Dão Gottwald [:dao] from comment #12)
+> >+#snippetContainer[snippetLoading] {
+> >+  min-height: 74px;
+> >+}
+> 
+> Where does this number come from?
+
+I added a comment to the file to explain this number. This is the comment I added:
+  /* This number comes from the default height of the snippetContainer
+     when viewed with default font-size on Windows. The goal here is to
+     provide the most common default height, which will then be removed
+     when a snippet is loaded. This should reduce visual moving/flickering. */
+ 
+> > #aboutMozilla::before {
+> >   content: url("chrome://browser/content/abouthome/mozilla.png");
+> >   display: block;
+> >   position: absolute;
+> >   top: 12px;
+> >   right: 12px;
+> >+  height: 19px;
+> >+  width: 69px;
+> 
+> This is unlikely to help, since the image positioned absolutely.
+
+I thought I had removed this. Thanks for catching that.
+
+> >+  let searchText = document.getElementById("searchText");
+> >+  searchText.addEventListener("blur", function searchText_onBlur(e) {
+> >+    searchText.removeEventListener("blur", searchText_onBlur, false);
+> >+    e.target.removeAttribute("autofocus");
+> >+  }, false);
+> 
+> Document why you're doing this.
+> 
+> nit: remove the third add/removeEventListener argument
+
+Done and done.
+ 
+> >+<!ENTITY abouthome.brandLogo.height "154px">
+> >+<!ENTITY abouthome.brandLogo.width "154px">
+> >+<!ENTITY abouthome.searchEngineLogo.height "28px">
+> >+<!ENTITY abouthome.searchEngineLogo.width "70px">
+> 
+> This doesn't belong in locales.
+
+Moved out of locales and into the CSS file.
+(In reply to Jared Wein [:jaws] from comment #13)
+> (In reply to Dão Gottwald [:dao] from comment #12)
+> > >+#snippetContainer[snippetLoading] {
+> > >+  min-height: 74px;
+> > >+}
+> > 
+> > Where does this number come from?
+> 
+> I added a comment to the file to explain this number. This is the comment I
+> added:
+>   /* This number comes from the default height of the snippetContainer
+>      when viewed with default font-size on Windows. The goal here is to
+
+If it depends on the font size, you should use em, and em + px if it's a combination of both. Presumably it also depends on the number of lines, which you should document as well.
+
+>      provide the most common default height, which will then be removed
+>      when a snippet is loaded. This should reduce visual moving/flickering.
+> */
+
+It's unclear why it should be removed when the snippet is loaded; if the snippet is smaller than anticipated, this will cause flickering.
+Created attachment 634759
+Patch for bug v3
+
+This patch now uses -moz-calc to calculate the height of the #snippetContainer. I've updated the comment in aboutHome.css to explain where the calculation came from.
+Comment on attachment 634759
+Patch for bug v3
+
+Review of attachment 634759:
+-----------------------------------------------------------------
+
+::: browser/base/content/abouthome/aboutHome.css
+@@ +154,5 @@
+> +     The goal here is to provide the most common default height to reduce visual
+> +     moving/flickering. */
+> +  min-height: -moz-calc(1.1875 * 2em + 36px);
+> +}
+> +
+
+What does "most common default height" mean? Whence are you getting that?
+
+@@ +278,1 @@
+>    margin-bottom: 6px;
+
+margin: 0 auto 6px;
+
+::: browser/base/content/abouthome/aboutHome.js
+@@ +211,5 @@
+>  }
+>  
+>  function showSnippets()
+>  {
+> +  let snippetContainer = document.getElementById("snippetContainer");
+
+I don't think this is needed.
+Comment on attachment 634759
+Patch for bug v3
+
+Review of attachment 634759:
+-----------------------------------------------------------------
+
+r+ with comments addressed.
+
+::: browser/base/content/abouthome/aboutHome.css
+@@ +154,5 @@
+> +     The goal here is to provide the most common default height to reduce visual
+> +     moving/flickering. */
+> +  min-height: -moz-calc(1.1875 * 2em + 36px);
+> +}
+> +
+
+Perhaps, replace "provide the most common default height" with "initialize at the height of a two-line snippet". I'm assuming that you tested this.
+
+I fixed bug 733651, preventing the container from being unintentionally empty, so this won't be a risky change, I think.
+Created attachment 634766
+Patch for checkin
+
+Thanks for the reviews Dao and Frank. I've made the requested changes and will land it tomorrow.
+Comment on attachment 634766
+Patch for checkin
+
+>+#snippetContainer {
+>+  /* The font-size is at 75% and the line-height is left unchanged, so this
+>+     expression converts the font-size back to a line-height and then adds
+>+     the various vertical paddings and margins that are applied to the snippets.
+>+     The goal here is to initialize at the height of a two-line snippet to
+>+     reduce visual moving/flickering. */
+>+  min-height: -moz-calc(1.1875 * 2em + 36px);
+
+This doesn't make sense. The inner text has a 75% font size, which means that 1em here is 133% of the actual font size. This is already more than the actual line height.
+
+Can you move the min-height to #snippets to avoid this mess?
+Created attachment 635197
+Patch for bug v4
+
+This patch moves the min-height to the #snippets element and just uses 50px since the default snippets have a min-height of 38px + 6px of top/bottom padding.
+
+((4/3) * 2em + 12px) equals 44px, which is less than the min-height + vertical padding of the default snippet (50px), so it won't help us here.
+Comment on attachment 635197
+Patch for bug v4
+
+>+  /* The min-height here is the min-height of the defaultSnippets plus
+>+     their padding. The goal here is to initialize at the height of a
+>+     two-line snippet to reduce visual moving/flickering. */
+>+  min-height: 50px;
+
+Please base this on real snippets. Afaik they don't have a min-height and I see a number of (German) snippets with three lines.
+Created attachment 635220
+Patch for bug v5
+
+Changed the min-height to 3 lines of text as discussed on IRC.
+Comment on attachment 635220
+Patch for bug v5
+
+> #snippets {
+>   display: inline-block;
+>   text-align: start;
+>   margin: 12px 0;
+>   color: #3c3c3c;
+>   font-size: 75%;
+>+  /* 17/12 is the default line-height divided by the
+>+     reduced (16px * 75%) font-size, which converts em
+>+     from units of font-size to units of line-height.
+>+     The goal here is to initialize at the height of a
+>+     three-line snippet to reduce visual moving/flickering. */
+>+  min-height: -moz-calc(17/12 * 3em);
+
+Looks ok code wise, but this comment doesn't seem sane. 17px isn't the "default line-height". Unless set explicitly, the line-height depends on the font-size. You should also mention that these numbers are measured on Windows and a mere approximation. The line-height / font-size ratio is likely different on other OSes, with other font faces or at other font sizes.
+Created attachment 638057
+Patch for bug v6
+
+I updated the comment to hopefully be clearer. This is what the comment now reads:
+
+>  /* 17px is approx. the default line-height as measured on Windows 7 Segoe UI.
+>     12px is 75% of approx. the default font-size as measured on Windows 7 Segoe UI.
+>     The 17/12 is here to convert em from units of font-size to units of
+>     line-height. The goal here is to initialize at the height of a
+>     three-line snippet to reduce visual moving/flickering. */
+Comment on attachment 638057
+Patch for bug v6
+
+>+  /* 17px is approx. the default line-height as measured on Windows 7 Segoe UI.
+>+     12px is 75% of approx. the default font-size as measured on Windows 7 Segoe UI.
+>+     The 17/12 is here to convert em from units of font-size to units of
+>+     line-height. The goal here is to initialize at the height of a
+>+     three-line snippet to reduce visual moving/flickering. */
+
+  /* 12px is the computed font size, 17px the computed line height of the snippets
+     with Segoe UI on a default Windows 7 setup. The 17/12 multiplier approximately
+     converts em from units of font-size to units of line-height. The goal is to
+     preset the height of a three-line snippet to avoid visual moving/flickering as
+     the snippets load. */
+
+I measured the line height again and got 17px in Firefox 13 but 15px in the current nightly. Please double-check this.
+
+Please move the script back into the <head>, since you weren't able to measure a perf win.
+Using the Inspector with this data URI,
+> data:text/html,<style>body{font:message-box;}</style>hello
+I was able to reproduce the 17px line-height on Nightly.
+
+There is a visible difference with the script location. With the <script> moved to the head, holding down F5 will show a blank page. With the <script> moved to the bottom of the <body>, holding down F5 will show a mostly complete about:home page (only missing the snippets and search engine logo). Based on this, I left the <script> at the bottom of the <body>.
+
+Pushed to mozilla-inbound:
+https://hg.mozilla.org/integration/mozilla-inbound/rev/e5248b32d1b6
+https://hg.mozilla.org/mozilla-central/rev/e5248b32d1b6
+Sigh. Backed out: http://hg.mozilla.org/mozilla-central/rev/69062ce37818
+
+(In reply to Jared Wein [:jaws] from comment #26)
+> Using the Inspector with this data URI,
+> > data:text/html,<style>body{font:message-box;}</style>hello
+> I was able to reproduce the 17px line-height on Nightly.
+
+This isn't a useful test case, since it doesn't have the same reduced font size as the snippets.
+
+You also committed this with your latest comment rather than the one I proposed in comment 25, which I hoped would be clearer. Is there a problem with my proposed comment?
+
+> There is a visible difference with the script location. With the <script>
+> moved to the head, holding down F5 will show a blank page. With the <script>
+> moved to the bottom of the <body>, holding down F5 will show a mostly
+> complete about:home page (only missing the snippets and search engine logo).
+> Based on this, I left the <script> at the bottom of the <body>.
+
+Shouldn't this be measurable when loading the page once?
+Landed with the review comment addressed:
+http://hg.mozilla.org/integration/mozilla-inbound/rev/1fdfd85870b9
+https://hg.mozilla.org/mozilla-central/rev/1fdfd85870b9
+
+
+about:home loading performance optimizations
+
+
+
+Bug 765411 - Performance improvements for about:home. r=dao 
+
+Bug 765411 - about:home loading performance optimizations. r=dao 

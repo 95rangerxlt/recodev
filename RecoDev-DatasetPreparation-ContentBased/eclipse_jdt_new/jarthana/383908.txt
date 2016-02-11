@@ -1,0 +1,327 @@
+BETA_JAVA8:
+
+Post support for explicit this parameter as a holder for receiver annotations,
+we now accept this program which we should not:
+
+// ------
+public class X {
+  void foo(X this) {
+  }
+  void foo() {
+  }
+}
+
+The other side of the coin is that the following should compile,
+but doesn't anymore:
+
+// --------
+public class X {
+  void foo(X this) {
+  }
+  public static void main(String[] args) {
+    new X().foo();
+  }
+}
+
+BETA_JAVA8:
+
+Post support for explicit this parameter as a holder for receiver annotations,
+we now accept this program which we should not:
+
+// ------
+public class X {
+  void foo(X this) {
+  }
+  void foo() {
+  }
+}
+
+The other side of the coin is that the following should compile,
+but doesn't anymore:
+
+// --------
+public class X {
+  void foo(X this) {
+  }
+  public static void main(String[] args) {
+    new X().foo();
+  }
+}
+Jay, please follow up, thanks.
+Earlier communication from Markus:
+
+> I suggest we treat this parameter extra in the MethodDeclaration 
+> API, i.e. don't include it in the parameters() list, but add a new 
+> property get/setThisParameter(..). Then most of the extra code can 
+> be confined to the ASTRewrite.
+(In reply to comment #0)
+Sounds like the 'this' parameter should be treated specially even earlier in the food chain (i.e. as early as possible). E.g. compile error messages also shouldn't contain the 'this' parameter. 
+
+When implementing this support, I suggest you never consider the 'this' parameter as a parameter at all and don't ever include it in a parameter list. To make the perspective switch easier, assume the syntax would be something like this where it's clear that 'this' is not a parameter:
+
+  void foo [@ReceiverAnnotation X this] () { //syntax from a parallel universe
+  }
+(In reply to comment #3)
+> (In reply to comment #0)
+> Sounds like the 'this' parameter should be treated specially even earlier in
+> the food chain (i.e. as early as possible). E.g. compile error messages also
+> shouldn't contain the 'this' parameter. 
+> 
+> When implementing this support, I suggest you never consider the 'this'
+> parameter as a parameter at all and don't ever include it in a parameter list.
+
+Yes, Jay, just after the AbstractMethodDeclaration.arguments's types are
+resolved and any errors are reported, if argument.isReceiver(), it should be 
+moved out of AbstractMethodDeclaration.arguments into a separate decoration
+say `receiver' and the original array be shrunk. 
+
+Remember to change print methods so as to include this decoration in the 
+output.
+Created attachment 219564
+Proposed fix
+
+All current tests pass. The new tests will have to be adjusted once we will be able to resolve ElementType.TYPE_USE.
+(In reply to comment #5)
+> Created attachment 219564 [details]
+> Proposed fix
+
+Jay, I am not sure this is the simplest fix. We are perhaps moving the receiver
+our rather early. It is going to be painful to move it out too early as well as
+too late.
+
+What happens in you discriminate just at the point in STB where the
+code on BETA_JAVA8 reads:
+
+		// only assign parameters if no problems are found
+		if (!foundArgProblem) {
+			method.parameters = newParameters;
+		}
+
+In here, check if newParameters[0] is a receiver and if so move it out
+and assign a shrunk array to method.parameters ?
+(In reply to comment #6)
+> What happens in you discriminate just at the point in STB where the
+> code on BETA_JAVA8 reads:
+> 
+> 		// only assign parameters if no problems are found
+> 		if (!foundArgProblem) {
+> 			method.parameters = newParameters;
+> 		}
+
+This was my first choice too. But for things like search, open declaration it was too late and they won't work.
+(In reply to comment #7)
+
+> This was my first choice too. But for things like search, open declaration
+> it was too late and they won't work.
+
+What exactly happens when you say it won't work ?
+Can you point me to some tests that fail ?
+(In reply to comment #9)
+> Can you point me to some tests that fail ?
+
+I don't recall any tests failing. But when I delay the separation of the receiver, the open declaration of a method with a receiver doesn't work. Other scenarios that don't work are searching for the same method (ctrl+shift+G) don't produce any results. In both these cases, the cause is that the method binding can't be associated with a valid JavaElement because of the additional 'this' param. The missing JavaElement can be seen on the ASTViewer as well.
+Please read comment 3 again. I still think the 'this' parameter should be separated as early as possible, i.e. in Parser#consumeMethodHeaderRightParen().
+Neither the ASTs nor bindings nor Java elements should treat 'this' as a regular parameter.
+
+The first step should just be to make the existing infrastructure work regardless of whether the 'this' parameter is present or not.
+
+The second step will be to add support for the new feature, but this can IMO wait until the rest of the jsr308 has been implemented, so that existing implementation can be reused.
+(In reply to comment #11)
+> Please read comment 3 again. I still think the 'this' parameter should be
+> separated as early as possible, i.e. in
+> Parser#consumeMethodHeaderRightParen().
+
+Markus, I would like it separated as early as possible, but no earlier.
+It could still turn out that Parser#consumeMethodHeaderRightParen() is
+the right place to do it - It leads to code changes that don't look the
+simplest - which is why this is being discussed.
+
+> Neither the ASTs nor bindings nor Java elements should treat 'this' as a
+> regular parameter.
+
+I would with be fine with an approach that slightly defers the separation 
+if all observers see the separation. I am not sure this is possible, but I
+want this explored.
+Created attachment 219801
+Updated patch
+
+This patch minimizes the numbers of changes lines comparing with the previous patch as suggested by Srikanth.
+Here are some review comments:
+
+   1. Parser.java: A few nits: (a) Our coding convention is that
+we use either:
+
+     if (a  > b) c = 10;     // all in one line or
+     
+                 or
+
+     if (length > 1) {
+	System.arraycopy(
+	this.astStack,
+	this.astPtr + 2,
+	md.arguments = new Argument[length - 1],
+	0,
+	length - 1);
+    }
+
+    (b) Likewise it is:
+
+        if (a > b) {
+        } else {
+        } and NOT
+
+        if (a > b) {
+        }
+        else {
+        }
+
+    (c) If else has a { block }, we also bracket if in { block }
+
+Please apply these comments everywhere.
+
+(2) SourceTypeBinding.java:
+
+I would push the block:
+
+if (methodDecl.receiver != null) 
+    method.receiver = newParameters[0];
+
+inside the if (methodDecl.receiver != null) { just below.
+This has the effect of assigning the receiver field only
+if there are no arg problems, but that is just fine. What
+is good for real parameters is good enough for the explicit
+this parameter.
+
+(3) MethodBinding.java: Add a comment on the field receiver // JSR308 - explicit this parameter
+
+(4) methodScope.java:
+
+The block: (which occurs in two places)
+
+if (CharOperation.equals(argument.name, ConstantPool.This)) {
+	if (argLength != 0) {
+		problemReporter().illegalThis(argument, method, sourceLevel);
+	}
+	else if (argument.annotations != null) {
+        	method.receiverAnnotations = argument.annotations;
+		method.bits |= ASTNode.HasTypeAnnotations;
+	}
+}
+
+looks wrong. It should simply read:
+if (CharOperation.equals(argument.name, ConstantPool.This)) {
+	problemReporter().illegalThis(argument, method, sourceLevel);
+}
+
+(5) We are not transferring annotations from method.receiver into
+method.receiverAnnotations. This latter decoration is the one that
+is resolved by existing code. The best place to do this would be
+the 3rd diff in MethodScope.java
+
+(6) It would appear to make up for this not transfer of annotations,
+there is additional code put in place. For example, do we really
+need the diffs 2-6 in AbstractMethodDeclaration ? If you implement
+(1) through (5) and get rid of the diffs 2-6 in AMD.java, what breaks ?
+Created attachment 219875
+Updated patch
+
+This patch includes suggestions from Srikanth.
+(In reply to comment #14)
+> (2) SourceTypeBinding.java:
+> 
+> I would push the block:
+> 
+> if (methodDecl.receiver != null) 
+>     method.receiver = newParameters[0];
+> 
+> inside the if (methodDecl.receiver != null) { just below.
+> This has the effect of assigning the receiver field only
+> if there are no arg problems, but that is just fine. What
+> is good for real parameters is good enough for the explicit
+> this parameter.
+
+I thought I could come up with a test case that this change would break. But couldn't. Only case I found where foundArgProblem is true is when I use a void as a argument type. But that doesn't make a difference because we end up with a null binding for the method itself.
+
+Another point w.r.t to the patch is, we set the receiverAnnotations and HasTypeAnnotations flag even if the source level is less than 1.8, just to keep the previous behavior, though I am not absolutely sure receiverAnnotations needs to be set.
+(In reply to comment #15)
+> Created attachment 219875 [details]
+> Updated patch
+> 
+> This patch includes suggestions from Srikanth.
+
+Thanks, this looks *significantly* simpler.
+
+More comments:
+
+(0) Fix indentation issues with if-else in SourceTypeBinding.java 2nd diff.
+HOWEVER,
+
+(1) This much simpler patch allows me to better understand the code and this
+understanding raises the following question: By merging explicit this
+into arguments array temporarily, we are causing certain processing to
+happen on this which we should not: (a) We should NOT be setting HasParameterAnnotations on account of the 'this' parameter having 
+annotations. (b) We should not be creating a LVB for 'this'. We never used
+to earlier and should not now.
+
+So if we look at the for loop that iterates over the arguments, the only
+relevant processing there is the line
+
+parameterType = arg.type.resolveType(methodDecl.scope, true /* check bounds*/);
+
+which means we are better off not doing the dance we do in STB to merge
+and separate, but we are better off with a separate block ahead of the
+argument processing code that reads:
+
+if (methodDecl.receiver != null) {
+    method.receiver = methodDecl.receiver.type.resolveType(methodDecl.scope, true /* check bounds*/);
+}
+
+I suspect this is ALL the change required in STB.
+ 
+(2) SourceTypeBinding.java second diff could have been shortened into:
+if (methodDecl.receiver != null) {
+	method.receiver = newParameters[0];
+	int length = newParameters.length;
+
+I'll attach a patch shortly.
+	if (length == 1) {
+	    newParameters = NO_PARAMETERS;
+	} else {
+	    System.arraycopy(newParameters, 1, newParameters = new TypeBinding[length - 1], 0, length - 1);
+	}
+	method.parameters = newParameters;
+
+BUT it is irrelevant if suggestion (1) works out for us.
+Created attachment 219890
+Simpler patch ??
+
+Jay, see if this patch is simpler. It passes all the Java8 tests except the one that uses TYPE_USE.
+
+If you agree with this patch, please release after testing.
+(In reply to comment #18)
+> Created attachment 219890 [details]
+> Simpler patch ??
+> 
+> Jay, see if this patch is simpler. It passes all the Java8 tests except the
+> one that uses TYPE_USE.
+> 
+> If you agree with this patch, please release after testing.
+
+I ran all the tests - Except for NegativeTypeAnnotationTest.test0383913d()
+which uses TYPE_USE, all tests are green.
+Created attachment 220088
+Updated patch
+
+Same as the last one from Srikanth with couple of minor changes:
+
+1. Removed the reference to TYPE_USE to make the NegativeTypeAnnotationTest.test0383913d() test pass for the time being.
+2. Some minor changes in the Problem Reporter to remove unused parameters.
+Released the fix in BETA_JAVA8:
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=cedc325f2a935c759cba1f1e5e6c7415bee87a4f
+
+
+[1.8][compiler] Explicit this parameter interferes with method overloading/resolution.
+
+
+
+Fix for bug 383908: [1.8][compiler] Explicit this parameter interferes with method overloading/resolution. 

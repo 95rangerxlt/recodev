@@ -1,0 +1,260 @@
+Currently, SessionStore writes file using a xpcom SafeOutputStream and asyncCopy. We should migrate the operation to the more lightweight OS.File. Telemetry will tell us if this offers any performance benefit.
+
+Currently, SessionStore writes file using a xpcom SafeOutputStream and asyncCopy. We should migrate the operation to the more lightweight OS.File. Telemetry will tell us if this offers any performance benefit.
+Created attachment 665461
+Prototype
+
+Attaching a first prototype. This uses the default encoding (utf-8) to write the file to disk.
+Created attachment 665462
+Prototype
+
+Same one, *after* qref.
+Comment on attachment 665462
+Prototype
+
+Review of attachment 665462:
+-----------------------------------------------------------------
+
+Simple patch, looks good to me. I *think* we already have tests that actually check if the file is written and updated.
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #0)
+> Telemetry will tell us if this offers any performance benefit.
+
+Not sure about that. Even if the operation itself would take a little longer but doesn't block as much that's definitely better, too.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4433,5 @@
+>      TelemetryStopwatch.start("FX_SESSION_RESTORE_WRITE_FILE_MS");
+> +    let path = aFile.path;
+> +    let promise = OS.File.writeAtomic(path, aData, {tmpPath: path + ".tmp"});
+> +
+> +    promise = promise.then(
+
+Couldn't we just do 'promise.then(' without the assignment? I would expect the value to be used for *something* otherwise.
+Created attachment 666871
+Moving the write fully off the main thread
+
+Now that bug 795544 is landing, we have decided to rework the Encoding-related API of OS.File. Here is the updated code.
+Comment on attachment 666871
+Moving the write fully off the main thread
+
+Review of attachment 666871:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4436,5 @@
+>      TelemetryStopwatch.start("FX_SESSION_RESTORE_WRITE_FILE_MS", refObj);
+> +    let path = aFile.path;
+> +    if (this._writeFileEncoder == null) {
+> +      this._writeFileEncoder = new TextEncoder();
+> +    }
+
+We can use XPCOMUtil.defineLazyGetter() for this in .initService().
+
+@@ +4440,5 @@
+> +    }
+> +    let encoded = this._writeFileEncoder.encode(aData);
+> +    let promise = OS.File.writeAtomic(path, encoded, {tmpPath: path + ".tmp"});
+> +
+> +    promise = promise.then(
+
+Let's just do 'promise.then(' without the assignment. I would expect the value to be used for *something* otherwise.
+
+@@ +4442,5 @@
+> +    let promise = OS.File.writeAtomic(path, encoded, {tmpPath: path + ".tmp"});
+> +
+> +    promise = promise.then(
+> +      function onSuccess() {
+> +         TelemetryStopwatch.finish("FX_SESSION_RESTORE_WRITE_FILE_MS");
+
+Where has the 'refObj' argument gone?
+
+@@ +4448,5 @@
+> +                                      "sessionstore-state-write-complete",
+> +                                      "");
+> +      },
+> +      function onFailure(reason) {
+> +        TelemetryStopwatch.finish("FX_SESSION_RESTORE_WRITE_FILE_MS");
+
+Failures would probably screw up Telemetry measurements, so let's do |TelemetryStopwatch.cancel("FX_SESSION_RESTORE_WRITE_FILE_MS", refObj)| here.
+
+@@ +4452,5 @@
+> +        TelemetryStopwatch.finish("FX_SESSION_RESTORE_WRITE_FILE_MS");
+> +        Components.reportError("ssi_writeFile failure " + reason);
+> +      });
+> +  },
+> +  _writeFileEncoder: null
+
+Let's move this to the top and add a comment like for the other properties.
+> > +    promise = promise.then(
+> 
+> Let's just do 'promise.then(' without the assignment. I would expect the
+> value to be used for *something* otherwise.
+
+Fair enough. In the future, we might even want to migrate to Task.js-style.
+
+> Where has the 'refObj' argument gone?
+Oops.
+
+> Failures would probably screw up Telemetry measurements, so let's do
+> |TelemetryStopwatch.cancel("FX_SESSION_RESTORE_WRITE_FILE_MS", refObj)| here.
+
+Ok. I believe that the issue was already present before I touched that code.
+
+
+> 
+> @@ +4452,5 @@
+> > +        TelemetryStopwatch.finish("FX_SESSION_RESTORE_WRITE_FILE_MS");
+> > +        Components.reportError("ssi_writeFile failure " + reason);
+> > +      });
+> > +  },
+> > +  _writeFileEncoder: null
+> 
+> Let's move this to the top and add a comment like for the other properties.
+
+Well, I applied your other suggestion of making this a lazy getter, so I can't do that.
+Created attachment 671225
+Moving the write fully off the main thread, v2
+
+Feedback applied. Of course, if we decide to proceed with bug 532150, this patch is essentially a subset.
+Doesn't this rather block bug 801599 than depend on it?
+I also think this bug should probably be moved to the Session Store component because all we touch is SS code? People watching this component have no idea what we're about to do :) Or am I overlooking something?
+Comment on attachment 671225
+Moving the write fully off the main thread, v2
+
+Review of attachment 671225:
+-----------------------------------------------------------------
+
+Thank you! r=me
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +447,4 @@
+>      this._initialized = true;
+>    },
+>  
+> +  _initEncoding : function _initEncoding() {
+
+nit: ssi_initEncoding()
+Created attachment 673834
+Moving the write fully off the main thread, v3
+
+Applied feedback.
+Try: https://tbpl.mozilla.org/?tree=Try&rev=7895067f6a69
+Canceled the try run and replaced it with something gentler:
+https://tbpl.mozilla.org/?tree=Try&rev=8562f1f800b8
+I can't quite make sense of the two oranges on tbpl, but I seem to understand that they are unrelated to this patch.
+Yeah, those are just general test crappiness.
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/b8214dfa2924
+Backed out in https://hg.mozilla.org/integration/mozilla-inbound/rev/a8e578300d3e - looks like this was one of those times where people's claims that you never need to run talos on try were not entirely accurate.
+Try again as: https://tbpl.mozilla.org/?tree=Try&rev=4e5e85da0a4b
+So far, I have no clue how this could even interact with Talos.
+Let me summarize my Talos-related findings so far:
+- the process seems to be freezing during the shutdown of worker threads (RuntimeService::Cleanup);
+- freezes are 100% reproducible on tbpl but do not show up on any test other than talos and seem impossible to reproduce locally;
+- freezes take place if we add a call to OS.File in SessionStore, and it seems that they take place regardless of which call, which hints that the problem is a bug of long-running chrome workers;
+- under Linux debug, the freeze seems to take place during a call to libpthreads https://tbpl.mozilla.org/php/getParsedLog.php?id=16748921&tree=Try#error1
+- on MacOS, after web-workers-shutdown is sent, we have a cycle collection, an endless fury of NS_ProcessEvent, which after ~3 minutes stabilize to *exactly* one every 5 seconds for 17 minutes before talos kills the process, https://tbpl.mozilla.org/php/getParsedLog.php?id=16748970&tree=Try&full=1#error0 (output is instrumented);
+- locally, however, after web-workers-shutdown is sent, we have no cycle collection, no NS_ProcessEvent and the process shuts down quickly.
+
+I am currently investigating directly on a talos slave.
+
+Requesting information from bent, in case he has any idea of what could cause these symptoms.
+Created attachment 678725
+Stack
+
+Attaching the stack trace at the time of the freeze. This seems to suggest that the RuntimeService has not realized that all threads had finished executing.
+Yeah, we've seen random orange on tinderbox where the process hangs on shutdown in RuntimeService::Cleanup. Apparently talos manages to hit it more frequently. As you noted for some reason it is impossibly hard to reproduce locally (we've even run mochitests over and over again in a recording VM to try to catch it and have not succeeded thus far).
+
+The worker shutdown process is pretty complicated, but basically RuntimeService::Cleanup will not return until every worker signals that it is finished. When we hang it is because a worker failed to do so. In these cases we need to see stacks of all the live worker threads in order to figure out what's going on (the main thread stack is usually not that enlightening). I would bet that the worker is simply waiting in its run loop, but who knows.
+Unfortunately, this is something that I seem to reproduce 100% on tbpl, at least on both MacOS and Linux. This permaorange prevents me from landing a trivial, but rather high priority, Snappy patch that itself blocks further Snappy work. This is driving me just a little bit crazy.
+
+At JS level, the worker is not doing anything at the time of shutdown. I have even attempted to call |worker.terminate()| before reaching that stage, to no avail.
+Created attachment 678757
+Stacks
+
+Attaching the state of all threads, in case this can prove useful.
+Huh! This is actually kind of useful. The stack shows that your worker has importScripts called 4 times (recursively)... That's fine, but can you point me to these call spots?
+bent: 
+* the root is http://dxr.mozilla.org/mozilla-central/toolkit/components/osfile/osfile.jsm.html
+* this imports http://dxr.mozilla.org/mozilla-central/toolkit/components/osfile/osfile_unix_front.jsm.html
+* this imports http://dxr.mozilla.org/mozilla-central/toolkit/components/osfile/osfile_unix_back.jsm.html
+and
+ http://dxr.mozilla.org/mozilla-central/toolkit/components/osfile/ospath_unix_back.jsm.html
+and
+ http://dxr.mozilla.org/mozilla-central/toolkit/components/osfile/osfile_shared_front.jsm.html
+* osfile_unix_back itself imports
+and
+ http://dxr.mozilla.org/mozilla-central/toolkit/components/osfile/osfile_shared_allthreads.jsm.html
+
+Note that the code should have stopped executing some time ago already.
+Actually, I forgot one level. In this test, osfile.jsm is not the root. It is itself imported from http://dxr.mozilla.org/mozilla-central/toolkit/components/osfile/osfile_async_worker.js.html
+Created attachment 679428
+Workaround for the Talos sci-fi bug
+
+Well, it seems that we can work around this by simply reorganizing importScripts in the source of OS.File(!): https://tbpl.mozilla.org/?tree=Try&rev=4c655ffd3319
+You should probably file a new bug to track this particular issue (and its workaround) - it gets confusing quickly to track it in this bug about sessionstore :)
+Good point. Ben, I understand that you were aware of the existence of this bug. Where do you track it?
+Bug 786987 probably.
+Comment on attachment 679428
+Workaround for the Talos sci-fi bug
+
+Seems like a more reasonable way to go about things anyway.
+(In reply to Nathan Froyd (:froydnj) from comment #29)
+> Comment on attachment 679428
+> Workaround for the Talos sci-fi bug
+> 
+> Seems like a more reasonable way to go about things anyway.
+
+Well, it breaks modularity, but this is a sacrifice I am willing to make in the context.
+Try: https://tbpl.mozilla.org/?tree=Try&rev=2ff0540b52eb
+https://hg.mozilla.org/integration/mozilla-inbound/rev/73287cb2dc6a
+https://hg.mozilla.org/integration/mozilla-inbound/rev/5ebd6549bf93
+What on *earth* did you do to the Gods of the Tree, call them Imps? They are, but it makes them very very angry when you call them that.
+
+Backed out in https://hg.mozilla.org/integration/mozilla-inbound/rev/04fa7fd1c588 because something in https://tbpl.mozilla.org/?tree=Mozilla-Inbound&rev=6f9dd07d9d64 broken Win64 PGO builds (see https://tbpl.mozilla.org/php/getParsedLog.php?id=16882606&tree=Mozilla-Inbound for the less-than-clear log of how they are broken), and both because you were the only non-b2g thing in there and because you're clearly cursed, I started the backouts with you. Check https://tbpl.mozilla.org/?tree=Mozilla-Inbound&onlyunstarred=1&rev=04fa7fd1c588 to see whether or not it will go green.
+Gasp, I must have forgotten my bi-yearly rubber chicken sacrifice (with extra spaghetti sauce). I will fetch my hunting attire and get this done immediately.
+
+P.S.: My commit doesn't contain any single line of C++ or Makefile and this looks semi- clearly like a C++ error.
+And yet, the backout worked - every one of them failed while it was in, they started working when it came out.
+
+Are you sure this is something you really want to land?
+Oh, great... Win64 PGO bustage confirmed.
+https://tbpl.mozilla.org/?tree=Try&rev=4383d7958d1b
+
+I see:
+- two mysterious PGOCVT "internal errors" in unspecified files;
+- one equally mysterious "compiler error" in CTypes.cpp, with the great error message "try simplifying or changing the program near the locations listed above".
+
+... all of this for two pure JavaScript patches.
+The two mysterious errors are present in green builds, too, despite claiming to be "fatal" - they may or may not be An Clue.
+Filed the MSVC bustage as a followup bug.
+Now that the PGO issue is solved, let's try this again!
+https://hg.mozilla.org/integration/mozilla-inbound/rev/e9d18da148c5
+https://hg.mozilla.org/integration/mozilla-inbound/rev/93a465ae3e4d
+https://hg.mozilla.org/mozilla-central/rev/e9d18da148c5
+https://hg.mozilla.org/mozilla-central/rev/93a465ae3e4d
+Yeah \o/
+I'll add some more spaghetti sauce on the rubber chicken, just in case.
+hmm. wondering if the bug i'm seeing is related to this change:
+
+https://bugzilla.mozilla.org/show_bug.cgi?id=812647
+
+
+[OS.File] Write session store with OS.File
+
+
+
+Bug 794091 - Write SessionStore with OS.File. r=ttaubert 
+
+Back out b8214dfa2924 (bug 794091) for talos hangs 
+
+Bug 794091 - Write SessionStore with OS.File. r=ttaubert 
+
+Bug 794091 - Reorganize OS.File importScripts to avoid talos hangs. r=froydnj 
+
+Back out 5ebd6549bf93 and 73287cb2dc6a (bug 794091) on suspicion of breaking Win64 PGO builds 
+
+Bug 794091 - Write SessionStore with OS.File. r=ttaubert 
+
+Bug 794091 - Reorganize OS.File importScripts to avoid talos hangs. r=froydnj 

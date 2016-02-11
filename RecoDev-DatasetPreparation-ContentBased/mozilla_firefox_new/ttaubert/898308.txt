@@ -1,0 +1,173 @@
+Currently, SessionStore is initialized by the delayedStartup() routine. Every time a browser window is opened we call ss.init() that then lazily initializes the service and starts tracking the window.
+
+That's certainly a bad API, nsBrowserGlue should just call ss.init() once and browser.js should then use ss.promiseInitialized.then() to initialize stuff that depends on ss being initialized.
+
+Currently, SessionStore is initialized by the delayedStartup() routine. Every time a browser window is opened we call ss.init() that then lazily initializes the service and starts tracking the window.
+
+That's certainly a bad API, nsBrowserGlue should just call ss.init() once and browser.js should then use ss.promiseInitialized.then() to initialize stuff that depends on ss being initialized.
+Created attachment 781583
+Clean up SessionStore initialization
+
+Steven, as you did somewhat related work in bug 881049, I'd really like to get your thoughts on this.
+Comment on attachment 781583
+Clean up SessionStore initialization
+
+Review of attachment 781583:
+-----------------------------------------------------------------
+
+Looks good to me! Thanks for cleaning up the whole "promise" vs "deferred" naming I missed in my patch :D
+Comment on attachment 781583
+Clean up SessionStore initialization
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+>+XPCOMUtils.defineLazyModuleGetter(this, "SessionStore",
+
+>diff --git a/browser/base/content/test/social/browser_social_window.js b/browser/base/content/test/social/browser_social_window.js
+
+>+let tmp = {};
+>+Cu.import("resource:///modules/sessionstore/SessionStore.jsm", tmp);
+>+let {SessionStore} = tmp;
+
+This could just instead refer to the browser.js global you added, right?
+
+(I wonder why Social depends on sessionstore initialization...)
+
+(I also wonder a bit whether the introduction of the "SessionStore" global will cause extension conflicts, but I suppose that's probably unlikely.)
+
+Looks like a nice cleanup!
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #3)
+> >+let tmp = {};
+> >+Cu.import("resource:///modules/sessionstore/SessionStore.jsm", tmp);
+> >+let {SessionStore} = tmp;
+> 
+> This could just instead refer to the browser.js global you added, right?
+
+Good idea... :)
+
+> (I wonder why Social depends on sessionstore initialization...)
+
+Hmmm. Maybe it actually doesn't. I couldn't find any code referring to it. Maybe we came to the wrong conclusions with all the initial test failures in bug 881049. I'll try to make it not depend on SessionStore initialization anymore and see what try says.
+
+> (I also wonder a bit whether the introduction of the "SessionStore" global
+> will cause extension conflicts, but I suppose that's probably unlikely.)
+
+Yeah, I wondered that, too. We'll see I guess.
+Created attachment 781896
+Clean up SessionStore initialization, v2
+
+https://tbpl.mozilla.org/?tree=Try&rev=61d2f733b333
+Comment on attachment 781896
+Clean up SessionStore initialization, v2
+
+>+  init: function (aWindow) {
+>+    if (this._initialized) {
+>+      throw new Error("SessionStore.init() must only be called once!");
+>+    }
+>+
+>+    if (!aWindow) {
+>+      throw new Error("SessionStore.init() must be called with a valid window.");
+>+    }
+>+
+>     TelemetryTimestamps.add("sessionRestoreInitialized");
+>     OBSERVING.forEach(function(aTopic) {
+>       Services.obs.addObserver(this, aTopic, true);
+>     }, this);
+> 
+>     this._initPrefs();
+>-
+>+    this._initialized = true;
+>     this._disabledForMultiProcess = this._prefBranch.getBoolPref("tabs.remote");
+> 
+>     // this pref is only read at startup, so no need to observe it
+>     this._sessionhistory_max_entries =
+>       this._prefBranch.getIntPref("sessionhistory.max_entries");
+> 
+>-    gSessionStartup.onceInitialized.then(
+>-      this.initSession.bind(this)
+>-    );
+>+    // Wait until nsISessionStartup has finished reading the session data.
+>+    return gSessionStartup.onceInitialized.then(() => {
+>+      // Parse session data and start restoring.
+>+      this.initSession();
+>+
+>+      // Start tracking the given (initial) browser window.
+>+      if (!aWindow.closed) {
+>+        this.onLoad(aWindow);
+>+      }
+>+
+>+      // Let everyone know we're done.
+>+      this._deferredInitialized.resolve();
+>+    });
+>   },
+
+the return value appears to be unused...
+(In reply to Dão Gottwald [:dao] from comment #6)
+> the return value appears to be unused...
+
+It is. Thanks for catching that!
+https://hg.mozilla.org/integration/fx-team/rev/1e1f3cd07479
+https://hg.mozilla.org/mozilla-central/rev/1e1f3cd07479
+BrowserGlue._onFirstWindowLoaded is broken if extension call SessionStore.init before BrowserGlue._onFirstWindowLoaded
+
+we need a way to now if SessionStore already initialized.
+
+you can set SessionStore.init not to throw if it already initialized and post console message instead.
+(In reply to onemen.one from comment #10)
+> BrowserGlue._onFirstWindowLoaded is broken if extension call
+> SessionStore.init before BrowserGlue._onFirstWindowLoaded
+
+Extensions are not supposed to call that.
+
+> we need a way to know if SessionStore already initialized.
+
+Please use SessionStore.promiseInitialized. That's the right place to initialize stuff that depends on SessionStore being ready.
+(In reply to Tim Taubert [:ttaubert] from comment #11)
+> (In reply to onemen.one from comment #10)
+> > BrowserGlue._onFirstWindowLoaded is broken if extension call
+> > SessionStore.init before BrowserGlue._onFirstWindowLoaded
+> 
+> Extensions are not supposed to call that.
+
+Is this well documented? Do we know to what extent they already do call it, and whether their use cases are covered by other existing APIs (IIRC SessionStore.promiseInitialized is relatively new, how did things work previously)?
+
+Seems like it might be prudent to guard against this case if we have reason to believe it will happen in practice.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #12)
+> Is this well documented? Do we know to what extent they already do call it,
+> and whether their use cases are covered by other existing APIs (IIRC
+> SessionStore.promiseInitialized is relatively new, how did things work
+> previously)?
+
+From https://developer.mozilla.org/en-US/docs/XPCOM_Interface_Reference/nsISessionStore#init%28%29
+
+"Note: This function is intended for use only by the browser; extensions shouldn't call it."
+
+> Seems like it might be prudent to guard against this case if we have reason
+> to believe it will happen in practice.
+
+Yeah, I wouldn't mind removing the error and just fail silently though I haven't heard of any actual add-on breaking, yet. Comment #10 is just stating that add-ons might break.
+I was assuming onemen was referring to an actual problem he ran into with TabMixPlus, but maybe that's a bad assumption!
+In bug 902866, we detected a missing error handler for a promise here:
+
+gSessionStartup.onceInitialized.then(() => {
+  // ...
+});
+
+Should read:
+
+gSessionStartup.onceInitialized.then(() => {
+  // ...
+}).then(null, Cu.reportError);
+
+It would be cool if we could detect those cases automatically at runtime or with
+static analysis, for the moment let's spread the word about error handling in
+promises and keep an eye on that when reviewing!
+
+https://developer.mozilla.org/Mozilla/JavaScript_code_modules/Promise.jsm/Promise#Handling_errors_and_common_pitfalls
+
+
+Clean up SessionStore initialization
+
+addon-compat
+
+Bug 898308 - Clean up SessionStore initialization; f=smacleod, r=dao 

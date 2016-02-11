@@ -1,0 +1,92 @@
+Created attachment 787193
+open-uri
+
+When a content process wants to create a new browser window, it goes through a somewhat odd path:
+  in the child, it calls TabChild::ProvideWindow
+    http://mxr.mozilla.org/mozilla-central/source/dom/ipc/TabChild.cpp#941
+  that triggers TabParent::AnswerCreateWindow
+    http://mxr.mozilla.org/mozilla-central/source/dom/ipc/TabParent.cpp#346
+  that calls nsBrowserStatus.openURIInNewFrame
+
+That last function is implemented in the metro and mobile versions of Firefox, but not in desktop FF. This patch provides an implementation by cribbing from the existing nsBrowserAccess.openURI. I changed that way that focus moves around, so I'd appreciate feedback on that. I did some tests myself and the behavior seems to be the same, but I could have missed something.
+
+Created attachment 787193
+open-uri
+
+When a content process wants to create a new browser window, it goes through a somewhat odd path:
+  in the child, it calls TabChild::ProvideWindow
+    http://mxr.mozilla.org/mozilla-central/source/dom/ipc/TabChild.cpp#941
+  that triggers TabParent::AnswerCreateWindow
+    http://mxr.mozilla.org/mozilla-central/source/dom/ipc/TabParent.cpp#346
+  that calls nsBrowserStatus.openURIInNewFrame
+
+That last function is implemented in the metro and mobile versions of Firefox, but not in desktop FF. This patch provides an implementation by cribbing from the existing nsBrowserAccess.openURI. I changed that way that focus moves around, so I'd appreciate feedback on that. I did some tests myself and the behavior seems to be the same, but I could have missed something.
+(In reply to Bill McCloskey (:billm) from comment #0)
+> I changed that way that
+> focus moves around, so I'd appreciate feedback on that. I did some tests
+> myself and the behavior seems to be the same, but I could have missed
+> something.
+
+Why did you need to change this around?
+
+Was changing browser.contentWindow to browser.ownerDocument.defaultView intentional?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #1)
+> Was changing browser.contentWindow to browser.ownerDocument.defaultView
+> intentional?
+
+Yes. If |browser| is remote, then calling focus on browser.contentWindow is going to do some CPOW stuff that, at best will be slow, and probably also won't work--I'm not sure how the focus manager works across processes.
+If the focus change is too scary, I could move it out of the common method back into openURI. I just thought the two were probably equivalent, but it sounds like maybe not.
+I'm not sure, they may be. Bug 691925 comment 1 is one distinction I'm aware of re: focus, but it doesn't apply in this case (chrome window vs. content window).
+
+I'm mostly concerned that this is a hack around some more fundamental bustage (focus manager doing the wrong thing) and isn't being marked as such somehow (e.g. with a comment). One of the premises of the CPOW stuff is that it should "just work" (but maybe be suboptimal re: perf), and so if there are cases where it isn't working, we need to track those problems somehow, and not work around them blindly (potentially breaking other things in the interim).
+Created attachment 787229
+open-uri v2
+
+I realized that it doesn't really matter whether the focus works perfectly in e10s right now, so I left the focus code alone. That way we can guarantee we're not breaking normal builds. It's probably fine to use CPOWs here, since it's a user-initiated action and so it's less jarring if we jank on content.
+
+I also filed bug 902715 for the focusing issue and made a comment about it in the patch.
+
+The patch also depends on win.gBrowser.selectedBrowser.contentWindow being the same as win.content. I'm pretty sure that updateCurrentBrowser should maintain this invariant, but I just wanted to call it out in case I'm wrong. Otherwise, the patch is just code movement.
+(In reply to Bill McCloskey (:billm) from comment #5)
+> The patch also depends on win.gBrowser.selectedBrowser.contentWindow being
+> the same as win.content.
+
+Yeah, that's a safe assumption.
+Comment on attachment 787229
+open-uri v2
+
+Review of attachment 787229:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +4316,5 @@
+> +                                      fromExternal: aIsExternal,
+> +                                      inBackground: loadInBackground});
+> +    let browser = win.gBrowser.getBrowserForTab(tab);
+> +
+> +    // In electrolysis, this won't work because of bug 902715.
+
+I think bug 902715 might not block this: there it is the content process that is calling focus. Here in the parent process, we do have (or at least should have) working support for calling focus on the browser element and having content focused (with the caveat explained in Bug 691925 comment 1 that the window won't be raised).
+
+So give it a try, replacing browser.contentWindow.focus() with simply browser.focus();
+(In reply to :Felipe Gomes from comment #7)
+> So give it a try, replacing browser.contentWindow.focus() with simply
+> browser.focus();
+
+No, that's wrong. We need this call to raise the window.
+Yes, I tried this earlier and browser.focus() doesn't raise the window. That's why I used browser.ownerDocument.defaultView.focus(). However, that *may* have the side effect of not focusing the the browser widget itself. I never observed this, since calling addTab always seems to move the focus anyway. But maybe there's some circumstance where it happens.
+
+The reason bug 902715 is relevant is that the current call to browser.contentWindow.focus() is sending a CPOW request to the child process and calling focus there (at least when the browser is remote). So if we fixed that bug, this should work.
+(In reply to Dão Gottwald [:dao] from comment #8)
+> (In reply to :Felipe Gomes from comment #7)
+> > So give it a try, replacing browser.contentWindow.focus() with simply
+> > browser.focus();
+> 
+> No, that's wrong. We need this call to raise the window.
+
+So can't we do the two things, call newWindow.focus() to raise the window and also browser.focus() so the content is focused, like it was suggested for example in bug 691925 comment 12 and 20?
+win.focus() should be sufficient here, you shouldn't need to explicitly focus the content area.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/82d28bdf9317
+
+Landed with win.focus().
+https://hg.mozilla.org/mozilla-central/rev/82d28bdf9317

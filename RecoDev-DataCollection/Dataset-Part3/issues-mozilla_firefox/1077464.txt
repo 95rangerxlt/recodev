@@ -1,0 +1,368 @@
+console methods (console.timeline, console.profile, etc.) to control the new performance recording
+
+console methods (console.timeline, console.profile, etc.) to control the new performance recording
+We need to ensure that "clear" correctly stops and removes in progress console recordings
+In Chrome, console.profile("foo") on one document, and console.profileEnd("foo") on a subsequent document will work. Maybe clearing out in progress console recordings doesn't make sense.
+Created attachment 8579025
+1077464-console-profile.patch
+
+This was fun.
+
+Created many bugs for future additions. This patch is large enough, mostly focusing on the ability to have multiple recordings at once. Some general concepts:
+
+* Starting/stopping console profiles will not auto select them, like normal profiles
+* The PerformanceActorsConnection emits recording models in events, and does not store them after they're completed. It starts up the performance tools when needed (on first console.profile), but does not select them. The approach is these recording models are like child actors, pretty much. To further this idea, nowhere else in the views/controller should they be created, so should change that for importing recordings in the future (the only place that the front does this now, I believe).
+* As of now, console.profile recordings use the same settings as the normal UI recordings (ticks, memory, etc) -- we may want to disable things like memory, or something. I have a patch to show when the perf++ tool is doing something, so a developer would have to see it with the tools open, so it's not like it'd be a hidden surprise cost, I think.
+* duplicately labeled recordings are no longer special -- can discuss in bug 1144388
+* other bugs filed to increase snappiness/perceived snappiness, as this certainly increased the stress tests of our recordings
+* Handling the toggling on/off of memory/ticks while multiple recordings are recording may cause weirdness, need to figure out how we want to handle that
+
+I have other comments on this, but can't think of them right now.
+jesus
+This currently deals with the starting/stopping/matching of labels from console.profile/End in the performance front -- was unaware the profiler actor did this too! I think we should move that logic to the PerformanceFront so its all in one place and keep our actors in sync, and remove the console.profile logic (outside of emitting events) in the profiler backend actor.
+Comment on attachment 8579025
+1077464-console-profile.patch
+
+Review of attachment 8579025:
+-----------------------------------------------------------------
+
+r+ with comments. Could be worth asking for another r?, but up to you.
+
+::: browser/devtools/performance/modules/front.js
+@@ +123,5 @@
+>      yield this._connectMemoryActor();
+>  
+>      this._connected = true;
+>  
+> +    yield this._registerListeners();
+
+Might want to do this before this._connected = true.
+
+@@ +142,5 @@
+>      yield this._disconnectActors();
+>      this._connected = false;
+>    }),
+>  
+> +  _registerListeners: Task.async(function*() {
+
+Nit: move this method after _connectMemoryActor. Makes things a bit easier to read.
+Uber nit: document this.
+
+@@ +255,5 @@
+> +    if (topic === "console-api-profiler") {
+> +      if (subject.action === "profile") {
+> +        this._onConsoleProfileStart(details);
+> +      }
+> +      else if (subject.action === "profileEnd") {
+
+Nit: } else if {
+
+@@ +301,5 @@
+> +
+> +    this.emit("console-profile-start", model);
+> +  }),
+> +
+> +  _onConsoleProfileEnd: Task.async(function *(profilerData) {
+
+Nit: document.
+
+@@ +319,5 @@
+> +      model = pending[pending.length - 1];
+> +    }
+> +
+> +    // If `profileEnd()` was called with a label, and there are no matching
+> +    // sessions, abort
+
+Nit: fullstop at the end of sentences.
+
+@@ +321,5 @@
+> +
+> +    // If `profileEnd()` was called with a label, and there are no matching
+> +    // sessions, abort
+> +    if (!model) {
+> +      return;
+
+It might be a good idea to Cu.reportError and/or dump here. Could be useful for tracking down bugs or letting users know about it.
+
+@@ +379,5 @@
+>      };
+> +
+> +    // Signify to the model that the recording has started,
+> +    // populate with data and store the recording model here.
+> +    model._onStartRecording(data);
+
+Ugh, calling private methods. Maybe have a `populate` method of some sort.
+
+@@ +657,5 @@
+>  
+> +/**
+> + * Creates an object of configurations based off of preferences for a RecordingModel.
+> + */
+> +function getRecordingModelPrefs () {
+
+Makes sense to have this as a static method on RecordingModel.
+
+::: browser/devtools/performance/performance-view.js
+@@ +161,5 @@
+>     * When a recording is complete.
+>     */
+>    _onRecordingStopped: function (_, recording) {
+> +    // A stopped recording can be from `console.profileEnd` -- only unlock
+> +    // the button if its the main recording that was started via UI.
+
+nit: it's
+
+::: browser/devtools/performance/performance.xul
+@@ +157,5 @@
+> +                  align="center"
+> +                  pack="center"
+> +                  flex="1">
+> +              <label class="console-profile-recording-notice" />
+> +              <br />
+
+Why not use a vbox instead of having a <br>?
+
+::: browser/devtools/performance/test/browser_perf-console-record-04.js
+@@ +7,5 @@
+> + */
+> +
+> +function spawnTest () {
+> +  loadFrameScripts();
+> +  let profilerConnected = waitForProfilerConnection();
+
+Don't think you need waitForProfilerConnection(); in this case. Just waiting for `initPerformance` is (or should be) enough.
+
+::: browser/devtools/performance/test/browser_perf-console-record-05.js
+@@ +7,5 @@
+> + */
+> +
+> +function spawnTest () {
+> +  loadFrameScripts();
+> +  let profilerConnected = waitForProfilerConnection();
+
+Ditto.
+
+::: browser/devtools/performance/test/browser_perf-console-record-06.js
+@@ +6,5 @@
+> + */
+> +
+> +function spawnTest () {
+> +  loadFrameScripts();
+> +  let profilerConnected = waitForProfilerConnection();
+
+Ditto.
+
+::: browser/devtools/performance/test/browser_perf-console-record-07.js
+@@ +8,5 @@
+> + */
+> +
+> +function spawnTest () {
+> +  loadFrameScripts();
+> +  let profilerConnected = waitForProfilerConnection();
+
+Ditto.
+
+@@ +56,5 @@
+> +  yield detailsRendered;
+> +
+> +  consoleProfileEnd(panel.panelWin);
+> +  yield idleWait(500);
+> +  ok(true, "Calling additional console.profileEnd() with no argument and no pending recordings does nothing.");
+
+How do you know it does nothing? You're not checking for anything.
+
+::: browser/devtools/performance/test/head.js
+@@ +222,5 @@
+> +function initConsole(aUrl) {
+> +  return Task.spawn(function*() {
+> +    let { target, toolbox, panel } = yield initPerformance(aUrl, "webconsole");
+> +    let { hud } = panel;
+> +    hud.jsterm._lazyVariablesView = false;
+
+I don't think _lazyVariablesView is relevant here.
+
+@@ +255,5 @@
+> +}
+> +
+> +function waitForProfilerConnection() {
+> +  let profilerConnected = Promise.defer();
+> +  let profilerConnectionObserver = () => profilerConnected.resolve();
+
+Nit: you don't need this wrapper function. Just use `profilerConnected.resolve` everywhere.
+
+@@ +290,5 @@
+> +  // for test helpers, so swap out the argument if its undefined with an empty string.
+> +  // Differences between empty string and undefined are tested on the front itself.
+> +  if (args[1] == null) {
+> +    args[1] = "";
+> +  }
+
+T_T
+
+::: browser/devtools/performance/views/overview.js
+@@ +317,5 @@
+>     * Called when recording actually stops.
+>     */
+>    _onRecordingStopped: Task.async(function* (_, recording) {
+> +    this._onRecordingStateChange();
+> +    if (recording !== PerformanceController.getCurrentRecording()) {
+
+Haha, fun. Might want to document here when this happens (console vs. manual).
+Comment on attachment 8579025
+1077464-console-profile.patch
+
+Review of attachment 8579025:
+-----------------------------------------------------------------
+
+::: browser/devtools/performance/modules/front.js
+@@ +379,5 @@
+>      };
+> +
+> +    // Signify to the model that the recording has started,
+> +    // populate with data and store the recording model here.
+> +    model._onStartRecording(data);
+
++1
+
+::: browser/devtools/performance/performance.xul
+@@ +157,5 @@
+> +                  align="center"
+> +                  pack="center"
+> +                  flex="1">
+> +              <label class="console-profile-recording-notice" />
+> +              <br />
+
++1
+
+::: browser/devtools/performance/test/browser_perf-console-record-07.js
+@@ +56,5 @@
+> +  yield detailsRendered;
+> +
+> +  consoleProfileEnd(panel.panelWin);
+> +  yield idleWait(500);
+> +  ok(true, "Calling additional console.profileEnd() with no argument and no pending recordings does nothing.");
+
+fair -- changing this label to "does not throw", unless there's something in particular you have in mind to test (I can't think of one)
+Created attachment 8586415
+1077464-console-profile.patch
+
+All comments addressed -- no real controversies, so don't think another review is needed.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=2e948f335c59
+Test failure for `registerEventNotifications` in the addon debugger (???)
+
+ 268 INFO TEST-UNEXPECTED-FAIL | browser/devtools/debugger/test/browser_dbg_addon-console.js | A promise chain failed to handle a rejection: - at resource://gre/modules/devtools/dbg-client.jsm:714 - Error: 'registerEventNotifications' request packet has no destination.
+
+    1005274 Intermittent browser_dbg_addon-console.js | Test timed out followed by 30+ more failures
+
+330 INFO TEST-UNEXPECTED-FAIL | browser/devtools/debugger/test/browser_dbg_addon-modules-unpacked.js | A promise chain failed to handle a rejection: - at resource://gre/modules/devtools/dbg-client.jsm:714 - Error: 'registerEventNotifications' request packet has no destination.
+
+    1128315 Intermittent browser_dbg_addon-modules-unpacked.js | application crashed [@ nsPurpleBuffer::Block::VisitEntries<RemoveSkippableVisitor>(nsPurpleBuffer&, RemoveSkippableVisitor&)]
+
+392 INFO TEST-UNEXPECTED-FAIL | browser/devtools/debugger/test/browser_dbg_addon-modules.js | A promise chain failed to handle a rejection: - at resource://gre/modules/devtools/dbg-client.jsm:714 - Error: 'registerEventNotifications' request packet has no destination.
+429 INFO TEST-UNEXPECTED-FAIL | browser/devtools/debugger/test/browser_dbg_addon-panels.js | A promise chain failed to handle a rejection: - at resource://gre/modules/devtools/dbg-client.jsm:714 - Error: 'registerEventNotifications' request packet has no destination.
+466 INFO TEST-UNEXPECTED-FAIL | browser/devtools/debugger/test/browser_dbg_addon-sources.js | A promise chain failed to handle a rejection: - at resource://gre/modules/devtools/dbg-client.jsm:714 - Error: 'registerEventNotifications' request packet has no destination.
+Need to do something like in bug 1132713, where we don't even try to connect to the profiler in the shared connection, as none of the underlying actors exist.
+Created attachment 8586533
+1077464-console-profile.patch
+
+The SharedPerformanceActorConnection no longer gets initialized in gDevTools when there is no profiler actor (for addons).
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=69adce827d3a
+Pretty common theme in that Try run:
+TEST-UNEXPECTED-FAIL | browser/devtools/shared/test/browser_telemetry_button_eyedropper.js | leaked 2 window(s) until shutdown [url = chrome://browser/content/devtools/framework/toolbox.xul]
+Looks like the linked intermittent on those failures are for something else in the file.. looking into it
+Created attachment 8586850
+1077464-console-profile.patch
+
+Unregister events from the underlying profiler actor (we didn't even have this in the prev profiler!) seeing if this fixes a leaky window in the eyedropper test (???)
+
+ https://treeherder.mozilla.org/#/jobs?repo=try&revision=66f6f997c1ef
+Created attachment 8589992
+1077464-console-profile.patch
+
+I believe the leaks were due to gDevTools never destroying the performance actor connection when a toolbox is destroyed -- the performance tool would use the same connection, and destroy it when closed. When interacting with the toolbox outside of the perf tool, the connection was never explicitly destroyed previously, and didn't cause any leaks. In this patch, we retain the toolbox in the connection, causing the leaks.
+
+Changes:
+* Toolbox is no longer stored in the connection. We lazily fetch this if and when we need from the target (on console.profile)
+* gDevTools no longer sets up the perf connection. This is handled in the toolbox's ctor/dtor. On open, the perf connection is fetched/created and opened, but only in tests do we yield for this to finish.
+* performance tool's panel no longer destroys the shared perf connection. This is handled by the toolbox. It also fetches the connection directly from the toolbox itself.
+
+If this try push is successful, the areas for new review are performance/panel.js, and toolbox.js
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=4688879dc761
+Latest try push has some failures for bug 1151703's tests (parsing html timeline markers), which I'm feeling this patch is not the culprit.
+
+Another error, though, is probably because gDevTools.testing is not on in style editor, where the perf connection is lazily loaded:
+5638 INFO TEST-UNEXPECTED-FAIL | browser/devtools/shadereditor/test/browser_se_editors-contents.js | A promise chain failed to handle a rejection: - at resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/performance/front.js:212 - TypeError: this._client is null
+Created attachment 8590113
+1077464-console-profile.patch
+
+Updated with setting shader editor to gDevTools.testing, and a console.warn if the connection attempts to destroy before it finishes initializing.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=d5d257cfd763
+Created attachment 8590292
+1077464-console-profile.patch
+
+Issue with bug 1151703 needing to update the events it listens to in tests.
+
+r? for new changes described in more detail #c15
+victor: SharedPerformanceActorsConnection overall, and performance/panel.js
+jryans: toolbox.js changes
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=f10da495300f
+Comment on attachment 8590292
+1077464-console-profile.patch
+
+Review of attachment 8590292:
+-----------------------------------------------------------------
+
+toolbox.js and gDevTools.jsm changes look good to me!
+Needs rebasing.
+Created attachment 8590958
+1077464-console-profile.patch
+
+Rebased!
+Scratch that, let me rebase after bug 1147945 backing out to prevent another need for rebase
+Created attachment 8590973
+1077464-console-profile.patch
+
+Rebased post bug 1147945 backout
+https://hg.mozilla.org/integration/fx-team/rev/946b935a9cb4
+sorry had to back this out since this might have caused perma failures on fx-team like https://treeherder.mozilla.org/logviewer.html#?job_id=2669171&repo=fx-team
+
+
+investigation is now done in #devtools to check whats going on
+notes to self: me and pbrosset believe it's from the change in `gDevTools.testing` requiring the full start up of the profiler now before tests can continue, causing a race condition (most likely) in the animation inspector's startup and missing an inspector-updated event. Will check it out in the morning
+Created attachment 8592284
+1077464-console-profile.patch
+
+Pinging Mr. Brosset for the change in animation inspector test, just changing the order of the setup
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=70b20866a1a7
+Comment on attachment 8592284
+1077464-console-profile.patch
+
+Review of attachment 8592284:
+-----------------------------------------------------------------
+
+The change to animationinspector/test/head.js looks good. I haven't reviewed the other 500Kb :)
+Created attachment 8592588
+1077464-console-profile.patch
+
+Still some failures intermittently atleast with animation inspector. Looks like with e10s, and waiting for the profiler connection to be made, the "animationinspector-ready" event on sidebar is missed sometimes. Now checks for the AI doc's ready state as well. Fingers crossed.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=78d9952c9592
+Looks like it's working on e10s now
+Comment on attachment 8592588
+1077464-console-profile.patch
+
+Review of attachment 8592588:
+-----------------------------------------------------------------
+
+I had another quick look at the latest changes in animationinspector's head.js file. Looks good to me.
+https://hg.mozilla.org/integration/fx-team/rev/963ca422f7c5
+https://hg.mozilla.org/mozilla-central/rev/963ca422f7c5
+Is there a specific reason for the amount of escaping in this string?
+http://hg.mozilla.org/mozilla-central/diff/963ca422f7c5/browser/locales/en-US/chrome/browser/devtools/profiler.properties
+
+If all that escaping is actually needed, I fear this will break all over the place in localized builds.
+Good eye, Francesco -- thanks. Adding a note to our localization string audit for performance tools in bug 1082695

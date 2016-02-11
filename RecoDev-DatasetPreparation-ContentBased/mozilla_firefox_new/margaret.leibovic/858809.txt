@@ -1,0 +1,148 @@
+On Android, if Firefox gets killed it doesn't go through the shutdown path that calls _saveSortedEngineList, so we should find a way to save the engine list earlier.
+
+On Android, if Firefox gets killed it doesn't go through the shutdown path that calls _saveSortedEngineList, so we should find a way to save the engine list earlier.
+Created attachment 734121
+WIP
+
+This patch works for my purposes.
+
+Gavin, you mentioned on IRC that I should make sure the batching of writes works. How should I do that? 
+
+Also, we should think about what else might be going wrong if we never get a "quit-application" notification (bnicholson said we never send that in Fennec anymore).
+Comment on attachment 734121
+WIP
+
+>diff --git a/toolkit/components/search/nsSearchService.js b/toolkit/components/search/nsSearchService.js
+
+>         // Since the DB isn't regularly cleared, and engine files may disappear
+>         // without us knowing, we may already have an engine in this slot. If
+>         // that happens, we just skip it - it will be added later on as an
+>-        // unsorted engine. This problem will sort itself out when we call
+>-        // _saveSortedEngineList at shutdown.
+>+        // unsorted engine.
+>         if (orderNumber && !this.__sortedEngines[orderNumber-1]) {
+>           this.__sortedEngines[orderNumber-1] = engine;
+>           addedEngines[engine.name] = engine;
+>         } else {
+>           // We need to call _saveSortedEngines so this gets sorted out.
+>-          this._needToSetOrderPrefs = true;
+>+          this._saveSortedEngineList();
+>         }
+
+Hmm, this won't work quite right. We need to call this._saveSortedEngineList once we're done building this.__sortedEngines, not in the middle. So you'll need to set a flag here ("needToSaveList") and then call _saveSortedEngineList at the end of the function when __sortedEngines is final.
+
+>       // Filter out any nulls for engines that may have been removed
+>       var filteredEngines = this.__sortedEngines.filter(function(a) { return !!a; });
+>       if (this.__sortedEngines.length != filteredEngines.length)
+>-        this._needToSetOrderPrefs = true;
+>+        this._saveSortedEngineList();
+>       this.__sortedEngines = filteredEngines;
+
+ditto
+(In reply to :Margaret Leibovic from comment #1)
+> Gavin, you mentioned on IRC that I should make sure the batching of writes
+> works. How should I do that?
+
+There's some built-in batching in engineMetadataService._commit that uses DeferredTask to avoid serializing the file to disk repeatedly if you're e.g. changing multiple engines in a loop. Now that we're calling _saveSortedEngineList much more often, we need to make sure that batching is effective in avoiding multiple writes due to e.g. multiple moveEngine calls in a row. Since the batching is time-based, it should be fine. You can test by making sure "writeCommit" is only invoked once after e.g. using the engine manager to re-order multiple engines and then committing those changes.
+Created attachment 734732
+patch
+
+Addressed comments, and I tested with a desktop build to verify that writeCommit is only called once, even if there are lots of calls to moveEngine.
+Comment on attachment 734732
+patch
+
+Looks good, but need to add a test that hits all of these code paths and checks that the search-metadata.json contains correct data. test_nodb_pluschanges.js already does almost exactly that in a different context, so it should be useful as a base.
+Created attachment 736570
+test
+
+This test hits the moveEngine/removeEngine/addEngineWithDetails code paths (going through addEngineWithDetails should hit the _saveSortedEngineList call in _addEngineToStore). I'm not positive we're hitting all the calls in _buildSortedEngineList, but I feel like this test provides pretty decent coverage.
+Pushed to try:
+https://tbpl.mozilla.org/?tree=Try&rev=d94ff6942eaf
+Comment on attachment 736570
+test
+
+>diff --git a/toolkit/components/search/tests/xpcshell/test_save_sorted_engines.js b/toolkit/components/search/tests/xpcshell/test_save_sorted_engines.js
+
+>+function run_test() {
+
+>+  do_load_manifest("data/chrome.manifest");
+
+This isn't needed unless you're using the JAR engines (you aren't in this test).
+
+>+        // Test adding a new engine
+>+        search.addEngineWithDetails("foo", "", "foo", "", "GET", "http://searchget/?search={searchTerms}");
+>+        afterCommit(function() {
+>+          do_print("Commit complete after addEngineWithDetails");
+>+
+>+          // Check that engine was added to the list of sorted engines
+>+          let json = getSearchMetadata();
+>+          do_check_eq(json["[profile]/foo.xml"].alias, "foo");
+
+Shouldn't this check .order? I guess you can't check the exact number because that depends on how many engines we ship by default, which isn't a good dependency to have, but you could just check that order is present and >=0 or something.
+
+>+          do_print("Cleaning up");
+>+          httpServer.stop(function() {});
+>+          removeMetadata();
+>+          do_test_finished();
+
+Do you need to remove the observer you added too? (I'm not sure how much clean up is needed for xpcshell tests - in theory the whole app is being shut down after do_test_finished() anyways so I'm not sure why it bothers explicitly stopping the http server.)
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #8)
+> Comment on attachment 736570
+> test
+> 
+> >diff --git a/toolkit/components/search/tests/xpcshell/test_save_sorted_engines.js b/toolkit/components/search/tests/xpcshell/test_save_sorted_engines.js
+> 
+> >+function run_test() {
+> 
+> >+  do_load_manifest("data/chrome.manifest");
+> 
+> This isn't needed unless you're using the JAR engines (you aren't in this
+> test).
+
+Oh, I just copied this from test_nodb_pluschanges.js. Should it be gone in that test, too?
+
+> >+        // Test adding a new engine
+> >+        search.addEngineWithDetails("foo", "", "foo", "", "GET", "http://searchget/?search={searchTerms}");
+> >+        afterCommit(function() {
+> >+          do_print("Commit complete after addEngineWithDetails");
+> >+
+> >+          // Check that engine was added to the list of sorted engines
+> >+          let json = getSearchMetadata();
+> >+          do_check_eq(json["[profile]/foo.xml"].alias, "foo");
+> 
+> Shouldn't this check .order? I guess you can't check the exact number
+> because that depends on how many engines we ship by default, which isn't a
+> good dependency to have, but you could just check that order is present and
+> >=0 or something.
+
+Yeah, we don't know what the exact number would be, but I can check that it's > 0 (there should always be at least one engine already there, the one we added earlier in the test).
+
+> >+          do_print("Cleaning up");
+> >+          httpServer.stop(function() {});
+> >+          removeMetadata();
+> >+          do_test_finished();
+> 
+> Do you need to remove the observer you added too? (I'm not sure how much
+> clean up is needed for xpcshell tests - in theory the whole app is being
+> shut down after do_test_finished() anyways so I'm not sure why it bothers
+> explicitly stopping the http server.)
+
+Once again, just copied from test_nodb_pluschanges.js :)
+(In reply to :Margaret Leibovic from comment #9)
+> Oh, I just copied this from test_nodb_pluschanges.js. Should it be gone in
+> that test, too?
+
+Yeah. This stuff has been cargo-culted, I haven't fixed those tests yet and have just been trying to stem the flow of unnecessary copying :)
+https://hg.mozilla.org/integration/mozilla-inbound/rev/cf2307b4ccd4
+https://hg.mozilla.org/integration/mozilla-inbound/rev/47e42a3aebe9
+https://hg.mozilla.org/mozilla-central/rev/cf2307b4ccd4
+https://hg.mozilla.org/mozilla-central/rev/47e42a3aebe9
+
+
+Don't wait until shutdown to save search engine order
+
+
+
+Bug 858809 - Don't wait until shutdown to save search engine order. r=gavin 
+
+Bug 858809 - Tests for _saveSortedEngineList. r=gavin 

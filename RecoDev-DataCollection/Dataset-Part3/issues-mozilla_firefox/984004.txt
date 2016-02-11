@@ -1,0 +1,147 @@
+Build Identifier:
+https://hg.mozilla.org/mozilla-central/rev/82c90c17fc95
+Mozilla/5.0 (Windows NT 6.1; WOW64; rv:30.0) Gecko/20100101 Firefox/30.0 ID:20140315030204
+
+Steps To Reproduce:
+1. Open e10s window
+2. Open PanelUI
+3. Observe %label
+
+4. Change zoom level by click the Zoom Widget or press Ctrl++, Ctrl+-
+5. Observe %label
+6. Repeat Step.4 and 5
+
+Actual Results:
+%label of the Zoom Widget indicates previous zoom level
+
+Expected Results:
+%label of the Zoom Widget should indicate current zoom level
+
+Build Identifier:
+https://hg.mozilla.org/mozilla-central/rev/82c90c17fc95
+Mozilla/5.0 (Windows NT 6.1; WOW64; rv:30.0) Gecko/20100101 Firefox/30.0 ID:20140315030204
+
+Steps To Reproduce:
+1. Open e10s window
+2. Open PanelUI
+3. Observe %label
+
+4. Change zoom level by click the Zoom Widget or press Ctrl++, Ctrl+-
+5. Observe %label
+6. Repeat Step.4 and 5
+
+Actual Results:
+%label of the Zoom Widget indicates previous zoom level
+
+Expected Results:
+%label of the Zoom Widget should indicate current zoom level
+The problem here is that listener (registered via Services.obs.addObserver to update the %label) for "browser-fullZoom:zoomChange" event inside CustomizableWidgets.jsm is fired before actual markupDocumentViewer.fullZoom\textZoom is updated. In e10s mode fullZoom\fullText property is updated asynchronously via several messageManager.sendAsyncMessage calls. So it's kind of race between sendAsyncMessage and Services.obs.notifyObservers.
+
+Is there any recommended solution for this problem known?
+Thanks for looking into this. I think the main problem is that we're trying to handle zoom changes that can be initiated in both the parent and the child. That's a harder problem that just assuming that one side or the other has control.
+
+I think the easiest fix is as follows:
+
+1. In the remote-browser.xml binding, the setters for the fullZoom and textZoom properties [1] should immediately set the local _fullZoom and _textZoom properties. That will ensure that we return the right value if someone queries browser.fullZoom right afterwards.
+
+2. In the handlers for the FullZoomChange and TextZoomChange in browser-child.js [2], we should avoid notifying the parent if the change was initiated by the parent. We can just create a top-level variable called settingZoom that's normally false. The message listeners for FullZoom and TextZoom would set it to true while they're running. The event handlers for FullZoomChange and TextZoomChange would skip sending a message if settingZoom is true.
+
+I also think we need to decide whether it's really that important to handle changes to the zoom level from the child. It adds a lot of complexity, and I don't know what use case requires it. Tom, I assume you added the code to handle something. What was it?
+
+Oleg, if you have any questions about this, please ping me on irc (billm).
+
+[1] http://mxr.mozilla.org/mozilla-central/source/toolkit/content/widgets/remote-browser.xml#136
+[2] http://mxr.mozilla.org/mozilla-central/source/toolkit/content/browser-child.js#267
+(In reply to Bill McCloskey (:billm) from comment #2)
+> 2. In the handlers for the FullZoomChange and TextZoomChange in
+> browser-child.js [2], we should avoid notifying the parent if the change was
+> initiated by the parent. We can just create a top-level variable called
+> settingZoom that's normally false. The message listeners for FullZoom and
+> TextZoom would set it to true while they're running. The event handlers for
+> FullZoomChange and TextZoomChange would skip sending a message if
+> settingZoom is true.
+
+Yeah, or instead of having a flag, compare the value received from the message with the value we had stored. If they are the same, it can be ignored
+(In reply to :Felipe Gomes from comment #3)
+> Yeah, or instead of having a flag, compare the value received from the
+> message with the value we had stored. If they are the same, it can be ignored
+
+Yeah, that would be better.
+We have that code in the child because zooming with the keyboard or mouse (ctrl + mouse wheel) only happens in the child. I agree that the solution in comment 3 is better.
+Ok, thanks for clarifying that guys! I'll take care of it.
+Created attachment 8393412
+Part 1: Cache parent's fullZoom\textZoom value to ensure that we always return the fresh one.
+Created attachment 8393413
+Part 2: Immediately update %label on reset.
+
+Looks like we have typo\legacy in the reset event name.
+
+Pushed to try: https://tbpl.mozilla.org/?tree=Try&rev=ce7157b7adf8
+Comment on attachment 8393412
+Part 1: Cache parent's fullZoom\textZoom value to ensure that we always return the fresh one.
+
+Review of attachment 8393412:
+-----------------------------------------------------------------
+
+This approach looks fine to me.
+
+::: toolkit/content/browser-child.js
+@@ +268,5 @@
+>  
+>  function _getMarkupViewer() {
+>    return docShell.contentViewer.QueryInterface(Ci.nsIMarkupDocumentViewer);
+>  }
+>  
+
+Can you move all of this code into an object literal, like we do SecurityUI, DocumentObserver etc.
+
+@@ +272,5 @@
+>  
+> +// Contains last parent's zoom values that are used to avoid unnecessary
+> +// child-to-parent updates.
+> +const lastParentZoomValues = {
+> +  fullZoom: null,
+
+NaN
+Comment on attachment 8393413
+Part 2: Immediately update %label on reset.
+
+Review of attachment 8393413:
+-----------------------------------------------------------------
+
+So, "browser-fullZoom:reset" doesn't actually exists? :)
+(In reply to Tom Schuster [:evilpie] from comment #10)
+> Comment on attachment 8393413
+> Part 2: Immediately update %label on reset.
+> 
+> Review of attachment 8393413:
+> -----------------------------------------------------------------
+> 
+> So, "browser-fullZoom:reset" doesn't actually exists? :)
+
+Well, looks like this :) I've used http://mxr.mozilla.org/mozilla-central/search?string=browser-fullZoom%3Areset to find all places where it's used. Is there any other way to find usages?
+Thanks very much Oleg. Please ask :felipe to review once you fix the object literal thing.
+Created attachment 8393749
+Part 1: Cache parent's fullZoom\textZoom value to ensure that we always return the fresh one.
+
+Moved some stuff to the object literal as Tom suggested. Using "cache" in name to indicate that values can actually be stale and refresh is maybe needed.
+I'm curious: with part 2, is part 1 necessary to fix the bug?
+(In reply to :Felipe Gomes from comment #14)
+> I'm curious: with part 2, is part 1 necessary to fix the bug?
+
+Thanks for review!
+
+Well, basically only Part 1 related to the initial bug, Part 2 is for issue that I've noticed while poking around of the first one. But the fix was too small and looked like a typo\legacy that I decided not to file a separate bug for that :) Or you think I should file a separate bug for Part 2?
+I think Felipe was just wondering if part 2 would fix the problem by itself. It doesn't,  because the observer name issue only affects reset, and the problem happens with the +/- buttons as well. Landing both in this bug should be fine.
+(In reply to Bill McCloskey (:billm) from comment #16)
+> I think Felipe was just wondering if part 2 would fix the problem by itself.
+> It doesn't,  because the observer name issue only affects reset, and the
+> problem happens with the +/- buttons as well. Landing both in this bug
+> should be fine.
+
+Ah, OK. Adding "checkin-needed" to get assistance with landing of the fix.
+Yep, exactly. Thanks for the patches, Oleg!
+https://hg.mozilla.org/integration/mozilla-inbound/rev/529df6d36735
+https://hg.mozilla.org/integration/mozilla-inbound/rev/9ea0e49c589d
+https://hg.mozilla.org/mozilla-central/rev/529df6d36735
+https://hg.mozilla.org/mozilla-central/rev/9ea0e49c589d

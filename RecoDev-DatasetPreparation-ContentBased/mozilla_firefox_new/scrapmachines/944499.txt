@@ -1,0 +1,273 @@
+Bug 717369 introduces a css autocompleter which can be slow if you are editing at the end of a big file.
+
+It can be made faster. I have plans.
+
+This should not block Bug 717369 from landing though. Although, I will try to make sure that both get in the same cycle.
+
+Bug 717369 introduces a css autocompleter which can be slow if you are editing at the end of a big file.
+
+It can be made faster. I have plans.
+
+This should not block Bug 717369 from landing though. Although, I will try to make sure that both get in the same cycle.
+How slow is slow? Does it hang the browser?
+(In reply to Anton Kovalyov (:anton, @valueof) from comment #1)
+> How slow is slow? Does it hang the browser?
+
+Its like 500ms or so delay when you are at the end of a 3500 lines CSS file.
+Since it is all promises and async all the way, it should not hang the browser. Although, it would need a 2s+ delay to be able to notice that whether it actually hangs or not.
+I have an idea that will make this thing instant for any number of lines (except for the first time when popup is shown)
+(In reply to Girish Sharma [:Optimizer] from comment #2)
+> (In reply to Anton Kovalyov (:anton, @valueof) from comment #1)
+...
+> I have an idea that will make this thing instant for any number of lines
+> (except for the first time when popup is shown)
+
+...so the other measure to watch here is how fast the first time is. As a hint, if the first autocomplete is always 'very slow' ( we need to discuss that obv. ) I'm not sure if we have a better solution.
+(In reply to Jeff Griffiths (:canuckistani) from comment #3)
+> (In reply to Girish Sharma [:Optimizer] from comment #2)
+> > (In reply to Anton Kovalyov (:anton, @valueof) from comment #1)
+> ...
+> > I have an idea that will make this thing instant for any number of lines
+> > (except for the first time when popup is shown)
+> 
+> ...so the other measure to watch here is how fast the first time is. As a
+> hint, if the first autocomplete is always 'very slow' ( we need to discuss
+> that obv. ) I'm not sure if we have a better solution.
+
+In most cases , yes. If the user starts typing at the end of the file, we really have no info about the file. Nothing can be done except for full parsing once.
+(In reply to Girish Sharma [:Optimizer] from comment #4)
+> (In reply to Jeff Griffiths (:canuckistani) from comment #3)
+> > (In reply to Girish Sharma [:Optimizer] from comment #2)
+> > > (In reply to Anton Kovalyov (:anton, @valueof) from comment #1)
+> > ...
+> > > I have an idea that will make this thing instant for any number of lines
+> > > (except for the first time when popup is shown)
+> > 
+> > ...so the other measure to watch here is how fast the first time is. As a
+> > hint, if the first autocomplete is always 'very slow' ( we need to discuss
+> > that obv. ) I'm not sure if we have a better solution.
+> 
+> In most cases , yes. If the user starts typing at the end of the file, we
+> really have no info about the file. Nothing can be done except for full
+> parsing once.
+
+Sure, and an 800kb css file with thousands of lines is a pathological case to be sure. I think the key requirements are:
+
+* opportunistically parse the file as soon as possible
+* don't hang the browser while you're doing it
+* if the user has started rtyping before we've parsed the file fully, we should indicate to the user that we're still parsing, whether this be via a throbber or some other UI flair. It is not acceptable to not provide some feedback there.
+
+I think there is room to tune how this is handled via some heuristics, like for example we know that for a short file with few total characters the whole ceremony of throwing up a throbber or similar is probably wasted effort.
+
+Aside: for cases like this where we might have slow perf, we should also try to test on really crappy systems with low memory ( vms? sub 1GHz netbooks? )
+Created attachment 8376350
+patch v0.1
+
+This patch introduces the concept of on demand caching of states per 10 lines.
+This mean that only the first completion with a huge gap from the last completion will be slower, rest all will be super fast.
+
+try : https://tbpl.mozilla.org/?tree=Try&rev=457c63f4363d
+Created attachment 8380206
+patch v0.2
+
+After a bit playing through, I noticed that things break if the 10Xth line is ending inside a comment like
+
+9 : /* comment start
+10:  * continues..
+11:  */
+
+This breaks the state machine the next time state from 10th line is fetched. So I changed the logic to store the line and columns of the null state locations instead. Then I fetch the nearest null state location and start the state machine from there, populating the null state locations in the process.
+(In reply to Girish Sharma [:Optimizer] from comment #2)
+> (In reply to Anton Kovalyov (:anton, @valueof) from comment #1)
+> > How slow is slow? Does it hang the browser?
+> 
+> Its like 500ms or so delay when you are at the end of a 3500 lines CSS file.
+> Since it is all promises and async all the way, it should not hang the
+> browser.
+
+Heads up, just because it's async doesn't mean it won't hang the browser. You could only guarantee that if it's in on a separate thread, like a Worker.
+Comment on attachment 8380206
+patch v0.2
+
+Review of attachment 8380206:
+-----------------------------------------------------------------
+
+Do you have an STR?
+
+I didn't review the original file, Anton did, so I'm not sure exactly what's going on here. Maybe Anton should review. I do have some comments though, (mainly about adding more comments)
+
+::: browser/devtools/sourceeditor/css-autocompleter.js
+@@ +83,5 @@
+>   */
+>  function CSSCompleter(options = {}) {
+>    this.walker = options.walker;
+>    this.maxEntries = options.maxEntries || 15;
+> +  this.nullStates = [];
+
+Explain what nullStates is. And somewhere explain how it's making things faster.
+
+@@ +157,5 @@
+> +    let selectorState = SELECTOR_STATES.null;
+> +    let propertyName = null;
+> +    let scopeStack = [];
+> +
+> +    // Fetch the closest null state line, ch from caches null state locations
+
+cache's?
+
+@@ +163,5 @@
+> +    if (matchedStateIndex > -1) {
+> +      let state = this.nullStates[matchedStateIndex];
+> +      line -= state[0];
+> +      if (line == 0)
+> +        ch -= state[1];
+
+I guess we already have no-brackets if statements elsewhere in the file, but eek.
+
+@@ +802,5 @@
+>    },
+> +
+> +  /**
+> +   * A biased binary search in a sorted array. Finds if the line exists in the
+> +   * list of null states.
+
+This makes it sound like a generic function. It's not, it only searches this.nullStates, so I'd say something about that instead.
+
+In what way is it biased?
+(In reply to Heather Arthur [:harth] from comment #9)
+> Comment on attachment 8380206
+> patch v0.2
+> 
+> Review of attachment 8380206:
+> -----------------------------------------------------------------
+> 
+> Do you have an STR?
+
+Go to Ubuntu.com, it has a 3.5K line stylesheet. Go to the end of the fine and type "b". It will take like 1-2 seconds to show up selector suggestions. The type "o", then "d".
+
+Without this patch, every keypress will be like that. With this patch, only the first one will be slow, remaining ones will be fast.
+
+
+> I didn't review the original file, Anton did, so I'm not sure exactly what's
+> going on here. Maybe Anton should review. I do have some comments though,
+> (mainly about adding more comments)
+
+Actually, the state machine was reviewed by Dave. Will try to see if he has time.
+
+> ::: browser/devtools/sourceeditor/css-autocompleter.js
+> @@ +83,5 @@
+> >   */
+> >  function CSSCompleter(options = {}) {
+> >    this.walker = options.walker;
+> >    this.maxEntries = options.maxEntries || 15;
+> > +  this.nullStates = [];
+> 
+> Explain what nullStates is. And somewhere explain how it's making things
+> faster.
+
+Null state is explained in the top section of the document. Will add a comment here about the array.
+
+> @@ +157,5 @@
+> > +    let selectorState = SELECTOR_STATES.null;
+> > +    let propertyName = null;
+> > +    let scopeStack = [];
+> > +
+> > +    // Fetch the closest null state line, ch from caches null state locations
+> 
+> cache's?
+
+err, no, actually cached :)
+
+> @@ +163,5 @@
+> > +    if (matchedStateIndex > -1) {
+> > +      let state = this.nullStates[matchedStateIndex];
+> > +      line -= state[0];
+> > +      if (line == 0)
+> > +        ch -= state[1];
+> 
+> I guess we already have no-brackets if statements elsewhere in the file, but
+> eek.
+
+Yeah, that is the general styling of everything in sourceeditor/
+
+> @@ +802,5 @@
+> >    },
+> > +
+> > +  /**
+> > +   * A biased binary search in a sorted array. Finds if the line exists in the
+> > +   * list of null states.
+> 
+> This makes it sound like a generic function. It's not, it only searches
+> this.nullStates, so I'd say something about that instead.
+> 
+> In what way is it biased?
+
+In a normal binary search, the target is in the middle of high and low. Here, since array is sorted, it is in the weighted middle. For ex, for this array:
+
+[1,3,5,100,200]
+
+If 0th is the low and 4th is the high index, then target will be 3rd index instead of 2nd.
+Created attachment 8384247
+patch v0.3
+
+Addressed comments by Heather.
+
+Asking Dave for review as he is the original reviewer of the state machine.
+
+We might want to uplift this patch to aurora for better experience :)
+(In reply to Girish Sharma [:Optimizer] from comment #11)
+
+> We might want to uplift this patch to aurora for better experience :)
+
+Unless the current state is broken, it's pretty late in the cycle.
+What is the risk of uplifting this ? We still have around 13 days left .
+(In reply to Girish Sharma [:Optimizer] from comment #13)
+> What is the risk of uplifting this ? We still have around 13 days left .
+
+needs review. needs time on central.
+Heather did the first round here, why not the second too?
+(In reply to Dave Camp (:dcamp) from comment #15)
+> Heather did the first round here, why not the second too?
+
+From comment 9 :
+
+I didn't review the original file, Anton did, so I'm not sure exactly what's going on here. Maybe Anton should review. I do have some comments though, (mainly about adding more comments)
+
+s/Anton/Dave as Anton did not review this file originally .
+Anton may or may not have time to review this. He's CCed, so he may offer help. Dave almost certainly won't, so asking Heather may be your best bet.
+Comment on attachment 8384247
+patch v0.3
+
+I have no issues in asking Heather, but she only suggested to ask the original reviewer.
+
+Anyways, asking Heather back as there is no other option.
+(I would really like to get this in before merge. pretty please :) )
+Comment on attachment 8384247
+patch v0.3
+
+Review of attachment 8384247:
+-----------------------------------------------------------------
+
+Wow it's so fast now, and autocomplete is so awesome. Thanks for the STR and patch.
+
+::: browser/devtools/sourceeditor/css-autocompleter.js
+@@ +805,5 @@
+>    },
+> +
+> +  /**
+> +   * A biased binary search in a sorted array where the middle element is
+> +   * calculated based on the values at the lowe and the upper index in each
+
+*lower
+landed in fx-team after correcting the typo.
+
+https://hg.mozilla.org/integration/fx-team/rev/00a016605d9e
+https://tbpl.mozilla.org/?tree=Fx-Team&rev=00a016605d9e
+https://hg.mozilla.org/mozilla-central/rev/00a016605d9e
+
+
+Make the css autocompletion faster
+
+
+
+Bug 944499 - Make the css autocompletion faster, r=harth 

@@ -1,0 +1,164 @@
+Build I20020115. Autobuild on.
+I started the debugger an then the IDE was frozen.
+
+It looks like during the refresh of the type hierachy (which takes place in a
+modal contex) another modal operation is started.
+
+See the appended stack dumps for more details.
+
+Build I20020115. Autobuild on.
+I started the debugger an then the IDE was frozen.
+
+It looks like during the refresh of the type hierachy (which takes place in a
+modal contex) another modal operation is started.
+
+See the appended stack dumps for more details.
+Created attachment 227
+Dump
+moving to jdt.core
+This has nothing to do with Jdt/Core. It is UI competion in between the various 
+lock (ui lock and swt lock). Looking at the core dump, it seems that the busy 
+cursor is waiting on the ui lock, which has been acquired by the jdt.debug 
+thread already. This latter thread looks like the offending one. It did not 
+acquire the swt lock prior to the ui one, which would have occurred if it had 
+run its operation through an asyncExec() or a similar facility.
+
+See below: 
+	at org.eclipse.jdt.internal.debug.core.EventDispatcher.run
+(EventDispatcher.java:159)
+
+So this would be a JDT/Debug problem.
+---------
+    "org.eclipse.jdt.debug: JDI Event Dispatcher" (TID:0x144dfe90, 
+sys_thread_t:0x297761d8, state:CW, native ID:0x145) prio=5
+	at java.lang.Object.wait(Native Method)
+	at java.lang.Object.wait(Object.java:421)
+	at org.eclipse.ui.internal.Semaphore.acquire(Semaphore.java:20)
+	at org.eclipse.ui.internal.UISynchronizer.syncExec
+(UISynchronizer.java:34)
+	at org.eclipse.swt.widgets.Display.syncExec(Display.java:1641)
+	at org.eclipse.search.internal.ui.SearchManager.resourceChanged
+(SearchManager.java:473)
+	at org.eclipse.core.internal.events.NotificationManager$1.run
+(NotificationManager.java:125)
+	at org.eclipse.core.internal.runtime.InternalPlatform.run
+(InternalPlatform.java(Compiled Code))
+	at org.eclipse.core.runtime.Platform.run(Platform.java(Compiled Code))
+	at org.eclipse.core.internal.events.NotificationManager.notify
+(NotificationManager.java:140)
+	at org.eclipse.core.internal.events.NotificationManager.broadcastChanges
+(NotificationManager.java:43)
+	at org.eclipse.core.internal.events.NotificationManager.broadcastChanges
+(NotificationManager.java:64)
+	at org.eclipse.core.internal.resources.Workspace.broadcastChanges
+(Workspace.java:121)
+	at org.eclipse.core.internal.resources.Workspace.endOperation
+(Workspace.java(Compiled Code))
+	at org.eclipse.core.internal.resources.Workspace.run
+(Workspace.java:1237)
+	at org.eclipse.jdt.internal.debug.core.EventDispatcher.run
+(EventDispatcher.java:159)
+	at java.lang.Thread.run(Thread.java:498)
+
+
+main (ui) thread started the busycontext thread, which waits for the 
+workspacelock to get free.
+The workspacelock has been aquired already from the debug thread which started 
+an operation that triggered a resource delta what triggered the search view. 
+The search view waits for accessing the UI thread.
+
+As Jerome, I also suspect
+  org.eclipse.jdt.internal.debug.core.EventDispatcher.run
+to be the problem. Why does its dispatching trigger a resource change?
+Why does it dispatch in a workspace-runnable?
+
+An event, such as a class load can cause a breakpoint to be installed, which 
+changes a breakpoint marker (which causes a resource delta).
+I will investigate if we can avoid the marker update (as the install attribute 
+is transient across workbench invocations).
+If we do not update the marker, the editors will not know the breakpoint has 
+changed, and will not know to update its breakpoint icons.
+I think the problem is that both the Eclipse Launcher and the SearchManager are 
+causing/doing syncExec's. Why is the SearchManager doing a "syncExec"? and why 
+does it care about a breapoint marker delta?
+In the beginning asynch was used but then Core decided to explicitly delete the
+resource delta and hence it was no longer available inside the asynch call.
+
+I now changed the SearchManager to at least test if there are search markers at
+all and if not simply return without doing any *exec. You can get it from HEAD
+if you want to do any tests or I can send you the Search plug-in
+
+Since there's no reproducable test case we can't be sure if this solved the
+problem or not. Do you have any hint in which case a breakpoint marker change is
+triggered?
+
+chaging the search view to async might help, but any other resource listener 
+might run into the same.
+
+what about the debug thread posting the marker updating with async exec?
+
+The debugger code is non-ui code. It does not know about async exec (i.e. it 
+does not require SWT).
+It is unclear if the event dispatcher needs to dispatch debug events in a 
+workspace runnable. To risky to change for M2 build, deferring to M3. 
+Created attachment 237
+deadlock 2
+Created attachment 238
+deadlock 3
+just had two new variants:
+deadlock 2) seems to wait for packets that dont arrive (maybe I should have 
+waited longer, however, UI was completly frozen as the receiver had the 
+workspace lock)
+deadlock 3): the navigator also uses sync in resource deltas
+
+Looking at all deadlocks, there is something in common - the 
+org.eclipse.jdt.internal.ui.util.BusyIndicatorRunnableContext is doing a join() 
+which is locking the UI thread. John W and I believe this is the problem. 
+
+Re-assigning to JDT-UI
+I don't thinknot using the busycontext would change anything. Then the UI 
+thread would wait for the lock instead.
+
+Why is the type hierarchy build in a workspace runnable?
+This seems to be a core design issue wrt to lock acquisition order.
+
+The WorkspaceLock and the UILock can be acquired in different orders, depending 
+on when the client code is UI aware or not.
+
+UI clients are acquiring UILock first, then potentially WksLock after if like 
+the busy cursor here trying to run a JavaModel operation (which itself performs 
+a workspace runnable). Core clients are simply taking a WksLock, and when 
+notifying clients, these could be UI clients acquiring the UILock.
+
+As a work-around, we will prevent the hierarchy refresh from taking the WksLock
+(JavaModel operation involved here to perform a workspace runnable, since it 
+clearly does not need to), but this is only a short-term solution, since any 
+other JavaModel operation could legitimatelly require the Workspace lock.
+
+We will release the workaround, and issue a patch for it (this is a good change 
+anyway), but this bug should move to Platform/Core.
+Created attachment 246
+Deadlock not depending on Debug plug-in
+We have changed the JDT UI code to no longer create a thread for the 
+BusyIndicatorRunnable context in the deadlock scenarios. We could make a patch 
+available but, as Martin pointed out below this wouldn't change the deadlock 
+problem. The lock ordering issue raised by Philppe looks like the real culprit 
+to me.
+
+The debugger can't aquire the UI lock first, since the EventDispatch is UI 
+free. One idea to solve this would be adding support for registering a dispatch 
+policy with the debug plugin. The Debug UI would register a dispatch policy 
+that posts the event via asynExec to the current Display (this would work in 
+the single Display case).
+
+Why does the debugger post any event inside a Workspace runnable and acquire 
+the workspace lock? I suspect that most of the events only result in read 
+access to the workspace.
+
+Conclusion: only the debugger can solve the lock ordering problem resulting in 
+this dead lock. However, there exists a general lock policy probelm in the 
+platform.
+*** Bug 8057 has been marked as a duplicate of this bug. ***
+workaround is in place and has avoided that problem from happening again. 
+Keeping bug open since it is a general problem
+problem didn't show up since a long time - closing

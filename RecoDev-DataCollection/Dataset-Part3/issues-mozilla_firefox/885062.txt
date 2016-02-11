@@ -1,0 +1,355 @@
+window titlebar extends a few too many pixels lower than the navbar
+
+https://www.flickr.com/photos/12814025@N06/9073759707/in/set-72157634194258154
+
+window titlebar extends a few too many pixels lower than the navbar
+
+https://www.flickr.com/photos/12814025@N06/9073759707/in/set-72157634194258154
+(Originally made bug 885063 P3 for this, but then found this bug)
+Two things going on here (investigated as part of XP tpaint issues):
+
+1) we extend the titlebar too far by default, all the way to the bottom of the navbar
+2) we don't update the titlebar size when we enter customization mode.
+(In reply to :Gijs Kruitbosch from comment #2)
+> 1) we extend the titlebar too far by default, all the way to the bottom of
+> the navbar
+
+Do you think this could be causing us a performance regression?
+(In reply to Jared Wein [:jaws] from comment #3)
+> (In reply to :Gijs Kruitbosch from comment #2)
+> > 1) we extend the titlebar too far by default, all the way to the bottom of
+> > the navbar
+> 
+> Do you think this could be causing us a performance regression?
+
+Don't really see how, but we're running out of ideas so it might be worth investigating why we're doing this. Personally, I suspect the Math.abs call for outerHeight, but that's just a hunch (although logically, it's just wrong - we shouldn't be turning, say, height: 5px + negative margin -30px into +25px - if for some reason it can't be -25px then it should be 0 - not +25px. Blame might help figure out why we do things this way).
+Original writer of that function reporting in. Did not consider negative margins when we wrote it, I believe. You're right - should be 0 in the negative case.
+Gijs, can you take this?
+(In reply to Jared Wein [:jaws] from comment #6)
+> Gijs, can you take this?
+
+Yeah, looking into this. Might be harder to fix properly everywhere than I thought, though - also because we don't currently do anything when an autohidden menubar is unhidden, for instance, which looks gross on XP if you adapt the size.
+Created attachment 781889
+Make the titlebar calculations not come out way too high
+
+So here's a thing. It seems to work on Windows, at least. I don't offhand know why it shouldn't work on OS X, but I guess it could do with testing. It fixes bugs that we already have regarding showing the menubar. It makes the problem worse in customize mode, though, visually, although it's the same problem we've always had - we don't do anything to deal with resizing the titlebar, although we should.
+Comment on attachment 781889
+Make the titlebar calculations not come out way too high
+
+Mike, what do you think of this, offhand?
+
+(note that I've not dealt with the peculiar order of the browser.js calls we discussed, or the actual issue in customize mode - I've just cleaned this up a bit and I think this works, considering what we're doing everywhere)
+
+Some notes:
+1) we don't read titlebar margins, so we don't need to reset them. Yay, less work for layout.
+2) we should read margins for the menubar because it's now fixed at height 0 but has a margin that does affect us somehow (otherwise the calculations come out too low by exactly the size of the margin, on Windows XP).
+3) resizing the titlebar if the menubar appears/hides was broken in restored windows. Fixed now.
+Try for perf: https://tbpl.mozilla.org/?tree=Try&rev=2a4e8c6265db
+(In reply to :Gijs Kruitbosch from comment #10)
+> Try for perf: https://tbpl.mozilla.org/?tree=Try&rev=2a4e8c6265db
+
+Baseline: https://tbpl.mozilla.org/?tree=Try&rev=5b5c93f0f31f
+(In reply to :Gijs Kruitbosch from comment #11)
+> (In reply to :Gijs Kruitbosch from comment #10)
+> > Try for perf: https://tbpl.mozilla.org/?tree=Try&rev=2a4e8c6265db
+> 
+> Baseline: https://tbpl.mozilla.org/?tree=Try&rev=5b5c93f0f31f
+
+This seems to be essentially no perf impact. The patch can probably be slightly tweaked to avoid measuring the menubar on OS X, but I don't expect that to be the issue, either.
+Comment on attachment 781889
+Make the titlebar calculations not come out way too high
+
+Review of attachment 781889:
+-----------------------------------------------------------------
+
+Yes, this seems to simplify things a great deal. I used Matt's mozscreenshot tool to check appearance across each configuration on XP (including system theme). I also fiddled with the system font-size on XP. Manual testing on Windows 7 looks OK. Going to get additional feedback from Matt, in case there are any cases we've forgotten.
+
+::: browser/base/content/browser.js
+@@ +4359,5 @@
+>      let titlebar = $("titlebar");
+>      let titlebarContent = $("titlebar-content");
+>      let menubar = $("toolbar-menubar");
+>  
+>      // Reset the margins and padding that _update modifies so that we can take
+
+Just resetting the padding now - so this comment needs to be updated.
+
+@@ +4378,2 @@
+>        let tabsToolbar = $("TabsToolbar");
+> +      let tabsToolbarOuterHeight = rect(tabsToolbar).height + this._getMargins(tabsToolbar);
+
+We might as well use the same naming convention here, and call this the fullTabsToolbarHeight.
+Created attachment 787438
+Fix titlebar calculations, also account for customization mode
+
+This is what I currently have. I *believe* it works well everywhere, but it's been a bit since I checked as I got distracted due to perf work and this didn't seem to impact it much. It might avoid an extra reflow when switching between restored/maximized mode because it no longer needs to reset anything at the start of the update process. I've switched to using the placeholder IDs in this patch, but if we prefer we could continue to use querySelectorAll. From my profiling I guess this will gain us a tiny bit in terms of performance, but if we decide that isn't worth it it's not hard to switch back.
+(In reply to :Gijs Kruitbosch (PTO Aug 8-Aug 18) from comment #14)
+> From my profiling I guess this will gain us a tiny bit in
+> terms of performance, but if we decide that isn't worth it it's not hard to
+> switch back.
+
+This seems backwards. Please switch it back until we've decided that it's a worthwhile change.
+Comment on attachment 787438
+Fix titlebar calculations, also account for customization mode
+
+>+  registerCustomizationListener: function() {
+>+#ifdef CAN_DRAW_IN_TITLEBAR
+>+    this._customizeObserver = new MutationObserver(this._onCustomizeMutate);
+>+    this._customizeObserver.observe(document.documentElement, {attributes: true});
+>+#endif
+>+  },
+
+Why is this not just part of the init method?
+But... why do you need the observer at all? Don't we have events and callbacks such as BrowserToolboxCustomizeDone for that?
+Comment on attachment 787438
+Fix titlebar calculations, also account for customization mode
+
+Review of attachment 787438:
+-----------------------------------------------------------------
+
+It feels like at least three patches combined in one which makes it harder to review:
+1) Fixing the titlebar in customize mode (the intention of the bug)
+2) CustomizableUI.jsm change for skipincurrentset. r=me on that. I'm going to check it in as a follow-up to bug 877178.
+3) TabsInTitlebar perf improvements
+
+Note that I didn't do any manual testing.
+
+Dão's comments and my questions about the padding bottom of the menubar are the main issues.
+
+::: browser/base/content/browser.js
+@@ +4180,5 @@
+>    },
+>  
+> +  registerCustomizationListener: function() {
+> +#ifdef CAN_DRAW_IN_TITLEBAR
+> +    this._customizeObserver = new MutationObserver(this._onCustomizeMutate);
+
+I agree with Dão that this should be in init and use the events, if possible.
+
+@@ +4264,5 @@
+>  
+>    _update: function (aForce=false) {
+>      function $(id) document.getElementById(id);
+>      function rect(ele) ele.getBoundingClientRect();
+> +    function margins(cstyle) parseInt(cstyle.marginBottom, 10) + parseInt(cstyle.marginTop, 10);
+
+verticalMargins?
+
+@@ +4321,5 @@
+> +
+> +      // And get the height of what's in the titlebar:
+> +      let titlebarContentHeight = rect(titlebarContent).height;
+> +
+> +      // Get customization height here if necessary:
+
+You're actually getting the padding on the top, not the height. Something like this would be nice:
+Padding surrounds the tab-view-deck when in customization mode so take the padding-top into account.
+
+@@ +4344,5 @@
+> +          fullMenuHeight += menuTitlebarDelta;
+> +          // If there is already padding on the menubar, we need to add that
+> +          // to the delta so the outcome is correct:
+> +          if ((paddingBottom = menuStyles.paddingBottom)) {
+> +            menuTitlebarDelta += parseInt(paddingBottom, 10);
+
+Can you explain to me how we won't double-count the paddingBottom of the menubar if this branch is run again? It seems like it still needs to be reset before the calculations or somehow taken into account.
+
+@@ +4347,5 @@
+> +          if ((paddingBottom = menuStyles.paddingBottom)) {
+> +            menuTitlebarDelta += parseInt(paddingBottom, 10);
+> +          }
+> +          menubar.style.paddingBottom = menuTitlebarDelta + "px";
+> +        } else if (menuTitlebarDelta < 0 && (paddingBottom = menuStyles.paddingBottom)) {
+
+I'm not sure about this but I think we may still want this branch to add menuTitlebarDelta to the padding if there is no padding-bottom set on the menu bar. It seems like that check should be inside the if and you would need to handle the lack of padding-bottom inside.
+
+@@ +4350,5 @@
+> +          menubar.style.paddingBottom = menuTitlebarDelta + "px";
+> +        } else if (menuTitlebarDelta < 0 && (paddingBottom = menuStyles.paddingBottom)) {
+> +          let existingPadding = parseInt(paddingBottom, 10);
+> +          // menuTitlebarDelta is negative; work out what's left, but don't set negative padding:
+> +          let desiredPadding = Math.max(0, existingPadding + menuTitlebarDelta);
+
+When do we reset menubar's padding bottom? I think we have the same problem as the first branch that this will re-add the padding-bottom even when the last time though the branch added it on already.
+
+@@ +4353,5 @@
+> +          // menuTitlebarDelta is negative; work out what's left, but don't set negative padding:
+> +          let desiredPadding = Math.max(0, existingPadding + menuTitlebarDelta);
+> +          menubar.style.paddingBottom = desiredPadding + "px";
+> +          // We've changed the menu height now:
+> +          fullMenuHeight -= (existingPadding - desiredPadding);
+
+I thikn we should avoid the double-negation and do:
+fullMenuHeight += desiredPadding - existingPadding;
+(no brackets necessary AFAIK)
+
+@@ +4383,3 @@
+>  #endif
+> +      for (let placeholder of this._captionButtonsPlaceholders)
+> +        $(placeholder).width = captionButtonsBoxWidth;
+
+I think we should leave the placeholder stuff untouched for this bug as those changes are unrelated.
+(In reply to Dão Gottwald [:dao] from comment #15)
+> (In reply to :Gijs Kruitbosch (PTO Aug 8-Aug 18) from comment #14)
+> > From my profiling I guess this will gain us a tiny bit in
+> > terms of performance, but if we decide that isn't worth it it's not hard to
+> > switch back.
+> 
+> This seems backwards. Please switch it back until we've decided that it's a
+> worthwhile change.
+
+I expressed myself poorly here (note to self: don't post patches from a train to the airport to head to a holiday). Here's an alternative version: it's a logical perf improvement, profiles show it is an actual perf improvement, and it's net code-removal. Why should we not do it?
+
+(In reply to Matthew N. [:MattN] from comment #18)
+> Comment on attachment 787438
+> Fix titlebar calculations, also account for customization mode
+> 
+> Review of attachment 787438:
+> -----------------------------------------------------------------
+> 
+> It feels like at least three patches combined in one which makes it harder
+> to review:
+> 1) Fixing the titlebar in customize mode (the intention of the bug)
+> 2) CustomizableUI.jsm change for skipincurrentset. r=me on that. I'm going
+> to check it in as a follow-up to bug 877178.
+> 3) TabsInTitlebar perf improvements
+
+And, looking at the patch a while later:
+4) fixing the menubar to be taken into account for sizemode=normal windows, too.
+
+
+> ::: browser/base/content/browser.js
+> @@ +4180,5 @@
+> >    },
+> >  
+> > +  registerCustomizationListener: function() {
+> > +#ifdef CAN_DRAW_IN_TITLEBAR
+> > +    this._customizeObserver = new MutationObserver(this._onCustomizeMutate);
+> 
+> I agree with Dão that this should be in init and use the events, if possible.
+
+I'll look at using init() tomorrow; I don't recall what, if any, my reasoning was.
+
+The mutation observer is checking for customizing/customize-exiting attributes on the window. We don't currently have events that fire when those are set. The events we do have fire at different times, meaning we add reflows and/or chunkiness to all the animation/transitioning that's going on. We could add them, of course, if we think that's a better way of doing this. I suspect it is, so I can do that in the next version unless someone tells me I'm wrong before I do it... :-)
+
+> @@ +4344,5 @@
+> > +          fullMenuHeight += menuTitlebarDelta;
+> > +          // If there is already padding on the menubar, we need to add that
+> > +          // to the delta so the outcome is correct:
+> > +          if ((paddingBottom = menuStyles.paddingBottom)) {
+> > +            menuTitlebarDelta += parseInt(paddingBottom, 10);
+> 
+> Can you explain to me how we won't double-count the paddingBottom of the
+> menubar if this branch is run again? It seems like it still needs to be
+> reset before the calculations or somehow taken into account.
+
+The goal of the code here is to make the menubar at least as high as the titlebar. In order to do this, we calculate the difference between the (current, including bottom padding) full height of the menubar and that of the titlebar. If this is > 0 (id est, the titlebar is bigger), the padding bottom of the menubar needs to be increased. Suppose the difference is 5, and there is already 10px bottom padding. This code will then increase the delta to 15, and then set the padding bottom to the delta (of 15px). Does this make sense?
+
+> 
+> @@ +4347,5 @@
+> > +          if ((paddingBottom = menuStyles.paddingBottom)) {
+> > +            menuTitlebarDelta += parseInt(paddingBottom, 10);
+> > +          }
+> > +          menubar.style.paddingBottom = menuTitlebarDelta + "px";
+> > +        } else if (menuTitlebarDelta < 0 && (paddingBottom = menuStyles.paddingBottom)) {
+> 
+> I'm not sure about this but I think we may still want this branch to add
+> menuTitlebarDelta to the padding if there is no padding-bottom set on the
+> menu bar. It seems like that check should be inside the if and you would
+> need to handle the lack of padding-bottom inside.
+
+If menuTitlebarDelta < 0, the menubar is bigger than the titlebar. We don't want to set negative padding to the menubar.
+
+> 
+> @@ +4350,5 @@
+> > +          menubar.style.paddingBottom = menuTitlebarDelta + "px";
+> > +        } else if (menuTitlebarDelta < 0 && (paddingBottom = menuStyles.paddingBottom)) {
+> > +          let existingPadding = parseInt(paddingBottom, 10);
+> > +          // menuTitlebarDelta is negative; work out what's left, but don't set negative padding:
+> > +          let desiredPadding = Math.max(0, existingPadding + menuTitlebarDelta);
+> 
+> When do we reset menubar's padding bottom? I think we have the same problem
+> as the first branch that this will re-add the padding-bottom even when the
+> last time though the branch added it on already.
+
+See above.
+(In reply to :Gijs Kruitbosch from comment #19)
+> (In reply to Dão Gottwald [:dao] from comment #15)
+> > (In reply to :Gijs Kruitbosch (PTO Aug 8-Aug 18) from comment #14)
+> > > From my profiling I guess this will gain us a tiny bit in
+> > > terms of performance, but if we decide that isn't worth it it's not hard to
+> > > switch back.
+> > 
+> > This seems backwards. Please switch it back until we've decided that it's a
+> > worthwhile change.
+> 
+> I expressed myself poorly here (note to self: don't post patches from a
+> train to the airport to head to a holiday). Here's an alternative version:
+> it's a logical perf improvement,
+
+Like CSS selector matching, querySelector is very fast for a straightforward selector like the one at hand. So it's not logical that this improves anything at a level we care about.
+
+> profiles show it is an actual perf improvement,
+
+How much?
+
+> and it's net code-removal.
+
+Is it? I count -7 +15 lines.
+
+> Why should we not do it?
+
+Because it's unnecessary code churn.
+Created attachment 792781
+Also change when menu changes in restored mode
+
+I'm trying to split this up so we can shepherd it in bit by bit. First off, the assertion that we don't care about restored windows doesn't hold in Australis, so this just needs to go away.
+Comment on attachment 792781
+Also change when menu changes in restored mode
+
+LGTM
+Created attachment 792918
+Streamline TabsInTitlebar._update, take navbar overlap and customize mode into account.
+
+So here's an updated version of the remainder of the changes. This keeps the current system for placeholders, so we can investigate the performance impact there separately. I hope the additional comments and my previous response to your concerns address your concerns. Note that I've used the transitionend notification to adjust the titlebar after the customize mode padding on entering as well as exiting. This is because when doing it immediately as the attribute is set (rather than after the transition) on entering was causing the titlebar to no extend further down, weirdly enough. I'd like to investigate that further, but I think this can be landed in the meantime. Finally, note that I'm now also including the navbar's top margin (currently -1px), as otherwise the navbar's top overlaps the titlebar. That doesn't sound so bad - but then if you look at this in customize mode, the titlebar clearly extends further down beside the main UI (in the padding area). Taking the negative margin into account fixes this so it aligns nicely.
+Created attachment 792922
+Streamline TabsInTitlebar._update, take navbar overlap and customize mode into account.
+
+Forgot to update two comment/structure nits.
+Comment on attachment 792922
+Streamline TabsInTitlebar._update, take navbar overlap and customize mode into account.
+
+>+    gNavToolbox.addEventListener("customization-transitionend", this._onCustomizingChanged);
+
+You should either use 'this' as the listener (and implement handleEvent) or this._onCustomizingChanged.bind(this). You don't need to remove the event listener in uninit().
+
+>+  _onCustomizingChanged: function (aEvent) {
+>+    TabsInTitlebar._update(true);
+
+and use this._update(true); here
+Created attachment 792968
+Streamline TabsInTitlebar._update, take navbar overlap and customize mode into account.
+
+Using handleEvent now, not unregistering...
+Created attachment 792977
+make maximized win7 classic mode not try to do hideous vertical gradients
+
+I don't think this gradient should still be here with Australis... but perhaps this needs ui-review from shorlander or someone else?
+Created attachment 793002
+Streamline TabsInTitlebar._update, take navbar overlap and customize mode into account.
+
+Yay for qref not DWIM...
+Comment on attachment 792977
+make maximized win7 classic mode not try to do hideous vertical gradients
+
+Followup'd this to bug 907336
+Comment on attachment 793002
+Streamline TabsInTitlebar._update, take navbar overlap and customize mode into account.
+
+Thanks for your patience. r=me
+https://hg.mozilla.org/projects/ux/rev/fa31ba5c7b41
+https://hg.mozilla.org/projects/ux/rev/cc7e9c7a908b
+
+I'll file a followup bug for investigating updating the titlebar sooner when entering customize mode.
+https://hg.mozilla.org/mozilla-central/rev/fa31ba5c7b41
+https://hg.mozilla.org/mozilla-central/rev/cc7e9c7a908b

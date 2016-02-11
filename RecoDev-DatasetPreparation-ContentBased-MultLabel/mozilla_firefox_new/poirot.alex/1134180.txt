@@ -1,0 +1,310 @@
+The following code is expensive:
+  http://mxr.mozilla.org/mozilla-central/source/browser/devtools/framework/target.js#409
+
+The call to listTabs forces the creation of TabActor instances for all tabs. It is somewhat ok to do such thing for tabs running in parent process as the creation of new TabActor instance shouldn't be expensive. But it is definitely not something we want to do for tabs running OOP. As it forces calling DebuggerServer.connectToChild and instanciate a lot of stuff dedicated to e10s support (a frame script, various message manager listener on both sides, ChildDebuggerTransport and NetworkMonitorManager).
+
+It is especially unfortunate when this typical codepath only cares about just one tab, and knows about which tab it is interested in even before calling listTabs (has a reference to the <tab> element).
+
+The following code is expensive:
+  http://mxr.mozilla.org/mozilla-central/source/browser/devtools/framework/target.js#409
+
+The call to listTabs forces the creation of TabActor instances for all tabs. It is somewhat ok to do such thing for tabs running in parent process as the creation of new TabActor instance shouldn't be expensive. But it is definitely not something we want to do for tabs running OOP. As it forces calling DebuggerServer.connectToChild and instanciate a lot of stuff dedicated to e10s support (a frame script, various message manager listener on both sides, ChildDebuggerTransport and NetworkMonitorManager).
+
+It is especially unfortunate when this typical codepath only cares about just one tab, and knows about which tab it is interested in even before calling listTabs (has a reference to the <tab> element).
+Created attachment 8565947
+patch v1
+
+Here is one way to address this.
+That is focused on fixing target.js. It won't solve the overall issue of listTabs when connecting remotely from WebIDE.
+But we could also fix the remote usecase by modifying listTabs or introducing a new request similar to listTabs
+but that would expose TabActor grip/form and instead only return some metadata and tab ids.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=44316177f4d9
+(In reply to Alexandre Poirot [:ochameau] from comment #1)
+> Created attachment 8565947
+> patch v1
+> 
+> Here is one way to address this.
+> That is focused on fixing target.js. It won't solve the overall issue of
+> listTabs when connecting remotely from WebIDE.
+> But we could also fix the remote usecase by modifying listTabs or
+> introducing a new request similar to listTabs
+> but that would expose TabActor grip/form and instead only return some
+> metadata and tab ids.
+
+I think my personal preference would be this alternative approach: just return basic metadata at first, instead of creating all the actors at the beginning.
+
+This would make the API parallel listProcesses.
+Comment on attachment 8565947
+patch v1
+
+Review of attachment 8565947:
+-----------------------------------------------------------------
+
+Apart from my confusion about the need for the tabId parameter, I'm not opposed to this approach.
+
+You say that the expensive bit is the call to actor.connect() for each actor, but the only reason we do it so early is to get the tab's form. I assume you tried the idea we discussed on IRC (which I think Ryan is also alluding to) about returning a fake form (grip) from the RemoteBrowserTabActor in the parent when creating the listTabs response and couldn't make it work. I bet that the tab title isn't available in the parent, but even just the URL should probably do for matching purposes.
+
+I still think that the only existing use cases for getTab() (Toolbox and Scratchpad) is to fetch the current tab, and a getCurrentTab() would simplify the API and target.js accordingly. Did you find any other cases where we want a specific tab, but not the current one?
+
+::: browser/devtools/framework/target.js
+@@ +428,5 @@
+> +          filter.outerWindowID = windowUtils.outerWindowID;
+> +        } else if (this._tab.linkedBrowser &&
+> +                   this._tab.linkedBrowser.frameLoader.tabParent) {
+> +          // Tabs in child process
+> +          filter.tabId = this._tab.linkedBrowser.frameLoader.tabParent.tabId;
+
+What is this new conditional branch about? I don't see it being used anywhere yet and we weren't checking for it before.
+
+::: toolkit/devtools/server/actors/webbrowser.js
+@@ +348,3 @@
+>    }
+>  
+> +  if (this._testing && initialMapSize !== this._foundCount)
+
+It seems that this._foundCount is never updated, so the sanity check is no longer performed.
+Comment on attachment 8565947
+patch v1
+
+Review of attachment 8565947:
+-----------------------------------------------------------------
+
+Alex's patch brings up two points:
+
+* Before his patch, we were forced to create remote actors (and servers) for every tab as part of the |listTabs| call
+  * Here, it is solved for some cases by skipping |listTabs| and providing the server enough to find the right tab
+* Before his patch, for the local tab case, we never really matched the local window to the server at all before, we only indirectly assumed that the tab we wanted was |response.selected|
+  * Now, we explicitly select the correct tab based on information the target has: the window / tab ID, which seems better than making an assumption
+
+These seem like useful improvements on their own.
+
+I think a future patch could go further and make it possible for |listTabs| to work without starting full servers in every tab as I mentioned in the comments (and I think Panos does as well), and I don't think it would be in conflict with the work done here.
+
+So, I think it's reasonable to proceed with this approach.
+
+::: toolkit/devtools/server/actors/root.js
+@@ +410,5 @@
+>  };
+>  
+>  RootActor.prototype.requestTypes = {
+>    "listTabs": RootActor.prototype.onListTabs,
+> +  "getTab": RootActor.prototype.onGetTab,
+
+What about |attachTab| to parallel |attachProcess| below?
+
+Or is too confusing because there is a separate |attach| method on the actual tab actor?
+
+I just like things to appear logical and similar when grouped together...  Maybe |attachProcess| should have been |getProcess|...  It's too bad you can't rename existing methods!  :)
+
+Anyway, just think about the name and do what seems best.
+Created attachment 8578589
+patch v2
+
+Factorized some code from target.js to dbg-client.jsm.
+And added a test.
+
+Panos, I'm requesting TabActor/DebuggerServer/Target reviews to you
+as you are the elder of this code to my eyes ;)
+But feel free to ask me to throw reviews to jryans who seems
+to have a good understanding of this code.
+
+
+(In reply to Panos Astithas [:past] from comment #4)
+> Comment on attachment 8565947
+> You say that the expensive bit is the call to actor.connect() for each
+> actor, but the only reason we do it so early is to get the tab's form. I
+> assume you tried the idea we discussed on IRC (which I think Ryan is also
+> alluding to) about returning a fake form (grip) from the
+> RemoteBrowserTabActor in the parent when creating the listTabs response and
+> couldn't make it work. I bet that the tab title isn't available in the
+> parent, but even just the URL should probably do for matching purposes.
+
+I think we can get title, url and such things.
+I haven't tried, because I know we can't reasonably compute tab actors ids from the parent.
+They are added to the TabActor grip from here, from the child process:
+  http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webbrowser.js#800
+
+> I still think that the only existing use cases for getTab() (Toolbox and
+> Scratchpad) is to fetch the current tab, and a getCurrentTab() would
+> simplify the API and target.js accordingly. Did you find any other cases
+> where we want a specific tab, but not the current one?
+
+Yes I found one! The code I'm modifying in target.js expects to connect to a very specific tab!!
+http://mxr.mozilla.org/mozilla-central/source/browser/devtools/framework/target.js#432
+Except that this code doesn't work on e10s as the `window` attribute on target is null (it may introduce some randomness on e10s..).
+But really, we expect the target to connect to a very specific tab, not just the currently selected one.
+And this code is the main production codepath used by toolboxes, so that it ends up being the main usecase.
+
+> 
+> ::: browser/devtools/framework/target.js
+> @@ +428,5 @@
+> > +          filter.outerWindowID = windowUtils.outerWindowID;
+> > +        } else if (this._tab.linkedBrowser &&
+> > +                   this._tab.linkedBrowser.frameLoader.tabParent) {
+> > +          // Tabs in child process
+> > +          filter.tabId = this._tab.linkedBrowser.frameLoader.tabParent.tabId;
+> 
+> What is this new conditional branch about? I don't see it being used
+> anywhere yet and we weren't checking for it before.
+
+I added this branch in order to correctly support e10s and have correct tab actor filtering like what is being done for non-e10s builds.
+
+> 
+> ::: toolkit/devtools/server/actors/webbrowser.js
+> @@ +348,3 @@
+> >    }
+> >  
+> > +  if (this._testing && initialMapSize !== this._foundCount)
+> 
+> It seems that this._foundCount is never updated, so the sanity check is no
+> longer performed.
+
+Ooops, I added it again. Having said that, I found that really weird to have such tests in code :o
+
+(In reply to J. Ryan Stinnett [:jryans] from comment #5)
+> Comment on attachment 8565947 
+> >  RootActor.prototype.requestTypes = {
+> >    "listTabs": RootActor.prototype.onListTabs,
+> > +  "getTab": RootActor.prototype.onGetTab,
+> 
+> What about |attachTab| to parallel |attachProcess| below?
+> 
+> Or is too confusing because there is a separate |attach| method on the
+> actual tab actor?
+
+Yes it sounds confusing as we do not attach, we have to attach the tabactor after that...
+
+> 
+> I just like things to appear logical and similar when grouped together... 
+> Maybe |attachProcess| should have been |getProcess|...  It's too bad you
+> can't rename existing methods!  :)
+
+Yes, it sounds more like attachProcess should be getProcess, like getTab and getAppActor.
+All the threee are the same pattern.
+
+attachProcess has been introduced in bug 1060093, for Firefox 36.
+So we can't uplift to rename it, but AFAIK, this request is only used locally,
+there is no remote usage of it (desktop -> device).
+I'm not sure anyone started using this feature remotely?
+If that's only used for the browser content toolbox, locally, we can reasonably rename it.
+
+Would you both agree on keeping getTab and renaming attachProcess to getProcess in followup?
+
+Green try (with additional inspector test refactoring depending on getTab):
+  https://treeherder.mozilla.org/#/jobs?repo=try&revision=a8ceb3b345fd
+It looks like I broke browser/devtools/debugger/test/browser_dbg_multiple-windows.js
+and something around listTabs's response selected attribute.
+I'll look into that tomorrow.
+(In reply to Alexandre Poirot [:ochameau] from comment #6)
+> > I just like things to appear logical and similar when grouped together... 
+> > Maybe |attachProcess| should have been |getProcess|...  It's too bad you
+> > can't rename existing methods!  :)
+> 
+> Yes, it sounds more like attachProcess should be getProcess, like getTab and
+> getAppActor.
+> All the threee are the same pattern.
+> 
+> attachProcess has been introduced in bug 1060093, for Firefox 36.
+> So we can't uplift to rename it, but AFAIK, this request is only used
+> locally,
+> there is no remote usage of it (desktop -> device).
+> I'm not sure anyone started using this feature remotely?
+> If that's only used for the browser content toolbox, locally, we can
+> reasonably rename it.
+> 
+> Would you both agree on keeping getTab and renaming attachProcess to
+> getProcess in followup?
+
+Ah, I think you are right.  We *did* start using |attachProcess| remotely for b2g main process after your more recent bug 1059308 though.  I think it's okay to do the rename assuming it lands this cycle (before 2015-03-30), or else is uplifted into Gecko 39.
+
+Related to this, in bug 1059308, you landed several comments like "Fx >= 37 uses |attachProcess|", but it's really 39, not 37, since it took a while to land.  Please fix the comments in the follow up too!
+Created attachment 8578946
+interdiff
+
+Fix the test... some unexpected scope issue with let not working as expected.
+Created attachment 8578949
+patch v3
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=2c725fdbb202
+Comment on attachment 8578949
+patch v3
+
+Review of attachment 8578949:
+-----------------------------------------------------------------
+
+Just some error handling issues and I also think it would be best to change some other existing tests to use getTab() with the other possible filter values to increase coverage.
+
+::: toolkit/devtools/server/actors/root.js
+@@ +281,5 @@
+> +      this._tabActorPool = new ActorPool(this.conn);
+> +      this.conn.addActorPool(this._tabActorPool);
+> +    }
+> +    return tabList.getTab(options)
+> +                  .then(tabActor => {
+
+No error checking in case the tab couldn't be found?
+
+::: toolkit/devtools/server/actors/webbrowser.js
+@@ +390,5 @@
+> +        }
+> +      }
+> +    }
+> +    return { error: "noTab",
+> +             message: "Unable to find tab with outerWindowID '" + outerWindowID + "'" };
+
+getTab() returns a promise on success, so it should return a rejected one in case of an error, so that the root actor can catch() it.
+(In reply to Alexandre Poirot [:ochameau] from comment #6)
+> Yes I found one! The code I'm modifying in target.js expects to connect to a
+> very specific tab!!
+> http://mxr.mozilla.org/mozilla-central/source/browser/devtools/framework/
+> target.js#432
+> Except that this code doesn't work on e10s as the `window` attribute on
+> target is null (it may introduce some randomness on e10s..).
+> But really, we expect the target to connect to a very specific tab, not just
+> the currently selected one.
+> And this code is the main production codepath used by toolboxes, so that it
+> ends up being the main usecase.
+
+I don't remember the details of that particular codepath, but I think it is for the browser toolbox that also needs to connect to the current window. Anyway, perfect is the enemy of good, so I'm not going to argue any more about it.
+
+> > It seems that this._foundCount is never updated, so the sanity check is no
+> > longer performed.
+> 
+> Ooops, I added it again. Having said that, I found that really weird to have
+> such tests in code :o
+
+That's how you can tell jimb is the author, he is accustomed to sprinkling ASSERTs throughout his C++ :)
+
+> Would you both agree on keeping getTab and renaming attachProcess to
+> getProcess in followup?
+
+Sure, fine by me.
+(In reply to Panos Astithas [:past] from comment #12)
+> (In reply to Alexandre Poirot [:ochameau] from comment #6)
+> > Would you both agree on keeping getTab and renaming attachProcess to
+> > getProcess in followup?
+> 
+> Sure, fine by me.
+
+I have filed bug 1147042 for this.
+Created attachment 8583149
+patch v4
+
+Addressed review comments:
+- now rejects from BrowserTabList.getTab
+- now that BrowserTabList.getTab rejects, convert promise rejection into a RDP message with {error, message} fields.
+
+I also fixed a leak reported in last try,
+I missed some calls to _checkListening in RootActor.getTab codepath.
+(to cleanup _actorByBrowser Map)
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=ad160a2b3cf5
+https://hg.mozilla.org/integration/fx-team/rev/d058933e812e
+https://hg.mozilla.org/mozilla-central/rev/d058933e812e
+
+
+Prevent calling connectToChild for all tabs when opening a single toolbox
+
+
+
+Bug 1134180 - Introduce RootActor.getTab to prevent creating TabActor for all tabs. r=past 

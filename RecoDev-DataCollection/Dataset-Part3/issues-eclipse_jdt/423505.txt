@@ -1,0 +1,168 @@
+While work in bug 400874 is reaching the first milestone, the new spec section mentioned in the bug title has not yet been implemented, partly for lack of test cases for this situation.
+
+While work in bug 400874 is reaching the first milestone, the new spec section mentioned in the bug title has not yet been implemented, partly for lack of test cases for this situation.
+I have a first implementation of this in my workspace. While tests are running let me document the list of tests which seem to need adjusting:
+
+Some amgiguities are no longer reported:
+AmbiguousMethodTest:
+- test006()
+- test014h()
+- test014i()
+- test051()
+- test053()
+- test074()
+GenericTypeTest:
+- test1234()
+MethodVerifyTest:
+- test058b()
+VarargsTest:
+- test037()
+
+Different result because different candidate is picked:
+GenericTypeTest:
+- test0992()
+
+Still need to figure out in detail, which changes are mirrored also by javac, and if not, which compiler is right.
+Difference between compilers 
+
+AmbiguousMethodTest:
+
+test006():
+ javac8: 2x ambiguous method
+ ecj:    0x
+Methods using class-level type variable T2 are considered more specific than those using the method level type variables U1 or U2.
+This is because U1 and U2 can always be inferred to establish compatibility, whereas T2 is fix.
+Hence T2 <: U1#1 can be made true, whereas U1 <: T2 cannot (inference is asymmetric, using inference variables only at the RHS of these formulae).
+Ergo: foo(T2) is more specific. Is this a bug in javac?
+
+test014h():
+ javac8: 12x ambiguous method
+ ecj:    6x ambiguous method
+Not yet analyzed.
+
+test014i():
+ javac8: 18x ambiguous method
+ ecj:    8x ambiguous method
+Not yet analyzed.
+
+test051():
+test053():
+ javac8: 1x ambiguous
+ ecj:    0x
+Given that "class Z implements I#RAW", ECJ recognizes bar(Z) as being more specific than bar(I#RAW). Bug in javac?
+
+test074():
+ javac8: 6x ambiguous
+ ecj:    0x
+Differences between I#RAW and I<?>.
+
+
+
+GTT.test1234():
+ javac8: 2x ambiguous
+ ecj:    0x
+One direction of checking uses inference, the other doesn't.
+Consider candidates 
+  void a3(G#RAW) 
+  void a3(T) 
+where T has bound <T extends F<X>>, and class G<T2> extends F<T2>.
+Inference finds a solution to show that G#RAW is more specific than T#1.
+The opposite direction (<T extends F<X>> is more specific than G#RAW) is false.
+Ergo: not ambiguous. Bug in javac?
+
+
+MethodVerifyTest.test058b(): similar to AmbiguousMethodTest.test006()
+
+
+VarargsTest.test037()
+This one I could fix just now, so:
+ javac8: 2x ambiguous
+ ecj:    2x ambiguous (used to be 3x)
+
+
+
+GTT:test0992():
+ javac8: 2x unchecked warning
+ ecj:    1x
+Method inherited along two paths, 1x raw, 1x parameterized. ECJ picks the non-raw version as being more specific, hence no warning. Is a secondary warning anyway, hence no real need for action.
+
+
+Some of these differences involve raw types, s.t. the spec doesn't seem to explicitly handle in the context of more-specific analysis. I did some reading between the lines and the current solution is the one I could find, in terms of least possible deviation from old behavior / from javac.
+
+Another variable in the equation: previously our implementation compared substituted PGMB as returned from applicability analysis, but I read the spec in that way that substitution should only happen at the very end of type inference plus overload resolution. All prior solutions are only used to show applicability but should then be discarded!
+Created attachment 239123
+work in progress
+
+Here's my current patch, matching the above comments.
+I think I found the essential variable in this game, which I can modify to make ecj behavior more conform to javac: I had been going back and forth between using substituted methods and originals. Both variants caused regressions. In previous bugs I invented s.t. inbetween: shallowOriginal(), but even that didn't do the trick.
+
+I finally figured, that we need to unwrap and ParameterizedGenericMethodBinding while leaving ParameterizedMethodBinding in tact. Why so? We do have a resolved receiver type, which may be parameterized. If so, all its methods are PMBs, which should not be unwrapped. If, however, we see a PGMB, that's already a candidate for what we *will see after Invocation Type Inference*, but shouldn't actually be seeing during overload resolution.
+Thus I invented a query genericMethod() which does only the appropriate unwrapping. With this in place the number of regression becomes manageable to be addressed one by one.
+
+Additionally, for the cases count==0 and count==1 I started to make the new implementation self-contained, i.e., don't continue using old code for those cases. Only for count>1 we still seem to need some of the old, in particular for detecting overriding, which the spec doesn't handle in this section, because an overridden method is never applicable in the first place. So that's just our implementation performing tests in an unorthodox order.
+With a limited number of changes in tests I can achieve a green test run:
+
+AmbiguousMethodTest:
+
+- test014h, test014i
+ECJ infers that a3(G#RAW) is more specific than <T> a3(T) using T=G
+Traditional comparison says <T> a3(T) is *not* more specific than a3(G#RAW)
+-> unambiguous (while javac8 still reports ambiguous)
+Similar for 
+ - a3(G#RAW) vs. <T> a3(T)
+ - a4(G#RAW) vs, <T,S> a4(s)
+
+For <T> a6(T)  vs. <T,S> a6(S) we can infer "more specific" in one direction
+(using T=C,S=T) but not in the other (because S <: T <: G is unsatisfiable).
+-> not ambiguous (javac8 still reports ambiguous)
+
+
+- test051, test053, test074: see analysis in comment 2
+
+GenericTypeTest:
+
+- test0992, test1234 see analysis in comment 2
+
+- test1273, test1275, test1278: resolved "FIXME javac8 rejects"
+
+VarArgsTest:
+
+- test037: adjusted to expecting same result as javac8 gives
+
+
+All other deviations I could fix.
+
+This leaves us with
+ - 4 former deviations fixed
+ - 7 new deviations, where I can find no fault in ECJ's behavior
+
+Additionally, the patch fixes bug 426521!
+
+Doing some more tests, but I think this is ready for release.
+After more self-review released via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=3efbae02af9125c723d4c2de65767b20d72aaa7a
+*** Bug 426521 has been marked as a duplicate of this bug. ***
+(In reply to Stephan Herrmann from comment #4)
+
+> I finally figured, that we need to unwrap and
+> ParameterizedGenericMethodBinding while leaving ParameterizedMethodBinding
+> in tact. Why so?
+
+Stephan, could you take a look at the existing tiebreakMethod() API and its
+usage during overload resolution in the old engine ? 
+
+Is the new genericMethod() a parallel or orthogonal, augment ?
+(In reply to Srikanth Sankaran from comment #8)
+> (In reply to Stephan Herrmann from comment #4)
+> 
+> > I finally figured, that we need to unwrap and
+> > ParameterizedGenericMethodBinding while leaving ParameterizedMethodBinding
+> > in tact. Why so?
+> 
+> Stephan, could you take a look at the existing tiebreakMethod() API and its
+> usage during overload resolution in the old engine ? 
+> 
+> Is the new genericMethod() a parallel or orthogonal, augment ?
+
+I never really understood what tiebreak methods are and what they are used for. Why do we need raw methods? Is this based on some part of the spec or an implementation detail?
+
+The new method strips off instantiations of a method's type variables, nothing more. Structurally, both look similar, indeed.

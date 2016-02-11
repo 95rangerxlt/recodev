@@ -1,0 +1,169 @@
+Nightly 41.0a1 (2015-06-16)
+
+STR:
+
+1. Go to http://codepen.io/scottohara/pen/qobKB
+2. Inspect .main
+3. Change the rate for .circle.c1 to 10x instead of 1x
+
+ER:
+
+I would expect the animation to rotate 10x faster than before.
+
+AR:
+
+The progress marker in the animation inspector *does* move at 10x speed, but the animation itself seems fixed at 1x speed still.
+
+Nightly 41.0a1 (2015-06-16)
+
+STR:
+
+1. Go to http://codepen.io/scottohara/pen/qobKB
+2. Inspect .main
+3. Change the rate for .circle.c1 to 10x instead of 1x
+
+ER:
+
+I would expect the animation to rotate 10x faster than before.
+
+AR:
+
+The progress marker in the animation inspector *does* move at 10x speed, but the animation itself seems fixed at 1x speed still.
+This also happens when changing the playbackRate from the WebAnimations API directly, so it's not related to the inspector.
+- right click in the content part, "show only this frame"
+- open the console
+- enter: document.querySelector(".circle.c1").getAnimations()[0].playbackRate = 10;
+Hey Brian, do you think this is a waapi bug? Should it be moved to the DOM component instead?
+(In reply to Patrick Brosset [:pbrosset] [:patrick] [:pbro] from comment #2)
+> Hey Brian, do you think this is a waapi bug? Should it be moved to the DOM
+> component instead?
+
+Could well be. It shouldn't jump when you change speed either. jwatt any ideas? Any progress on those tests? ;)
+Created attachment 8629147
+A simple test case
+
+CSS transform is not affected by playbackRate.
+Created attachment 8629796
+Possible fix
+
+I confirmed this patch fixes attachment 8629147 case, but unfortunately I can not provide any tests for this issue because I can not find any way to get the element position during css animation.
+Any ideas?
+Comment on attachment 8629796
+Possible fix
+
+Clearing review flag because there is a compile error on android.
+
+/builds/slave/try-and-x86-000000000000000000/build/src/dom/animation/KeyframeEffect.cpp:198:53: error: ISO C++ says that these are ambiguous, even though the worst conversion for the first is better than the worst conversion for the second: [-Werror]
+Comment on attachment 8629796
+Possible fix
+
+Yes, that's the problem! We didn't implement playbackRate on the compositor!
+
+In Web Animations level 1, playbackRate is a property of the *Animation* that gets passed down to the *effect*.
+
+So, I think we shouldn't change KeyframeEffectReadOnly or AnimationTiming. We should make them match the specification. Instead, we should just pass the playbackRate to the compositor and apply it there.
+
+So for example,
+
+>@@ -184,19 +184,24 @@ KeyframeEffectReadOnly::GetComputedTimin
+>   } else if (result.mPhase == ComputedTiming::AnimationPhase_After) {
+>     result.mProgress = isEndOfFinalIteration
+>                        ? 1.0
+>                        : fmod(aTiming.mIterationCount, 1.0f);
+>   } else {
+>     // We are in the active phase so the iteration duration can't be zero.
+>     MOZ_ASSERT(aTiming.mIterationDuration != zeroDuration,
+>                "In the active phase of a zero-duration animation?");
+>-    result.mProgress = aTiming.mIterationDuration == TimeDuration::Forever()
+>-                       ? 0.0
+>-                       : iterationTime / aTiming.mIterationDuration;
+>+    result.mProgress =
+>+      aTiming.mIterationDuration == TimeDuration::Forever()
+>+      ? 0.0
+>+      : iterationTime.MultDouble(aTiming.mPlaybackRate) /
+>+        aTiming.mIterationDuration;
+>+    if (result.mProgress > 1.0) {
+>+      result.mProgress = fmod(result.mProgress, 1.0f);
+>+    }
+
+I think we shouldn't change this.
+
+>diff --git a/dom/animation/KeyframeEffect.h b/dom/animation/KeyframeEffect.h
+>--- a/dom/animation/KeyframeEffect.h
+>+++ b/dom/animation/KeyframeEffect.h
+>@@ -39,16 +39,17 @@ class AnimValuesStyleRule;
+>  */
+> struct AnimationTiming
+> {
+>   TimeDuration mIterationDuration;
+>   TimeDuration mDelay;
+>   float mIterationCount; // mozilla::PositiveInfinity<float>() means infinite
+>   uint8_t mDirection;
+>   uint8_t mFillMode;
+>+  float mPlaybackRate;
+
+We shouldn't change this either.
+
+>diff --git a/gfx/layers/composite/AsyncCompositionManager.cpp b/gfx/layers/composite/AsyncCompositionManager.cpp
+>--- a/gfx/layers/composite/AsyncCompositionManager.cpp
+>+++ b/gfx/layers/composite/AsyncCompositionManager.cpp
+>@@ -462,16 +462,17 @@ SampleAnimations(Layer* aLayer, TimeStam
+>     timing.mDelay = TimeDuration(0);
+>     timing.mIterationCount = animation.iterationCount();
+>     timing.mDirection = animation.direction();
+>     // Animations typically only run on the compositor during their active
+>     // interval but if we end up sampling them outside that range (for
+>     // example, while they are waiting to be removed) we currently just
+>     // assume that we should fill.
+>     timing.mFillMode = NS_STYLE_ANIMATION_FILL_MODE_BOTH;
+>+    timing.mPlaybackRate = animation.playbackRate();
+
+Instead, of doing this, we should change the line earlier up:
+
+  TimeDuration elapsedDuration = aPoint - animation.startTime();
+
+to something that like [1]:
+
+  e.g. TimeDuration elapsedDuration = (aPoint - animation.startTime()).MultDouble(animation.playbackRate());
+
+[1] http://w3c.github.io/web-animations/#the-current-time-of-an-animation
+
+The rest looks good.
+(In reply to Hiroyuki Ikezoe (:hiro) from comment #5)
+> Created attachment 8629796
+> Possible fix
+> 
+> I confirmed this patch fixes attachment 8629147 case, but
+> unfortunately I can not provide any tests for this issue because I can not
+> find any way to get the element position during css animation.
+> Any ideas?
+
+Yes, we can test the transform value on the compositor using DOMWindowUtils.getOMTAStyle. You can just add tests to layout/style/test/test_animations_omta.html
+Created attachment 8630189
+Fix v2 with test
+
+Brian, thanks for reviewing and helping.
+Now this patch includes a unit test in layout/style/test/.
+test_animations_omta.html can not be used because this test needs to set dom.animations-api.core.enabled  to use Animation.playbackRate. 
+
+I did a try but unfortunately try server seems to be broken now.  I will set review flag after try server is fixed.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5c0fa37d9110
+Comment on attachment 8630189
+Fix v2 with test
+
+Looks great. Thank you!
+
+Really really minor comment: The commit message could perhaps be "Apply playback rate to compositor animations" (I think we changed at one point from using the bug description in the commit message to describing what the patch does.)
+Created attachment 8630267
+Fix v3 with test
+
+Thanks for reviewing.
+Commit message has been fixed.
+
+I re-used the previous try.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=5c0fa37d9110
+
+There are build failures cause by infra issue and all known oranges.
+docshell/test/test_bug1121701.html is not filed but it seems to be caused by a prior failure. See bug 1169358#c53 for example.
+https://hg.mozilla.org/integration/fx-team/rev/f140f3bf8910
+https://hg.mozilla.org/mozilla-central/rev/f140f3bf8910

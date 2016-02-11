@@ -1,0 +1,95 @@
+STR:
+
+1. Open an e10s window with two tabs, one containing a GitHub page such as https://github.com/heycam/webidl/pull/22 and the other can be anything.
+2. Select the GitHub page tab.
+3. Right click on the other tab's tab.
+4. Press "C" to select the "Close Tab" menu item.
+5. Notice that the GitHub page has navigated to the "Create a new issue" page, presumably because the page got a keypress event for the "C".
+
+STR:
+
+1. Open an e10s window with two tabs, one containing a GitHub page such as https://github.com/heycam/webidl/pull/22 and the other can be anything.
+2. Select the GitHub page tab.
+3. Right click on the other tab's tab.
+4. Press "C" to select the "Close Tab" menu item.
+5. Notice that the GitHub page has navigated to the "Create a new issue" page, presumably because the page got a keypress event for the "C".
+I can't reproduce this. Has it been fixed?
+I can reproduce this. github doesn't seem to respond to a 'c' keypress anymore (or at least, on my machine it doesn't), but if you press 's' it focuses the search box when it shouldn't.
+Created attachment 8605481
+0001-Bug-1119074-Mark-events-which-have-been-set-to-no-lo.patch
+
+I'm not sure if this is the correct fix here, but basically what's happening is that we're dispatching the event to the DOM here: http://mxr.mozilla.org/mozilla-central/source/layout/base/nsPresShell.cpp#8156, then receiving it at http://mxr.mozilla.org/mozilla-central/source/layout/xul/nsXULPopupManager.cpp#2150. consume is set to true, and we mark the event to stop propagation, but it still gets sent to EventStateManager::PostHandleEvent, and eventually still ends up being sent across the process boundary here: http://mxr.mozilla.org/mozilla-central/source/dom/events/EventStateManager.cpp#3363
+
+Setting mNoCrossProcessBoundaryForwarding (obviously) ensures it doesn't get sent across, but I'm unsure as to the wider implications of this. Does it make sense to stop cross process forwarding if propagation is stopped (I think it does?).
+Let's see how much this breaks...
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=45cebc870132
+Comment on attachment 8605481
+0001-Bug-1119074-Mark-events-which-have-been-set-to-no-lo.patch
+
+Review of attachment 8605481:
+-----------------------------------------------------------------
+
+Looked to me like a reasonable thing to do, but there were tests failures from that change, right?  Perhaps it's just those tests that are broken..
+You might wanna check what smaug thinks about this too.
+Why not just call preventDefaut() on the event?
+... in case the context menu handles the event.
+But yeah, I guess that patch works too, and it is probably something we want.
+nsXULPopupManager already calls PreventDefault() at http://mxr.mozilla.org/mozilla-central/source/layout/xul/nsXULPopupManager.cpp#2223; it doesn't seem to have the desired effect? Is there another bug here at play?
+I reported something (bug 1168058) which seems to be a duplicate of this bug report.
+
+This is a security issue. Pages should not have access to my typing unless I intend to type on the page.
+Created attachment 8610223
+0001-Bug-1119074-If-we-re-stopping-event-propagation-from.patch
+
+I think this is a safer approach. Rather than hit the event's StopPropagation method with the no-cross-process hammer, I've added a new method to disallow cross-process forwarding explicitly, and only called it from within nsXULPopupManager. I think this should pass the tests now.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=6a49f76b8ddb
+Comment on attachment 8610223
+0001-Bug-1119074-If-we-re-stopping-event-propagation-from.patch
+
+Review of attachment 8610223:
+-----------------------------------------------------------------
+
+::: dom/interfaces/events/nsIDOMEvent.idl
+@@ +124,5 @@
+>    /**
+> +   * The StopCrossProcessForwarding method is used to disallow this event
+> +   * from crossing process boundaries
+> +   */
+> +  void                      stopCrossProcessForwarding();
+
+this will expose this function to web content. You'll need something like [chromeonly] or [notxpcom] (not sure which is the right one to use here). But I think it would be fine to just set the flag manually from nsXULPopupManager. Maybe you tried and that didn't work because you need a concrete class to do that? Try using GetInternalNSEvent to get access to mFlags.
+Created attachment 8610241
+0001-Bug-1119074-If-we-re-stopping-event-propagation-from.patch
+
+Updated as per smaug and felipe's comments on IRC.
+
+- Added [noscript] attribute to stopCrossProcessForwarding
+- Removed random comments from Event.h
+Comment on attachment 8610241
+0001-Bug-1119074-If-we-re-stopping-event-propagation-from.patch
+
+So do we actually need StopCrossProcessForwarding() calls in this case?
+What if nsXULPopupManager::KeyDown called PreventDefault() ?
+Comment on attachment 8610241
+0001-Bug-1119074-If-we-re-stopping-event-propagation-from.patch
+
+StopCrossProcessForwarding() implementation looks ok to me, but
+because of http://hg.mozilla.org/mozilla-central/rev/d5dc2d51f002
+I'd prefer if masayuki looked at this.
+
+gwright, could you test if just adding
+aKeyEvent->PreventDefault(); to nsXULPopupManager::KeyDown where it used to
+be before http://hg.mozilla.org/mozilla-central/rev/d5dc2d51f002 would fix this.
+OK, so it looks like we can't just call PreventDefault() because that stops the popup from handling a keypress that's not a navigation event (ie - you should be able to hit 'P' when the popup from right-clicking a tab is open to pin it).
+
+If PreventDefault() is called unconditionally in KeyDown(), then the event doesn't get sent to content as this bug wants, but then KeyPress() never gets the key event and so the popup doesn't get to handle it. This makes sense based on masayuki's comment here: https://bugzilla.mozilla.org/show_bug.cgi?id=501496#c16
+
+I think we can probably do away with the StopCrossProcessForwarding() calls everywhere except in KeyDown, but I think we should probably keep them in as they aren't expensive.
+Comment on attachment 8610241
+0001-Bug-1119074-If-we-re-stopping-event-propagation-from.patch
+
+I see. The StopCrossProcessForwarding calls are very cheap.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/63e57bc623d4
+https://hg.mozilla.org/mozilla-central/rev/63e57bc623d4
+*** Bug 1168058 has been marked as a duplicate of this bug. ***

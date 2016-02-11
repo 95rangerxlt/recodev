@@ -1,0 +1,190 @@
+In Add-on SDK we add the SDK widget's node using this code:
+
+    CustomizableUI.addWidgetToArea(id, placement.area, placement.position);
+    CustomizableUI.ensureWidgetPlacedInWindow(id, this.window);
+
+(See: https://github.com/mozilla/addon-sdk/blob/master/lib/sdk/widget.js#L636-L637)
+
+Unfortunately it seems that there is no way to invalidate the CustomizableUI cache when we destroy the SDK Widget – 'cause is not created by `Customizable.createWidget` method – and therefore if we disable an add-on and re-enable it, `CustomizableUI.getWidget(id).forWindow(window)` seems return the previous cached node instead the new one.
+
+In Add-on SDK we add the SDK widget's node using this code:
+
+    CustomizableUI.addWidgetToArea(id, placement.area, placement.position);
+    CustomizableUI.ensureWidgetPlacedInWindow(id, this.window);
+
+(See: https://github.com/mozilla/addon-sdk/blob/master/lib/sdk/widget.js#L636-L637)
+
+Unfortunately it seems that there is no way to invalidate the CustomizableUI cache when we destroy the SDK Widget – 'cause is not created by `Customizable.createWidget` method – and therefore if we disable an add-on and re-enable it, `CustomizableUI.getWidget(id).forWindow(window)` seems return the previous cached node instead the new one.
+We should either make CustomizableUI.destroyWidget not no-op for XUL widgets, or make the wrappers do some kind of sanity check on the node that they're using.
+
+I think I prefer the latter. The group wrapper I *think* is harmless to continue caching (we should doublecheck that), but the single wrapper needs some love. Hopefully just making wrapper.node a smarter getter would work? Blair/Jared, how does that sound?
+This comment may be relevant to your interests:
+http://hg.mozilla.org/mozilla-central/file/5c0673441fc8/browser/components/customizableui/src/CustomizableUI.jsm#l3377
+
+;)
+
+So yes, I think the XUL widget wrappers do need to be smarter. It's just something we never got around to doing. 
+
+Don't pay too much attention to my mention of events in that comment - that was just my thought at the time. A smart getter sounds like it should work. And I *think*, in theory, if the non-group wrapper is fixed, then the group wrapper's behaviour should automatically become correct too.
+Created attachment 8396374
+invalidate wrapper's node reference,
+
+So this should work, I believe. I'll do an orthogonal patch to make destroyWidget not no-op...
+Comment on attachment 8396374
+invalidate wrapper's node reference,
+
+Egh, this breaks an existing test. Whee.
+Created attachment 8396380
+invalidate wrapper's node reference,
+
+Forgot a nullcheck on aNode. Oops.
+Created attachment 8396574
+make destroyWidget clear caches for XUL wrappers,
+
+I think we should probably do this, too. I added an aDocument parameter to the single widget wrapper constructor because otherwise, if it is constructed without an instance having been found, it'll never find new instances in that window, because weakDoc would always be null, and that's annoying.
+Comment on attachment 8396380
+invalidate wrapper's node reference,
+
+Review of attachment 8396380:
+-----------------------------------------------------------------
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +3469,5 @@
+> +    if (!weakDoc) {
+> +      return null;
+> +    }
+> +    if (aNode) {
+> +      if (aNode.ownerDocument.contains(aNode)) {
+
+isn't aNode.ownerDocument going to be null if the weakDoc.get() returns null (which is checked later in this function).
+
+it seems that now that you have a weak reference to the document, you should check that it is still viable, and if so, grab a strong reference to it and use that throughout this function instead of still using aNode.ownerDocument.
+
+it may still be a good idea to check that aNode.ownerDocument is not null though, to make sure that the node is still within the document.
+
+@@ +3471,5 @@
+> +    }
+> +    if (aNode) {
+> +      if (aNode.ownerDocument.contains(aNode)) {
+> +        return aNode;
+> +      }
+
+this seems really circular to me. if aNode.ownerDocument is non-null, why the need to check if the document contains(aNode)?
+
+@@ +3481,5 @@
+> +    }
+> +    if (weakDoc) {
+> +      let doc = weakDoc.get();
+> +      if (doc) {
+> +        aNode = CustomizableUIInternal.findWidgetInWindow(aWidgetId, doc.defaultView);
+
+you can just make this `return CustomizableUIInternal.findWidgetInWindow(...);`
+
+@@ +3486,5 @@
+> +      } else {
+> +        weakDoc = null;
+> +      }
+> +    }
+> +    return aNode;
+
+then, this can just be `return null;`
+
+::: browser/components/customizableui/test/browser_987177_xul_wrapper_updating.js
+@@ +26,5 @@
+> +
+> +  CustomizableUI.removeWidgetFromArea(BUTTONID);
+> +
+> +  otherSingleWrapper = groupWrapper.forWindow(window);
+> +  isnot(singleWrapper, otherSingleWrapper, "Shouldn't get the same wrapper after removing again.");
+
+this is the first time it is removed, so "removing again" doesn't make sense here.
+Comment on attachment 8396574
+make destroyWidget clear caches for XUL wrappers,
+
+Review of attachment 8396574:
+-----------------------------------------------------------------
+
+Sounds good.
+(In reply to Jared Wein [:jaws] (please needinfo? me) from comment #7)
+> Comment on attachment 8396380
+> invalidate wrapper's node reference,
+> 
+> Review of attachment 8396380:
+> -----------------------------------------------------------------
+> 
+> ::: browser/components/customizableui/src/CustomizableUI.jsm
+> @@ +3469,5 @@
+> > +    if (!weakDoc) {
+> > +      return null;
+> > +    }
+> > +    if (aNode) {
+> > +      if (aNode.ownerDocument.contains(aNode)) {
+> 
+> isn't aNode.ownerDocument going to be null if the weakDoc.get() returns null
+> (which is checked later in this function).
+
+aNode.ownerDocument is, to the best of my knowledge, a strong ref that'll never be null. If you have a hold of a node, that'll keep the document alive. The problem is we might throw away the node, but we don't want to throw away the document. This is because if a node for this widget reappears, it'd be nice if the wrapper Just Worked. We could throw that out of the window, but then the null-ness or otherwise of the node would be non-deterministic: if you asked for .node while the node was gone, it'd be null and stay null, if you didn't ask while the node was gone, it'd cope with the change. That's very strange behaviour, so I've made the wrapper just always cope with "swapping out" the node, so to speak.
+
+The only reason that I return early for !weakDoc is because if the document went away (because the window was closed), there's no point doing anything else here - aNode is guaranteed to be nulled out, and we have no document to look at, so the endresult will always be null.
+
+> @@ +3471,5 @@
+> > +    }
+> > +    if (aNode) {
+> > +      if (aNode.ownerDocument.contains(aNode)) {
+> > +        return aNode;
+> > +      }
+> 
+> this seems really circular to me. if aNode.ownerDocument is non-null, why
+> the need to check if the document contains(aNode)?
+
+after aNode.remove(), aNode.ownerDocument isn't null. For nodes in the palette, which are no longer contained in the document (!) because the palette is detached from the DOM, aNode.ownerDocument isn't null. For nodes that you just createElement'd, ownerDocument isn't null.
+
+So, ownerDocument has no relation to whether the node is still in the DOM tree or not. AFAIK it's a strong ref and is never null.
+Created attachment 8396825
+invalidate wrapper's node reference,
+
+I know I already had r+, but I ended up not doing too much with the feedback, so I'm putting up the adjusted patch to make sure you're on board with this. Basically, I'm overloading aNode as the 'fast path'/cache for wrapper.node. We return it if it's still 'alive', and otherwise we use findWidgetInWindow. However, we should also make that update the cache, hence assigning to aNode. I've still added a return there, and taken out a redundant check (seeing as we nullchecked weakDoc in the beginning, we can now be sure that it isn't null). And I've folded in the changes from the followup patch so the changes to the wrapper itself are all in this patch, and added a bunch of comments which hopefully clarify things. Let me know what you think.
+Created attachment 8396828
+make destroyWidget clear caches for XUL wrappers,
+Comment on attachment 8396828
+make destroyWidget clear caches for XUL wrappers,
+
+Carrying over r+ on these bits, but I'm not sure this is landable without the other bit, so holding off on that.
+Comment on attachment 8396825
+invalidate wrapper's node reference,
+
+Review of attachment 8396825:
+-----------------------------------------------------------------
+
+Thanks!
+remote:   https://hg.mozilla.org/integration/fx-team/rev/d1ff84188da2
+remote:   https://hg.mozilla.org/integration/fx-team/rev/37b77d7a64c8
+https://hg.mozilla.org/mozilla-central/rev/d1ff84188da2
+https://hg.mozilla.org/mozilla-central/rev/37b77d7a64c8
+Comment on attachment 8396825
+invalidate wrapper's node reference,
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): Australis
+User impact if declined: API isn't friendly to add-on devs
+Testing completed (on m-c, etc.): on m-c, has automated test
+Risk to taking this patch (and alternatives if risky): low
+String or IDL/UUID changes made by this patch: none
+Comment on attachment 8396828
+make destroyWidget clear caches for XUL wrappers,
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): Australis
+User impact if declined: API isn't friendly to add-on devs
+Testing completed (on m-c, etc.): on m-c, has automated test
+Risk to taking this patch (and alternatives if risky): low
+String or IDL/UUID changes made by this patch: none
+Pushed to Aurora:
+
+https://hg.mozilla.org/releases/mozilla-aurora/rev/573846297dba
+https://hg.mozilla.org/releases/mozilla-aurora/rev/230efbf7f58d
+Pushed to Beta:
+
+https://hg.mozilla.org/releases/mozilla-beta/rev/d16251fab6bc
+https://hg.mozilla.org/releases/mozilla-beta/rev/77ece374096b
+Flagging as in-testsuite+ since it appears this landed with tests.

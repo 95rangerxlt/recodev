@@ -1,0 +1,124 @@
+Created attachment 572362
+WIP
+
+I played a little bit with the style inspector's creation and refresh logic.
+
+Attached patch refactors the refresh timeout stuff a bit.  The major change is that it yields to the event loop based on clock time spent processing rather than number of items processed, and it yields for less time.
+
+End result is that updates should go faster if the event loop is not otherwise clogged (old code was waiting around for 15ms even if the event loop was empty), and it feels less chunky while it's updating (old code would be processing about 150ms per yield on my machine, this clamps at around 45ms).
+
+While creating the html, items are added to a document fragment rather than directly to the dom.  This has some performance wins, and lets us tune yield time separately from visual-refresh time.  This version of the patch adds to the dom with every 50 properties processed.
+
+This still feels sluggish (but less choppy).  Searches are quite a bit faster though - they were doing the 15ms-every-15-items too, but filtering is a lot faster than item creation, so that was overwhelmingly waiting on timeouts to fire.
+
+Created attachment 572362
+WIP
+
+I played a little bit with the style inspector's creation and refresh logic.
+
+Attached patch refactors the refresh timeout stuff a bit.  The major change is that it yields to the event loop based on clock time spent processing rather than number of items processed, and it yields for less time.
+
+End result is that updates should go faster if the event loop is not otherwise clogged (old code was waiting around for 15ms even if the event loop was empty), and it feels less chunky while it's updating (old code would be processing about 150ms per yield on my machine, this clamps at around 45ms).
+
+While creating the html, items are added to a document fragment rather than directly to the dom.  This has some performance wins, and lets us tune yield time separately from visual-refresh time.  This version of the patch adds to the dom with every 50 properties processed.
+
+This still feels sluggish (but less choppy).  Searches are quite a bit faster though - they were doing the 15ms-every-15-items too, but filtering is a lot faster than item creation, so that was overwhelmingly waiting on timeouts to fire.
+Created attachment 572368
+also build property views manually
+
+This patch also creates the property view nodes manually rather than using Templater.jsm.  It's a small change, but it speeds up style inspector creation by about 5x.
+I didn't include any new tests here, this doesn't expose any new behavior.  All current tests pass on my machine.
+Comment on attachment 572368
+also build property views manually
+
+Review of attachment 572368:
+-----------------------------------------------------------------
+
+Patch looks good.
+
+Some thoughts:
+
+- The use of a document fragment avoids many reflows - which is good, but it also means the user won't see any update until all properties are built. This is fine with me, but that's something to keep in mind - wrt. perceived performance.
+
+- The switch away from the Templater to a document fragment built manually gives better performance, certainly, but I think it would have been far more valuable in the context of displaying hundreds of unmatched selectors. Perhaps this will be one of the changes we'll have to do for unmatched selectors, if we will re-enable them some day.
+
+- I am surprised that the Style Inspector still feels slow with the unmatched selectors removed. It doesn't feel so, on my machine.
+
+::: browser/devtools/styleinspector/CssHtmlTree.jsm
+@@ +79,5 @@
+> +  this.iter = Iterator(aGenerator);
+> +  this.onItem = "onItem" in aOptions ? aOptions.onItem : function() {};
+> +  this.onBatch = "onBatch" in aOptions ? aOptions.onBatch : function () {};
+> +  this.onDone = "onDone" in aOptions ? aOptions.onDone : function() {};
+> +  this.onCancel = "onCancel" in aOptions ? aOptions.onCancel : function() {};
+
+Nit: this.onCancel = aOptions.onCancel || function() {};
+
+(onFoo will be trueish when a function is provided, if it's falsy in any case we are not interested of the value. the "in" check looks like we are interested even in the falsy values.)
+
+@@ +131,5 @@
+> +  {
+> +    let time = Date.now();
+> +    while(!this.canceled) {
+> +      // Continue until iter.next() throws...
+> +      var next = this.iter.next();
+
+Nit: s/var/let
+
+@@ +137,5 @@
+> +      if ((Date.now() - time) > this.threshold) {
+> +        this.onBatch();
+> +        return;
+> +      }
+> +    } while(true);
+
+Why is this here?
+
+@@ +320,5 @@
+>    refreshPanel: function CssHtmlTree_refreshPanel()
+>    {
+> +    if (this._refreshProcess) {
+> +      this._refreshProcess.cancel();
+> +      this._refreshProcess = null;
+
+Nit: this line is not needed. _refreshProcess is going to be set to a new UpdateProcess() instance anyway.
+(In reply to Mihai Sucan [:msucan] from comment #3)
+> - The use of a document fragment avoids many reflows - which is good, but it
+> also means the user won't see any update until all properties are built.
+> This is fine with me, but that's something to keep in mind - wrt. perceived
+> performance.
+
+On my machine the perceived performance of multiple updates and a quickly-growing scrollbar was worse than a slight hitch before seeing everything.  Would be curious if anyone else has an opinion there.
+
+> - I am surprised that the Style Inspector still feels slow with the
+> unmatched selectors removed. It doesn't feel so, on my machine.
+
+See above - seeing the scrollbar growing while it was created (which took about a second and a half before this patch) felt sluggish.
+Created attachment 572457
+comments addressed
+(In reply to Dave Camp (:dcamp) from comment #4)
+> (In reply to Mihai Sucan [:msucan] from comment #3)
+> > - The use of a document fragment avoids many reflows - which is good, but it
+> > also means the user won't see any update until all properties are built.
+> > This is fine with me, but that's something to keep in mind - wrt. perceived
+> > performance.
+> 
+> On my machine the perceived performance of multiple updates and a
+> quickly-growing scrollbar was worse than a slight hitch before seeing
+> everything.  Would be curious if anyone else has an opinion there.
+
+Good point, but it might really be up to the system performance. On a really slow machine you want more visual updates, than to wait seconds to see updates. On a fast machine, the growing scrollbar is weird/worse than a slight hitch before seeing everything.
+
+Your patch does something I really like - it checks how much it took to run the code, and based on that it adds timeouts. Maybe you could flush the fragment to DOM in onBatch(). So, on a fast system one sees one flush, on slower systems flushes would happen after every N ms (as defined by the threshold). I think the threshold should be 100ms - perhaps 45 ms is too low.
+(In reply to Mihai Sucan [:msucan] from comment #6)
+> Your patch does something I really like - it checks how much it took to run
+> the code, and based on that it adds timeouts. Maybe you could flush the
+> fragment to DOM in onBatch(). So, on a fast system one sees one flush, on
+> slower systems flushes would happen after every N ms (as defined by the
+> threshold). I think the threshold should be 100ms - perhaps 45 ms is too low.
+
+45ms is to meet our generalized responsiveness goals (no more than 50ms per return to the event loop).
+
+But we could do a separate timer and merge fragments every few hundred ms....
+https://hg.mozilla.org/integration/fx-team/rev/316418701ba0
+https://hg.mozilla.org/mozilla-central/rev/316418701ba0

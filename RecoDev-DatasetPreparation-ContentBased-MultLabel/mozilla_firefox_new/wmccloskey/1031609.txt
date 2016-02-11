@@ -1,0 +1,595 @@
+I think it makes sense to put all the initial shims in one bug. The initial setup is as follows:
+
+multiprocessShims.js - This is an XPCOM service that gets notified whenever an add-on calls a method on some browser object outside the add-on (a DOM node or the observer service or whatever).
+
+RemoteAddonsParent.jsm - This module is loaded by multiprocessShims.js and contains the parent-side implementations of all the individual shims.
+
+RemoteAddonsChild.jsm - This is the child-side analog of RemoteAddonsParent.jsm.
+
+I think it makes sense to put all the initial shims in one bug. The initial setup is as follows:
+
+multiprocessShims.js - This is an XPCOM service that gets notified whenever an add-on calls a method on some browser object outside the add-on (a DOM node or the observer service or whatever).
+
+RemoteAddonsParent.jsm - This module is loaded by multiprocessShims.js and contains the parent-side implementations of all the individual shims.
+
+RemoteAddonsChild.jsm - This is the child-side analog of RemoteAddonsParent.jsm.
+Created attachment 8447541
+rm-remote-addons
+
+We have some old shims that are ugly and Adblock-specific. To simplify the diffs, I just decided to remove them and then add the code back in later patches. There's very little common code between the old and new shims.
+Created attachment 8447545
+base-shims
+
+This patch adds all the infrastructure for the new shims. I also put in the code for the content policy shims just to give an example of how it should be used. Hopefully the comments explain what's going on. I would recommend starting with the comment in multiprocessShims.js, then looking at RemoteAddonsParent.jsm, and then everything else.
+Created attachment 8447546
+observer-shims
+
+Shims for the observer service.
+Created attachment 8447547
+event-target
+
+Shims for events.
+Created attachment 8447548
+docshell-roottreeitem
+
+This patch intercepts call to docshell.rootTreeItem on child docshells. The purpose is to make this kind of code work:
+
+     chromeWin = contentWin
+                 .QueryInterface(Ci.nsIInterfaceRequestor)
+                 .getInterface(Ci.nsIWebNavigation)
+                 .QueryInterface(Ci.nsIDocShellTreeItem)
+                 .rootTreeItem
+                 .QueryInterface(Ci.nsIInterfaceRequestor)
+                 .getInterface(Ci.nsIDOMWindow)
+                 .QueryInterface(Ci.nsIDOMChromeWindow);
+
+Yuck.
+Created attachment 8447549
+sandbox-shims
+
+This patch is designed to make Greasemonkey work. Greasemonkey creates a sandbox with content principals and runs the user script in that. The shims detect the content principal and create the sandbox in the child process, which is much more efficient. However, there are some difficulties in managing the lifetime of the sandbox that are explained in the comments.
+Created attachment 8447550
+import-node-shim
+
+This is an ugly shim to make Video Download Helper work. It creates a XUL menu in chrome and then tries to import it into the content document. That totally doesn't work and we don't really have any good way to make it work. So this patch just makes the code not generate an exception so that the add-on can continue without the menu (which isn't all that important anyway).
+Created attachment 8447551
+docshell-getter-shim
+
+This shim makes browser.docShell return a CPOW.
+Comment on attachment 8447541
+rm-remote-addons
+
+Review of attachment 8447541:
+-----------------------------------------------------------------
+
+A DXR search seems to indicate that you got all of it. Looks good, thanks billm.
+Comment on attachment 8447545
+base-shims
+
+Review of attachment 8447545:
+-----------------------------------------------------------------
+
+So I think I understand what's going on in here, and it looks sane. Most of my comments are either questions or little style-nits. You'll probably want mrbkap's review for a more substantial critique - but I think this looks fine.
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +12,5 @@
+> +Cu.import("resource://gre/modules/Services.jsm");
+> +
+> +// Similar to Python. Returns dict[key] if it exists. Otherwise,
+> +// sets dict[key] to default_ and returns default_.
+> +function setdefault(dict, key, default_)
+
+Same comment as before. Are RemoteAddonsChild and RemoteAddonsParent likely to share common utility methods like this? If so, we might want a third shared module, or an include.
+
+@@ +41,5 @@
+> +    this._paths = paths;
+> +    this._watchers = {};
+> +  },
+> +
+> +  receiveMessage: function(msg) {
+
+aMsg
+
+@@ +66,5 @@
+> +      cb(path, count);
+> +    }
+> +  },
+> +
+> +  watch: function(component1, callback) {
+
+aComponent, aCallback
+
+@@ +69,5 @@
+> +
+> +  watch: function(component1, callback) {
+> +    setdefault(this._watchers, component1, []).push(callback);
+> +
+> +    function enumerate(tracked, curPath) {
+
+aTracked, aCurPath
+
+@@ +77,5 @@
+> +        } else {
+> +          let path = curPath.slice();
+> +          if (component === "true") {
+> +            component = true;
+> +          } else if (component === "false") {
+
+What if component !== "true" or "false"? Do we want a default?
+
+@@ +110,5 @@
+> +  QueryInterface: XPCOMUtils.generateQI([Ci.nsIContentPolicy, Ci.nsIObserver,
+> +                                         Ci.nsIChannelEventSink, Ci.nsIFactory,
+> +                                         Ci.nsISupportsWeakReference]),
+> +
+> +  track: function(path, count) {
+
+I'll stop mentioning the "a" prefix thing for arguments - I think you get the idea.
+
+::: toolkit/components/addoncompat/RemoteAddonsParent.jsm
+@@ +12,5 @@
+> +Cu.import('resource://gre/modules/Services.jsm');
+> +
+> +// Similar to Python. Returns dict[key] if it exists. Otherwise,
+> +// sets dict[key] to default_ and returns default_.
+> +function setdefault(dict, key, default_)
+
+aDict, aKey, aDefault, and this function should probably be cased "setDefault".
+
+@@ +39,5 @@
+> +
+> +  init: function() {
+> +    let ppmm = Cc["@mozilla.org/parentprocessmessagemanager;1"]
+> +               .getService(Ci.nsIMessageBroadcaster);
+> +    ppmm.addMessageListener("Addons:GetNotifications", this);
+
+Can I assume we don't have to worry about removing this listener?
+
+@@ +49,5 @@
+> +      tracked = setdefault(tracked, component, {});
+> +    }
+> +    let count = tracked._count || 0;
+> +    count++;
+> +    tracked._count = count;
+
+tracked._count++?
+
+::: toolkit/components/addoncompat/multiprocessShims.js
+@@ +99,5 @@
+> +
+> +    return "generic";
+> +  },
+> +
+> +  getInterposition: function(addon, target, iid, prop, flags, v) {
+
+Please forgive my pedantry, but I think these should be aAddon, aTarget, aIID, aProp, aFlags, aValueObj, respectively.
+
+::: toolkit/content/browser-child.js
+@@ +353,5 @@
+>    }
+>  }, false);
+>  
+> +// This needs to be rooted so that it stays alive as long as the tab.
+> +let addonsChild = RemoteAddonsChild.init(this);
+
+Let's call this AddonsChild to be consistent with the rest of the globals in this file.
+Comment on attachment 8447546
+observer-shims
+
+Review of attachment 8447546:
+-----------------------------------------------------------------
+
+This also looks pretty straight-forward, and really illustrates the nice interposition framework you've set up. Right on!
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +170,5 @@
+> +  observe: function(subject, topic, data) {
+> +    let cpmm = Cc["@mozilla.org/childprocessmessagemanager;1"]
+> +               .getService(Ci.nsISyncMessageSender);
+> +    cpmm.sendRpcMessage("Addons:Observer:Run", {
+> +      topic: topic
+
+Curious to know why topic is being split apart from subject and data?
+
+::: toolkit/components/addoncompat/RemoteAddonsParent.jsm
+@@ +206,5 @@
+> +    }
+> +  },
+> +
+> +  notify: function(subject, topic, data) {
+> +    let e = Services.obs.enumerateObservers("e10s-" + topic);
+
+Curious to know why you're doing it this way, rather than just forwarding straight to the observer service, a la:
+
+Services.obs.notifyObservers(subject, "e10s-" + topic, data);
+
+?
+
+@@ +223,5 @@
+> +// We only forward observers for these topics.
+> +let TOPIC_WHITELIST = ["content-document-global-created",
+> +                       "document-element-inserted", /*
+> +                       "http-on-opening-request",
+> +                       "http-on-modify-request" */];
+
+These commented out topics... should we just chop them out until needed? Landing commented out code isn't great.
+> ::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+> @@ +170,5 @@
+> > +  observe: function(subject, topic, data) {
+> > +    let cpmm = Cc["@mozilla.org/childprocessmessagemanager;1"]
+> > +               .getService(Ci.nsISyncMessageSender);
+> > +    cpmm.sendRpcMessage("Addons:Observer:Run", {
+> > +      topic: topic
+> 
+> Curious to know why topic is being split apart from subject and data?
+
+I guess there's no reason. I was trying to avoid using CPOWs. However, since topic is a string, it will just be sent as a string event if it's part of |objects|.
+
+> ::: toolkit/components/addoncompat/RemoteAddonsParent.jsm
+> @@ +206,5 @@
+> > +    }
+> > +  },
+> > +
+> > +  notify: function(subject, topic, data) {
+> > +    let e = Services.obs.enumerateObservers("e10s-" + topic);
+> 
+> Curious to know why you're doing it this way, rather than just forwarding
+> straight to the observer service, a la:
+> 
+> Services.obs.notifyObservers(subject, "e10s-" + topic, data);
+> 
+> ?
+
+I tried that first :-). But then the add-on would see the topic as "e10s-foo", and they often switch on that.
+
+> @@ +223,5 @@
+> > +// We only forward observers for these topics.
+> > +let TOPIC_WHITELIST = ["content-document-global-created",
+> > +                       "document-element-inserted", /*
+> > +                       "http-on-opening-request",
+> > +                       "http-on-modify-request" */];
+> 
+> These commented out topics... should we just chop them out until needed?
+> Landing commented out code isn't great.
+
+I'll fix that.
+Comment on attachment 8447547
+event-target
+
+Review of attachment 8447547:
+-----------------------------------------------------------------
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +190,5 @@
+> +}
+> +
+> +EventTargetChild.prototype = {
+> +  track: function(path, count) {
+> +    let [kind, type, useCapture] = path;
+
+"kind" and "type" are kind of synonymous, which makes this a little confusing.
+
+shimKind or eventType might be better to help disambiguate.
+Comment on attachment 8447548
+docshell-roottreeitem
+
+Review of attachment 8447548:
+-----------------------------------------------------------------
+
+Just a few lingering questions here, so withholding my r+ until I hear more about them.
+
+::: toolkit/components/addoncompat/RemoteAddonsParent.jsm
+@@ +415,5 @@
+> +      .QueryInterface(Ci.nsIInterfaceRequestor)
+> +      .getInterface(Ci.nsIContentFrameMessageManager);
+> +
+> +    // Map it to a <browser> element and window.
+> +    let browser = RemoteAddonsParent.globals.get(chromeGlobal);
+
+Can we get into a case where the global isn't set yet - example: a new tab is opened, and is in the process of booting itself up, and during that time, an add-on attempts to get the root item?
+
+If so, we probably want to handle the case where browser is null here.
+
+@@ +461,5 @@
+> +
+> +  receiveMessage: function(msg) {
+> +    switch (msg.name) {
+> +    case "Addons:RegisterGlobal":
+> +      msg.target.remoteChromeGlobal = msg.objects.global;
+
+Where is remoteChromeGlobal going to be used?
+Comment on attachment 8447549
+sandbox-shims
+
+Review of attachment 8447549:
+-----------------------------------------------------------------
+
+LGTM, modulo the XPCOMUtils comment.
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +246,5 @@
+> +    }
+> +    this.sandboxes.push(sandbox);
+> +  },
+> +
+> +  QueryInterface: function QueryInterface(aIID) {
+
+Why not use XPCOMUtils.generateQI?
+Comment on attachment 8447550
+import-node-shim
+
+Review of attachment 8447550:
+-----------------------------------------------------------------
+
+::: toolkit/components/addoncompat/RemoteAddonsParent.jsm
+@@ +499,5 @@
+> +      // Trying to import a node from the parent process into the
+> +      // child process. We don't support this now. Video Download
+> +      // Helper does this in domhook-service.js to add a XUL
+> +      // popupmenu to content.
+> +      return node;
+
+This operation is failing silently. Maybe we should issue a warning here?
+Comment on attachment 8447551
+docshell-getter-shim
+
+Review of attachment 8447551:
+-----------------------------------------------------------------
+
+::: toolkit/components/addoncompat/RemoteAddonsParent.jsm
+@@ +514,5 @@
+> +  if (!target.remoteChromeGlobal) {
+> +    return null;
+> +  }
+> +
+> +  return target.remoteChromeGlobal.docShell;
+
+What is remoteChromeGlobal?
+Comment on attachment 8447545
+base-shims
+
+Review of attachment 8447545:
+-----------------------------------------------------------------
+
+r=me with the changes that we talked about in person a couple of weeks ago.
+Comment on attachment 8447547
+event-target
+
+Olli, could you take a look at this patch? Here's what it does:
+
+We want to ensure that if an add-on calls addEventListener on a <browser> or <tab>, then it will get events like "load" that fire in the child. The patch intercepts calls to add/removeEventListener from add-ons, checks if they're called on EventTargets that are on a path from a <browser> element up to the window root, and then asks the child to forward events.
+
+In that case, the child adds an event listener on the TabChild global and forwards any events. It passes the event up to the parent using a CPOW. Then the parent runs the add-on event listeners that apply.
+
+Ideally, I would have just made an event in the parent and dispatched it on the <browser>. However, then we wouldn't be able to use CPOWs for event.target and other fields that reference child objects. So instead the code just runs the listeners directly.
+
+We're probably never going to perfectly emulate how things work in single-process Firefox, but I mainly want feedback about whether the semantics of removeEventListener are correct, whether the capture and bubble behavior is right, etc.
+Comment on attachment 8447548
+docshell-roottreeitem
+
+Review of attachment 8447548:
+-----------------------------------------------------------------
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +207,5 @@
+>  };
+>  
+>  let RemoteAddonsChild = {
+>    init: function(global) {
+> +    global.sendSyncMessage("Addons:RegisterGlobal", {}, {global: global});
+
+Why is this a sync message? Can't it be async?
+Comment on attachment 8447547
+event-target
+
+
+>+      // Walk from <tabbrowser> up to the root element to see if we find
+>+      // |target|.
+>+      let window = target.ownerDocument.defaultView;
+>+      let elt = window.gBrowser;
+>+      while (elt) {
+>+        if (elt === target) {
+>+          return window;
+>+        }
+>+        elt = elt.parentNode;
+>+      }
+perhaps target.contains(elt); ?
+
+
+>+    }
+>+
+>+    return null;
+>+  },
+>+
+>+  addEventListener: function(target, type, listener, useCapture, wantsUntrusted) {
+>+    let newTarget = this.redirectEventTarget(target);
+>+    if (!newTarget) {
+>+      return;
+>+    }
+>+
+>+    useCapture = useCapture || false;
+>+    wantsUntrusted = wantsUntrusted || false;
+>+
+>+    NotificationTracker.add(["event", type, useCapture]);
+>+
+>+    let listeners = this._listeners.get(newTarget);
+>+    if (!listeners) {
+>+      listeners = {};
+>+      this._listeners.set(newTarget, listeners);
+>+    }
+>+    let forType = setdefault(listeners, type, []);
+I wonder what setdefault does
+
+>+    forType.push({listener: listener, wantsUntrusted: wantsUntrusted, useCapture: useCapture});
+If a listener is added for the same event type and for same phase more than once, the listener is registered only once.
+
+
+But I don't quite understand the setup. Addons get a special wrapper? Where is addEventListener etc in the prototype chain?
+> Same comment as before. Are RemoteAddonsChild and RemoteAddonsParent likely to share common
+> utility methods like this? If so, we might want a third shared module, or an include.
+
+For now it's just this one function. If there are more, I think it would make sense to have a third module. We can keep it in mind.
+
+> What if component !== "true" or "false"? Do we want a default?
+
+The idea here is that all these components are part of a "path" that might look like ["event", "DOMContentLoaded", true] (where true is the value for useCapture). Unfortunately, they all get stored as properties on an object, which converts them all to strings. This code is just there to convert back true and false. Ideally we would use a Map, which would keep track of the type, but it's not possible to send Maps over with the message manager yet. I filed bug 1036136 to make it possible to do this.
+
+> Can I assume we don't have to worry about removing this listener?
+
+Correct. When we tear down the parent process message manager, the listener will get removed.
+
+> tracked._count++?
+
+The behavior we need is for count to go to 1 if it wasn't defined before, and to increment otherwise. If the property isn't defined, then incrementing it sets it to NaN (I had to try this to find out what would happen).
+Created attachment 8452753
+event-target v2
+
+This fixes the issue smaug found.
+Comment on attachment 8447549
+sandbox-shims
+
+Review of attachment 8447549:
+-----------------------------------------------------------------
+
+::: toolkit/components/addoncompat/RemoteAddonsParent.jsm
+@@ +434,5 @@
+> +
+> +  makeContentSandbox: function(principal, ...rest) {
+> +    // The chrome global in the content process.
+> +    let chromeGlobal = principal
+> +      .QueryInterface(Ci.nsIInterfaceRequestor)
+
+This assumes that the principal is a window, is it possible for the addon to have gotten an nsIPrincpal as a CPOW from the child in order to pass in?
+
+@@ +470,5 @@
+> +let ComponentsUtilsInterposition = new Interposition();
+> +
+> +ComponentsUtilsInterposition.methods.Sandbox =
+> +  function(addon, target, principal, ...rest) {
+> +    if (typeof(principal) == "object" && Cu.isCrossProcessWrapper(principal)) {
+
+Do we have to worry about principal === null here?
+
+@@ +479,5 @@
+> +  };
+> +
+> +ComponentsUtilsInterposition.methods.evalInSandbox =
+> +  function(addon, target, code, sandbox, ...rest) {
+> +    if (Cu.isCrossProcessWrapper(sandbox)) {
+
+Should we protect against null sandboxes?
+Created attachment 8452762
+docshell-roottreeitem v2
+
+> Can we get into a case where the global isn't set yet - example: a new tab is
+> opened, and is in the process of booting itself up, and during that time, an
+> add-on attempts to get the root item?
+> 
+> If so, we probably want to handle the case where browser is null here.
+
+That seems... unlikely. The situation here is that we have an object that we've identified as a ContentDocShellTreeItem. That's based on the value returned from getObjectTag in multiprocessShims.js. That function return ContentDocShellTreeItem if it gets a CPOW around a docshell tree item.
+
+So we only get here if we already have a CPOW around the child process docshell. And somehow we must have gotten that CPOW from the child somehow, so we're already exchanging messages with it about the child related to the tab.
+
+The code that sends the global from the content script runs pretty early, but I guess it is possible that some other message is sent first, and that message contains a CPOW for the docshell. I added a nullcheck just in case, but hopefully this will never happen.
+
+> Where is remoteChromeGlobal going to be used?
+
+Sorry, this is used in the docshell-getter-shim patch. Also, I converted it to a weakmap to be cleaner.
+Created attachment 8452780
+docshell-getter-shim v2
+
+Sorry, the remoteChromeGlobal was getting set in the Addons:RegisterGlobal message handler in RemoteAddonsParent. However, I switched that to use a weakmap instead.
+Also, I forgot to say that I fixed the docshell getter shim so that it's only active on remote browser elements. Otherwise it would break tabs that aren't remote.
+Comment on attachment 8452753
+event-target v2
+
+r+ for the event handling related parts only, since I'm not familiar with 
+NotificationTracker stuff.
+
+>+    const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+>+    if (target instanceof Ci.nsIDOMXULElement) {
+>+      if (target.namespaceURI == XUL_NS) {
+>+        if (target.localName == "browser") {
+if (target instanceof XULElement) 
+and then just localName check.
+no need for namespace check _and_ instanceof check
+
+>+      // Check if |target| is somewhere on the patch from the
+>+      // <tabbrowser> up to the root element.
+>+      let window = target.ownerDocument.defaultView;
+>+      if (target.contains(window.gBrowser)) {
+>+        return window;
+>+      }
+>+    }
+Hmm, actually, is this quite enough? If target is in anonymous content, .contains will return null.
+The earlier parentNode approach would have the same issue.
+But I guess this is enough for now.
+
+
+>+  addEventListener: function(target, type, listener, useCapture, wantsUntrusted) {
+>+    let newTarget = this.redirectEventTarget(target);
+>+    if (!newTarget) {
+>+      return;
+>+    }
+>+
+>+    useCapture = useCapture || false;
+>+    wantsUntrusted = wantsUntrusted || false;
+(I don't know how this wrapper magic works, but it is a bit surprising if useCapture can be something else than true or false...
+though, the magic happens before bindings, so I guess it is expected.)
+Comment on attachment 8452762
+docshell-roottreeitem v2
+
+Review of attachment 8452762:
+-----------------------------------------------------------------
+
+Looks good, thanks billm.
+Comment on attachment 8452780
+docshell-getter-shim v2
+
+Review of attachment 8452780:
+-----------------------------------------------------------------
+
+Looks right to me!
+Created attachment 8454828
+base-shims v2
+
+This is an updated version of the base shims patch to match the changes in bug 1017323.
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/d899aa0fb6c5
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/9bf7525ef861
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/2edb6251c795
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/8723969ebaec
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/1e14af130411
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/5bbb653cac57
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/dc0eb1d286f0
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/58de0be65bc2
+https://hg.mozilla.org/mozilla-central/rev/d899aa0fb6c5
+https://hg.mozilla.org/mozilla-central/rev/9bf7525ef861
+https://hg.mozilla.org/mozilla-central/rev/2edb6251c795
+https://hg.mozilla.org/mozilla-central/rev/8723969ebaec
+https://hg.mozilla.org/mozilla-central/rev/1e14af130411
+https://hg.mozilla.org/mozilla-central/rev/5bbb653cac57
+https://hg.mozilla.org/mozilla-central/rev/dc0eb1d286f0
+https://hg.mozilla.org/mozilla-central/rev/58de0be65bc2
+Since today's update of my local fx-team repo, I get "this._paths is undefined RemoteAddonsChild.jsm:89" errors when opening new E10S windows, and I can't navigate to any URL in these windows.
+
+
+Initial compatibility shims for e10s
+
+
+
+Bug 1031609 - Remove old e10s Adblock compat code (r=mconley) 
+
+Bug 1031609 - Basic e10s add-on shim architecture and content-policy shims (r=mconley,mrbkap) 
+
+Bug 1031609 - Observer service shims (r=mconley) 
+
+Bug 1031609 - Event target shims (r=mconley,smaug) 
+
+Bug 1031609 - Docshell rootTreeItem shim (r=mconley) 
+
+Bug 1031609 - Sandbox shim (r=mconley,mrbkap) 
+
+Bug 1031609 - XUL node import shim (r=mconley) 
+
+Bug 1031609 - Docshell getter shim (r=mconley) 

@@ -1,0 +1,188 @@
+In my settings, I ask Firefox to always restore my tabs from previous session. This works fine but since yesterday, about:home is loaded on my focused tab (which isn't lost, I just have to hit back button to get it back).
+
+In my settings, I ask Firefox to always restore my tabs from previous session. This works fine but since yesterday, about:home is loaded on my focused tab (which isn't lost, I just have to hit back button to get it back).
+Can you please provide some steps to reproduce with an expected and actual outcome?
+- I start Nightly with a new profile;
+- go to preferences and select "when Nightly starts, show my windows and tabs from last time";
+- go to http://www.mozilla.org;
+- quit;
+- restart with the same profile;
+- I expect to see http://www.mozilla.org on the first tab, but it's about:home;
+- the back button is available so I click on it and go back to mozilla.org;
+
+So I think it loads my previous page in the tab, and then override it with about:home.
+
+This happens for 2 or 3 days, and other people using 64bit Nightly on Debian GNU/Linux have the same behaviour.
+I got the same behavior, when I reopen a profile with "when Nightly starts, show my windows and tabs from last time", I can briefly see the last restored tab, then it is immediately replaced with about:home.
+
+It seems to be always reproducible on my Ubuntu 13.10 with a 64bit Nightly.
+The regression range according to comment #0:
+
+http://hg.mozilla.org/integration/mozilla-inbound/pushloghtml?fromchange=423b9c30c73d&tochange=4e7d1e2c93a6
+It looks like this is caused by bug 900910? Backing out fixes it for me.
+Created attachment 819955
+Wait for delayed startup to be finished for the initial window before initializing sessionstore
+
+Stealing this bug from Steven. We talked on IRC and he had trouble setting up his Linux VM so I took over to get this fixed soon.
+
+As discussed with him on IRC, this makes sure that we restore the session only after the initial window's delayed startup routine has finished.
+Can you include some more context from the IRC convo? Why do we need to wait on delayedStartup?
+Comment on attachment 819955
+Wait for delayed startup to be finished for the initial window before initializing sessionstore
+
+Review of attachment 819955:
+-----------------------------------------------------------------
+
+Tim, this LGTM. Just a single nit about some comment wording.
+
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #7)
+> Can you include some more context from the IRC convo? Why do we need to wait
+> on delayedStartup?
+
+Before the patch in Bug 900910, Session Store initialization happened at, or after, delayed startup for the first window. Now that we are initializing earlier, we actually start the restore process during load for the first window, which is before delayed startup. On linux, the restore process seems to be fast enough to actually complete the restore before delayed startup happens. Then, when delayed startup is finally triggered, it has |window.arguments[0]|, which is then loaded over the current tab.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +349,5 @@
+>    // True if session store is disabled by multi-process browsing.
+>    // See bug 516755.
+>    _disabledForMultiProcess: false,
+>  
+> +  // Promise that is resolved when we're ready to initialize session store.
+
+I'm not sure "initialize session store" is the best wording here (Since it's not |SessionStore.init()|).
+
+How about something like "Promise that is resolved when we're ready to initialize and restore the session"?
+Thanks for the review Steven but I will replace the current patch. I looked into this a little more and here's what I discovered:
+
+The problem is that Linux is so fast at restoring the session, that nsISessionStartup wipes its internal _initialState property after it receives 'sessionstore-windows-restored' and after that willOverrideHomepage always returns false.
+
+I think we can fix this a little more elegantly without having to wait much longer.
+Created attachment 820114
+Make sure that nsISessionStartup.willOverrideHomepage's  value sticks around even after the session has been restored
+
+willOverrideHomepage isn't really a great name for this if it's being checked even after the session has been restored but as we will need/want to uplift this I don't think we can accept API changes here.
+
+I will file a follow-up bug to look over this code again and come up with a better name or maybe a better solution.
+FWIW the Firebug Working Group also has that problem using FBTrace.[1]
+
+Sebastian
+
+[1] http://code.google.com/p/fbug/issues/detail?id=6881
+Comment on attachment 820114
+Make sure that nsISessionStartup.willOverrideHomepage's  value sticks around even after the session has been restored
+
+Review of attachment 820114:
+-----------------------------------------------------------------
+
+Since |willOverrideHomepage| is no longer cleared, any new windows opened will not have the home page loaded.
+
+1) Open firefox with a session which is restored.
+2) Open a new window.
+3) A blank page is shown in the new window.
+
+We'd expect the home page to be loaded in that new window.
+
+Off the top of my head I don't have a nice way to modify the patch to deal with this issue.
+How about we outright replace the domwindowopened observer and load event listener with a browser-delayed-startup-finished observer?
+It seems better to find a way to avoid loading the home page entirely in the case where we know it will be replaced by a session restore, rather than delaying the session restore to guarantee that it will override home page loads.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #14)
+> It seems better to find a way to avoid loading the home page entirely in the
+> case where we know it will be replaced by a session restore, rather than
+> delaying the session restore to guarantee that it will override home page
+> loads.
+
+Except that session restore should really be delayed in the first place, because it shouldn't block a window's first paint. It sounds like bug 900910 changed that.
+This bug has an annoying side effect: if the browser crashes, on restart about:home loads on top of about:session-restore, so if you don't notice the back button is available, you have no way to restore your previous session and lost your hundreds of opened tabs.
+In my case (comment 11) the back button is not activated, so there is no way to restore the session. See bug 928626.
+
+Sebastian
+Created attachment 820900
+Wait for the initial window's delayed startup to be finished before restoring a session
+
+Here's what this patch does:
+
+1) It listens for the first browser-delayed-startup-finished notification and uses that to initialize session restore. We thus ensure that we will not get in the way of the first paint. All subsequent windows will still be handled by onOpen(). This is basically the same as attachment 819955.
+
+2) It makes nsISessionStartup.willOverrideHomepage check the first window, only. If the first window doesn't have unpinned tabs we will want to load the home page even if there are other windows that have unpinned tabs.
+
+--
+
+I tried just replacing 'domwindowopened' with 'browser-delayed-startup-finished' but that's breaking too many tests and probably also add-ons out there. It is currently assumed that after initialization, windows are handled by sessionstore as soon as they are loaded.
+
+Switching to 'browser-delayed-startup-finished' completely would ease the code a lot but I think we should do this in a follow-up. Add-ons and tests would need to be updated to wait for the delayed startup to finish before calling ss.getWindowValue(), ss.setWindowState(), and such.
+Why you set willOverrideHomepage to check tabs from windows[0] and not from the selected window from the session?
+Because this method is about the initial window and that will become the state of windows[0]. No matter how many windows you have and which of them is selected.
+
+http://mxr.mozilla.org/mozilla-central/source/browser/components/sessionstore/src/SessionStore.jsm#2231
+(In reply to Tim Taubert [:ttaubert] from comment #20)
+> Because this method is about the initial window and that will become the
+> state of windows[0]. No matter how many windows you have and which of them
+> is selected.
+> 
+> http://mxr.mozilla.org/mozilla-central/source/browser/components/
+> sessionstore/src/SessionStore.jsm#2231
+So willOverrideHomepage need to be true not only for the first window but for all windows that will restore from the last session
+willOverrideHomepage will always be false for all subsequent windows. We don't even access .willOverrideHomepage from those windows when restoring multiple at startup because they are opened by _openWindowWithState() and that passes an empty argument list. Thus we will never load the home page in those anyway.
+Comment on attachment 820900
+Wait for the initial window's delayed startup to be finished before restoring a session
+
+Review of attachment 820900:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +349,5 @@
+>    // True if session store is disabled by multi-process browsing.
+>    // See bug 516755.
+>    _disabledForMultiProcess: false,
+>  
+> +  // Promise that is resolved when we're ready to initialize session store.
+
+I'm not sure "initialize session store" is the best wording here (Since it's not |SessionStore.init()|).
+
+How about something like "Promise that is resolved when we're ready to initialize and restore the session"?
+
+::: browser/components/sessionstore/src/nsSessionStartup.js
+@@ +266,3 @@
+>        // If there are valid windows with not only pinned tabs, signal that we
+>        // will override the default homepage by restoring a session.
+> +      return tabs && tabs.some(t => !t.pinned);
+
+If we're going to be waiting on delayed startup for the first window, should we even bother fixing this up in this patch? Might it be better to just keep it as simple as possible for uplift?
+
+It does look correct to me, if we're going to keep it in.
+(In reply to Steven MacLeod [:smacleod] from comment #23)
+> If we're going to be waiting on delayed startup for the first window, should
+> we even bother fixing this up in this patch? Might it be better to just keep
+> it as simple as possible for uplift?
+
+I agree, it might be better to stick with the behavior we have right now. Let's revisit this in the followup.
+https://hg.mozilla.org/integration/fx-team/rev/b185e2dd95d4
+*** Bug 930225 has been marked as a duplicate of this bug. ***
+https://hg.mozilla.org/mozilla-central/rev/b185e2dd95d4
+Created attachment 822150
+Wait for the initial window's delayed startup to be finished before restoring a session
+
+The patch that has been checked in.
+Comment on attachment 822150
+Wait for the initial window's delayed startup to be finished before restoring a session
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): bug 900910
+User impact if declined: Automatic session restore might load about:home in the selected tab on startup. No data loss but definitely quite annoying.
+Testing completed (on m-c, etc.): In Nightly since Oct 24th.
+Risk to taking this patch (and alternatives if risky): The patch doesn't contain any unnecessary changes. It just reverts to the old behavior prior to bug 900910. Low risk.
+String or IDL/UUID changes made by this patch: None.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/cc6e947e4284
+*** Bug 931026 has been marked as a duplicate of this bug. ***
+I'm seeing this on a release build of Firefox 25 which makes sense since bug 900910 which caused the regression was fixed there. It would have been nice to fix this in 25 but I guess we missed that boat. It's noticeable on every startup which makes us look janky :(
+To be clear, I'm seeing the variant from comment 3 wherein it's only a flicker of the homepage that shows and then the tab is properly replaced. This is for a session with only tab to restore and one homepage (about:newtab).
+That's bug 893061 and it's been around for some time. There currently is nothing we can do about that if loading the session file is just a tad too slow to determine whether we want to load about:home or not.
+I confirm the fix is verified on Latest Aurora 27 using Windows 7 x64 and Mac OS 10.8.4
+BuildID: 20131031004003
+
+
+Selected tab loads homepage when restoring a session
+
+regression
+
+Bug 928630 - Wait for the initial window's delayed startup to be finished before restoring a session; r=smacleod 

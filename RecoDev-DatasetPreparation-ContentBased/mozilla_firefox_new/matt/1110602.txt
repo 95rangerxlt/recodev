@@ -1,0 +1,189 @@
+STR:
+1) Tour page does: Mozilla.UITour.observe((...rest) => console.log("observed", rest))
+2) User switches away to a non-tour tab
+3) User switches back to tab from #1
+4) Firefox does UITour.notify(…)
+
+Expected result:
+The notification info is logged in the console for the tour tab
+
+Actual result:
+Nothing is logged since the tour tab is no longer in `originTabs`. This means that web developers need to re-register for APIs with the page visibility API which is annoying.
+
+I think teardownTour can be split into two methods:
+* one for when you switch away from a tour tab (may need to handle pinned tab case)?
+* another for when the last tour tab (for a window?) closes to cleanup global/window listeners
+
+We probably want to fix bug 1079554 first to avoid introducing bugs with this change.
+
+STR:
+1) Tour page does: Mozilla.UITour.observe((...rest) => console.log("observed", rest))
+2) User switches away to a non-tour tab
+3) User switches back to tab from #1
+4) Firefox does UITour.notify(…)
+
+Expected result:
+The notification info is logged in the console for the tour tab
+
+Actual result:
+Nothing is logged since the tour tab is no longer in `originTabs`. This means that web developers need to re-register for APIs with the page visibility API which is annoying.
+
+I think teardownTour can be split into two methods:
+* one for when you switch away from a tour tab (may need to handle pinned tab case)?
+* another for when the last tour tab (for a window?) closes to cleanup global/window listeners
+
+We probably want to fix bug 1079554 first to avoid introducing bugs with this change.
+Also what if the user leaves the tab open, and a "Loop:IncomingConversation" event is sent while the tab is not visible? Does this mean there would be currently no way to receive that notification, unless this bug is fixed?
+(In reply to Alex Gibson [:agibson] from comment #1)
+> Also what if the user leaves the tab open, and a "Loop:IncomingConversation"
+> event is sent while the tab is not visible?
+
+That would be a problem if it happened but this isn't what's going to happen for that notification in the Loop tour.
+
+> Does this mean there would be
+> currently no way to receive that notification, unless this bug is fixed?
+
+No, we switch to the tab before dispatching the notification in bug 1080953.
+I think there's also another edge-case to consider here that might be related here:
+
+1) Tour page does: Mozilla.UITour.observe((...rest) => console.log("observed", rest))
+2) User opens same tour page in a new tab
+3) User closes the newly opened tour page and gets switched back to #1
+4) Firefox does UITour.notify(…)
+
+Even when refreshing the tab or using Page Visibility API to bind/unbind the listener, events don't get received again in this instance. The user must close the tab and reenter the tour again.
+(In reply to Alex Gibson [:agibson] from comment #3)
+> Even when refreshing the tab or using Page Visibility API to bind/unbind the
+> listener, events don't get received again in this instance. The user must
+> close the tab and reenter the tour again.
+
+Er, hmm... that sounds like a separate bug. Mind filing?
+(In reply to Blair McBride [:Unfocused] (I don't read bugmail - needinfo? me!) from comment #4)
+> (In reply to Alex Gibson [:agibson] from comment #3)
+> > Even when refreshing the tab or using Page Visibility API to bind/unbind the
+> > listener, events don't get received again in this instance. The user must
+> > close the tab and reenter the tour again.
+> 
+> Er, hmm... that sounds like a separate bug. Mind filing?
+
+I just re-tested, and I may have got this part wrong the first time. The page does receive Loop events again If I refresh. So the issue seems to be that closing the second tab, which switches focus back to the first - results in the first tab no longer receiving events. Hope that makes sense, please let me know if this still warrants a separate bug or not.
+I opened a new bug anyway: Bug 1119218
+
+Please feel free to close it should it turn out to be the same issue as here.
+Taking this since it unblocks Heartbeat and fixes other UITour bugs related to Loop.
+(I confirm that if:
+
+```
+  teardownTour: function(aWindow, aWindowClosing = false) {
+    return false;
+```
+
+Then cross tab events work fine.  
+
+(Of course, then there are other problems!)
+
+(For heartbeat at least, "tabs in a window" is fine, because bars are pinned to windows.)
+Created attachment 8552258
+v.1 Switch from tracking <tab>s to <browser>s
+
+Sorry, I can't use mozreview since this conflicts with bug 1122830 and/or bug 1079554 and bug 1097213 isn't fixed yet :(
+
+* simplified the pageID handling and separated tearDown into 2 functions (one for a tab and the other for a window)
+* switched to tracking <browser>s for heartbeat
+Comment on attachment 8552258
+v.1 Switch from tracking <tab>s to <browser>s
+
+Review of attachment 8552258:
+-----------------------------------------------------------------
+
+::: browser/components/uitour/UITour.jsm
+@@ +68,5 @@
+>  this.UITour = {
+>    url: null,
+>    seenPageIDs: null,
+> +  pageIDSourceBrowsers: new WeakMap(),
+> +  /* Map from browser chrome windows to a set of <browser>s in which a tour is open (both visible and hidden) */
+
+Nit: s/set/Set/ to make it obvious.
+
+@@ +655,5 @@
+> +
+> +    // We don't have a tab if it's being detached or we're in a <browser> without a tab.
+> +    if (tab) {
+> +      tab.addEventListener("TabClose", this);
+> +      if (window.gMultiProcessBrowser) {
+
+Er, shouldn't this be negated?
+
+@@ +776,5 @@
+>          tab.removeEventListener("TabBecomingWindow", this);
+> +        if (openTourBrowsers) {
+> +          log.debug("deleting browser from tourBrowsersByWindow", aBrowser, openTourBrowsers.size);
+> +          openTourBrowsers.delete(aBrowser);
+> +          log.debug("deleted browser from tourBrowsersByWindow", openTourBrowsers.size);
+
+Leftover from debugging? Seems superfluous.
+
+Also, as a general comment for any added logging you do want to keep, "deleted browser from tourBrowsersBywindow 3" doesn't tell me what the "3" means without me keeping context of what arguments are passed in, or re-reading the code.
+
+@@ +799,5 @@
+>      this.endUrlbarCapture(aWindow);
+>      this.resetTheme();
+> +
+> +    // If there are no more tour tabs left in the window, teardown the tour for the whole window.
+> +    if (!openTourBrowsers || !openTourBrowsers.size) {
+
+Nit: Make the size check explicit so it's obvious? (ie, == 0)
+
+@@ +807,5 @@
+> +
+> +  /**
+> +   * Tear down all tours for a ChromeWindow.
+> +   */
+> +  teardownTour: function(aWindow) {
+
+Nit: teardownTourForWindow?
+https://hg.mozilla.org/integration/fx-team/rev/5a4d0f82563f
+*** Bug 1118346 has been marked as a duplicate of this bug. ***
+Uplift for bug 1118346 - The workaround that works in 35 will stay in place for the broken functionality but uplift to 36 is wanted for better analytics.
+I think uplift is also wanted for HeartBeat
+Backed out for about:accounts test failures. I didn't even know about this code reaching into UITour…
+
+https://hg.mozilla.org/integration/fx-team/rev/9ea84a34c518
+
+11:28:25 INFO - 872 INFO TEST-UNEXPECTED-FAIL | browser/components/customizableui/test/browser_967000_button_sync.js | A promise chain failed to handle a rejection: - at chrome://browser/content/browser.js:9111 - TypeError: UITour.originTabs is undefined
+4594 11:29:09 INFO - 873 INFO TEST-UNEXPECTED-FAIL | browser/components/customizableui/test/browser_967000_button_sync.js | Test timed out - expected PASS
+Re-pushed with the straight-forward changes: https://hg.mozilla.org/integration/fx-team/rev/fad9208f38f1
+Yeah, I checked add-on MXR the other day.
+
+https://hg.mozilla.org/integration/fx-team/rev/fad9208f38f1
+Yeah, I checked add-on MXR the other day.
+
+https://hg.mozilla.org/integration/fx-team/rev/fad9208f38f1
+https://hg.mozilla.org/mozilla-central/rev/fad9208f38f1
+*** Bug 1119218 has been marked as a duplicate of this bug. ***
+Comment on attachment 8552258
+v.1 Switch from tracking <tab>s to <browser>s
+
+Approval Request Comment
+[Feature/regressing bug #]: Needed for bug 1111027 uplift. Also makes uplifting bug 1118874 dependencies easier and makes UITour consistent with Nightly where developers are testing.
+[User impact if declined]: Helps with the two bugs above. Reduces the amount of quirks www.mozilla.org has to workaround.
+[Describe test coverage new/current, TreeHerder]: Existing extensive UITour tests pass and 2 new m-bc tests.
+[Risks and why]: Low risk isolated to UITour. Worst case is that we skip a tour.
+[String/UUID change made/needed]: None
+
+RyanVM/others: Note that I will do uplifts myself since there are many UITour
+patches to uplift in the correct order.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/3e2f2236333d
+https://hg.mozilla.org/releases/mozilla-beta/rev/ba8e83fca8f2
+
+
+UITour: Change teardownTour to not remove tour tabs from originTabs so they can continue to get notifications
+
+
+
+Bug 1110602 - Don't remove tour tabs from originTabs when switching tabs so they can continue to get notifications. r=Unfocused 
+
+Backed out changeset 5a4d0f82563f (bug 1110602) for about:accounts test failures. 
+
+Bug 1110602 - Don't remove tour tabs from originTabs when switching tabs so they can continue to get notifications. r=Unfocused 

@@ -1,0 +1,192 @@
+i imported a 3.5mb bookmarks.html file, and now firefox hangs a long time on shutdown. in my profile dir, i noticed the bookmarks.html file slowly growing, until the app finally quit.
+
+i imported a 3.5mb bookmarks.html file, and now firefox hangs a long time on shutdown. in my profile dir, i noticed the bookmarks.html file slowly growing, until the app finally quit.
+Created attachment 265827
+wip patch
+
+- re-uses the original query result, instead of re-querying per-container
+- re-uses query result nodes where possible, in favor of calls back to the service (which result in yet another db query)
+
+on mac i'm seeing delays of *a couple of minutes* when exporting a bookmarks file of 3.3mb, whether manually exporting to file, or on shutdown.
+
+this patch reduces export time by about 5%. so it helps, but is obviously not the root cause of the problem.
+Created attachment 265862
+fix v1
+
+the major blocker was writing out descriptions.
+
+the ItemHasAnnotation calls for descriptions (and any other consumers of mDBGetAnnotationForItem) were taking a really long time. 3 minutes long to export a 3.5mb bookmarks file.
+
+once i commented out exporting of descriptions, export went down to 3 seconds for the same file.
+
+i modified the moz_items_annos_attributesindex index to be a compound index, comprised of the item_id first, and then the anno_attribute_id, which caused the query to perform radically faster. full export of the same bookmarks file went from 180+ seconds down to 6 seconds.
+
+since livemarks, microsummaries and other bookmark properties all use item-based annotations, we should see some perf gains in these other places as well.
+
+note that i've *not* made this change to the url annos index. that query is structured differently, and would likely need to be rewritten and have an index optimized for it. i'll file a followup for doing a sweep of all our queries/indexes and make sure that we're optimizing properly.
+Comment on attachment 265862
+fix v1
+
+>Index: browser/components/places/src/nsPlacesImportExportService.cpp
+>===================================================================
+
+>+  // get folder id
+>+  PRInt64 folderId;
+>+  rv = aFolder->GetItemId(&folderId);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>   // write ADD_DATE
+>   PRTime dateAdded = 0;
+>-  rv = mBookmarksService->GetItemDateAdded(aFolder, &dateAdded);
+>+  rv = mBookmarksService->GetItemDateAdded(folderId, &dateAdded);
+
+you could optimize this to aFolder->GetDateAdded here which doesn't result in a query.
+
+>   NS_ENSURE_SUCCESS(rv, rv);
+> 
+>   if (dateAdded) {
+>     rv = WriteDateAttribute(kDateAddedAttribute, sizeof(kDateAddedAttribute)-1, dateAdded, aOutput);
+>     NS_ENSURE_SUCCESS(rv, rv);
+>   }
+> 
+>   // write LAST_MODIFIED
+>   PRTime lastModified = 0;
+>-  rv = mBookmarksService->GetItemLastModified(aFolder, &lastModified);
+>+  rv = mBookmarksService->GetItemLastModified(folderId, &lastModified);
+
+and aFolder->GetLastModified here.
+
+> nsresult
+>-nsPlacesImportExportService::WriteContainerTitle(PRInt64 aFolder, nsIOutputStream* aOutput)
+>+nsPlacesImportExportService::WriteTitle(nsINavHistoryResultNode* aItem, nsIOutputStream* aOutput)
+> {
+>-  nsAutoString title;
+>-  nsresult rv;
+>-  
+>-  rv = mBookmarksService->GetItemTitle(aFolder, title);
+>+  nsCAutoString title;
+>+  nsresult rv = aItem->GetTitle(title);
+
+Make sure this code isn't reached for separators, for which node->GetTitle() doesn't work yet (or fix that ;)).
+
+>   NS_ENSURE_SUCCESS(rv, rv);
+> 
+>-  char* escapedTitle = nsEscapeHTML(NS_ConvertUTF16toUTF8(title).get());
+>+  char* escapedTitle = nsEscapeHTML(title.get());
+
+So I was wondering whether we should make GetItemTitle return AUTF8String/ACString too.
+
+>@@ -2415,67 +2400,105 @@ nsPlacesImportExportService::ExportHTMLT
+> 
+>+  // get empty options
+>+  nsCOMPtr<nsINavHistoryQueryOptions> optionsInterface;
+>+  rv = mHistoryService->GetNewQueryOptions(getter_AddRefs(optionsInterface));
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  // QueryFolderChildren requires a concrete options
+>+  nsCOMPtr<nsINavHistoryQueryOptions> options = do_QueryInterface(optionsInterface);
+
+Er? they're both nsINavHistoryQueryOptions, you cannot even use the concrete classes in this component.
+
+>+  NS_ENSURE_TRUE(options, NS_ERROR_UNEXPECTED);
+>+
+>+  // get the query object
+
+s/the/a new/ ?
+
+>+  // group by folder (necessary? doesn't SetFolders trigger this?)
+>+  const PRUint16 groupMode = nsINavHistoryQueryOptions::GROUP_BY_FOLDER;
+
+yeah, I think GROUP_BY_FOLDER is inferred for simple folder nodes.
+
+>+  rv = options->SetGroupingMode(&groupMode, 1);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  // execute query
+>+  nsCOMPtr<nsINavHistoryResult> result;
+>+  rv = mHistoryService->ExecuteQuery(query, options, getter_AddRefs(result));
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  // get root (folder) node
+>+  nsCOMPtr<nsINavHistoryQueryResultNode> rootNode;
+>+  rv = result->GetRoot(getter_AddRefs(rootNode));
+>+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+>Index: browser/components/places/tests/unit/test_bookmarks_html.js
+>===================================================================
+
+don't rev the file if you don't have too ;)
+
+>Index: toolkit/components/places/src/nsAnnotationService.cpp
+>===================================================================
+>RCS file: /cvsroot/mozilla/toolkit/components/places/src/nsAnnotationService.cpp,v
+>retrieving revision 1.22
+>diff -u -8 -p -r1.22 nsAnnotationService.cpp
+>--- toolkit/components/places/src/nsAnnotationService.cpp	10 May 2007 23:52:47 -0000	1.22
+>+++ toolkit/components/places/src/nsAnnotationService.cpp	23 May 2007 23:41:20 -0000
+>@@ -278,17 +278,17 @@ nsAnnotationService::InitTables(mozIStor
+>         "content LONGVARCHAR, flags INTEGER DEFAULT 0,"
+>         "expiration INTEGER DEFAULT 0, "
+>         "type INTEGER DEFAULT 0)"));
+>     NS_ENSURE_SUCCESS(rv, rv);
+>     rv = aDBConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
+>         "CREATE INDEX moz_annos_item_idindex ON moz_items_annos (item_id)"));
+>     NS_ENSURE_SUCCESS(rv, rv);
+>     rv = aDBConn->ExecuteSimpleSQL(NS_LITERAL_CSTRING(
+>-        "CREATE INDEX moz_items_annos_attributesindex ON moz_items_annos (anno_attribute_id)"));
+>+        "CREATE INDEX moz_items_annos_attributesindex ON moz_items_annos (item_id, anno_attribute_id)"));
+
+Nice nice!
+Created attachment 265960
+fix v2
+
+
+> Make sure this code isn't reached for separators, for which node->GetTitle()
+> doesn't work yet (or fix that ;)).
+
+not a p1 or a5 blocker, so just made sure not reached and put a XXX noting the bug #.
+
+> >   NS_ENSURE_SUCCESS(rv, rv);
+> > 
+> >-  char* escapedTitle = nsEscapeHTML(NS_ConvertUTF16toUTF8(title).get());
+> >+  char* escapedTitle = nsEscapeHTML(title.get());
+> 
+> So I was wondering whether we should make GetItemTitle return
+> AUTF8String/ACString too.
+
+why would we do that instead of making them both AString?
+> why would we do that instead of making them both AString?
+
+Depends on callers... if most of them need AUTF8String, use that, otherwise use AString, we should unify the two either way.
+Comment on attachment 265960
+fix v2
+
+r=mano.
+Checking in browser/components/places/src/nsPlacesImportExportService.cpp;
+/cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.cpp,v  <--  nsPlacesImportExportService.cpp
+new revision: 1.20; previous revision: 1.19
+done
+Checking in browser/components/places/src/nsPlacesImportExportService.h;
+/cvsroot/mozilla/browser/components/places/src/nsPlacesImportExportService.h,v  <--  nsPlacesImportExportService.h
+new revision: 1.7; previous revision: 1.6
+done
+Checking in toolkit/components/places/src/nsAnnotationService.cpp;
+/cvsroot/mozilla/toolkit/components/places/src/nsAnnotationService.cpp,v  <--  nsAnnotationService.cpp
+new revision: 1.23; previous revision: 1.22
+done
+
+filed bug 381971 for the string consolidation.
+Bug 451915 - move Firefox/Places bugs to Firefox/Bookmarks and History. Remove all bugspam from this move by filtering for the string "places-to-b-and-h".
+
+In Thunderbird 3.0b, you do that as follows:
+Tools | Message Filters
+Make sure the correct account is selected. Click "New"
+Conditions: Body   contains   places-to-b-and-h
+Change the action to "Delete Message".
+Select "Manually Run" from the dropdown at the top.
+Click OK.
+
+Select the filter in the list, make sure "Inbox" is selected at the bottom, and click "Run Now". This should delete all the bugspam. You can then delete the filter.
+
+Gerv

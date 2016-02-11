@@ -1,0 +1,142 @@
+1) Open at-poke, click "Log Events"
+2) Mark "window:activate", "window:deactivate" and "focus"
+3) Open Firefox and gnome-terminal
+4) Click gnome-terminal
+5) Click Firefox
+
+In at-poke window, you may see 
+"focus" events for Firefox frame and html container before "window:deactivate" and "window:activate" events.
+
+On Linux, sometimes, you may not see "window:activate" and "window:deactivate" events on step 5)
+I think the bad event sequence caused this problem.
+And missing "window:activate" event can cause GOK problems.
+
+1) Open at-poke, click "Log Events"
+2) Mark "window:activate", "window:deactivate" and "focus"
+3) Open Firefox and gnome-terminal
+4) Click gnome-terminal
+5) Click Firefox
+
+In at-poke window, you may see 
+"focus" events for Firefox frame and html container before "window:deactivate" and "window:activate" events.
+
+On Linux, sometimes, you may not see "window:activate" and "window:deactivate" events on step 5)
+I think the bad event sequence caused this problem.
+And missing "window:activate" event can cause GOK problems.
+Created attachment 225530
+patch
+
+change the sequence
+sorry, it's not enough.
+
+nsWindow::OnContainerFocusInEvent() is calling nsCommonWidget::DispatchGotFocusEvent() before DispatchActivateEvent()
+
+Created attachment 225847
+accessible part of the fix
+
+Add mActivated into atk/nsDocAccessibleWrap.cpp, do not fire focus event if it is false;
+Add a helper function to get root accessible into nsAccessNode.cpp;
+Also move nsRootAccessibleWrap::GetExtState to nsRootAccessible
++    nsIAccessibleDocument* GetRootAccessible();
+
+You could make this:
+
+nsRootAccessible* GetRootAccessible();   since we're in the concrete classes anyway, why not return the concrete type?
+
+To make the cast safe, you can do:
+
+dynamic_cast<nsRootAccessible*>(docAccessible);
+Comment on attachment 225847
+accessible part of the fix
+
+r+ if you fix the following items:
+
+docShellTreeItem->GetSameTypeRootTreeItem(getter_AddRefs(root));
+Use GetRootTreeItem() instead. SameType will give you the top of the content tree if you're on a content docshell. I don't think that's what you want.
+
+nsIAccessibleDocument* GetRootAccessible();
+We refcount our objects so I recommend using already_AddRefed<> for that getter.
+
+
++NS_IMETHODIMP nsRootAccessible::GetExtState(PRUint32 *aExtState)
++{
++  nsAccessibleWrap::GetExtState(aExtState);
+Thanks for moving this into cross platform code. Please call up to the next class instead of jumping up too fast, so you need nsDocAccessibleWrap::GetExtState()
+(In reply to comment #4)
+> +    nsIAccessibleDocument* GetRootAccessible();
+There's also something called nsRefPtr<> which you can use with a concrete class but is like an nsCOMPtr<>. However, this getter should really be already_AddRefed<> -- all of our getters should addref at this point. I don't know if there's an already_AddRefed for nsRefPtrs.
+Created attachment 226116
+accessible part of the fix v2 (addressing Aaron's comments)
+Comment on attachment 226116
+accessible part of the fix v2 (addressing Aaron's comments)
+
++        already_AddRefed<nsIAccessibleDocument> root =
+This should be an nsCOMPtr<>. I believe already_AddRefed<> is only for the function declaration.
+
++        nsDocAccessibleWrap* rootAccWrap =
++          NS_STATIC_CAST(nsDocAccessibleWrap *, root.get());
+This isn't okay for final code, I've been told. It's good for a quick test to see something works, but then we need to modify nsIAccessibleDocument() to be able to tell us if it is activated. Can't we check the extended state here by QI'ing to nsIAccessible?
+Question, instead of using mActivated and caching the value, could you check the docshell to see if it considers us active via nsIDocShell::hasFocus() for the root docshell?
+(In reply to comment #8)
+> +        nsDocAccessibleWrap* rootAccWrap =
+> +          NS_STATIC_CAST(nsDocAccessibleWrap *, root.get());
+> This isn't okay for final code, I've been told. It's good for a quick test to
+> see something works, but then we need to modify nsIAccessibleDocument() to be
+> able to tell us if it is activated. Can't we check the extended state here by
+> QI'ing to nsIAccessible?
+> 
+
+If that helper returned an nsRootAccessible* you could safely cast it up to a nsDocAccessibleWrap ... just something to keep in mind if you have to spend some time to modify that anyway. :-)
+Hwaara, in scriptable interfaces we need to return nsIFoo interfaces, not actual classes.
+(In reply to comment #11)
+> Hwaara, in scriptable interfaces we need to return nsIFoo interfaces, not
+> actual classes.
+
+Hmm, but GetRootAccessible() is not an interface method, it's just a helper method from what I gather?
+No, Hwaara's right. The helper method could return a true already_AddRefed<nsRootAccessible>
+That would be better.
+(In reply to comment #13)
+> No, Hwaara's right. The helper method could return a true
+> already_AddRefed<nsRootAccessible>
+> That would be better.
+
+[16:34] bsmedberg: typically the "right" way to cast from an interface to a concrete class type
+[16:34] bsmedberg: is to make a special "concrete class IID"
+[16:34] bsmedberg: and call QI
+[16:35] hwaara: ah, modify the QI of that implementation?
+[16:36] bsmedberg: http://lxr.mozilla.org/mozilla/source/modules/libjar/nsJARURI.cpp#78
+
+Spent some time on it and "almost" got it to work. If I manage to solve it, I'll file a new bug with a patch, don't worry about it Ginn (unless Aaron wants it for the next patch).
+Created attachment 226162
+implement GetRootAccessible()
+
+This could be one of the most horrible things I've ever written, but it's why we love C++ and XPCOM, right? ;-)  
+
+I modified Ginn's getter and made nsRootAccessible be QI'able to, like bsmedberg suggested.
+
+Ginn, wanna test it and see if it works? (I haven't.) You should be able to do:
+
+nsRefPtr<nsRootAccessible> rootAcc;
+yourAccNode->GetRootAccessible (getter_AddRefs (rootAcc));
+
+or simply use a naked nsRootAccessible* pointer, but remember to release it.
+(In reply to comment #9)
+> Question, instead of using mActivated and caching the value, could you check
+> the docshell to see if it considers us active via nsIDocShell::hasFocus() for
+> the root docshell?
+> 
+I guess not.
+nsWindow.cpp calls DispatchGotFocusEvent() first, then DispatchActivateEvent()
+I can't check hasFocus() or GetActive(), because it is already focused before DispatchActivateEvent().
+That's the reason we have this bug.
+
+Also we only have window:acivate/deactivate events for atk, so I don't want it in nsIAccessibleDocument.
+The value is not usable on other platforms.
+
+Created attachment 226485
+patch (get Hakan's patch work)
+
+
+Firefox emits focus event before "window:activate" event
+
+access

@@ -1,0 +1,414 @@
+Created attachment 429538
+Patch v1.0
+
+Since i need to hook into this method and it's causing me an headache, i'm going to try cleaning it up a bit.
+
+See https://bugzilla.mozilla.org/show_bug.cgi?id=542941#c46 for the rationale.
+
+So, i'm just unsure the preventDefault and StopPropagation calls we have here are all really pertinent and needed, the caller should already preventDefault when we return false, and i don't actually see much reasoning for the stopPropagation calls once the default action is prevented. 
+But since i don't know all the implications of this code in browser.js, what do you think Gavin?
+
+Created attachment 429538
+Patch v1.0
+
+Since i need to hook into this method and it's causing me an headache, i'm going to try cleaning it up a bit.
+
+See https://bugzilla.mozilla.org/show_bug.cgi?id=542941#c46 for the rationale.
+
+So, i'm just unsure the preventDefault and StopPropagation calls we have here are all really pertinent and needed, the caller should already preventDefault when we return false, and i don't actually see much reasoning for the stopPropagation calls once the default action is prevented. 
+But since i don't know all the implications of this code in browser.js, what do you think Gavin?
+Comment on attachment 429538
+Patch v1.0
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+>+ function contentAreaClick(event, isPanelClick)
+
+>+   if (event.button == 1 &&
+>+       gPrefService.getBoolPref("middlemouse.contentLoadURL") &&
+>+       !gPrefService.getBoolPref("general.autoScroll")) {
+>+     middleMousePaste(event);
+>+     return true;
+>+   }
+
+Putting this first means we'll favor middle mouse pastes over middle mouse link clicks, right? Don't think we want that...
+
+>+     href = linkNode.href;
+>+     if (!href)
+>+       return true;
+
+Guess this is a bugfix, eh? Alt+Click on <a href="">foo</a> is currently broken, and this fixes it.
+
+>+     while (node) {
+>+       if (node.nodeType == Node.ELEMENT_NODE) {
+>+         realHref = node.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+>          if (realHref) {
+>            href = realHref;
+>            baseURI = wrapper.baseURI
+
+needs to change to linkNode.baseURI, "wrapper" no longer exists (also add a semi-colon?)
+
+I took a stab at re-factoring this a little bit further to make control flow a bit easier to read. I'll attach a patch on top of yours that makes these changes:
+
+- factor out the "link finding" logic into a helper function
+- addresses the comments above
+
+I think we may also want to consider doing an audit of the preventDefault()/stopPropagation() calls in a future bug (don't want to scope creep this one too much). I think most of the preventDefault()s are redundant (with contentAreaClick()'s return value) and I suspect most of the stopPropagation()s are unneeded given that we're a bubbling listener on a nearly-root element.
+
+Finally, I think we should probably write tests to at least cover the basic code flows through contentAreaClick() if we're going to do this, since changing this code around makes me a bit nervous (particularly for things like xlink which are easy to break without anyone noticing).
+Created attachment 430390
+additional tweaks
+
+This is a diff -w since I also un-indented the entire function by one space.
+(In reply to comment #1)
+
+> >+   if (event.button == 1 &&
+> >+       gPrefService.getBoolPref("middlemouse.contentLoadURL") &&
+> >+       !gPrefService.getBoolPref("general.autoScroll")) {
+> >+     middleMousePaste(event);
+> >+     return true;
+> >+   }
+> 
+> Putting this first means we'll favor middle mouse pastes over middle mouse link
+> clicks, right? Don't think we want that...
+
+oh yeah, sorry i probably misread the contentLoadURL pref as something that should have precedence, nvm
+
+> 
+> >+     href = linkNode.href;
+> >+     if (!href)
+> >+       return true;
+> 
+> Guess this is a bugfix, eh? Alt+Click on <a href="">foo</a> is currently
+> broken, and this fixes it.
+
+yep this is the path i was talking to you, when we were not correctly checking href validity
+ 
+> >            baseURI = wrapper.baseURI
+> 
+> needs to change to linkNode.baseURI, "wrapper" no longer exists (also add a
+> semi-colon?)
+
+right, my searchAndReplace foo got worse.
+
+> Finally, I think we should probably write tests to at least cover the basic
+> code flows through contentAreaClick() if we're going to do this, since changing
+> this code around makes me a bit nervous (particularly for things like xlink
+> which are easy to break without anyone noticing).
+
+which kind of tests? a b-c test is probably covering most uses, but it will be quite large/complex to cover all possibilities and check all results.
+Comment on attachment 430390
+additional tweaks
+
+>--- mozilla-central.27f3f712e722/browser/base/content/browser.js	2010-03-04 11:52:27.000000000 -0800
+
+>+function getLinkNodeAndHref(aEvent) {
+
+some javadoc about scope and return values of the method?
+
+>+  let [linkNode, href] = getLinkNodeAndHref(aEvent);
+>+  if (!href) {
+>+    // Not a link, handle middle mouse navigation
+>+    if (event.button == 1 &&
+>+        gPrefService.getBoolPref("middlemouse.contentLoadURL") &&
+>+        !gPrefService.getBoolPref("general.autoScroll")) {
+>+      middleMousePaste(event);
+>+    }
+
+so we want to return false (and thus prevent default action) if we served a middle mouse paste?
+
+>-     if (event.button == 0 && !event.ctrlKey && !event.shiftKey &&
+>-                              !event.altKey && !event.metaKey) {
+>+  if (linkNode && event.button == 0 &&
+>+    !event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+
+a small comment explaining why we check linkNode, could help future comers. that said, if someone in getLinkNodeAndHref, changes the code after the xxx comment to return the node (because maybe now he needs it), then this code will end up handling XLinks too, sounds fragile.
+s/so we want/do we want/
+(In reply to comment #4)
+> so we want to return false (and thus prevent default action) if we served a
+> middle mouse paste?
+
+Not sure what you mean, my patch doesn't change anything from yours or the old code. They all return true in this case. I don't think it actually matters since there's no default action for middle mouse clicks AFAIK.
+
+> that said, if someone in getLinkNodeAndHref, changes the code after the xxx
+> comment to return the node (because maybe now he needs it), then this code will
+> end up handling XLinks too, sounds fragile.
+
+Well if someone does that, we want this code to handle xlinks :) But I think we want to just remove that XXX, it seems unlikely that we should return a linkNode for the xlink case.
+
+I agree that this could use more comments overall.
+(In reply to comment #6)
+> (In reply to comment #4)
+> > so we want to return false (and thus prevent default action) if we served a
+> > middle mouse paste?
+> 
+> Not sure what you mean, my patch doesn't change anything from yours or the old
+> code. They all return true in this case. I don't think it actually matters
+> since there's no default action for middle mouse clicks AFAIK.
+
+yep, this was a random thought on my patch too. I don't think there is a default action for middle-click (does not matter in real world), but was thinking about that for consistency.
+
+> > that said, if someone in getLinkNodeAndHref, changes the code after the xxx
+> > comment to return the node (because maybe now he needs it), then this code will
+> > end up handling XLinks too, sounds fragile.
+> 
+> Well if someone does that, we want this code to handle xlinks :) But I think we
+> want to just remove that XXX, it seems unlikely that we should return a
+> linkNode for the xlink case.
+
+sounds fine, so whoever will touch that code will know that we don't return linkNode per our choice, and not because we are unsure if we should.
+I also noticed that the SeaMonkey code is similarly structured to the code with my patch applied (they have hrefAndLinkNodeForClickEvent()), it's probably a good idea to compare the functions and try to sync them up more.
+so, it's a bit unclear so far what you want me to do, and what you're going to do. Thus, i'll wait for your directions to avoid doing double work.
+I won't complain if you want to do it all! :)
+sure, i'll do. you're busy enough.
+Created attachment 431639
+patch v1.1
+
+unified patches, renamed the helper to the same as Seamonkey (and inverted return values to sync with it). Added a couple comments.
+
+I'm going to work on a test. Since b-c tests don't run in separate envs i cannot just overload browser.js methods. i'll probably go for a common chrome test including browser.js.
+Created attachment 432219
+patch v1.2 + test
+
+The test is a bit hackish, but is the best i've been able to achieve and it took quite some time. It is testing almost all paths, more could be easily added.
+For example it is not testing the addBookmarkPanel path, since it would have required some additional logic, and does not look like having a good win/cost ratio.
+I still have to test this on all 3 platforms, so most likely i'll push it to the tryserver in the next days.
+ps: per Gavin's request i've not removed preventDefault and stopPropagation calls, even if they are probably just redundant. That will be done in a small follow-up.
+The test looks overly complicated - can't you just have a browser chrome test that loads a content page (for the test elements), and then does the replacements and function calls in the actual browser window's scope, rather than doing this weird thing where you load browser.js in content? Could do it in a new window's scope to avoid polluting the current window, if that's the worry.
+i did not want to break a browser window, because i would like to avoid oranges as far as possible. i fear that touching a real browser window could cause future changes to prevent it from closing or other bad things due to replaced methods.
+
+apart that the structure of the test would not change much in a b-c test, it would only save the replace methods part, an array and a cycle.
+well no, actually it would only save the browser.js import and the __defineGetter__ replacement.
+There's no real risk of breaking a browser window if you keep references to the old methods and later restore them, and if you do that on a new window that's specifically only used for this test, the risk is even lower.
+ok i can do that, still i don't understand what we are supposed to save in b-c from what is here. Instead, as you said, i should also add code to restore methods.
+What we gain is running the test in an actual window vs. some hacked-up environment. The method replacing code is pretty simple.
+(In reply to comment #8)
+> it's probably a
+> good idea to compare the functions and try to sync them up more.
+
+Does SeaMonkey need to update to sync up even more here?
+Created attachment 434344
+patch v1.3 + b-c test
+
+New browser chrome test. This was stressing!
+(In reply to comment #21)
+> Does SeaMonkey need to update to sync up even more here?
+
+if you have ideas, bring them to the table! :)
+note to self: wrap clearUserPref in try/catch
+Created attachment 434669
+patch v1.4
+
+with try catch.
+Can we avoid changing event to aEvent? event is pretty much always an argument and it would be consistent with xbl and onfoo="" handlers where we can't influence the argument name.
+sure, will merge with gavin's comments.
+Has nothing been done with this bug since 2 April 2010? I and many others are anxiously awaiting a fix for bug 477882, but work on 477882 cannot proceed until this bug 549340 is resolved. Thank you very much.
+Asking blocking because I need this bug to proper support visits across frames in Places. We are not tracking them correctly, differently from other browsers, and this regressed from FX3.5 on.
+Blocks a blocker -> blocking.
+
+Gavin, any ETA on a final review of this?
+Created attachment 462153
+patch v1.5
+
+unbitrot, remove some cleanup change to reduce patch size
+Comment on attachment 462153
+patch v1.5
+
+Why does this declare hrefAndLinkNodeForClickEvent in the global scope?
+(In reply to comment #32)
+> Comment on attachment 462153 [details]
+> patch v1.5
+> 
+> Why does this declare hrefAndLinkNodeForClickEvent in the global scope?
+
+hm, no reason, good catch, if you wish to do a first pass that could help gavin.
+(In reply to comment #33)
+> (In reply to comment #32)
+> > Why does this declare hrefAndLinkNodeForClickEvent in the global scope?
+> 
+> hm, no reason, good catch, if you wish to do a first pass that could help
+> gavin.
+
+actually, rethinking to that, IIRC i put it there to sync more code with suite and help code sharing across the two implementations. But I agree with your concern.
+It doesn't look like handleLinkClick should have a return value at all. I'm removing it in bug 586234.
+What exactly blocks bug 477882 here, btw?
+(In reply to comment #35)
+> It doesn't look like handleLinkClick should have a return value at all. I'm
+> removing it in bug 586234.
+
+the result value is used by some addons though, see above.
+
+(In reply to comment #36)
+> What exactly blocks bug 477882 here, btw?
+
+the fact that without this bug I have to hack around the call putting it in multiple places and with various ifs... while this is maaking the method more linear and I can just hook in one point. Not an hard blocker but I talked with Gavin about this during the last work week.
+(In reply to comment #37)
+> (In reply to comment #35)
+> > It doesn't look like handleLinkClick should have a return value at all. I'm
+> > removing it in bug 586234.
+> 
+> the result value is used by some addons though, see above.
+
+Which comment exactly?
+Since the return value is currently random (isn't it?), how /could/ an add-on even use it?
+(In reply to comment #38)
+> Which comment exactly?
+
+hm can't find it. maybe it was on irc, btw you can search in the addons mxr, I think addons were using return value of both contentAreaClick and handleLinkClick.
+
+(In reply to comment #39)
+> Since the return value is currently random (isn't it?), how /could/ an add-on
+> even use it?
+
+Good question, that's why I titled this bug "give it consistent return values"! I have no idea how they use these random values honestly.
+could be values are correct in the most common cases, thus they didn't notice the randomness.
+This is still waiting on review and blocks a blocker - ETA on review?
+Comment on attachment 462153
+patch v1.5
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+>+ * Extracts linkNode and href for the current click target.
+
+>+ * @return [href, linkNode].
+
+"will be null if the click wasn't on an anchor element (or XLink)"
+
+>+function hrefAndLinkNodeForClickEvent(event)
+
+>+    // This is a hack to work around Gecko bug 266932.
+>+    // Walk up the DOM looking for a parent link node, to match the existing
+>+    // behaviour for left click.
+
+I think this is no longer necessary, given bug 266932 comment 40. I suppose it's best to make that change separately, though (can use bug 325652).
+
+>+    while (node && !(node instanceof HTMLAnchorElement))
+>+      node = node.parentNode;
+>+      // <a> cannot be nested.  So if we find an anchor without an
+>+      // href, there is no useful <a> around the target.
+>+      if (node && node.hasAttribute("href"))
+>+        linkNode = node;
+
+Indent is wrong here (and the comment seems to contradict the one above... but that's an existing issue, and moot if we fix bug 325652)
+
+>+function contentAreaClick(event, isPanelClick)
+
+>+  // This code is not intended to handle XLinks, thus the check for linkNode.
+
+"This code only applies if we have a linkNode (i.e. clicks on real anchor elements, as opposed to XLink)." 
+
+>+    // XXX Now that markLinkVisited is gone, we may not need to field _main
+>+    // and _content here.
+
+I don't understand this XXX comment. markLinkVisited doesn't seem relevant to the need to handle magic sidebar target values. Just remove it?
+
+>+    let target = linkNode.getAttribute("target");
+
+This should use linkNode.target (change only affects corner cases of documents with e.g. <base target="_content">, and is more correct IMO).
+
+>+      let postData = {};
+>+      let url = getShortcutOrURI(href, postData);
+>+      if (!url)
+>+        return true;
+>+      loadURI(url, null, postData.value, false);
+
+This is really messed up (existing behavior)... we shouldn't be calling getShortcutOrURI for link clicks, even just for panels. Followup bug?
+
+>+    if (linkNode.getAttribute("rel") == "sidebar") {
+>+      // This is the Opera convention for a special link that, when clicked,
+>+      // allows to add a sidebar panel.  The link's title attribute contains
+>+      // the title that should be used for the sidebar panel.
+
+Do we have a bug on file for removing this yet? If not, we should!
+
+>+/**
+>+ * Handles clicks on links.
+>+ *
+>+ * @return false if the caller should prevent default action.
+> function handleLinkClick(event, href, linkNode)
+
+I think this method should return whether or not it did something (i.e. whether it "handled" the click) - that seems to match what the add-on callers that check the return value expect.
+
+I think the stopPropagation() calls don't actually matter very much. contentAreaClick is a bubbling phase listener on the browser, so the event has already propagated to most other possible listeners by the time it hits this method. Those calls will only affect bubbling phase listeners on ancestors of the tabbrowser (I don't think we have any?), and I don't think it really makes sense to stop that propagation due to triggered loads (in new tabs or windows), so I think we should just remove all the stopPropagation() calls.
+
+We should be consistent about whether we're stopping the default action using preventDefault() or contentAreaClick's return value, to avoid confusing things. It's probably actually easier to just have all of the code paths that want to cancel the normal link click (in both handleLinkClick and contentAreaClick) do that explicitly using preventDefault(), and just always return true from contentAreaClick.
+
+This will need to be merged with bug 586234.
+
+>diff --git a/browser/base/content/test/browser_contentAreaClick.js b/browser/base/content/test/browser_contentAreaClick.js
+
+I think I would prefer a test that actually observes the tab/window opening rather than monkeypatching the code and checking that, but I guess this is fine.
+
+>+let gClickHandler = {
+
+>+    // Check that all required methods have been called.
+>+    gCurrentTest.expectedInvokedMethods.forEach(function(aExpectedMethodName) {
+>+      isnot(gInvokedMethods.indexOf(aExpectedMethodName), -1,
+>+            gCurrentTest.desc + ":" + aExpectedMethodName + " was invoked");
+>+    });
+
+also compare expectedInvokedMethods.length/gInvokedMethods.length?
+
+r=me with all of those addressed.
+(In reply to comment #43)
+> >+      let postData = {};
+> >+      let url = getShortcutOrURI(href, postData);
+> >+      if (!url)
+> >+        return true;
+> >+      loadURI(url, null, postData.value, false);
+> 
+> This is really messed up (existing behavior)... we shouldn't be calling
+> getShortcutOrURI for link clicks, even just for panels. Followup bug?
+
+filed bug 607280
+
+> >+    if (linkNode.getAttribute("rel") == "sidebar") {
+> >+      // This is the Opera convention for a special link that, when clicked,
+> >+      // allows to add a sidebar panel.  The link's title attribute contains
+> >+      // the title that should be used for the sidebar panel.
+> 
+> Do we have a bug on file for removing this yet? If not, we should!
+
+There is bug 560305, is it enough?
+
+> I think this method should return whether or not it did something [...]
+> It's probably actually easier to just have all of the code paths that want to
+> cancel the normal link click [...] do
+> that explicitly using preventDefault(), and just always return true from
+> contentAreaClick.
+
+So, let's see if I figured out all of this.
+Wherever ContentAreaClick or handleLinkClick are handling a click, they should preventDefault.
+ContentAreaClick always returns true, while handleLinkClick returns true if it handled the click, false otherwise.
+Created attachment 486060
+patch v1.6
+
+addressed comments, will pass through tryserver to ensure the test is not going to give unexpected randomness.
+(In reply to comment #44)
+> > Do we have a bug on file for removing this yet? If not, we should!
+> 
+> There is bug 560305, is it enough?
+
+Yeah, sounds good.
+
+> So, let's see if I figured out all of this.
+> Wherever ContentAreaClick or handleLinkClick are handling a click, they should
+> preventDefault.
+> ContentAreaClick always returns true, while handleLinkClick returns true if it
+> handled the click, false otherwise.
+
+This too!
+http://hg.mozilla.org/mozilla-central/rev/98bd39f6f1ce
+We check "event.button == 2" in handleLinkClick, so it's not necessary to do the same check in ContentAreaClick, is it?
+The early check is saving some work though.
+Left-click without modifiers used to not passing through handleLinkClick, but now it goes. Is it intentional? 
+Left-click with modifiers, middle-click, or right-click used to being handled by handleLinkClick.
+I'm not sure why (where == "current") will return from handleLinkClick. Shouldn't it be (event.button == 0 && !event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey)?
+Sorry, comment 51 seems not related to this patch.
+
+
+reorganize ContentAreaClick, give it consistent return values and comments
+
+
+
+Bug 549340 - reorganize ContentAreaClick, give it consistent return values and comments.

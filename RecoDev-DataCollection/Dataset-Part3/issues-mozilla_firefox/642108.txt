@@ -1,0 +1,225 @@
+I regularly get many, many, of these errors:
+
+Error: hudRef is null
+Source File: resource:///modules/HUDService.jsm
+Line: 1213
+
+...which make looking for "real" errors in the Error Console really annoying.
+
+I suspect they happen when I use the Web Console, but am not sure.  I'm on ff4-rc1.
+
+I regularly get many, many, of these errors:
+
+Error: hudRef is null
+Source File: resource:///modules/HUDService.jsm
+Line: 1213
+
+...which make looking for "real" errors in the Error Console really annoying.
+
+I suspect they happen when I use the Web Console, but am not sure.  I'm on ff4-rc1.
+this is happening here:
+
+http://mxr.mozilla.org/mozilla-central/source/toolkit/components/console/hudservice/HUDService.jsm#1213
+
+1206   // Prune the nodes.
+1207   let messageNodes = aConsoleNode.querySelectorAll(".hud-msg-node");
+1208   let removeNodes = messageNodes.length - logLimit;
+1209   for (let i = 0; i < removeNodes; i++) {
+1210     if (messageNodes[i].classList.contains("webconsole-msg-cssparser")) {
+1211       let desc = messageNodes[i].childNodes[2].textContent;
+1212       let location = messageNodes[i].childNodes[4].getAttribute("title");
+1213       delete hudRef.cssNodes[desc + location];
+1214     }
+1215     messageNodes[i].parentNode.removeChild(messageNodes[i]);
+1216   }
+
+delete hudRef.cssNodes.
+
+Added from bug 611795.
+
+I expect you only see this if you've had the console open for awhile or you have a lot of history built up in the console? Are there any other associated errors you see with this or is it pretty-much filling the error console for you?
+
+We should be able to write a test-case for this.
+taking this. unittest to follow.
+In pruneConsoleOutputIfNecessary():
+
+  let hudRef = HUDService.getHudReferenceForOutputNode(aConsoleNode);
+
+which returns null and breaks all pruning.
+
+We have HUDService.getHudReferenceForOutputNode() which does:
+
+    while (!node.classList.contains("hudbox-animated")) {
+      if (node.parent) {
+        node = node.parent;
+      }
+      else {
+        return null;
+      }
+    }
+
+node.parent is always undefined. That should be node.parentNode. Also, I expect that the while condition needs an update - we cannot assume node.classList is available on all nodes ... it's definitely a possible failure point as well.
+Created attachment 520287
+getHudRefForOutputNode Fix
+
+this method never really worked before. I removed the classList checking code and verified that we weren't calling getHudRefForOutputNode with child nodes of the output box. The comment doc even specifies that this needs to be an output box as delivered by getHeadsUpDisplay.
+ftr, this needs one more test to verify pruning of repeated nodes works. I'll append that when I get to it.
+Comment on attachment 520287
+getHudRefForOutputNode Fix
+
+The patch looked fine. Got to test it today.
+
+The patch doesn't fix the problem. hudRef is still null.
+
+getHudReferenceForOutputNode() is called for both the outputNode (which is a xul:richlistbox element that holds the messages) and for the consoleNode (which is a xul:vbox with class name .hud-box. I think you need to support both cases in the getHudReferenceForOutputNode() implementation. If not, then you must really make sure it's called only for vbox.hud-box. Currently that's not the case.
+
+In pruneConsoleOutputIfNecessary():
+  let hudRef = HUDService.getHudReferenceForOutputNode(aConsoleNode);
+
+aConsoleNode is a reference to the outputNode (the xul:richlistbox).
+
+Unfortunately, yes, it's very confusing. All the code has confusion over what is console node, hud box and output node. You must determine which is which based on the context and how it is used. Reported bug 643135 because we should cleanup the confusion.
+
+I have to give the patch f-.
+ugh. imo.
+Created attachment 520701
+cssPruning tests
+Created attachment 520709
+cssPruning tests
+
+now checking cssNodes contents.
+Comment on attachment 520709
+cssPruning tests
+
+The patch looks fine. Comments:
+
+For the function pruneConsoleOutputIfNecessary():
+
+- *        The DOM node that holds the output of the console.
++ *        The DOM node (richlistbox aka hudbox) that holds the output of the
++ *        console.
+
+richlistbox is aka outputNode ... not hudbox. The HUD box is is the xul:vbox that holds the entire web console. See HeadsUpDisplay.makeHUDNodes().
+
+
+For the getHudReferenceForOutputNode():
+
+-   * @param nsIDOMNode aNode
+-   *        an output node (as returned by getOutputNodeById()).
++   * @param nsIDOMNode aNode (currently either a richlistbox as returned by
++   *        getOutputNodeById() or a vbox of class hudbox-animated).
+
+The getOutputNodeById() returns the xul:vbox, not the richlistbox.
+
+The xul:vbox has no hudbox-animated class. The xul:vbox always has the .hud-box class and sometimes it has the .animated class.
+
++    while (!node.id) { // starting from richlistbox, need to find hudbox
++      if (node.parentNode) {
++        node = node.parentNode;
++      } else {
+         return null;
+       }
+     }
+
+That while looks almost fine, but it will break if we add an ID to any element within the tree of nodes. Why not check for the .hud-box class? or the "hud_" ID prefix? This loop is prone to errors.
+
++const TEST_URI = "http://example.com/browser/toolkit/components/console/hudservice/tests/browser/test-console.html";
+
+I think you can use a data URI here. data:text/html,<p>test for bug 642108.
+
++  let hudId = HUDService.displaysIndex()[0];
++  let hudBox = HUDService.getHeadsUpDisplay(hudId);
++  let hudRef = HUDService.getHudReferenceById(hudId);
+
+This is stuff that is going to be removed.
+
+I recommend:
+
++  let hudId = HUDService.getHudIdByWindow(content);
++  let hudRef = HUDService.getHudReferenceById(hudId);
++  let hudBox = hudRef.HUDBox;
+
+Also hudBox is unused in testCSSPruning().
+
+You could just use getHudIdByWindow(), then getHudReferenceById() and pass the hudRef object to the other functions. No need to repeat stuff in the other functions.
+
+I am giving the patch f+ with the above comments addressed.
+Created attachment 521634
+pruneFix
+
+updated patch with nits addressed.
+Comment on attachment 521634
+pruneFix
+
+What is this test testing? anything other than the existence of a console UI?
+
+
+>new file mode 100644
+>--- /dev/null
+>+++ b/toolkit/components/console/hudservice/tests/browser/browser_webconsole_bug_642108_refForOutputNode.js
+>@@ -0,0 +1,30 @@
+>+/* vim:set ts=2 sw=2 sts=2 et: */
+>+/* ***** BEGIN LICENSE BLOCK *****
+>+ * Any copyright is dedicated to the Public Domain.
+>+ * http://creativecommons.org/publicdomain/zero/1.0/
+>+ *
+>+ * ***** END LICENSE BLOCK ***** */
+>+
+>+// Tests that the Web Console limits the number of lines displayed according to
+>+// the user's preferences.
+>+
+>+const TEST_URI = "http://example.com/browser/toolkit/components/console/hudservice/tests/browser/test-console.html";
+>+
+>+function test() {
+>+  addTab(TEST_URI);
+>+  browser.addEventListener("DOMContentLoaded", testHudRef,
+>+                           false);
+>+}
+>+
+>+function testHudRef() {
+>+  browser.removeEventListener("DOMContentLoaded",testHudRef, false);
+>+
+>+  openConsole();
+>+  let hudId = HUDService.displaysIndex()[0];
+>+  let hudBox = HUDService.getHeadsUpDisplay(hudId);
+>+  let hudRef = HUDService.getHudReferenceForOutputNode(hudBox);
+>+
+>+  ok(hudRef, "We have a hudRef");
+>+
+>+  finishTest();
+>+}
+ (In reply to comment #12)
+> Comment on attachment 521634 [details]
+> pruneFix
+> 
+> What is this test testing? anything other than the existence of a console UI?
+
+I found a bug in getHudReferenceForOutput node where the original implementation didn't properly walk up the chain and retrieve the correct top-level xul console node. I wrote this test to verify that it worked given a hudBox.
+Comment on attachment 521634
+pruneFix
+
+Nice - you have simplified some of this code even. 
+
++ * ***** END LICENSE BLOCK ***** */
++
++// Tests that the Web Console limits the number of lines displayed according to
++// the user's preferences.
++
+
+Maybe add a more descriptive comment to the second test ^^
+
+
+r+ with additional review from a toolkit peer
+Created attachment 522424
+[in-devtools] pruneFix2
+
+above fix rebased onto current devtools repo and better-commented. Also! As a bonus, added additional tests to verify getHudReferenceForOutputNode works with both types of input.
+
+Asking for additional toolkit review, if the module owner thinks it's necessary.
+Comment on attachment 522424
+[in-devtools] pruneFix2
+
+checked into devtools:
+
+http://hg.mozilla.org/projects/devtools/rev/23b79a3b6959
+http://hg.mozilla.org/mozilla-central/rev/23b79a3b6959

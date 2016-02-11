@@ -1,0 +1,100 @@
+Not sure why the debugger didn't prettify a specific external JS file while I was looking at an issue with video.foxnews.com. I've copied the file for this smaller demo:
+http://hallvord.com/temp/moz/bug/devt-prettify-comm.htm
+
+Not sure why the debugger didn't prettify a specific external JS file while I was looking at an issue with video.foxnews.com. I've copied the file for this smaller demo:
+http://hallvord.com/temp/moz/bug/devt-prettify-comm.htm
+(Original URL for external JS is http://global.fncstatic.com/static/p/video/app/landing/js/lib/ag.landing.base.js - base page http://video.foxnews.com loaded on Firefox for Android)
+togglePrettyPrint threw an exception: Error: Expecting Unicode escape sequence \uXXXX (2:10979)
+raise@resource://gre/modules/devtools/acorn/acorn.js:231:15
+readWord1@resource://gre/modules/devtools/acorn/acorn.js:919:11
+readWord@resource://gre/modules/devtools/acorn/acorn.js:939:16
+readToken@resource://gre/modules/devtools/acorn/acorn.js:729:1
+getToken@resource://gre/modules/devtools/acorn/acorn.js:146:7
+prettyFast@resource://gre/modules/devtools/pretty-fast.js:777:15
+self.onmessage@resource://gre/modules/devtools/server/actors/pretty-print-worker.js:37:24
+
+Stack: SourceActor.prototype._sendToPrettyPrintWorker/</onReply@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/server/actors/script.js:2719:27
+Line: 2719, column: 26
+Fun. Either removing this part or placing a semicolon after the last curly brace will work around the bug:
+
+else{var o=f[h];g[c]=o.slice&&"%"==o.slice(-1)?parseFloat(o)/100*m:o}
+
+so this is a bug in acorn.js - for some reason it thinks that the backslash in /^\d just after the above code is inside a string, not a regexp.
+http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/acorn/acorn.js#919
+
+(BTW - given that browser JS implementations will just ignore \ in strings if it isn't part of some escape, it seems a bit odd if the debugger and its parser can't prettify such scripts?)
+It seems like we haven't upgraded acorn from upstream for a long time. Marijn might know if this bug is already fixed in the latest version of acorn or not.
+(Summary is wrong - I first wrote "stylesheet" instead of "javascript", probably because I had just seen Karl's bug 1114929 8-])
+Current Acorn (0.11.0) seems to parse the file at http://global.fncstatic.com/static/p/video/app/landing/js/lib/ag.landing.base.js just fine. So yes, upgrading might help.
+Upgrading to the latest acorn breaks pretty-fast and regexps. Looking into it.
+Seems like a pretty simple change required for pretty-fast in the end: https://github.com/mozilla/pretty-fast/pull/11
+
+That PR is r? jlongster.
+
+Will have a patch for m-c up in a moment.
+Created attachment 8543364
+upgrade-acorn.patch
+
+Panos, this is just the rubber stamp for updating the libraries (assuming that jlongster gives r+ to the pretty-fast PR).
+
+Still seeing acorn throw the parse error, though, so this patch doesn't fix this bug (but I still think it is worth updating, if only to stay recent).
+
+Looking into it...
+Confirming that if I just download the script and run ./bin/acorn on it, it does parse.
+So Acorn's ./bin/acorn reads files as UTF-8.
+
+When we don't rely on Debugger.Source.prototype.text for source contents, we "convert" our source code from UTF-8 to "unicode" which doesn't make sense to me. If I understand correctly, unicode is just a collection of code point -> character definitions and doesn't describe how to encode a series of code points together (which is what UTF-8, UTF-16, UCS-4, etc do). In other words, there are many encodings that can all express every code point defined by unicode.
+
+When we do rely on Debugger.Source.prototype.text, we don't do anything special to convert it to anything else. I don't know what encoding it is using. Digging in now.
+Created attachment 8543418
+Reduced Test Case
+
+Here is a reduced test case.
+
+Clear ni? jlongster because he r+'d the PR and its been merged in the GH repo.
+Created attachment 8543425
+Reduced Test Case
+
+Even more reduced.
+
+Seeing the difference between acorn on the command line vs in firefox for just this snippet:
+
+  {var o=f[h];g[c]=o.slice&&"%"==o.slice(-1)?parseFloat(o)/100*m:o}/^\d+$/.test(g[c])
+Ok so this isn't an encoding issue: I am able to reproduce this in acorn running on node as well. Opened an issue on github: https://github.com/marijnh/acorn/issues/189
+
+Strange that acorn can parse this just fine, but it can't tokenize it.
+
+Marijn, any insights?
+Marijn explains on GitHub: "JS-style regexp syntax is rather hard to tokenize, because it is ambiguous with the division operator". 
+Indeed - I struggled with that too when I wrote my ultra-simple JS reformatter [1]. Compared to acorn this is of course an extremely rudimentary piece of crappy code - but it's been battle tested for years on some of the web's worst obfuscated scripts, and its $at_start_of_statement_or_expression logic appears to handle this string of code OK too.
+
+[1] https://github.com/hallvors/javascript-formatter
+I've outlined a potential solution in https://github.com/marijnh/acorn/issues/189#issuecomment-68649305 .
+Comment on attachment 8543364
+upgrade-acorn.patch
+
+Review of attachment 8543364:
+-----------------------------------------------------------------
+
+"In Nick We Trust"! rs=me
+Created attachment 8544670
+upgrade-acorn.patch
+
+Updated patch grabbing the latest acorn sources with the regexp tokenizing fix.
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=5fd4b90d620e
+Created attachment 8544866
+upgrade-acorn.patch
+
+Fixed the failing test from last time. New try push:
+
+https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=4f9d7472d8cf
+https://hg.mozilla.org/integration/fx-team/rev/083244e15674
+https://hg.mozilla.org/mozilla-central/rev/083244e15674
+
+
+pretty printing fails with acorn tokenizer error
+
+
+
+Bug 1114962 - Update the in-tree copies of acorn and pretty-fast. r=past

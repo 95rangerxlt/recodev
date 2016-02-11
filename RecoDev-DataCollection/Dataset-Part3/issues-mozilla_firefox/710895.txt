@@ -1,0 +1,1148 @@
+Port the old IE migrator to JS and use new places async APIs
+
+Port the old IE migrator to JS and use new places async APIs
+Created attachment 581797
+Part 1 - Migrator structure + bookmarks
+Created attachment 581798
+Part 2 - History reader helper
+Created attachment 581799
+Part 3 - Main IE prefs
+Felipe, do you have any update on this?
+Created attachment 590141
+IE Migrator structure + bookmarks
+
+Sorry, I got a bit behind on this because I was updating all the patches to already use Mano's changes to the MigrationUtils helpers. Thus this patch requires the changes from the Safari's patch that have been spun off to bug 718608.
+
+This part sets up the new migrator JS module and handles all the bookmarks importing features.
+
+I'm breaking everything in separate patches for easier review. The removal of the old .cpp files are done on a separate patch
+Created attachment 590142
+Import preferences
+
+This patch ports the Preferences importer. I moved most of the prefs conversion code to a separate file that is #included in the main file; this should make it easier to visualize the list of imported preferences and update/add new prefs in the future.
+
+I'll post the other patches tomorrow
+Thanks, I'll try to complete reviewing Mano's changes today and then these, so we can move on and hopefully have working migrators in 12.
+Created attachment 591347
+History reader helper
+
+This is the history reader service. I changed it a bit from the last version to output an object with the data instead of using outparams. I was gonna use mozIVisitInfo or mozIPlaceInfo but none of those fit the requirements, so I created a new one (nsIIEHistoryEntry).
+
+I've split the JS code that uses it and talks to Places on a separate patch so you can direct this review to some windev if you prefer
+Created attachment 591348
+History migrator
+
+This is the actual JS history code that uses the helper and adds the data to Places using the async API.
+Created attachment 591349
+Remove previous C++ migrator
+
+Code and module removal for the previous migrator
+Created attachment 592652
+Import preferences
+
+After talking with bsmith and going over all the network prefs that are currently being imported, we reached the conclusion that those preferences shouldn't be imported at all, and the network setting should be left as "Use system settings", which will keep the current behavior.
+The current (old) migrator does the following:
+
+1 - if there are custom network settings on the system, we clone them to our own settings and mark as "use custom setting"
+2 - if there are no custom settings, we mark as "use no proxy"
+
+Both of these behaviors are wrong. (Dolske also mentioned prob #2 on bug 719321 comment 1)
+
+So this is an updated patch that removes all the network prefs migration code that I had ported to JS
+Comment on attachment 591347
+History reader helper
+
+Review of attachment 591347:
+-----------------------------------------------------------------
+
+::: browser/components/migration/public/nsIIEHistoryReader.idl
+@@ +22,5 @@
+> +
+> +  /**
+> +   * The time and date of the last visit.
+> +   */
+> +  readonly attribute PRTime lastVisit;
+
+maybe lastVisitTime would be clearer
+
+@@ +43,5 @@
+> +
+> +  /*
+> +   * Retrieves the next entry from Windows' history service.
+> +   *
+> +   * @returns nsIIEHistoryEntry Returns an object containing the URI of the
+
+the right form is @return without the s.
+Please also add @throws to specify uncommon cases when it throws.
+Also specify that returns null on the last entry
+
+@@ +45,5 @@
+> +   * Retrieves the next entry from Windows' history service.
+> +   *
+> +   * @returns nsIIEHistoryEntry Returns an object containing the URI of the
+> +                                entry, the time it was last visited, and a
+> +   *                            title (which is blank for non-toplevel visits).
+
+as discussed we don't have evidence these blank elements are non-toplevel. Btw, if you can find a correlation among those, this comment should rather be on nsIIEHistoryEntry::title than here.
+
+@@ +47,5 @@
+> +   * @returns nsIIEHistoryEntry Returns an object containing the URI of the
+> +                                entry, the time it was last visited, and a
+> +   *                            title (which is blank for non-toplevel visits).
+> +   */
+> +  nsIIEHistoryEntry getNextEntry();
+
+As we discussed, I think having a begin() and a end() is pretty much error-prone and looks like redundant work that the instance may do by itself. Imo this should just be a Reader instance that lazily initializes the resource on the first getNextEntry call, and destroy it either on the last entry or on destruction, if the last entry was not required. if the user needs to read it in multiple places he should just instance a new Reader.
+
+::: browser/components/migration/src/nsIEHistoryReader.cpp
+@@ +25,5 @@
+> +nsIEHistoryEntry::~nsIEHistoryEntry()
+> +{
+> +}
+> +
+> +NS_IMETHODIMP nsIEHistoryEntry::GetUri(nsIURI * *aURI)
+
+global: decorators towards types please, nsIURI** is fine
+
+@@ +94,5 @@
+> +{
+> +  if (!mURLEnumerator)
+> +    return NS_ERROR_NOT_INITIALIZED;
+> +
+> +  *retval = nsnull;
+
+just in case, set this before the initial check. it's true that nobody should use return value when we throw, but we can still be nice
+
+@@ +102,5 @@
+> +  SYSTEMTIME st;
+> +
+> +  HRESULT hr = mURLEnumerator->Next(1, &statURL, &fetched);
+> +
+> +  if (FAILED(hr) || fetched != 1UL)
+
+nit: no newline in between error fetching and checking
+
+@@ +119,5 @@
+> +  prt.tm_wday = 0;
+> +  prt.tm_yday = 0;
+> +  prt.tm_params.tp_gmt_offset = 0;
+> +  prt.tm_params.tp_dst_offset = 0;
+> +  PRTime lastVisited = PR_ImplodeTime(&prt);
+
+could ou make this convertion into an anonymous namespaced helper function?
+
+::: browser/components/migration/src/nsIEHistoryReader.h
+@@ +21,5 @@
+> +  NS_DECL_NSIIEHISTORYENTRY
+> +
+> +nsIEHistoryEntry(const nsString& aTitle,
+> +                 already_AddRefed<nsIURI> aURI,
+> +                 PRTime aLastVisit);
+
+wrong indentation
+Comment on attachment 590141
+IE Migrator structure + bookmarks
+
+Review of attachment 590141:
+-----------------------------------------------------------------
+
+global-nit: please prefix params with "a" per code style
+
+::: browser/components/migration/src/IEProfileMigrator.js
+@@ +10,5 @@
+> +
+> +Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> +Cu.import("resource://gre/modules/Services.jsm");
+> +Cu.import("resource://gre/modules/MigrationUtils.jsm");
+> +Cu.import("resource://gre/modules/PlacesUtils.jsm");
+
+I'd suggest to make PlacesUtils a lazyModuleGetter, we may not need it in some case (like migrating just cookies, to say one)
+
+@@ +32,5 @@
+> +
+> +  _toolbarFolder: null,
+> +
+> +  migrate: function(aCallback, aReplace) {
+> +   AsyncMigrateFunction(function() {
+
+actually, I think that the module already checks for migrate throwing an invokes the callback by itself, there should be no need to do all of this wrapping. and if it doesn't it should. There should really be no need to wrap like this in the end.
+
+@@ +36,5 @@
+> +   AsyncMigrateFunction(function() {
+> +    let favs = Services.dirsvc.get("Favs", Ci.nsIFile);
+> +
+> +    if (!favs.exists() || !favs.isReadable())
+> +      throw "Could not read bookmarks folder";
+
+always throw New Error( please
+
+@@ +43,5 @@
+> +    // in the toolbar. This was previously stored in the registry and changed
+> +    // in IE7 to always be called "Links".
+> +    let toolbarName = null;
+> +    try {
+> +      let registry = Cc["@mozilla.org/windows-registry-key;1"].createInstance(Ci.nsIWindowsRegKey);
+
+limit to about 80 chars please
+
+@@ +54,5 @@
+> +      }
+> +      registry.close();
+> +    } catch (ex) { }
+> +    this._toolbarFolder = favs.clone();
+> +    this._toolbarFolder.append(toolbarName || "Links");
+
+you may make a nice helper to get the toolbarName so we move all this code out of here.
+
+@@ +57,5 @@
+> +    this._toolbarFolder = favs.clone();
+> +    this._toolbarFolder.append(toolbarName || "Links");
+> +
+> +
+> +    function migrateBatched() {
+
+too many newlines
+
+@@ +61,5 @@
+> +    function migrateBatched() {
+> +      let placesFolderId;
+> +      if (!aReplace) {
+> +        placesFolderId = MigrationUtils.createImportedBookmarksFolder("IE",
+> +        PlacesUtils.bookmarksMenuFolderId);
+
+better indentation please
+
+@@ +63,5 @@
+> +      if (!aReplace) {
+> +        placesFolderId = MigrationUtils.createImportedBookmarksFolder("IE",
+> +        PlacesUtils.bookmarksMenuFolderId);
+> +      } else {
+> +        placesFolderId = PlacesUtils.bookmarksMenuFolderId;
+
+just init to the menu folder and overwrite if !aReplace
+
+@@ +74,5 @@
+> +    }
+> +
+> +    PlacesUtils.bookmarks.runInBatchMode({
+> +      runBatched: migrateBatched.bind(this)
+> +    }, null);
+
+we should have done this from a long time, btw, if you wish you may add the "function" specification to the batch, so that you don't need to make an object.
+
+@@ +81,5 @@
+> +
+> +   }.bind(this), aCallback)();
+> +  },
+> +
+> +  _migrateFolder: function IE_migrateFolder(folder, placesFolderId) {
+
+s/placesFolderId/targetFolderId
+
+@@ +99,5 @@
+> +        let subfolderId = entry.equals(this._toolbarFolder) ?
+> +                          PlacesUtils.toolbarFolderId :
+> +                          PlacesUtils.bookmarks.createFolder(placesFolderId,
+> +                                                             entry.leafName,
+> +                                                             PlacesUtils.bookmarks.DEFAULT_INDEX);
+
+A common if/else would be more readable in this case
+
+@@ +103,5 @@
+> +                                                             PlacesUtils.bookmarks.DEFAULT_INDEX);
+> +
+> +        this._migrateFolder(entry, subfolderId);
+> +      } else {
+> +        let fileURL = Services.io.newFileURI(entry).QueryInterface(Ci.nsIFileURL);
+
+I suspect NetUtil.newURI may do all of this for you?
+
+@@ +105,5 @@
+> +        this._migrateFolder(entry, subfolderId);
+> +      } else {
+> +        let fileURL = Services.io.newFileURI(entry).QueryInterface(Ci.nsIFileURL);
+> +
+> +        if (/url/i.test(fileURL.fileExtension)) {
+
+doesn't look like you need a regex here, a == fileURL.fileExtension.toLowercase may be cheaper
+
+@@ +106,5 @@
+> +      } else {
+> +        let fileURL = Services.io.newFileURI(entry).QueryInterface(Ci.nsIFileURL);
+> +
+> +        if (/url/i.test(fileURL.fileExtension)) {
+> +          let fileHandler = Cc["@mozilla.org/network/protocol;1?name=file"].getService(Ci.nsIFileProtocolHandler);
+
+80 chars limit please
+
+@@ +108,5 @@
+> +
+> +        if (/url/i.test(fileURL.fileExtension)) {
+> +          let fileHandler = Cc["@mozilla.org/network/protocol;1?name=file"].getService(Ci.nsIFileProtocolHandler);
+> +          let uri = fileHandler.readURLFile(entry);
+> +          let name = entry.leafName.substr(0, entry.leafName.length - 4); // -4 == ".url".length
+
+we usually use title, rather than name
+
+::: browser/components/migration/src/Makefile.in
+@@ +61,5 @@
+>    ProfileMigrator.js \
+>    ChromeProfileMigrator.js \
+>    FirefoxProfileMigrator.js \
+>    SafariProfileMigrator.js \
+> +  IEProfileMigrator.js \
+
+doesn't look like you have anything to preprocess, so for now should go to the EXTRA_COMPONENTS section
+Comment on attachment 591348
+History migrator
+
+Review of attachment 591348:
+-----------------------------------------------------------------
+
+::: browser/components/migration/src/IEProfileMigrator.js
+@@ +238,5 @@
+> +  migrate: function(aCallback) {
+> +    // First get the list of typed URLs since it's stored in the registry rather
+> +    // than the history service. Currently, IE stores 25 entries and this value
+> +    // is not configurable. We will hard-limit it to 100 entries since we don't
+> +    // want to be surprised here from an unbounded changed in a future IE version.
+
+typo: unbounded changed
+
+@@ +242,5 @@
+> +    // want to be surprised here from an unbounded changed in a future IE version.
+> +    let IETypedURLs = {};
+> +
+> +    try {
+> +      let registry = Cc["@mozilla.org/windows-registry-key;1"].createInstance(Ci.nsIWindowsRegKey);
+
+limit to 80 chars please
+
+@@ +252,5 @@
+> +        if (registry.hasValue("url" + entry)) {
+> +          let url = registry.readStringValue("url" + entry);
+> +          IETypedURLs[url] = true;
+> +        } else {
+> +          break;
+
+so you could change the for condition to
+entry <= 100 && registry.hasValue("url" + entry)
+
+@@ +256,5 @@
+> +          break;
+> +        }
+> +      }
+> +      registry.close();
+> +    } catch (ex) {}
+
+we should probably reportError this, otherwise I don't see a way users may notice something going wrong.
+
+@@ +259,5 @@
+> +      registry.close();
+> +    } catch (ex) {}
+> +
+> +    let places = [];
+> +    let histreader = Cc["@mozilla.org/profile/migrator/iehistoryreader;1"].getService(Ci.nsIIEHistoryReader);
+
+createInstance please, according to the idl changes we discussed
+
+@@ +264,5 @@
+> +    let entry, transitionType;
+> +
+> +    histreader.begin();
+> +    while (entry = histreader.getNextEntry()) {
+> +      if (!entry.uri ||
+
+should we export the entry if it doesn't have an url? My understanding is that the reader should already filter these out.
+
+@@ +271,5 @@
+> +        continue;
+> +      }
+> +
+> +      if (!entry.title) {
+> +        transitionType = Ci.nsINavHistoryService.TRANSITION_EMBED;
+
+as discussed, no point in storing embed visits, they will be lost with the session since are only used for temporary link coloring
+Comment on attachment 591349
+Remove previous C++ migrator
+
+Review of attachment 591349:
+-----------------------------------------------------------------
+
+nothing interesting to review here :)
+Comment on attachment 592652
+Import preferences
+
+Review of attachment 592652:
+-----------------------------------------------------------------
+
+::: browser/components/migration/src/IERegistryPrefs.js
+@@ +1,5 @@
+> +/* This Source Code Form is subject to the terms of the Mozilla Public
+> + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+> + * You can obtain one at http://mozilla.org/MPL/2.0/. */
+> +
+> +let IERegistryPrefs = [
+
+may you please document the format of each entry above?
+
+@@ +3,5 @@
+> + * You can obtain one at http://mozilla.org/MPL/2.0/. */
+> +
+> +let IERegistryPrefs = [
+> +  [ "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoComplete", "AutoSuggest",
+> +     "browser.urlbar.autocomplete.enabled", IE_ReadBoolPreference ],
+
+hm, I think here we are shooting ourselves in the foot here, the user may have disavled ie autocomplete cause it sucks, the awesomebar is quite a different concept and a central point of our experience. don't think we should disable it since it's not really the same thing.
+
+@@ +6,5 @@
+> +  [ "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoComplete", "AutoSuggest",
+> +     "browser.urlbar.autocomplete.enabled", IE_ReadBoolPreference ],
+> +  [ "Software\\Microsoft\\Internet Explorer\\International", "AcceptLanguage",
+> +    "intl.accept_languages", IE_ReadLangListPreference ],
+> +  // XXX : For now, only x-western font is translated.
+
+no XXX please, ensure if a bug is filed, if not filed the bug and make this a // TODO (bug 123456): some comment
+
+@@ +27,5 @@
+> +    "accessibility.browsewithcaret", IE_ReadBoolPreference ],
+> +  [ null, "NotifyDownloadComplete",
+> +    "browser.download.manager.showAlertOnComplete", IE_ReadBoolPreference ],
+> +  [ null, "SmoothScroll",
+> +    "general.smoothScroll", IE_ReadBoolPreference ],
+
+our smoothscrolll is likely different, not sure if this makes sense, if ie's one is bad not a sign of ours being. Maybe ask Jared?
+
+@@ +39,5 @@
+> +    "browser.anchor_color", IE_ReadDRGBPreference ],
+> +  [ null, "Anchor Color Visited",
+> +    "browser.visited_color", IE_ReadDRGBPreference ],
+> +  [ null, "Always Use My Font Face",
+> +    "browser.display.use_document_fonts", IE_ReadInvertedBoolPreference ]
+
+I think to each entry you should add a validator function that ensures that what we are about to store makes any sense... I fear registry corruption here, and we may end up storing bad values. if the validator returns false we should not import the pref.
+
+@@ +42,5 @@
+> +  [ null, "Always Use My Font Face",
+> +    "browser.display.use_document_fonts", IE_ReadInvertedBoolPreference ]
+> +];
+> +
+> +function IE_ReadLangListPreference(registry, keyName, prefName) {
+
+these functions don't just read the value, they actually convert it prefs to ours.
+s/Read/Import/
+I'd be fine with cropping Preference to Pref (we do the same for our preferences service)
+Hey Felipe, what's the status of this?
+Hi Dietrich, I've updated the patches with most of mak's comments, but I'm waiting on bug 718608 to see what other changes will be needed
+Created attachment 596850
+History reader helper, v2
+
+Posting the new patch for the history reader already is it won't depend on other changes
+
+(In reply to Marco Bonardo [:mak] from comment #12)
+> Review of attachment 591347:
+> ::: browser/components/migration/public/nsIIEHistoryReader.idl
+> > +  readonly attribute PRTime lastVisit;
+> 
+> maybe lastVisitTime would be clearer
+done
+
+> the right form is @return without the s.
+> Please also add @throws to specify uncommon cases when it throws.
+> Also specify that returns null on the last entry
+
+fixed the @return and explained the null return after the last entry. With the removal of begin/end it doesn't throw anymore (it would throw if you attempted to use it before initializing)
+
+> as discussed we don't have evidence these blank elements are non-toplevel.
+> Btw, if you can find a correlation among those, this comment should rather
+> be on nsIIEHistoryEntry::title than here.
+
+Moved the comment to nsIIEHistoryEntry::title. The win API docs say that it's possible to tell if an entry is for a top-level visit or not, but that data is always served as false, so apparently that's not implemented. Going by the blank title seems to be our only alternative
+
+> 
+> @@ +47,5 @@
+> > +   * @returns nsIIEHistoryEntry Returns an object containing the URI of the
+> > +                                entry, the time it was last visited, and a
+> > +   *                            title (which is blank for non-toplevel visits).
+> > +   */
+> > +  nsIIEHistoryEntry getNextEntry();
+> 
+> As we discussed, I think having a begin() and a end() is pretty much
+> error-prone and looks like redundant work that the instance may do by
+> itself. Imo this should just be a Reader instance that lazily initializes
+> the resource on the first getNextEntry call, and destroy it either on the
+> last entry or on destruction, if the last entry was not required. if the
+> user needs to read it in multiple places he should just instance a new
+> Reader.
+
+Done!
+
+> 
+> @@ +119,5 @@
+> > +  prt.tm_params.tp_gmt_offset = 0;
+> > +  prt.tm_params.tp_dst_offset = 0;
+> > +  PRTime lastVisited = PR_ImplodeTime(&prt);
+> 
+> could ou make this convertion into an anonymous namespaced helper function?
+
+yeah, done
+
+All other small nits fixed too
+I'll try to do this review tomorrow, or at a maximum on Thursday.
+Comment on attachment 596850
+History reader helper, v2
+
+Review of attachment 596850:
+-----------------------------------------------------------------
+
+thanks. You will need an SR on this since introduces a new interface, I assume gavin may do it.
+
+::: browser/components/migration/src/nsIEHistoryReader.cpp
+@@ +9,5 @@
+> +
+> +#include "nsNetUtil.h"
+> +
+> +namespace {
+> +  PRTime FileTimeToPlacesTime(FILETIME* filetime) {
+
+FileTimeToPRTime please, this is more generic than just Places.
+please indent as
+rtype
+function(args)
+{
+
+could this just take a const FILETIME&?
+
+@@ +28,5 @@
+> +    prt.tm_params.tp_gmt_offset = 0;
+> +    prt.tm_params.tp_dst_offset = 0;
+> +    return PR_ImplodeTime(&prt);
+> +  }
+> +}
+
+please mark end of namespaces, when they grow it's useful (likely this won't grow though it's good habit)
+} // Anonymous namespace.
+
+@@ +100,5 @@
+> +  }
+> +
+> +  hr = mIEHistory->EnumUrls(&mURLEnumerator);
+> +
+> +  if (FAILED(hr)) {
+
+nit: useless newline
+
+@@ +104,5 @@
+> +  if (FAILED(hr)) {
+> +    mIEHistory->Release();
+> +    ::CoUninitialize();
+> +    mIEHistory = nsnull;
+> +    mURLEnumerator = nsnull;
+
+may you just call Uninit() here?
+
+@@ +124,5 @@
+> +  *retval = nsnull;
+> +
+> +  Init();
+> +  if (!mURLEnumerator)
+> +    return NS_OK;
+
+or you could have Init return a rv and throw here, this is an initialization failed error, we may be interested in not hiding it.
+
+@@ +129,5 @@
+> +
+> +  STATURL statURL;
+> +  ULONG fetched;
+> +
+> +  HRESULT hr = mURLEnumerator->Next(1, &statURL, &fetched);
+
+please add a comment regarding the first argument (the doc says it's just not implemented). As it is it looks like a magic number.
+If possible this should fix bookmarks import order, looks like we are importing them in alphabetical order. or file a follow-up for that.
+It would be great if the the history helper used simple enumerator and property bags, rather than introducing new interfaces.
+We can't use SimpleEnumerator cause we can't implement hasMoreElements easily, we should fetch the element and cache it for getNext, or fetch it in getNext, that adds some complication.
+well, "can't use" is not correct, using it adds complication.
+Hey Felipe, do you mind if I steal you this bug to bring it to completion?
+I have the history reader rewritten to not use custom interfaces, and could free you some time to dedicate to webapps.
+Created attachment 612017
+Part 1: IE History Reader v3.0
+
+Reimplemented using nsISimpleEnumerator and nsIPropertyBag, to avoid new interfaces.
+Created attachment 612018
+Part 2: Remove old migrator v3.0
+
+unbitrot, and it's a bit smaller than the previous one since I still don't know the order Safari and IE migrators will land (I'm working on a clean tree atm), btw we may even remove utils.cpp at a later time, doesn't matter much.
+Created attachment 612021
+Part 3: Boilerplate and bookmarks v3.0
+
+Unbitrot against the new utils and fix my comments. Let's see how far we are.
+Created attachment 612025
+Part 4: History Migrator v3.0
+
+Unbitrot and using the new reader.
+So far I've tested bookmarks and history migration, and they work.
+So, what's left to convert from the old migrator: prefs, cookies, homepage, keywords.
+Comment on attachment 612017
+Part 1: IE History Reader v3.0
+
+1. Is there any reason not to use the default writable property-bag implementation?
+2. Please switch to CComPtr where appropriate.  I would also move the calls to CoInitialize and CoUninitialize to the constructor and the destructor.
+(In reply to Mano from comment #32)
+> 2. Please switch to CComPtr where appropriate.  I would also move the calls
+> to CoInitialize and CoUninitialize to the constructor and the destructor.
+
+We don't use ATL on Firefox code.  CComPtr is ATL's.  So we should use nsRefPtr instead of CComPtr for auto AddRef/Release.
+(In reply to Mano from comment #32)
+> Comment on attachment 612017
+> Part 1: IE History Reader v3.0
+> 
+> 1. Is there any reason not to use the default writable property-bag
+> implementation?
+
+you mean nsHashPropertyBag? It's unaccessible from browsercomps.dll.
+Comment on attachment 612021
+Part 3: Boilerplate and bookmarks v3.0
+
+1. As discussed over IRC, the Links folder should be imported as a "From Internet Explorer" folder (under the toolbar) in the case of non-startup migration.
+2. Please separate out the _favoritesFolder from the exists getter.
+3. s/IEProfileMigrator/IEMigrator
+Created attachment 612154
+IE History Enumerator v3.1
+
+Updated per IRC and previous comments, hope I didn't forget any comments.
+Created attachment 612162
+Part 1: IE History Enumerator v3.1
+Landed the IE History Enumerator
+https://hg.mozilla.org/integration/mozilla-inbound/rev/13b84bf759eb
+Created attachment 612504
+Part 3: boilerplate and bookmarks
+
+This should address previous comments
+Created attachment 612505
+Part 4: history
+
+Updated to the new history enumerator
+Comment on attachment 612505
+Part 4: history
+
+
+>+let History = {
+>+  type: Ci.nsIBrowserProfileMigrator.HISTORY,
+>+
+>+  get exists() true,
+
+I think it's worth creating the enumerator here (as a lazy getter) rather than claiming that.
+
+>+
+>+  migrate: function H_migrate(aCallback) {
+>+    // First get the list of typed URLs since it's stored in the registry rather
+>+    // than the history service. Currently, IE stores 25 entries and this value
+>+    // is not configurable. We will hard-limit it to 100 entries since we don't
+>+    // want to be surprised from an unbounded changed in a future IE version.
+>+    let IETypedURLs = {};
+>+    try {
+>+      let registry = Cc["@mozilla.org/windows-registry-key;1"].
+>+                     createInstance(Ci.nsIWindowsRegKey);
+>+      registry.open(Ci.nsIWindowsRegKey.ROOT_KEY_CURRENT_USER,
+>+                    "Software\\Microsoft\\Internet Explorer\\TypedURLs",
+>+                    Ci.nsIWindowsRegKey.ACCESS_READ);
+>+      for (let entry = 1; entry <= 100; entry++) {
+>+        if (!registry.hasValue("url" + entry))
+>+          break;
+>+
+>+        let url = registry.readStringValue("url" + entry);
+>+        IETypedURLs[url] = true;
+>+      }
+>+      registry.close();
+
+close should be called in a finally block.
+
+>+    } catch (ex) {}
+>+
+>+    let places = [];
+>+    let historyEnumerator = Cc["@mozilla.org/profile/migrator/iehistoryenumerator;1"].
+>+                            getService(Ci.nsISimpleEnumerator);
+>+    while (historyEnumerator.hasMoreElements()) {
+>+      let entry = historyEnumerator.getNext().QueryInterface(Ci.nsIPropertyBag2);
+>+      let uri = entry.get("uri").QueryInterface(Ci.nsIURI);
+>+      // MSIE stores some types of URLs in its history that we don't handle,
+>+      // like HTMLHelp and others.  Since we don't properly map handling for
+>+      // all of them we just avoid importing them.
+>+      if (!uri.schemeIs("http") && !uri.schemeIs("https") &&
+>+          !uri.schemeIs("ftp") && !uri.schemeIs("file")) {
+>+        continue;
+>+      }
+>+
+>+      let title = entry.get("title");
+>+      // Embed visits have no title and don't need to be imported.
+>+      if (title.length == 0) {
+
+Please make sure this does not filter out ftp entries.
+The comment about registry.close also applies to the bookmarks resource.
+https://hg.mozilla.org/mozilla-central/rev/13b84bf759eb
+Comment on attachment 612504
+Part 3: boilerplate and bookmarks
+
+(reviewed over irc)
+Created attachment 613032
+Part 3: boilerplate and bookmarks
+
+Should address all the comments so far.
+(In reply to Mano from comment #41)
+> Comment on attachment 612505
+> Part 4: history
+> 
+> 
+> >+let History = {
+> >+  type: Ci.nsIBrowserProfileMigrator.HISTORY,
+> >+
+> >+  get exists() true,
+> 
+> I think it's worth creating the enumerator here (as a lazy getter) rather
+> than claiming that.
+
+not sure if that makes sense, the only thing that may go wrong in creating the enumerator is the CoInitialize call, but if that fails we have far worse issues in widgets and shell than just an empty history import.
+Created attachment 613036
+Part 4: history
+
+As well as this one should fix comments.
+I verified that both ftp:// and file:// have titles, luckily file: entries added by the text editor (for example) don't have a title, so we'll skip them!
+
+But please check comment 46.
+Created attachment 613037
+Part 4: history
+
+sorry, didn't qref.
+Comment on attachment 613032
+Part 3: boilerplate and bookmarks
+
+Review of attachment 613032:
+-----------------------------------------------------------------
+
+Looks good overall.
+
+::: browser/components/migration/src/IEProfileMigrator.js
+@@ +3,5 @@
+> + * This Source Code is subject to the terms of the Mozilla Public License
+> + * version 2.0 (the "License"). You can obtain a copy of the License at
+> + * http://mozilla.org/MPL/2.0/. */
+> +
+> +"use strict"
+
+nit: missing semicolon.
+
+@@ +37,5 @@
+> +  get _toolbarFolderName() {
+> +    if (!this.__toolbarFolderName) {
+> +      // Retrieve the name of IE's favorites subfolder that holds the bookmarks
+> +      // in the toolbar. This was previously stored in the registry and changed
+> +      // in IE7 to always be called "Links".
+
+Should we ignore the registry entry then? What happens if the user has IE 7 installed after s/he changed the folder name in IE 6?
+
+@@ +69,5 @@
+> +
+> +        this._migrateFolder(this._favoritesFolder, destFolderId);
+> +      }).bind(this)
+> +    }, null);
+> +    aCallback(true);
+
+aCallback should be called in runBatched.
+
+@@ +73,5 @@
+> +    aCallback(true);
+> +  },
+> +
+> +  _migrateFolder: function B__migrateFolder(aSourceFolder, aDestFolderId) {
+> +    // TODO (bug 741993): the favorites order is stored in the Registry, at
+
+nit: s/the/The
+
+@@ +82,5 @@
+> +      let entry = entries.getNext().QueryInterface(Ci.nsIFile);
+> +
+> +      // Make sure that entry.path == entry.target to not follow .lnk folder
+> +      // shortcuts which could lead to infinite cycles.
+> +      // IE does not support .lnk folders in their UI.
+
+"in their UI" is somewhat confusing.  Does it mean that one can create these manually and then IE would honor that?
+
+If they're not supported at all, just remove this phrase.
+
+@@ +83,5 @@
+> +
+> +      // Make sure that entry.path == entry.target to not follow .lnk folder
+> +      // shortcuts which could lead to infinite cycles.
+> +      // IE does not support .lnk folders in their UI.
+> +      if (entry.isDirectory() && entry.path == entry.target) {
+
+You could use !isSymlink.
+Comment on attachment 613037
+Part 4: history
+
+Review of attachment 613037:
+-----------------------------------------------------------------
+
+r=mano.
+
+I disagree with comment 46, but given that other (async) importers have to do the same (report empty history resource as importable), I'm fine with leaving it as is for now.
+
+::: browser/components/migration/src/IEProfileMigrator.js
+@@ +199,5 @@
+> +      handleError: function() {},
+> +      handleCompletion: function() {
+> +        aCallback(this._success);
+> +      }
+> +    });
+
+I'm not sure what's the behavior of updatePlaces for an empty places array (it /should/ throw, IMO).  I would, however, special case it regardless, and call aCallback right away.
+To be clear, my suggested implementation for exists() would have called hasMoreElements.
+(In reply to Mano from comment #50)
+> I'm not sure what's the behavior of updatePlaces for an empty places array
+> (it /should/ throw, IMO).  I would, however, special case it regardless, and
+> call aCallback right away.
+
+It throws.
+(In reply to Mano from comment #49)
+> > +      let entry = entries.getNext().QueryInterface(Ci.nsIFile);
+> > +
+> > +      // Make sure that entry.path == entry.target to not follow .lnk folder
+> > +      // shortcuts which could lead to infinite cycles.
+> > +      // IE does not support .lnk folders in their UI.
+> 
+> "in their UI" is somewhat confusing.  Does it mean that one can create these
+> manually and then IE would honor that?
+> 
+> If they're not supported at all, just remove this phrase.
+
+I tried to make one, it shows a fake folder but not properly (you can't see its contents, it then tries to open it in Explorer with a security dialog), so yeah, not worth talking about it.
+
+> You could use !isSymlink.
+
+Nope, doesn't work with .lnk files.
+Created attachment 613954
+Part 5: Cookies migrator
+Created attachment 613957
+Part 6: Homepage migrator.
+Created attachment 613958
+Part 7: Keywords migrator
+Created attachment 614709
+Part 3: boilerplate and bookmarks
+Created attachment 614710
+Part 4: history
+Created attachment 614711
+Part 5: Cookies migrator
+Created attachment 614712
+Part 6: Homepage migrator
+
+the type passed with the keyname may look a bit cumbersome, but I reuse this method in prefs migration and there additional optional arguments may hit readability, so I went for this.
+Created attachment 614713
+Part 7: Keywords migrator
+Created attachment 614714
+Part8: Settings migrator
+
+I removed some prefs from Felipe's patch, and added another couple ones.
+Obviously there are for sure other settings we may import, but I think this is a good start.
+Obviously this could leverage the module changes that are in the revised Firefox migrator, but that didn't land yet.  I'll update to those once available.
+Comment on attachment 614714
+Part8: Settings migrator
+
+>+    [ kMainKey,
+>+      "Enable AutoImageResize",
+>+      "browser.enable_automatic_image_resizing",
+>+      function (v) v == "yes" ],
+...
+>+    [ kMainKey,
+>+      "REG_DWORD,Expand Alt Text",
+>+      "browser.display.force_inline_alttext",
+>+      function (v) v == 1 ],
+...
+>+    [ "Software\\Microsoft\\Internet Explorer\\TabbedBrowsing\\",
+>+      "REG_DWORD,OpenAdjacent",
+>+      "browser.tabs.insertRelatedAfterCurrent",
+>+      function (v) v == 1 ],
+
+Don't import preferences which has no UI.
+
+>+    [ kMainKey,
+>+      "Display Inline Images",
+>+      "permissions.default.image",
+>+      function (v) Number(v == "yes") ],
+
+0 is not a valid value for permissions.default.image (should be 2, I think)
+
+>+    [ "Software\\Microsoft\\Internet Explorer\\International",
+>+      "AcceptLanguage",
+>+      "intl.accept_languages",
+>+      function (v) {
+>+        // Copy source format like "en-us,ar-kw;q=0.7,ar-om;q=0.3" into
+>+        // destination format like "en-us, ar-kw, ar-om".
+>+        return v.replace(/;[^,]+/g, "").replace(/,/g, ", ");
+
+The old migrator is broken too, yes, but it doesn't make sense to ignore the order for this preference.  Either fix it, or leave this preference to a follow up.
+
+>+Settings.prototype = {
+>+  type: Ci.nsIBrowserProfileMigrator.SETTINGS,
+>+
+>+  get exists() true,
+>+
+>+  get _prefs() [
+
+I don't see the point for this getter. Make it a constant within the migrate method.
+
+
+>+    // TODO: For now, only x-western font is translated.
+>+    [ "Software\\Microsoft\\Internet Explorer\\International\\Scripts\\3",
+>+      "IEFixedFontName",
+>+      "font.name.monospace.x-western" ],
+
+As you said, 1998-todo, but please file it.
+
+>+    [ kMainKey,
+>+      "Use FormSuggest",
+>+      "browser.formfill.enable",
+>+      function (v) v == "yes" ],
+
+You may want to define this transform once (same goes for the invert method). Not-so-important though.
+
+
+
+>+    [ "Software\\Microsoft\\Internet Explorer\\TabbedBrowsing\\",
+>+      "REG_DWORD,WarnOnClose",
+>+      "browser.tabs.warnOnClose",
+>+      function (v) v == 1 ],
+
+use Boolean
+Comment on attachment 614712
+Part 6: Homepage migrator
+
+>+ * Safely reads a value from the registry.
+...
+>+ * @param aKey
+>+ *        The key name.  Can be prefixed by "keyType,".
+>+ *        Supported types are: REG_SZ, REG_DWORD, REG_MULTI_SZ, if omitted
+>+ *        REG_SZ is assumed.
+
+I Don't Like This. Yet again, leaving the final decision for you :)
+
+>+ * @return The key value or undefined if it doesn't exist.  If the key is
+>+ *         a REG_MULTI_SZ, entries are separated by "|".
+>+ *
+>+ */
+>+function readRegKey(aRoot, aPath, aKey) {
+>+  let type = "REG_SZ";
+>+  let key = aKey;
+>+  if (key.indexOf(",") != -1) {
+>+    [type, key] = key.split(",");
+>+    key = key.trim();
+>+  }
+>+
+>+  let registry = Cc["@mozilla.org/windows-registry-key;1"].
+>+                 createInstance(Ci.nsIWindowsRegKey);
+>+  try {
+>+    registry.open(aRoot, aPath, Ci.nsIWindowsRegKey.ACCESS_READ);
+>+    if (registry.hasValue(key)) {
+>+      switch (type) {
+>+        case "REG_MULTI_SZ":
+>+          // nsIWindowsRegKey doesn't support REG_MULTI_SZ type out of the box.
+>+          let buffer = registry.readBinaryValue(aKey).replace("\0\0", "\0|");
+>+          return [String.fromCharCode(buffer.charCodeAt(i) |
+>+                                     (buffer.charCodeAt(i + 1) << 8))
+>+                  for (i in buffer) if (i % 2 == 0)
+>+                 ].join("");
+
+It seems this dark magic might not be necessary. I'm not sure how \0 in nsAutoString is handled when converted to a js-string.
+
+If it turns out this is necessary as-is: (1) document it a little bit; (2) file a bug on fixing win-reg-key.
+Comment on attachment 614713
+Part 7: Keywords migrator
+
+As there's no UI for these keywords in IE, I don't think we should continue importing them. I realize some advanced users (or Maxthon users) have found this, but I'm sure they can manage.
+Created attachment 615441
+Part 2: remove old migrator and unused stuff
+
+This should contain all of the removals now.
+Created attachment 615457
+Part 3: the new JS migrator
+Comment on attachment 615457
+Part 3: the new JS migrator
+
+Review of attachment 615457:
+-----------------------------------------------------------------
+
+r=mano.
+
+::: browser/components/migration/src/IEProfileMigrator.js
+@@ +120,5 @@
+> +function hostIsIPAddress(aHost) {
+> +  try {
+> +    Services.eTLD.getBaseDomainFromHost(aHost);
+> +  } catch (e if e.result == Cr.NS_ERROR_HOST_IS_IP_ADDRESS) {
+> +    return true;
+
+This is pretty ugly. Please file a bug on exposing PR_StringToNetAddr.
+
+@@ +135,5 @@
+> + *        The registry path to the key.
+> + * @param aKey
+> + *        The key name.
+> + * @return The key value or undefined if it doesn't exist.  If the key is
+> + *         a REG_MULTI_SZ, entries are separated by "|".
+
+"If the key is
+* a REG_MULTI_SZ, entries are separated by "|"." - I think it's cleaner to do the final join in the caller.  Here you should just return the array.
+
+@@ +283,5 @@
+> +    if (!__typedURLs) {
+> +      // The list of typed URLs is a sort of annotation stored in the registry.
+> +      // Currently, IE stores 25 entries and this value is not configurable.  We
+> +      // rather limit it to 100 entries, to support eventual increases in future
+> +      // IE versions.
+
+Given that the list in question is ordered, a less arbitrary criteria would be to stop at the first url that was not returned by the enumerator.
+
+I realize this does require some changes, and it's probably not so important, so I'm ok with landing this as-is.
+
+With all that said, I'm not sure what are you afraid of here - reading registry keys isn't that slow, is it?
+
+@@ +284,5 @@
+> +      // The list of typed URLs is a sort of annotation stored in the registry.
+> +      // Currently, IE stores 25 entries and this value is not configurable.  We
+> +      // rather limit it to 100 entries, to support eventual increases in future
+> +      // IE versions.
+> +      this.__typedURLs = {};
+
+Looking at the relevant bugs, it seems that on trunk it's safe to use Set.  However, if you decide not to so, go with a simple array.
+
+@@ +309,5 @@
+> +
+> +  migrate: function H_migrate(aCallback) {
+> +    let places = [];
+> +    let historyEnumerator = Cc["@mozilla.org/profile/migrator/iehistoryenumerator;1"].
+> +                            getService(Ci.nsISimpleEnumerator);
+
+Not a service.  Using this as a service would make it work only once-per-session.
+
+@@ +327,5 @@
+> +      if (title.length == 0) {
+> +        continue;
+> +      }
+> +
+> +      let transitionType = this._typedURLs[uri.spec] ?
+
+It may worth stating that those  "typed" urls are fixed up urls, and therefore that comparing them to the spec is guaranteed to work.
+
+@@ +381,5 @@
+> +    // - Windows Vista/7 for apps running with low privileges (UAC):
+> +    //     Users\<username>\AppData\Roaming\Microsoft\Windows\Cookies\Low\
+> +    //     This is the most common destination for IE, unless the user
+> +    //     explicitly executes the browser with administrative privileges or
+> +    //     disables UAC.  The latter case is what we care about.
+
+Please remove the two other cases (CookD is here for that) and focus on the UAC case.
+
+@@ +387,5 @@
+> +      let cookiesFolder = Services.dirsvc.get("CookD", Ci.nsIFile);
+> +      if (cookiesFolder.exists() && cookiesFolder.isReadable()) {
+> +        // Check if UAC is enabled.
+> +        if (Services.appinfo.QueryInterface(Ci.nsIWinAppHelper).userCanElevate) {
+> +          cookiesFolder.append("Low");
+
+Shouldn't it be done by dirsvc though? File a bug please.
+
+@@ +426,5 @@
+> +    }).apply(this);
+> +    cookiesGenerator.next();
+> +  },
+> +
+> +  _parseCookieFile: function C__parseCookieFile(aFile, aCallback) {
+
+parse -> read
+
+@@ +512,5 @@
+> +function Settings() {
+> +}
+> +
+> +Settings.prototype = {
+> +  type: Ci.nsIBrowserProfileMigrator.SETTINGS,
+
+I'm unhappy about the number of preferences not imported, but it shouldn't block landing. Please file a bug on extending this resource.
+
+@@ +539,5 @@
+> +    //  * http://msdn.microsoft.com/en-us/library/cc980059%28v=prot.13%29.aspx
+> +
+> +    // Note that only settings exposed in our UI should be migrated.
+> +
+> +    let anySet = false;
+
+Remember to remove this, as discussed over #places. _set could still return whether or not the value was set, if you wish to keep it in sync with its version in the Safari migrator. I don't mind either way.
+
+@@ +660,5 @@
+> +    let startPage = readRegKey(Ci.nsIWindowsRegKey.ROOT_KEY_CURRENT_USER,
+> +                               kMainKey, "Start Page");
+> +    // If the user didn't customize the Start Page, he is still on the default
+> +    // page, that may be considered the equivalent of our about:home.  There's
+> +    // no reason to retain it, since may be heavily targeted to IE.
+
+...since it is heavily
+
+@@ +663,5 @@
+> +    // page, that may be considered the equivalent of our about:home.  There's
+> +    // no reason to retain it, since may be heavily targeted to IE.
+> +    let homepage = startPage != defaultStartPage ? startPage : "";
+> +
+> +    // IE7 supports secondary home pages located in a REG_MULTI_SZ key.  These
+
+IE7+?
+
+@@ +664,5 @@
+> +    // no reason to retain it, since may be heavily targeted to IE.
+> +    let homepage = startPage != defaultStartPage ? startPage : "";
+> +
+> +    // IE7 supports secondary home pages located in a REG_MULTI_SZ key.  These
+> +    // are in addition to the Start Page and no empty entries are possible,
+
+nit: , after "to the Start Page".
+(In reply to Mano from comment #69)
+> ::: browser/components/migration/src/IEProfileMigrator.js
+> @@ +120,5 @@
+> > +function hostIsIPAddress(aHost) {
+
+> This is pretty ugly. Please file a bug on exposing PR_StringToNetAddr.
+
+filed Bug 746104.
+
+> > +      this.__typedURLs = {};
+> 
+> Looking at the relevant bugs, it seems that on trunk it's safe to use Set. 
+> However, if you decide not to so, go with a simple array.
+
+we need a better confirmation of when we can use Set definitely, and array is too slow here, so not touching this.
+
+> I'm unhappy about the number of preferences not imported, but it shouldn't
+> block landing. Please file a bug on extending this resource.
+
+Didn't want to go over the scope of this bug.  Bug 719321 will be fine for that.
+Created attachment 615685
+Part 3: the new JS migrator
+
+Addressed comments, some additional IRC comments, new .resourceTypes constants from MigrationUtils, and a typo breaking history migration.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/2e3090639b46
+https://hg.mozilla.org/integration/mozilla-inbound/rev/193999908be8
+Created attachment 615958
+Part 4: fix the test
+
+Looks like I broke the only test we have, but actually it's the test that is broken.
+So I have disabled it with https://hg.mozilla.org/integration/mozilla-inbound/rev/e4aaf4456c6f
+and this is the patch to re-enable it. I'm not yet 100% happy with the bookmarks check, suggestions are welcome, but it's better than before.
+ah, the test is failing cause we use Services.appinfo, and there isn't a nsIXULAppInfo in xpcshell (thus the mock I added).
+While there I updated the test to MigrationUtils and removed the dependency on default bookmarks migration.
+Parts 2-3 + followup to disable test:
+https://hg.mozilla.org/mozilla-central/rev/2e3090639b46
+https://hg.mozilla.org/mozilla-central/rev/193999908be8
+https://hg.mozilla.org/mozilla-central/rev/e4aaf4456c6f
+
+(Leaving open for part 4 patch)
+https://hg.mozilla.org/integration/mozilla-inbound/rev/81c31a6906b6
+https://hg.mozilla.org/mozilla-central/rev/81c31a6906b6
+*** Bug 796855 has been marked as a duplicate of this bug. ***

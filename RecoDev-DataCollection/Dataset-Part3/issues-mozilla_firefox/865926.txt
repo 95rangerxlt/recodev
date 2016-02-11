@@ -1,0 +1,738 @@
+As more and more people start customizing their browsers and using add-ons, we anticipate a large number of add-ons accumulating in the nav-bar.
+
+We'd like to gracefully overflow those add-ons, as per shorlanders mock-up here:
+
+http://people.mozilla.com/~shorlander/files/addons-in-toolbar-i01/addons-in-toolbar.html (specifically, the last screenshot).
+
+As more and more people start customizing their browsers and using add-ons, we anticipate a large number of add-ons accumulating in the nav-bar.
+
+We'd like to gracefully overflow those add-ons, as per shorlanders mock-up here:
+
+http://people.mozilla.com/~shorlander/files/addons-in-toolbar-i01/addons-in-toolbar.html (specifically, the last screenshot).
+Hey Blair,
+
+We were chatting about this in IRC, but I had to head out.
+
+So, the plan to stack up the overflowed items beneath the chevron is brittle and probably not the best way forward.
+
+You mentioned the idea of somehow setting an attribute on all widgets to allow them to find the right anchor in the event that they're opening a panel. Can you go into more detail here, because I didn't follow 100%. Is CustomizableUI setting an attribute on the widget with a reference to the most appropriate anchor?
+
+-Mike
+My general idea there was to provide APIs for widgets/add-ons, so its easier to do the right thing - which is probably better suited for a separate (related) bug. 
+
+Was thinking that CustomizableUI could set some attributes on widgets when they're placed in an area or when they're moved into the overflow panel. Something like:
+* customizableui-areatype - can be toolbar, panel, overflow
+* customizableui-anchorid - ID of the anchor, or empty
+
+And CustomizableUI could have some APIs to help out, something like:
+* CustomizableUI.openWidgetPanel(aWidgetNode)
+* CustomizableUI.isWidgetInOverflow(aWidgetId)
+
+(I find its generally useful to set both declarative metadata, and provide methods to get the same info - it better covers use cases we haven't thought of, which is often an issue add-on authors hit.)
+
+I think being too smart with the overflow stuff is going to land us in hot water - there's just far too many edge cases. I'd rather we had a solid solution that worked good enough, even if the UX of some add-ons isn't ideal - and just help add-ons adapt to the new world order (by providing easy to use APIs and some tech evangelism).
+I've started investigating this.
+Created attachment 742506
+WIP Patch 1 (Windows only)
+Comment on attachment 742506
+WIP Patch 1 (Windows only)
+
+Ok, so this is my first rough shot at this. I went quick and dirty to get this going just to see if it'd work, so please forgive my sloppy coding. :)
+
+What I've done is made it possible to add a "overflowable" property to toolbars. I've added an overflow chevron button to the nav-bar, which it refers to by ID via the overflowbutton attribute.
+
+When registering the nav-bar, it instantiates an OverflowableToolbar instance, and attaches it to the node as toolbar.overflowable. The OverflowableToolbar takes care of attaching event listeners to the overflow and window.resize events.
+
+When we overflow elements, instead of moving the nodes, I'm just collapsing them. I'm also using a DeferredTask on resize so that we don't attempt to re-add elements for every resize event fired.
+
+I've got a sloppy little panel opening when clicking on the chevron, and it just shows the IDs of the overflowed elements. Not sure what we want to do there - either throw the actual buttons into that popup, or create proxy items to go into that panel. I think I prefer the second option since it doesn't involve us having to re-inject nodes in the right order when the panel closes.
+
+I've also added a nooverflow attribute for nav-bar elements so that they get skipped when determining which elements to overflow.
+
+Thoughts? Am I barking up the wrong tree here?
+
+If you wanted to try this patch out, apply the patches in bug 863753 and bug 864425 first in that order.
+Comment on attachment 742506
+WIP Patch 1 (Windows only)
+
+Review of attachment 742506:
+-----------------------------------------------------------------
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +1780,5 @@
+> +
+> +  _onOverflow: function(aEvent) {
+> +    let child = this._target.lastChild;
+> +
+> +    while(child && this._target.clientWidth < this._target.scrollWidth) {
+
+This loop will cause lots of synchronous layout flushes. It will be tricky, but it would be worthwhile to spend a little amount of time seeing if we could reduce the frequency that we modify the DOM and then immediately flush the layout.
+
+One way we could possibly do it would be to calculate the difference between scrollWidth and clientWidth, and then in one batch we could remove as many overflowable elements that will be greater than or equal to that difference.
+
+@@ +1796,5 @@
+> +
+> +  _onResize: function(aEvent) {
+> +    if (!this._lazyResizeHandler) {
+> +      this._lazyResizeHandler = new DeferredTask(this._onLazyResize.bind(this),
+> +                                                 LAZY_RESIZE_INTERVAL_MS);
+
+This is really cool.
+
+::: browser/themes/windows/browser.css
+@@ +102,5 @@
+>    background-image: linear-gradient(@toolbarHighlight@, rgba(255,255,255,0));
+>  }
+>  
+> +#nav-bar-overflow-button {
+> +  list-style-image: url("chrome://global/skin/toolbar/chevron.gif") !important;
+
+Why is "!important" needed here? My suspicion lies with the specificity of the selector that sets the list-style-image for all toolbarbuttons. Is there a way we can fix this by either increasing the specificity of this selector or decreasing that of the other selector?
+Created attachment 745280
+WIP v2 (Windows only)
+
+This version implements more of the overflow panel, and allows clicking on the items in the panel to execute the buttons command. It doesn't work with the search box yet, for that we'll open the search page (similar to pressing Ctrl+K if the search box has been customized out).
+
+Here is a screenshot of the current WIP.
+Created attachment 745282
+WIP v2.1 (Windows only)
+Created attachment 745953
+Patch v1
+
+Sending the review to Blair since Mike wrote a good portion of the patch, but I'd still like feedback from Mike on this.
+
+Things that this patch doesn't handle yet that I'd like to push to a follow-up bug:
+- Clicking on the search box when it is overflowed
+- The new combined Bookmarks button, when overflowed is wider than the fixed size area for the background image, so it is drawn underneath the text for the button
+Comment on attachment 745953
+Patch v1
+
+Review of attachment 745953:
+-----------------------------------------------------------------
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +1740,5 @@
+> +function OverflowableToolbar(aToolbarNode) {
+> +  this._toolbar = aToolbarNode;
+> +  this._target = aToolbarNode.customizationTarget;
+> +  let chevronId = this._toolbar.getAttribute("overflowbutton");
+> +  this._chevron = this._toolbar.ownerDocument.getElementById(chevronId);
+
+These next few lines could probably be simplified by aliasing this._toolbar.ownerDocument.
+
+@@ +1749,5 @@
+> +
+> +OverflowableToolbar.prototype = {
+> +
+> +  init: function() {
+> +    this._toolbar.customizationTarget.addEventListener("overflow", this);
+
+Is it possible for the toolbar to have already overflowed before this event listener gets set? We should probably look for that on init, and handle that case.
+
+@@ +1786,5 @@
+> +    }
+> +  },
+> +
+> +  _onClickChevron: function(aEvent) {
+> +    this._chevron.setAttribute("open", "true");
+
+Clicking the chevron when the panel is open should probably close it.
+
+Also, I think this._chevron.open = true should work here.
+
+@@ +1815,5 @@
+> +  _onPanelHiding: function(aEvent) {
+> +    while (this._list.hasChildNodes()) {
+> +      this._list.removeChild(this._list.firstChild);
+> +    }
+> +    this._chevron.removeAttribute("open");
+
+Can also use this._chevron.open = false.
+
+::: browser/themes/linux/browser.css
+@@ +61,5 @@
+> +#nav-bar-overflow-button {
+> +  -moz-image-region: rect(-5px, 12px, 11px, -4px);
+> +}
+> +
+> +.overflowedItem {
+
+This seems pretty universal and constant, and is less about form and more about function. I think this should go in browser/base/content/browser.css.
+Created attachment 746444
+Patch v1.1
+
+Thanks for the feedback Mike!
+Comment on attachment 746444
+Patch v1.1
+
+Review of attachment 746444:
+-----------------------------------------------------------------
+
+Somehow I get the feeling that this will be the can of worms that will keep on giving... 
+
+* Clicking an overflowed widget needs to close the overflow panel (ensureButtonClosesPanel/maybeAutoHidePanel)
+* In customization mode, overflowed widgets don't get wrapped in a toolbarpaletteitem
+* The overflow panel itself needs to somehow be linked to the main customization area of the toolbar, so you can drop widgets there and they'll be added to the right position in the area
+* When in customization mode, dragging to the overflow button should automatically open the overflow panel
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +1872,5 @@
+> +
+> +      if (!child.hasAttribute("nooverflow") &&
+> +          !child.classList.contains("overflowedItem")) {
+> +        let wrapper = child.ownerDocument.createElementNS(kNSXUL, "box");
+> +        wrapper = child.parentElement.insertBefore(wrapper, child);
+
+Using a wrapper for this really worries me (mconley and I discussed this on IRC awhile back) - it feels too fragile, too limiting, and seems like it will break many add-ons. 
+
+Is there any technical reason why we *can't* move the actual node to the overflow panel?
+(In reply to Blair McBride [:Unfocused] (Limited availability.) from comment #12)
+> * The overflow panel itself needs to somehow be linked to the main
+> customization area of the toolbar, so you can drop widgets there and they'll
+> be added to the right position in the area
+> * When in customization mode, dragging to the overflow button should
+> automatically open the overflow panel
+
+The overflow area isn't meant as a permanent area so if the user placed something in the overflow area intentionally, I think they would expect it to stay there. We *could* change the meaning of it though.
+
+> Using a wrapper for this really worries me (mconley and I discussed this on
+> IRC awhile back) - it feels too fragile, too limiting, and seems like it
+> will break many add-ons. 
+
+Can you give some examples of how this could break an add-on? I can understand how textboxes and split-buttons can get broken. The simple solution would be to not overflow those items.
+
+> Is there any technical reason why we *can't* move the actual node to the
+> overflow panel?
+
+The hardest part that Mike and I discussed would be if you have two windows open, one being in overflow mode and the other not being in overflow mode. If we move the actual toolbar items, how should the other windows react? I don't know if we have a good way to do this without it affecting the persisted order of toolbaritems.
+(In reply to Blair McBride [:Unfocused] (Limited availability.) from comment #12)
+> Comment on attachment 746444
+> Patch v1.1
+> 
+> Review of attachment 746444:
+> -----------------------------------------------------------------
+> 
+> Somehow I get the feeling that this will be the can of worms that will keep
+> on giving... 
+> 
+> * Clicking an overflowed widget needs to close the overflow panel
+> (ensureButtonClosesPanel/maybeAutoHidePanel)
+
+
+One idea for this is to add a command event listener to the panels, which check the event target for a "noautoclose" attribute. If they don't find one, they close themselves.
+
+> * In customization mode, overflowed widgets don't get wrapped in a
+> toolbarpaletteitem
+
+In customization mode, I believe the idea is that the overflow panel is gone. All of the items that were overflowed are made visible in the nav-bar again.
+
+It's a tricky problem, and we brought it up with UX. They've suggested we do the above, and then set overflow: hidden on the nav-bar until they can come up with something better.
+
+> 
+> Using a wrapper for this really worries me (mconley and I discussed this on
+> IRC awhile back) - it feels too fragile, too limiting, and seems like it
+> will break many add-ons. 
+> 
+
+I can't seem to find the chat log for that discussion, so I can't recall the points you brought up. I remember them to be quite compelling, but I think I'd like to hear them again because I've forgotten them. :/
+
+Can you describe the ways that add-ons could be broken by this?
+
+> Is there any technical reason why we *can't* move the actual node to the
+> overflow panel?
+
+Like Jared says, we think it might open a different can of worms because we'll be lying to CustomizableUI, since for some windows, some items are in the overflow panel, and in other windows they might not be. So now the whole notion of position is out of sync between the two windows.
+
+So, in summary:
+
+1) I don't believe the overflow panel is supposed to be a customization target. I think it's a feature of the nav-bar to handle too many widgets.
+2) I don't believe the overflow panel / chevron should be available while in customization mode.
+3) If #1 and #2 have serious problems with them, we should get those ironed out ASAP
+4) Can you remind me why proxying those buttons is a bad idea?
+(In reply to Jared Wein [:jaws] from comment #13)
+> The overflow area isn't meant as a permanent area so if the user placed
+> something in the overflow area intentionally, I think they would expect it
+> to stay there. We *could* change the meaning of it though.
+
+No, its extension of the toolbar. If something overflows there, I should be able to (at the very least) drag it from that panel to remove it. I think we should be making the overflow as seamless as possible - which means that if something is already overflowed into that panel, I should be able to add something after it.
+
+> Can you give some examples of how this could break an add-on? I can
+> understand how textboxes and split-buttons can get broken. The simple
+> solution would be to not overflow those items.
+
+Pretty much anything that isn't a simple button - eg, text fields, multiple buttons in one widgets, I think this will break even buttons with status indicators.
+
+It also means add-ons (or our own widgets) can't properly adapt to being in overflow. Ideally, each widget would adapt to where it is (toolbar, panel, overflow), and present the best UX for that position - we'd be restricting that with proxies.
+
+
+> The hardest part that Mike and I discussed would be if you have two windows
+> open, one being in overflow mode and the other not being in overflow mode.
+> If we move the actual toolbar items, how should the other windows react?
+
+I just assumed each windows would be independent in what's overflowed, based on the window size. I don't think it makes any sense to seem overflow in sync between windows. The only thing that won't work right now is currentSet property in toolbar.xml - but that can just use CustomizableUI APIs (which, arguably, it should do anyway) instead of looking at the actual nodes .
+
+
+> I
+> don't know if we have a good way to do this without it affecting the
+> persisted order of toolbaritems.
+
+Not the way the current patch works, no. CustomizableUI itself needs to understand the concept of overflowing. And it already handles windows independently, so I don't think it would be a big issue.
+(In reply to Mike Conley (:mconley) from comment #14)
+> > * Clicking an overflowed widget needs to close the overflow panel
+> > (ensureButtonClosesPanel/maybeAutoHidePanel)
+> 
+> 
+> One idea for this is to add a command event listener to the panels, which
+> check the event target for a "noautoclose" attribute. If they don't find
+> one, they close themselves.
+
+Yea, that's what ensureButtonClosesPanel/maybeAutoHidePanel does for the app panel :)
+
+
+> In customization mode, I believe the idea is that the overflow panel is
+> gone. All of the items that were overflowed are made visible in the nav-bar
+> again.
+
+How? Gotta make room somehow. Shrinking other items (eg, URL bar) is only going to work in some situations.
+
+
+> > Using a wrapper for this really worries me (mconley and I discussed this on
+> > IRC awhile back) - it feels too fragile, too limiting, and seems like it
+> > will break many add-ons. 
+> > 
+> 
+> I can't seem to find the chat log for that discussion
+
+Finally found it, I'll paste it in the next comment (we really need logbot in #ux).
+
+
+> Like Jared says, we think it might open a different can of worms because
+> we'll be lying to CustomizableUI, since for some windows, some items are in
+> the overflow panel, and in other windows they might not be. So now the whole
+> notion of position is out of sync between the two windows.
+
+I don't think we should be lying to CustomizableUI - the concept of overflow needs to be built into it. And as I mentioned above, it already handles windows independently.
+Irrelephant and superfluous parts of the log trimmed away (from 26th April in #ux, times are NZ time):
+
+
+
+11:51 AM <mconley> while overflowing, what we're doing is stashing those overflowed buttons in a stack underneath the chevron with visibility: collapse;
+11:51 AM <mconley> Unfocused: when we open the overflow panel, we either move the widgets in there, or we create proxy widgets to look like them...
+11:52 AM <mconley> and then when a command / click event happens on one of those, we close the overflow panel, and dispatch the event to the button hidden under the chevron
+11:52 AM <mconley> which opens the panel, making it look like its anchored to the chevron
+11:53 AM <Unfocused> i think proxy widgets would work for normal button dropdowns, but would break more complex widgets supplied by add-ons
+11:53 AM <mconley> the end behaviour that I think we want is that widgets that open panels should anchor to the chevron if triggered in the overflow panel
+11:53 AM — Unfocused nods
+11:53 AM <Unfocused> that seems reasonable
+11:53 AM <mconley> I was having trouble finding ways of doing it without forcing every add-on ever to update themselves
+11:54 AM <Unfocused> yea :\
+11:54 AM <mconley> Unfocused: can you explain a complex widget that could get broken with my hacky solution?
+11:54 AM <mconley> explain = give an example, I guess
+11:54 AM <Unfocused> ie, a search input box
+11:55 AM <mconley> right
+11:55 AM <mconley> so
+11:55 AM <Unfocused> or a widget with multiple buttons within one item
+11:55 AM <mconley> jaws wanted us to just open the search page for the provider in the case of clicking on the search input in the overflow panel
+11:55 AM <mconley> yeah
+11:55 AM <mconley> yeah this breaks down pretty fast
+11:56 AM <Unfocused> (i think in general we want to try to encourage addon authors to make their widgets adapt to where they are - toolbar, overflow, panel)
+11:56 AM <Unfocused> that works for our own search widget.. not for anything coming from an addon
+11:56 AM <mconley> well
+11:57 AM <mconley> if we're OK telling all add-ons they've got to do X to work in overflow, otherwise they're busted, then let's do that
+11:57 AM <mconley> I never was 100% comfortable with my hacky solution
+11:57 AM <mconley> but then what is X?
+11:58 AM <Unfocused> well, i think we can get most add-ons working ok - most just provide a button, and that will work fine
+11:58 AM <mconley> maybe we need a way for buttons to query for the most appropriate panel anchor
+11:58 AM <Unfocused> yep
+12:00 PM <mconley> maybe extend the toolbarbutton and toolbaritem bindings with such a function
+12:00 PM <mconley> just goes up the tree, either hitting the root, the overflow panel, or the menu panel
+12:00 PM <Unfocused> that assumes addons would use those bindings (would need to be new ones - can't put that in toolkit)
+12:01 PM <mconley> we could force the bindings on any toolbaritem / toolbarbutton within the browser. It's pretty ham-fisted
+12:01 PM <Unfocused> that would break many things :)
+12:02 PM <Unfocused> just setting an attribute on all widgets might work
+12:02 PM <Unfocused> and providing an API on CustomizableUI
+Created attachment 750057
+Patch v1.2
+
+This patch moves the elements to the customization panel and no longer uses proxies. The one bug that I know about is that clicking in the search field will dismiss the panel, but typing in it won't (you can Tab to it).
+Comment on attachment 750057
+Patch v1.2
+
+Review of attachment 750057:
+-----------------------------------------------------------------
+
+This looks really cool. :) Glad we've got something working here.
+
+A few notes from testing:
+
+1) I noticed that after I entered customization mode and dragged a bunch of items into the toolbar, when I exited customization mode, it looks like the items in the overflow panel weren't unwrapped for some reason...
+2) If I have overflow, and I open a new window, the new window (which is similarly sized) is *not* overflowing. Instead, the items just get clipped.
+
+Other general notes below.
+
+::: browser/components/customizableui/content/panelUI.inc.xul
+@@ +4,5 @@
+>  
+>  <panel id="PanelUI-popup"
+>         role="group"
+>         type="arrow"
+> +       level="top" noautohide="true"
+
+Should remove the noautohide before this lands.
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +1795,5 @@
+> +    this._chevron.addEventListener("command", this);
+> +    this._panel.addEventListener("popuphiding", this);
+> +
+> +    // The toolbar could initialize in an overflowed state, in which case
+> +    // the 'overflow' event may have been fired before the handler was register.
+
+type: register -> registered
+
+@@ +1799,5 @@
+> +    // the 'overflow' event may have been fired before the handler was register.
+> +    this._onOverflow();
+> +  },
+> +
+> +  uninit: function() {
+
+This never gets called.
+
+::: browser/locales/en-US/chrome/browser/browser.dtd
+@@ +15,5 @@
+>                                                                  inside the private browsing mode -->
+>  <!ENTITY mainWindow.titlePrivateBrowsingSuffix "(Private Browsing)">
+>  
+>  <!ENTITY appmenu.title                       "Customize and Control &brandFullName;">
+> +<!ENTITY navbarOverflow.label                "Moar buttonz…">
+
+Hm. :)
+
+How about "More tools..." or "More items..." ? Or file a follow-up bug to fix this after we get better copy, because while I enjoy the webby whimsy, we probably don't want to ship this. :)
+
+::: browser/themes/linux/browser.css
+@@ +61,5 @@
+> +#nav-bar-overflow-button {
+> +  -moz-image-region: rect(-5px, 12px, 11px, -4px);
+> +}
+> +
+> +#widget-overflow-list > toolbarbutton.overflowedItemClone {
+
+overflowedItemClone doesn't appear to be used anymore. Can these be removed? Or should it be overflowedItem?
+
+@@ +69,5 @@
+> +  background-repeat: no-repeat;
+> +  background-position: 0 center;
+> +}
+> +
+> +#widget-overflow-list > toolbarbutton.overflowedItemClone > .toolbarbutton-text {
+
+overflowedItemClone doesn't appear to be used anymore. Can these be removed? Or should it be overflowedItem?
+
+@@ +916,5 @@
+>  
+>  #urlbar-container {
+>    -moz-box-orient: horizontal;
+>    -moz-box-align: stretch;
+> +  min-width: 50ch;
+
+Already set in browser/base/content/browser.css
+
+@@ +920,5 @@
+> +  min-width: 50ch;
+> +}
+> +
+> +#search-container {
+> +  min-width: 25ch;
+
+Already set in browser/base/content/browser.css
+
+::: browser/themes/osx/browser.css
+@@ +111,5 @@
+> +#nav-bar-overflow-button {
+> +  -moz-image-region: rect(-5px, 12px, 11px, -4px);
+> +}
+> +
+> +#widget-overflow-list > toolbarbutton.overflowedItemClone {
+
+overflowedItemClone doesn't appear to be used anymore. Can these be removed? Or should it be overflowedItem?
+
+@@ +119,5 @@
+> +  background-repeat: no-repeat;
+> +  background-position: 0 center;
+> +}
+> +
+> +#widget-overflow-list > toolbarbutton.overflowedItemClone > .toolbarbutton-text {
+
+overflowedItemClone doesn't appear to be used anymore. Can these be removed? Or should it be overflowedItem?
+
+::: browser/themes/shared/customizableui/customizeMode.inc.css
+@@ +68,5 @@
+>    opacity: 0.8;
+>    transform: scale(1.1);
+>  }
+>  
+> +#main-window[customizing] [overflowable] > .overflow-button {
+
+Hm. Toolkit used to set a customizing attribute on all toolbars when in customization mode. We don't seem to do that anymore, and that means either huge chains of child selectors to determine if we're in customization mode, or more general descendent selectors.
+
+We might want to go back to putting a customizing attribute on customizable toolbars so that we can do:
+
+toolbar[customizing][overflowable] > .overflow-button {
+}
+
+I wouldn't make that block this, but I think it's something we should consider doing in a follow-up.
+
+::: browser/themes/windows/browser.css
+@@ +939,5 @@
+>  
+>  #urlbar-container {
+>    -moz-box-orient: horizontal;
+>    -moz-box-align: stretch;
+> +  min-width: 50ch;
+
+Set already in base/content/browser.css.
+
+@@ +959,5 @@
+>  .urlbar-icon {
+>    padding: 0 3px;
+>  }
+>  
+> +#search-container {
+
+Set already in base/content/browser.css.
+Comment on attachment 750057
+Patch v1.2
+
+Review of attachment 750057:
+-----------------------------------------------------------------
+
+Well, this solves one major issue I brought up earlier (use of proxies), but not the other (customization). Just not overflowing when in customization mode isn't a solution IMO - it'll only going to work for a handful of cases. Overflowing at all is really a power feature - so we should expect to need to support a dozen items overflowing, such that they'll never fit on the toolbar regardless of how much we shrink the urlbar. So at the very least, we need to support overflow in customization mode, and be able to remove items from the overflow dropdown. And we should try hard to support adding/moving items in the overflow dropdown.
+(In reply to Blair McBride [:Unfocused] (Limited availability.) from comment #20)
+> Comment on attachment 750057
+> Patch v1.2
+> 
+> Review of attachment 750057:
+> -----------------------------------------------------------------
+> 
+> Just not overflowing when in customization
+> mode isn't a solution IMO - it'll only going to work for a handful of cases.
+> Overflowing at all is really a power feature - so we should expect to need
+> to support a dozen items overflowing, such that they'll never fit on the
+> toolbar regardless of how much we shrink the urlbar. So at the very least,
+> we need to support overflow in customization mode, and be able to remove
+> items from the overflow dropdown. And we should try hard to support
+> adding/moving items in the overflow dropdown.
+
+During our Australis meeting two weeks ago this came up. It was decided then to first pursue letting overflowed items in customization mode be clipped, and that we shouldn't spend significant time engineering this as it is an edge feature that users can work around.
+
+We don't want to provide users with a *great* overflow experience, which would steer more users towards having items overflow. Overflowed items are bad for usability as well as performance of the browser.
+
+We should land a solution that doesn't show an overflow panel while in customization mode and reevaluate its necessity after living without it for a while.
+From IRC today:
+
+1:08 PM <mconley> shorlander: are the assumptions correct in https://bugzilla.mozilla.org/show_bug.cgi?id=865926#c21? We're still sorting out overflow behaviour, and I want to make sure we're all on the same page.
+...
+1:10 PM <shorlander> mconley: yeah, jaws summary is right
+Created attachment 751837
+Patch v1.3
+Comment on attachment 751837
+Patch v1.3
+
+Review of attachment 751837:
+-----------------------------------------------------------------
+
+* Debitrot
+
+::: browser/base/content/browser.css
+@@ +112,5 @@
+> +  overflow: hidden;
+> +}
+> +
+> +toolbar[customizing][overflowable] > .overflow-button,
+> +#nav-bar:not([overflowing]) > #nav-bar-overflow-button {
+
+Why not make this rule more general, and say:
+
+toolbar[overflowable]:not([overflowing]) > .overflow-button
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +225,5 @@
+>        this.restoreStateForArea(area, legacyState);
+>      }
+>  
+> +    if (areaProperties.has("overflowable")) {
+> +      aToolbar.overflowable = new OverflowableToolbar(aToolbar);
+
+Maybe make the steps in init(); just happen in the constructor?
+
+@@ +1578,5 @@
+> +}
+> +
+> +OverflowableToolbar.prototype = {
+> +
+> +  // XXXjaws Do we need an uninit method?
+
+Yeah, probably a good idea. In unregisterBuildWindow perhaps.
+
+@@ +1582,5 @@
+> +  // XXXjaws Do we need an uninit method?
+> +  init: function() {
+> +    this._toolbar.setAttribute("overflowable", "true");
+> +    this._toolbar.customizationTarget.addEventListener("overflow", this);
+> +    this._toolbar.ownerDocument.defaultView.addEventListener("resize", this);
+
+this._toolbar.ownerDocument can be aliased to simplify some of these lines a bit.
+
+@@ +1624,5 @@
+> +  _onClickChevron: function(aEvent) {
+> +    if (this._chevron.open)
+> +      this._panel.hidePopup();
+> +    else
+> +      this._panel.openPopup(this._chevron, "bottomcenter topright");
+
+Maybe anchor to the toolbarbutton-icon if it can find it.
+
+@@ +1645,5 @@
+> +      if (!child.hasAttribute("nooverflow")) {
+> +        this._collapsed.push({child: child, minSize: this._target.clientWidth});
+> +        child.classList.add("overflowedItem");
+> +
+> +        if (!child.hasAttribute("noautoclose")) {
+
+Maybe instead of conditionally adding the event listeners, we *always* add the event listeners, but then check for the noautoclose attribute on the event originalTarget in maybeAutoHidePanel?
+
+@@ +1658,5 @@
+> +    };
+> +  },
+> +
+> +  _maybeAutoHidePanel: function(aEvent) {
+> +    LOG(aEvent.type);
+
+Something more descriptive should probably go here if we want to keep this LOG.
+
+@@ +1699,5 @@
+> +        child.removeEventListener("keypress", this);
+> +      }
+> +    }
+> +
+> +    if (!this._collapsed.size) {
+
+Now that _collapsed is an Array, size isn't defined. Should be length.
+
+@@ +1707,5 @@
+> +
+> +  _disable: function() {
+> +    this._enabled = false;
+> +
+> +    for (let i = this._collapsed.length - 1; i >= 0; i--) {
+
+This looks mostly the same as the contents of _onLazyResize. Is it possible to de-dupe these somehow?
+
+::: browser/locales/en-US/chrome/browser/browser.dtd
+@@ +15,5 @@
+>                                                                  inside the private browsing mode -->
+>  <!ENTITY mainWindow.titlePrivateBrowsingSuffix "(Private Browsing)">
+>  
+>  <!ENTITY appmenu.title                       "Customize and Control &brandFullName;">
+> +<!ENTITY navbarOverflow.label                "Moar buttonz…">
+
+Let's replace this with "More tools...", and file a bug for some better copy.
+
+::: browser/themes/linux/browser.css
+@@ +71,5 @@
+> +#nav-bar-overflow-button {
+> +  -moz-image-region: rect(-5px, 12px, 11px, -4px);
+> +}
+> +
+> +#widget-overflow-list > .overflowedItem {
+
+Some of this can probably be in the shared theme, no?
+Sorry, that "* Debitrot" was a note to self to write up something about how this patch has bitrotted.
+
+So, this patch has bitrotted, and needs to be updated.
+Created attachment 752322
+Patch v1.4
+
+Rebased and fixed the issues that you found.
+Comment on attachment 752322
+Patch v1.4
+
+Review of attachment 752322:
+-----------------------------------------------------------------
+
+I'm OK with this - just last two tiny things to fix, then r=me.
+
+::: browser/components/customizableui/src/CustomizableUI.jsm
+@@ +1669,5 @@
+> +  this._toolbar.setAttribute("overflowable", "true");
+> +  this._toolbar.customizationTarget.addEventListener("overflow", this);
+> +  let window = doc.defaultView;
+> +  window.addEventListener("resize", this);
+> +  window.addEventListener("customizationstarting", this);
+
+Since bug 868612, the gNavToolbox is the event target for these events. You should attach event listeners there instead.
+
+@@ +1670,5 @@
+> +  this._toolbar.customizationTarget.addEventListener("overflow", this);
+> +  let window = doc.defaultView;
+> +  window.addEventListener("resize", this);
+> +  window.addEventListener("customizationstarting", this);
+> +  window.addEventListener("aftercustomization", this);
+
+Same as above for this too.
+
+@@ +1815,5 @@
+> +  },
+> +
+> +  _disable: function() {
+> +    this._enabled = false;
+> +
+
+No need for the newline here.
+https://hg.mozilla.org/projects/ux/rev/e8aa19ecf54d
+Backed out as it was suspected of causing leaks.
+
+https://hg.mozilla.org/projects/ux/rev/f919b08b50d5
+
+14:27:55 WARNING - TEST-UNEXPECTED-FAIL | leakcheck | 2712459 bytes leaked (AsyncStatement, AtomImpl, BackstagePass, CalculateFrecencyFunction, CallbackObject, ...)
+I'd hazard a guess that DeferredTask is leaking - should be ensuring its cancelled in _disable().
+Added the .cancel() call to _disable() and pushed to try:
+https://tbpl.mozilla.org/?tree=Try&rev=b4d726d80f30
+Adjusted the unregisterBuildWindow function with help from mconley and repushed to try: https://tbpl.mozilla.org/?tree=Try&rev=86f63fda6314
+The previous try push wasn't successful, trying this one out for a run since I noticed that I didn't actually cancel the deferred task in the previous pushes, and the panel should have hidden="true".
+
+https://tbpl.mozilla.org/?tree=Try&rev=eef916fdf118
+Created attachment 752646
+Patch v1.5
+
+Based on the try push this should fix the leaks. The changes here are setting overflowable to null and calling this._lazyResizeHandler.cancel().
+
+If this looks good to you can you land it for me?
+There were some more failures - the a.initialize error and some social test failures.
+
+For the a.initialize error, I'm now checking if a.initialize exists before calling it (I'll get someone who's knowledgeable about search.xml to review this change before landing). What was happening is that since the item can overflow, during testing, it was possible for the item's destructor to be called very soon after the constructor. The setTimeout would then fire *after* the destructor was called, and we wouldn't find a.initialize because at that point, the binding had been removed.
+
+For the social failures, it looks like this is because the social buttons are overflowed out and the tests weren't ready for that. According to shorlander, social buttons shouldn't be overflowable, so I just set nooverflow on them, and the tests passed again.
+
+https://tbpl.mozilla.org/?tree=Try&rev=17f2d3532284
+Try build looks good! \o/
+
+Gonna get someone who knows the search component to give my code a once over, and then I'll land this.
+Created attachment 752874
+Patch v1.6
+
+r=me for the overflowing code, but I'm going to r? someone who knows the search component.
+Created attachment 752906
+Patch v1.7
+
+Removed the change to browser/components/search/content/search.xml. This change is happening in bug 875042 on mozilla-central instead.
+
+Once that lands on m-c, I'll merge m-c into UX and then land this.
+Landed on UX:
+
+https://hg.mozilla.org/projects/ux/rev/0adccd52443e
+https://hg.mozilla.org/mozilla-central/rev/0adccd52443e
+I seem to be missing something, is there any way to trigger the overflow button on Nightly, no matter how much toolbar items or addon icons I add it doesn't show up and everything just looks cluttered. 
+I can't see it in the customization menu no matter if it's a fresh or dirty profile.

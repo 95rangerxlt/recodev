@@ -1,0 +1,190 @@
+For various telemetry probes that we want to add at the front end, we have to store timestamp data in order to calculate duration of events that we want to measure (e.g. "how long did it take to do X..")
+
+To do that, we will end up sticking these values in private variables all over the place. Also, in many situations, the beginning and ending of these measurements are at disjoint places, for example the start could be inside a function call and the end inside an event listener fired at a different element. So it becomes tricky and cumbersome to retrieve the start data again.
+
+I suggest that we create a lightweight .jsm that can be easily reached and that will store everything in a single location
+
+For various telemetry probes that we want to add at the front end, we have to store timestamp data in order to calculate duration of events that we want to measure (e.g. "how long did it take to do X..")
+
+To do that, we will end up sticking these values in private variables all over the place. Also, in many situations, the beginning and ending of these measurements are at disjoint places, for example the start could be inside a function call and the end inside an event listener fired at a different element. So it becomes tricky and cumbersome to retrieve the start data again.
+
+I suggest that we create a lightweight .jsm that can be easily reached and that will store everything in a single location
+Created attachment 593871
+Patch v1
+
+Gavin, Dão, what do you think about this? I described the use case in comment 0.
+I thought about adding this to "TelemetryTimestamps" since the name matches it perfectly, but Gavin said that module has a more specific purpose, so I decided to create another one.
+
+This current patch uses strings as the keys. Maybe in the future for some cases it'd make more sense to also support a WeakMap mode.
+
+The purpose of the lap function is to generate a stamp without removing the starting point, for cases where two measurements might have the same start point. E.g.:
+- start: click on new tab button
+- measurement 1: how long does it take for the tab animation to finish
+- measurement 2: how long does it take to paint the about:newtab page
+Comment on attachment 593871
+Patch v1
+
+>+  _timestamps: {},
+
+This could be a variable rather than a property of the exported object.
+
+>+  lap: function(aKey, aHistogram) {
+
+It took me some time to understand how to read "lap" here. I expected it to be an abbreviation...
+
+>+  has: function(aKey) {
+>+    return aKey in this._timestamps;
+>+  },
+>+
+>+  get: function(aKey) {
+>+    return this._timestamps[aKey];
+>+  }
+
+Are these methods needed?
+Comment on attachment 593871
+Patch v1
+
+This is a good idea.
+
+_timeStamps can be a local variable within the module to avoid exposing it (I did that for telemetryTimestamps in bug 723181).
+
+The error in start() should probably just say "foo is already started" rather than "Race condition", and I'm not sure it makes sense to delete the existing value.
+
+"lap" seems like a misleading term to use, but maybe it makes sense in a stopWatch context. Or maybe "checkpoint"?
+
+dietrich would tell you that you can just use (new Date()) instead of Date.now() :)
+
+"has" should probably use hasOwnProperty rather than "in".
+
+get() for TelemetryTimestamps returns a copy of the object, you might consider doing that here too.
+
+I'm not sure I understand why has/get are useful, what are the use cases?
+Comment on attachment 593871
+Patch v1
+
+Review of attachment 593871:
+-----------------------------------------------------------------
+
+::: browser/modules/TelemetryStopwatch.jsm
+@@ +2,5 @@
+> + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+> + * You can obtain one at http://mozilla.org/MPL/2.0/. */
+> +
+> +const Cc = Components.classes;
+> +const Ci = Components.itnerfaces;
+
+this is likely not working
+Comment on attachment 593871
+Patch v1
+
+(In reply to Gavin Sharp (use gavin@gavinsharp.com for email) from comment #3)
+> dietrich would tell you that you can just use (new Date()) instead of
+> Date.now() :)
+
+This isn't really simpler and there's no point in carrying the Date object around...
+Yes, I agree - the claim that was made was that it's somehow faster. That doesn't make much sense to me, but either way it probably doesn't matter in practice. I think we should continue to use Date.now() to get timestamps.
+Created attachment 595073
+Patch v2
+
+I significantly modified the module after using it in practice while writing some telemetry probes. It should be more useful now. It has two functions only, start and finish.
+
+A timer can be directly associated with a telemetry histogram, or with a pair of a histogram and an object. This makes it possible to measure more than 1 timer for the same histogram. An example would be SS restore time, which then you associated it with the pair histogram+tab, and is way less error prone (helps avoid measuring unpaired finish/start times)
+
+I removed the "lap" function from the previous iteration since it's not useful in practice. Given that the order that two events might happen can be unknown, you'd never be able to know when to |lap| and when to |finish| the timer.
+
+The rationale about removing a timer if it's started twice is to also fail the finish function in that case. Starting it twice should never happen, but if it does, the chance of measuring an unpaired finish/start is high, so it's better to submit no data rather than wrong data.
+
+Should be ready for review. Comments and tests are included.
+
+One thing I was discussing with Marco is that there's nothing browser-specific in this module, so we were wondering if we should perhaps add it to toolkit to make it more useful? On the other hand, do you think we might want to add browser-speficic features for it in the future?
+(In reply to Gavin Sharp (use gavin@gavinsharp.com for email) from comment #3)
+> dietrich would tell you that you can just use (new Date()) instead of
+> Date.now() :)
+
+Heh, I was told that in a review by Taras, who said he was told that by Brendan. Telephone!
+
+Marco measured it, and found that new Date() is faster for instance creation, but that diffing two of those is slower than diffing two of Date.now().
+(In reply to Dietrich Ayala (:dietrich) from comment #8)
+> Heh, I was told that in a review by Taras, who said he was told that by
+> Brendan. Telephone!
+
+Was told that new Date() was faster, that is.
+Comment on attachment 595073
+Patch v2
+
+>diff --git a/browser/modules/TelemetryStopwatch.jsm b/browser/modules/TelemetryStopwatch.jsm
+
+>+    let timers = aObj
+>+                 ? stampsMap.get(aObj, {})
+
+Looks like you forgot to update "stampsMap" after renaming it (or forgot to qref!)
+
+>diff --git a/browser/modules/test/test_TelemetryStopwatch.js b/browser/modules/test/test_TelemetryStopwatch.js
+
+>+function run_test() {
+
+>+  try {
+>+    do_check_true(TelemetryStopwatch.start("NON-EXISTENT_HISTOGRAM"));
+
+>+  try {
+>+    do_check_true(TelemetryStopwatch.start("NON-EXISTENT_HISTOGRAM", refObj));
+
+Can't these checks be outside the try?
+
+>+function finishTest() {
+
+>+  histogram = Telemetry.getHistogramById(HIST_NAME);
+
+Looks like this should be HIST_NAME2?
+
+Which consumers do you have lined up for this module?
+This is likely useful for toolkit components, I would use in Places for example, and I'm pretty sure other modules may make good use of it. So should really move to toolkit/components/telemetry otherwise they won't be able to use it.
+Putting it in toolkit/content sounds good to me.
+toolkit/components/telemetry - even better!
+Created attachment 595529
+Patch v3
+
+You're right, I had forgotten to qref! There's one other small change after the qref. I had update the validTypes check from:
+
+   (!aObj || typeof aObj == "object");
+to
+   (aObj === undefined || typeof aObj == "object");
+
+so that validTypes("", "") is false
+
+
+I now moved it from browser to toolkit/components/telemetry. Do I need to get a new review due to that? Maybe from mak?
+No, you don't need another review.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/2ca8d6ac63bc
+https://hg.mozilla.org/mozilla-central/rev/2ca8d6ac63bc
+In peptest logs, I am seeing this error at least a couple times per test:
+
+PEP WARNING    | MOZMILL fail {"message":"[JavaScript Error: \"TelemetryStopwatch: key was already initialized\" {file: \"resource:///modules/TelemetryStopwatch.jsm\" line: 52}]"}
+
+Peptest is not doing anything specifically with telemetry.  I'm not sure what's going on here.
+Mark: I'm not familiar with what the peptest workload is. The only TelemetryStopwatch user at the moment is sessionstore. Does peptest interact with sessionstore in any way? Can I run peptest myself to debug?
+So hmm I guess we should add the key name in the error message to make it easier to debug future occurrences of key re-use.
+To my knowledge peptest is not doing anything with sessionstore. You can run it via 'make peptest' in your obj dir.
+Created attachment 601877
+Follow-up: display key name on error
+
+Mark: does peptest run xpcshell-tests? The TelemetryStopwatch xpcshell test cause this exception to be logged.
+Please use this patch to see what's the key that is triggering this error
+http://hg.mozilla.org/integration/mozilla-inbound/rev/ca22be33f6b8
+https://hg.mozilla.org/mozilla-central/rev/ca22be33f6b8
+No, no xpcshell tests. Here's the new error:
+
+PEP WARNING    | MOZMILL fail {"message":"[JavaScript Error: \"TelemetryStopwatch: key \"FX_SESSION_RESTORE_COLLECT_DATA_MS\" was already initialized\" {file: \"resource:///modules/TelemetryStopwatch.jsm\" line: 53}]"}
+Looks like a valid bug - saveState can return early without finish()ing FX_SESSION_RESTORE_COLLECT_DATA_MS.
+
+Mark: can you file a new bug about that? In Firefox::Session Restore, CC me/felipe/zpao.
+Filed as bug 732874.
+
+
+Create telemetry stopwatch helper to easily store/retrieve timestamp data
+
+
+
+Bug 723561. Create telemetry stopwatch helper to easily store and retrieve timestamp data. r=gavin 
+
+Bug 723561 - TelemetryStopwatch follow-up: display key name on error. r=gavin 

@@ -1,0 +1,147 @@
+TabClose event is not available for browsers with no tabs. UITour should be able to clean up in this situation as well.
+
+The |outer-window-destroyed| [1] event could be used to trigger the cleanup in this case.
+
+[1] - https://developer.mozilla.org/en-US/docs/Observer_Notifications
+
+TabClose event is not available for browsers with no tabs. UITour should be able to clean up in this situation as well.
+
+The |outer-window-destroyed| [1] event could be used to trigger the cleanup in this case.
+
+[1] - https://developer.mozilla.org/en-US/docs/Observer_Notifications
+Created attachment 8557986
+bug1126756.patch
+
+This is a WIP patch to address the leakage when using UITour from a browser without a tab. Unfortunately, this does not seem to address the problem.
+
+There's something tricky going on, as |this.tourBrowsersByWindow.get(window)| returns "undefined" when called within the |onOuterWinDestroy| function.
+Comment on attachment 8557986
+bug1126756.patch
+
+Review of attachment 8557986:
+-----------------------------------------------------------------
+
+One reason why I was hoping for a browser notification instead of a content window one is because of e10s. I'm not sure which process(es) get outer-window-destroyed.
+
+You seem to be mixing up the ChromeWindow and the window loaded in the browser.
+
+::: browser/components/uitour/UITour.jsm
+@@ +680,5 @@
+>      if (tab) {
+>        tab.addEventListener("TabClose", this);
+> +    } else {
+> +      // Find the outer window ID, used to catch the correct window-destroyed message.
+> +      let outerID = window.QueryInterface(Ci.nsIInterfaceRequestor)
+
+`window` is the Chrome window but you want the content window which you would need to do in the child process.
+> One reason why I was hoping for a browser notification instead of a content
+> window one is because of e10s. I'm not sure which process(es) get
+> outer-window-destroyed.
+
+The |Services.appinfo.processType == Services.appinfo.PROCESS_TYPE_CONTENT| is false in |onOuterWinDestroy|.
+I filed bug 1131313 about outer-window-destroyed not working in frame scripts with e10s off so we may have to morph this bug to go with the following (which I haven't tested):
+
+<Mossop> MattN: The "message-manager-disconnect" observer notification is dispatched in the parent when a frame message manager shuts down, the subject is the message manager
+Created attachment 8564978
+Cleanup UITour when no TabClose is available.
+
+This patch allows to cleanup UITour using "message-manager-disconnect" if no tabs are available (i.e. windowless browser).
+Comment on attachment 8564978
+Cleanup UITour when no TabClose is available.
+
+Review of attachment 8564978:
+-----------------------------------------------------------------
+
+::: browser/components/uitour/UITour.jsm
+@@ +691,5 @@
+> +    } else {
+> +      let onMmDisconnect = function (aSubject, aTopic, aData) {
+> +        Services.obs.removeObserver(onMmDisconnect, aTopic);
+> +        let browserSet = this.tourBrowsersByWindow.get(window);
+> +        browserSet.delete(browser);
+
+I guess this works when there is only one tour browser without a tab but it should really only teardown the browser that is closing. aSubject should be the message manager and then you can loop over the tourBrowsersByWindow to find the browser that has that message manager with browser.messageManager. I personally would replace the TabClose code with this approach and call tearDownTourForBrowser to do a full cleanup.
+Created attachment 8566124
+MozReview Request: bz://1126756/MattN
+
+/r/3999 - Bug 1126756 - Listen for |message-manager-disconnect| instead of |TabClose| to teardown UITour.
+
+Pull down this commit:
+
+hg pull review -r 365bd7737e59a380a035b1093e293aff60ebb0b4
+Comment on attachment 8566124
+MozReview Request: bz://1126756/MattN
+
+https://reviewboard.mozilla.org/r/3997/#review3161
+
+Given this slipped by when we first added handling sources without a tab, and this bug wasn't filed for a week after that, I'm not terribly convinced we'll notice right away if we regress this. So I think we need a test for the tab-less case.
+
+::: browser/components/uitour/UITour.jsm
+(Diff revision 1)
+> +            this.teardownTourForBrowser(window, browser, true);
+
+Should break out of the loops here, least we keep iterating over everything.
+
+::: browser/components/uitour/UITour.jsm
+(Diff revision 1)
+> +      case "message-manager-disconnect": {
+
+This screams for a comment explaining the intent here (or add addObserver).
+(In reply to Blair McBride [:Unfocused] (I don't read bugmail - needinfo? me!) from comment #8)
+> Comment on attachment 8566124
+> MozReview Request: bz://1126756/MattN
+> 
+> https://reviewboard.mozilla.org/r/3997/#review3161
+> 
+> Given this slipped by when we first added handling sources without a tab,
+> and this bug wasn't filed for a week after that, I'm not terribly convinced
+> we'll notice right away if we regress this. So I think we need a test for
+> the tab-less case.
+
+It didn't slip, it was something Dexter and I were going to deal with once we needed it. Dexter wrote a test in bug 1111022 already.
+If it makes things clearer maybe we could move UITour related changes out of 1111022.
+Comment on attachment 8566124
+MozReview Request: bz://1126756/MattN
+
+/r/3999 - Bug 1126756 - Listen for |message-manager-disconnect| instead of |TabClose| to teardown UITour. r=Unfocused
+
+Pull down this commit:
+
+hg pull review -r c9859a639f9fcc4e26a7f434f422b70c37af45f2
+I addressed the comments. Blair, are you able to review this today as Dexter is trying to wrap up the heartbeat stuff and it's tiny changes.
+Comment on attachment 8566124
+MozReview Request: bz://1126756/MattN
+
+https://reviewboard.mozilla.org/r/3997/#review3257
+
+Ship It!
+https://hg.mozilla.org/integration/fx-team/rev/4bc67916867a
+https://hg.mozilla.org/mozilla-central/rev/4bc67916867a
+Comment on attachment 8566124
+MozReview Request: bz://1126756/MattN
+
+We would like to uplift this to beta to make Firefox 37 Beta 2. This should be uplifted together with the following bugs (order matters):
+
+* 1128500 (introduces the HiddenFrame object)
+* 1126756 (this bug)
+* 1128564 (whitelist selfsupport URL)
+* 1111022 (Self-Support backend)
+
+[Feature/regressing bug #]:
+Needed for heartbeat / selfsupport v0, bug 1111016
+
+[User impact if declined]:
+Heartbeat and self-support will not be available for the user.
+
+[Describe test coverage new/current, TreeHerder]: UITour tests and a test introduced with bug 1111022 cover this change.
+[Risks and why]: Low risk isolated to tours. Chance that closing a tab doesn't properly cleanup but this is unlikely due to many automated tests.
+[String/UUID change made/needed]: No
+Comment on attachment 8566124
+MozReview Request: bz://1126756/MattN
+
+Isolated to UITour and been on m-c for a week. Needed for Heartbeat. Beta+
+https://hg.mozilla.org/releases/mozilla-beta/rev/9ff796be0d67
+Comment on attachment 8566124
+MozReview Request: bz://1126756/MattN
+Created attachment 8619236
+MozReview Request: Bug 1126756 - Listen for |message-manager-disconnect| instead of |TabClose| to teardown UITour. r=Unfocused

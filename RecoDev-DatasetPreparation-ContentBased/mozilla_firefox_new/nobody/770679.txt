@@ -1,0 +1,75 @@
+The social API sandbox "imports" functions from a window scope into a Sandbox, in order to expose the functionality to the worker code. The code to do this was previously reviewed in bug 756173 and bug 751241, but some issues remain. I want to use this bug to track review from domain experts. More info in a bit!
+
+The social API sandbox "imports" functions from a window scope into a Sandbox, in order to expose the functionality to the worker code. The code to do this was previously reviewed in bug 756173 and bug 751241, but some issues remain. I want to use this bug to track review from domain experts. More info in a bit!
+So I think there is actually only one thing to review for the moment:
+- can we use wantXHRConstructor from bug 734891 instead of the gross un-wrapping hack that we have now? This seems to work, except that the relative URL test fails (XHRs created this way have no "base URI")
+The trick to load a JS script into an iframe is already an hacky way to get all standard web API (localStorage, WebSocket, ...) for a given domain.
+We are facing the same limitation in Jetpack. Gabor already worked on IndexedDB, in order to be able to use this DOM API without having to instanciate a document (bug 587797). So ideally, we would continue on this work and make it possible to do the same for all web API. But it is a lot of work and we can live with such hack.
+
+Then we have to expose these window/frame objects (Xhr, websocket, atob, ...) to the sandbox. Using unwrapped objects isn't a big security threat as it might only allow the frameworker to mess up with the frame document itself. It won't gain chrome priviledges but it might be able to get access to any DOM feature this domain has. (i.e. not only `workerAPI` functions whitelist) It just might. It depends on exposed object. One of those might give access to global object (frame global) somehow ... But this possible leak doesn't really depend on them being unwrapped.
+Actually, using unwrapped objects is a good thing, as xraywrapper have some bugs where they do not behave like a regular "web" object (see bug 738244). And I don't think xraywrappers make sense here. Xrays are designed to protect chrome/priviledged code against evil arbitrary/content code. It just ensure that you only have access to native DOM API.
+Here we have two players: the sandbox which has xraywrappers of frame document objects. But here the sandbox doesn't consider the frame used to inject the JS file as being arbitrary evil code. Actually this frame can be considered as being safe as it should only be modified by our code (or the sandbox if it break through as described sooner).
+
+So unwrapped object is a good thing, we may even ensure by unit tests that they stay unwrapped from inside of the sandbox (because of compartments, some wrappers might be automatically created).
+
+Finally, I'd like to talk about the biggest security issue you can face with sandboxes. You have to be extremelly carefull with any object you expose of pass to the sandbox. Especially strings and arrays.
+Here is a proof of concept that can be run in scratchpad:
+  let Cu = Components.utils;
+  let sandbox = Cu.Sandbox(content);
+  sandbox.foo = ["foo"];
+  Cu.evalInSandbox("Object.getPrototypeOf(foo).push='evil'", sandbox);
+  Cu.reportError(["bar"].push); // print "evil"
+I was not able to produce a similar test against strings. But a similar hack may work with strings, objects, ...
+I tried to find any such similar pattern in your code, without success! Mainly because you are using document's postMessage/addEvenListener. So it seems like you never expose any chrome objects except following two functions: fw_postMessage, fw_addEventListener. Functions should be safe as their prototype is undefined. But I would suggest you to avoid exposing these functions.
+(For example, you can call "__initWorkerMessageHandler" from chrome and pass these two methods to it)
+
+Here is some random comments:
+https://hg.mozilla.org/integration/mozilla-inbound/file/8ea07a17e25c/toolkit/components/social/FrameWorker.jsm#l146
+Instead of stringifying functions you might want to use subscriptloader instead. It works fine with sandboxes:
+  Services.scriptloader.loadSubScript(jsFileURI, sandbox);
+It would allow you to get rid of these awfull prototype issues.
+On top of that it would make a clear distinction between chrome and content code!
+
+https://hg.mozilla.org/integration/mozilla-inbound/file/8ea07a17e25c/toolkit/components/social/FrameWorker.jsm#l401
+I do not understand why would you need these __exposedProps__ here and elsewhere.
+This code should live in the sandbox and sandbox should have a content principal (not a priviledged/chrome one). We end up calling workerWindow.postMessage, which should be a using exactly same principal and still a content one. I thought __exposedProps__ was only used for chrome objects exposed to content.
+
+https://developer.mozilla.org/en/DOM/window.navigator
+You are exposing `navigator`. Are you aware that there is plenty of various stuff exposed here. Do you want workers to be able to access to registerContentHandler or mozSMS ? Most of these methods ask users for priviledges but that something to be aware of.
+
+https://hg.mozilla.org/integration/mozilla-inbound/file/8ea07a17e25c/toolkit/components/social/FrameWorker.jsm#l138
+Here you might leak or run this code twice. I'd suggest to unregister the listener on first event.
+
+https://hg.mozilla.org/integration/mozilla-inbound/file/8ea07a17e25c/toolkit/components/social/FrameWorker.jsm#l215
+Can be simplier and more robust: this.frame.parentNode.removeChild(this.frame)
+(In reply to Alexandre Poirot (:ochameau) from comment #2)
+
+awesome feedback.
+
+> https://hg.mozilla.org/integration/mozilla-inbound/file/8ea07a17e25c/toolkit/
+> components/social/FrameWorker.jsm#l401
+> I do not understand why would you need these __exposedProps__ here and
+> elsewhere.
+> This code should live in the sandbox and sandbox should have a content
+> principal (not a priviledged/chrome one). We end up calling
+> workerWindow.postMessage, which should be a using exactly same principal and
+> still a content one. I thought __exposedProps__ was only used for chrome
+> objects exposed to content.
+
+We were getting continuous warnings in the error console about the lack of exposedProps, and fixed it with the patch in bug 759219.
+Indeed, great feedback. Thanks a lot for taking a look at this! We should get some bugs filed for each of your suggestions, they're all good.
+
+(In reply to Shane Caraveo (:mixedpuppy) from comment #3)
+> We were getting continuous warnings in the error console about the lack of
+> exposedProps, and fixed it with the patch in bug 759219.
+
+That was probably a result of accidentally using a chrome iframe on Windows/Linux, prior to bug 769771? We should try removing them.
+(In reply to Alexandre Poirot (:ochameau) from comment #2)
+
+Alexandre, great feedback, I'm going to revisit this bug later when it's time to do security testing.
+I think we can close this, bug 773162 is the only remaining item to track.
+(bug 798660 tracks another cause of a bit of grossness)
+
+
+review socialAPI sandbox hacks
+

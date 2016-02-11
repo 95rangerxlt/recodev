@@ -1,0 +1,148 @@
+Created attachment 238617
+Zipped demo project
+
+Starting with Luna M4 I get a very annoying effect in some (not all) Java files. The indentation of some (not all) braces alternates between two different positions whenever I save those files. One position is correct and the other one not. The incorrect one can be fixed with Shift+Ctrl+F but that makes the editor dirty and the next save brings it back to the incorrect brace positions. The alternating behaviour can also be reproduced by adding a space after any line in the file and saving it.
+
+I attach a zipped project with a single Java file in it which seems to reproduce it in a fresh workspace. The file is full of compile errors because I stripped down the project but that doesn't impact the problem I describe above.
+
+Maybe bug 251824 has caused this regression?
+
+Created attachment 238617
+Zipped demo project
+
+Starting with Luna M4 I get a very annoying effect in some (not all) Java files. The indentation of some (not all) braces alternates between two different positions whenever I save those files. One position is correct and the other one not. The incorrect one can be fixed with Shift+Ctrl+F but that makes the editor dirty and the next save brings it back to the incorrect brace positions. The alternating behaviour can also be reproduced by adding a space after any line in the file and saving it.
+
+I attach a zipped project with a single Java file in it which seems to reproduce it in a fresh workspace. The file is full of compile errors because I stripped down the project but that doesn't impact the problem I describe above.
+
+Maybe bug 251824 has caused this regression?
+Created attachment 238618
+Screenshot that shows one of the braces that behave strange
+It can be reproduced in 4.4 M4 and it is not reproducible in 4.4 M3.
+On reverting the code changes done in bug 251824, the issue does not occur.
+Is it possible to revert the breaking changes immediately so that I can update my IDE from an I-build before M5? In the current state it's basically unusable ;-(
+(In reply to Noopur Gupta from comment #2)
+> It can be reproduced in 4.4 M4 and it is not reproducible in 4.4 M3.
+> On reverting the code changes done in bug 251824, the issue does not occur.
+
+That fix was OK (as it allows 'Correct Indentation' to be called now), but it reveals a bug in the JavaIndenter. If you just invoke 'Correct Indentation (Ctrl+I) on line 684, you'll see the bug.
+
+Simple test case:
+---%<---
+public class Bug {
+	void t()
+			throws Exception
+	{
+
+	}
+}
+---%<---
+Using Ctrl+I on line 4 shows the bug.
+
+
+Noopur, please take a look.
+Created attachment 238806
+Patch
+
+In this example, when we press Ctrl+I at the line with '{', we should find out that it is the opening brace of a method declaration and should indent it similar to the line where the beginning of the method declaration is present.
+
+The existing code (JavaIndenter#findReferencePosition), checks the immediately previous token of '{' to see if it is a ')'. If so, it checks if the tokens before ')' represent a method declaration.
+
+But it does not consider that there could be a 'throws' between '{' and ')' of method declaration. In the example, the previous token of '{' is not a ')' and hence it is not taken as a method declaration and is indented similar to the previous line (the line with - throws Exception).
+
+For the fix, when we are at token '{', we need to find if there is a 'throws' before it which is associated with it. If so, we should pass the offset of 'throws' to the existing code as its previous token would be ')'.
+
+We can keep checking the tokens backwards starting from '{' till we find a 'throws' or up to some other token. 
+But how can we make sure that the 'throws' we find, is associated with this '{'?
+
+The attached patch follows this approach:
+While scanning backwards from '{', ignore only those tokens that can come in between '{' and 'throws', and as soon as we get a token other that those, we should check if it is a 'throws'. If not, we can assume there is no related throws with '{'.
+
+The tokens that can come between '{' and 'throws' are:
+- identifier (exception name, annotation name in Java 8)
+- comma
+- '@' (for annotation in Java 8)
+- '.' (for qualified exceptions)
+
+I have added the test and also verified that existing JDT Text tests are green with the fix.
+
+Dani, please check if the approach is correct and complete.
+Created attachment 238807
+Patch
+
+Updated patch : Added 1 to the position while calling #findReferencePosition as  fScanner.getPosition() returns the position just before the scanned token starts.
+
+Hence, the following case would have failed:
+
+class Bug {
+	void t()throws 
+		Exception
+	{
+		
+	}
+}
+(In reply to Noopur Gupta from comment #5)
+> we should pass the
+> offset of 'throws' to the existing code as its previous token would be ')'.
+
+It is not correct as the previous token to 'throws' can also be ']' (brackets for array valued return types) in method declaration.
+Also, the brackets can be present without 'throws'.
+And in Java 8, we can also have annotations at brackets.
+
+Examples:
+	String f1()[] 
+	        throws Exception
+	{
+	    return new String[0];
+	}
+	
+	String f2()
+    	    @B1.B2 [] []
+	{
+		return new String[0][0];
+	}
+
+Dani, kindly let me know if the approach described in comment #5 is correct so that I can work on a patch considering the brackets also.
+(In reply to Noopur Gupta from comment #7)
+> Dani, kindly let me know if the approach described in comment #5 is correct
+> so that I can work on a patch considering the brackets also.
+
+That the right approach, but the code change looks wrong. If you look at the stack trace, you'll see that the previous stack element is 
+    #findReferencePosition(int offset, int nextToken)
+where the nextToken is the left brace and there we already handle that case (at least partially:
+    case Symbols.TokenLBRACE: // for opening-brace-on-new-line style
+So, I guess we want to put your changes at that location.
+Created attachment 238908
+Patch
+
+(In reply to Dani Megert from comment #8)
+>     #findReferencePosition(int offset, int nextToken)
+>     case Symbols.TokenLBRACE: // for opening-brace-on-new-line style
+Here, we only check the preference value set for the opening brace of block/array/method.
+
+The reference position is calculated in #findReferencePosition(int offset, boolean danglingElse, boolean matchBrace, boolean matchParen, boolean matchCase, boolean throwsClause).
+For methods, it is done at:
+    case Symbols.TokenRPAREN:
+        ...
+	if (looksLikeMethodDecl()) {
+		return skipToStatementStart(danglingElse, false);
+	}
+        ...
+
+I have moved the method declaration check as given in the attached patch.
+Also, added tests for Java 5 and verified for Java 8.
+Java 8 example:
+	String f1()[] 
+	        throws @B1.B2(9) A1.A2, Exception
+	{
+	    return new String[0];
+	}
+
+Dani, please have a look.
+Submitted with http://git.eclipse.org/c/jdt/eclipse.jdt.ui.git/commit/?id=8d013d0ca7c4fc79f13db91bc3b79b477793c2d0
+
+
+[typing] Correct Indentation for '{' is wrong when declaration isn't on a single line
+
+
+
+Fixed bug 424772: [typing] Correct Indentation for '{' is wrong when declaration isn't on a single line 

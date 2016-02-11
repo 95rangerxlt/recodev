@@ -1,0 +1,118 @@
+Created attachment 8445581
+addon-mgr
+
+In bug 1017320, we're going to add a bunch of shims so that add-ons will work in electrolysis without changes. However, I want add-ons to be able to opt out of the shims if they've been updated to work in e10s. I figure that a field in install.rdf would be the best way to do this. We've also talked about using a separate targetApplication, but that seems a little extreme to me.
+
+What makes this a little difficult is that we need to know whether an add-on needs compatibility shims before we load any code for it. The add-on manager seems to try really hard to avoid reading install.rdf during startup. I've come up with a WIP patch to do this and I'd like some feedback. It doesn't yet handle installation of restartless add-ons, and I'm interested in ideas there. As background, the patch needs to call Cu.registerAddonInterposition if the add-on needs shims.
+
+Irving, are you the right person to look this over?
+
+Created attachment 8445581
+addon-mgr
+
+In bug 1017320, we're going to add a bunch of shims so that add-ons will work in electrolysis without changes. However, I want add-ons to be able to opt out of the shims if they've been updated to work in e10s. I figure that a field in install.rdf would be the best way to do this. We've also talked about using a separate targetApplication, but that seems a little extreme to me.
+
+What makes this a little difficult is that we need to know whether an add-on needs compatibility shims before we load any code for it. The add-on manager seems to try really hard to avoid reading install.rdf during startup. I've come up with a WIP patch to do this and I'd like some feedback. It doesn't yet handle installation of restartless add-ons, and I'm interested in ideas there. As background, the patch needs to call Cu.registerAddonInterposition if the add-on needs shims.
+
+Irving, are you the right person to look this over?
+I think this should be the other way around. Add-ons that need the shims to work should declare it on install.rdf and we should assume they aren't needed. Otherwise we will be loading unnecessary shims for lots of add-ons that don't need them.
+
+We already have ways to mark add-ons as incompatible with Firefox versions in case any break or are unstable due to e10s.
+(In reply to Jorge Villalobos [:jorgev] from comment #1)
+> I think this should be the other way around. Add-ons that need the shims to
+> work should declare it on install.rdf and we should assume they aren't
+> needed. Otherwise we will be loading unnecessary shims for lots of add-ons
+> that don't need them.
+
+I think we should postpone the decision about whether shims should default to enabled or disabled. That's not really what this bug is about. However, I will say that every add-on I've tried so far has needed shims.
+
+> We already have ways to mark add-ons as incompatible with Firefox versions
+> in case any break or are unstable due to e10s.
+
+Even before we enable electrolysis, we'd like add-on authors to be able to test their add-ons with electrolysis and mark them as compatible if they've made the necessary changes. To do that, they'll turn on the preference that enables electrolysis, but they'll also need a way to turn the compatibility shims on or off for their add-on. Changing maxVersion or whatever won't help, since electrolysis isn't even enabled for that version.
+Brad suggested that we could change the default for multiProcessCompatible based on the add-on's maxVersion. Before version X, it would default to true. After version X, it would default to false. We'd want X to be a version where we had already advertised the change to add-on authors and reviewers. Another possibility is to require all new add-on submissions to set the multiProcessCompatible flag to something reasonable.
+Comment on attachment 8445581
+addon-mgr
+
+Review of attachment 8445581:
+-----------------------------------------------------------------
+
+It feels awkward to me to have a global list of add-on ID to interposer instances; can we restructure this so that we inject the interposer if required when we create each compartment that holds an add-on? If so, then we can add the necessary flag to the existing extensions.ini file and extensions.bootstrappedAddons pref rather than storing a separate list.
+
+Actually, looking at the code a bit more, I might still suggest registering the interposer as we start each add-on - this would need to happen in two places, around http://dxr.mozilla.org/mozilla-central/source/toolkit/mozapps/extensions/internal/XPIProvider.jsm#4232 and in http://dxr.mozilla.org/mozilla-central/source/toolkit/xre/nsXREDirProvider.cpp#542
+
+One advantage to that approach is that it would handle a case you're missing now; your WIP patch doesn't register the interposer for a restartless add-on installed after the browser starts up.
+
+Of course Blair has the final authority over design issues in this module...
+
+::: toolkit/mozapps/extensions/internal/XPIProvider.jsm
+@@ +5674,5 @@
+>          if (this.existingAddon) {
+>            extraParams.oldVersion = this.existingAddon.version;
+>          }
+>  
+> +        dump("INSTALL ADDON with multiProcessCompatible = " + this.addon.multiProcessCompatible + "\n");
+
+use logger.debug(...)
+(In reply to :Irving Reid from comment #4)
+> It feels awkward to me to have a global list of add-on ID to interposer
+> instances; can we restructure this so that we inject the interposer if
+> required when we create each compartment that holds an add-on?
+
+The problem is that the add-on manager doesn't control the creation of all the compartments for a given add-on. If an add-on does Cu.import, then we'll create a new compartment with the same add-on ID, and we want it to have an interposer tied to it as well. That's why I went with the global map.
+
+I'll look into moving the registration code to where you've suggested though, and moving the data to extensions.ini and extensions.bootstrappedAddons.
+Created attachment 8446787
+addon-mgr v2
+
+This is more what you asked for, I think.
+
+Comment on attachment 8446787
+addon-mgr v2
+
+Review of attachment 8446787:
+-----------------------------------------------------------------
+
+This looks good, except that I noticed one more special case it doesn't handle. For restartless add-ons, when an upgrade is available we uninstall the old add-on and install the new one in the background while the browser is running. In the case that an upgrade changes an add-on from multiProcessCompatible=false to =true, the interposer is not removed.
+
+If that only results in a slight degradation in performance until the next time the browser restarts, I'll be happy to r+ this, but if that would cause incorrect operation then we need a fix.
+Yeah, I guess I just need to unregister the interposition inside unloadBootstrapScope. I'll put up a new patch soon.
+Created attachment 8447336
+addon-mgr v3
+
+This takes care of deregistration. I changed the method names in XPConnect to setAddonInterposition since you can only have one interposition at a time.
+Comment on attachment 8447336
+addon-mgr v3
+
+Review of attachment 8447336:
+-----------------------------------------------------------------
+
+Much prefer this to the first iteration of the patch.
+
+Looks like you've been bitrotten by bug 1009328, which should make this patch significantly smaller.
+
+In addition to supporting this flag in install.rdf, we'll also want a followup bug to let AMO override it. This will let us cover cases like:
+* Add-on is multi-process compatible, but author didn't add multiprocessCompatible to install.rdf
+* Add-on specifies multiprocessCompatible, but we find it's buggy and needs the shims afterall
+* Something changes that makes an add-on that was once multi-process compatible now be broken and need shims
+
+And, finally, we should have some telemetry added for this, so we know what impact it's having now and over time.
+Comment on attachment 8447336
+addon-mgr v3
+
+Review of attachment 8447336:
+-----------------------------------------------------------------
+
+This looks great. What Blair said about supporting overrides in the AMO metadata ping - we really want to be able to override this if the manifest is wrong.
+
+I feel guilty about bringing up yet another thing in re-review, but I don't see this code switching on whether the browser is configured for e10s - do we always want to register the interposers even when we're running single process? I'll give r+ on the assumption that the code is OK as is.
+
+As for telemetry, I suppose we can add the multiProcessCompatible flag to the AddonDetails section to see which add-ons are using shims. You could add some histograms to the shims themselves to see how much overhead they add and how often they're used, but that's outside the scope of this bug.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/5ea30521f56b
+https://hg.mozilla.org/mozilla-central/rev/5ea30521f56b
+Did the followups get filed for this?
+I just filed bug 1040158.
+re dev-doc-needed: billm, does this work for you: https://developer.mozilla.org/en-US/Add-ons/Install_Manifests#multiprocessCompatible ?
+
+Somewhere we should have a detailed list of all the shims in their own page, but perhaps we are not ready for that yet.
+Sounds good. Thanks!

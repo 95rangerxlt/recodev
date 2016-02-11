@@ -1,0 +1,280 @@
+Example:
+
+package jsr308.bug;
+import java.lang.annotation.*;
+public class AnnotatedQualifiedType {
+	@Target(ElementType.TYPE_USE)
+	@Retention(RetentionPolicy.RUNTIME)
+	@Documented
+	static @interface NonNull { }
+
+	java.io.@NonNull IOException foo(
+			java.io.@NonNull FileNotFoundException arg)
+			throws java.io.@NonNull EOFException {
+		try {
+		} catch (java.io.@NonNull IOError e) {
+		}
+		return null;
+	}
+}
+
+The "java.io.@NonNull XyException" are all represented like this in the AST:
+
+SimpleType                         "java.io.@NonNull XyException"
++ annotations: MarkerAnnotation            "@NonNull"
++ name: QualifiedName              "java.io.@NonNull XyException"
+        + qualifier: QualifiedName "java.io"
+        + name: SimpleName                          "XyException"
+
+This is incorrect. The first QualifiedName's source range cannot contain the "@NonNull". In the current API, the legal representation would be:
+
+QualifiedType                       "java.io.@NonNull XyException"
++ qualifier: SimpleType             "java.io"
+             + annotations: <empty>
+             + name: QualifiedName  "java.io"
++ annotations: MarkerAnnotation             "@NonNull"
++ name: SimpleName                                   "XyException"
+
+Alternatively, the first qualifier could also be a QualifiedType containing a SimpleType and a SimpleName. Both of these representations have the problem that the "qualifier" property of a QualifiedType is a Type, but "java.io" is not a type.
+
+I don't have a good solution right now.
+
+Example:
+
+package jsr308.bug;
+import java.lang.annotation.*;
+public class AnnotatedQualifiedType {
+	@Target(ElementType.TYPE_USE)
+	@Retention(RetentionPolicy.RUNTIME)
+	@Documented
+	static @interface NonNull { }
+
+	java.io.@NonNull IOException foo(
+			java.io.@NonNull FileNotFoundException arg)
+			throws java.io.@NonNull EOFException {
+		try {
+		} catch (java.io.@NonNull IOError e) {
+		}
+		return null;
+	}
+}
+
+The "java.io.@NonNull XyException" are all represented like this in the AST:
+
+SimpleType                         "java.io.@NonNull XyException"
++ annotations: MarkerAnnotation            "@NonNull"
++ name: QualifiedName              "java.io.@NonNull XyException"
+        + qualifier: QualifiedName "java.io"
+        + name: SimpleName                          "XyException"
+
+This is incorrect. The first QualifiedName's source range cannot contain the "@NonNull". In the current API, the legal representation would be:
+
+QualifiedType                       "java.io.@NonNull XyException"
++ qualifier: SimpleType             "java.io"
+             + annotations: <empty>
+             + name: QualifiedName  "java.io"
++ annotations: MarkerAnnotation             "@NonNull"
++ name: SimpleName                                   "XyException"
+
+Alternatively, the first qualifier could also be a QualifiedType containing a SimpleType and a SimpleName. Both of these representations have the problem that the "qualifier" property of a QualifiedType is a Type, but "java.io" is not a type.
+
+I don't have a good solution right now.
+Maybe we have to step back and go the AnnotatedSimpleName/AnnotatedQualifiedName route as once discussed in 391847. In that case, SimpleType/QualifiedType would not be AnnotatableTypes any more.
+
+Example:
+
+QualifiedType                        "java.util.@NonNull Map.@NonNull Entry"
++ qualifier: SimpleType              "java.util.@NonNull Map"
+             + name: AnnotatedQName  "java.util.@NonNull Map"
+                     + qualifier: QN "java.util"
+                     + annotations: MA         "@NonNull"
+                     + name: SimpleName                 "Map"
+
++ name: AnnotatedSimpleName                                 "@NonNull Entry"
+        + annotations: MarkerAnnotation                     "@NonNull"
+        + identifier: String                                         "Entry"
+Srikanth: We should sort this out ASAP, since it blocks progress in JDT UI.
+
+The Annotated*Name solution would also make the MethodDeclaration#thrownExceptions -> thrownExceptionTypes
+change obsolete.
+(In reply to comment #2)
+> Srikanth: We should sort this out ASAP, since it blocks progress in JDT UI.
+> 
+> The Annotated*Name solution would also make the
+> MethodDeclaration#thrownExceptions -> thrownExceptionTypes
+> change obsolete.
+
+Naturally, we are willing to co-operate, if you confirm this what you want 
+from the client side - earlier there were some arguments made as to why this
+complicates client code. So I assume in overall consideration, names being
+annotatable is the lesser evil ?
+I realize comment 1 is exactly the opposite of what I once asked for in bug 391847. Back then, I still thought we could find a straightforward solution where TYPE_USE annotations could always be accessed through their corresponding Type node. Srikanth already mentioned this problem, but I didn't understand it back then.
+
+I was probably confused by the "@Annot java.util.List" syntax (before bug 394356), where an annotated SimpleType wrapping a QualifiedName would have worked in the DOM AST. However, that notation has other problems, so I don't want to turn that wheel back.
+
+Reverting bug 395886 would be one solution, but I'm trying to find a better one.
+
+Problem statement:
+
+We only have trouble with a qualified name that carries annotations. An annotated simple name can just be a SimpleType wrapping a SimpleName, nicely having the annotation on the type, not on the name.
+
+For qualified names, we would need a new node that is similar to QualifiedType, but that allows the qualifier to be a QualifiedName if it is a package.
+
+Proposal:
+
+- Add new class PackageQualifiedType extends AnnotatableType with properties:
+  - qualifier: QualifiedName        //(QualifiedType has "qualifier: Type")
+  - annotations: List of Annotation
+  - name: SimpleName
+
+- In the ASTConverter, only create a PackageQualifiedType if necessary:
+  1. to avoid breaking SimpleType's Javadoc comment "If annotations are present,
+        then the name must be a {@link SimpleName}."
+  2. to avoid creating a QualifiedType whose qualifier is actually not a type
+
+=> This wouldn't change anything for Java source that doesn't use annotated qualified types.
+- SimpleType(QualifiedName) would still be the "default" solution if the type is just a qualified name. Otherwise, resort to:
+- QualifiedType(<qualifier>, {annotations}, SimpleName) if <qualifier> is a type, or to
+- PackageQualifiedType(<qualifier>, {annotations}, SimpleName) if <qualifier> is a package.
+If the qualifier could be both and there are no binding that would help decide, then choose a QualifiedType (for compatibility with earlier AST levels).
+
+This proposal keeps the "thrownExceptions -> thrownExceptionTypes" change. That's conceptually the right solution, since the exception type is really a type, not just a name.
+(In reply to comment #4)
+
+> Problem statement:
+
+[...]
+
+> Proposal:
+
+[...]
+
+Manoj, please study the problem statement and proposal in detail and
+let us know what you think. This needs to be worked on a priority basis
+and please work on other items only when you are blocked waiting for
+clarifications/reviews etc.
+Markus, while we are waiting for a solution to be cooked for this,
+reviewing and closing bug 402231 would unblock the UI work for the
+other JSR. TIA.
+Created attachment 229447
+Proposed Patch - WIP
+
+As per the comment 4, a PackageQualifiedType is created and converter modified accordingly. This is a Work-In-Progress patch, though this is good enough to be used for conversion and viewing at the ASTViewer. Will dot the 'i's and cross the 't's later.
+
+Todo:
+  - cleanup/eyeball/re-review the patch.
+  - write additional test cases if required.
+
+Markus: Could you please do a quick and early review and let me know of any comments (particularly the functional ones)?
+The API looks good, except for two Javadoc typos:
+- AST#newPackageQualifiedType(..): @param qualifier: remove word "type"
+- PackageQualifiedType: "Type node for a package-qualified type"
+
+For the example in comment 0, the AST looks correct.
+
+But if you add ...
+
+	class Inner {}
+	jsr308.bug.@NonNull AnnotatedQualifiedType.@NonNull Inner fInner;
+
+... at the end, then fInner's type has 2 problems:
+
+1. the qualifier of the type is a QualifiedType, but should be a PackageQualifiedType
+2. the qualifier of that QualifiedType is just "jsr308". The token "bug" is missing in the AST
+
+
+There are also test failures if you open the launch configuration, go to the "Tracing" tab, check "org.eclipse.jdt.core" on the left and "debug" and "debug/dom/ast/throw" on the right (bug 404986).
+In the runtime workbench, I'd recommend you enable the "debug/dom/ast" option, so that you see the errors in the log but don't get flooded with dialogs.
+
+Code from first failing test (problem is that the first @Marker is missing in most source ranges of enclosing nodes):
+
+public class X {
+    class Y {
+        class Z {
+        }
+    }
+    Object o = (@Marker X. @Marker Y.@Marker Z) null;
+    @java.lang.annotation.Target (java.lang.annotation.ElementType.TYPE_USE)
+    @interface Marker {
+    }
+}
+Created attachment 229520
+Proposed Patch - WIP
+
+A work-in-progress patch 
+ - review comments of Markus addressed.
+ - testing done primarily using ASTViewer; hence test cases to be written (TODO)
+ - Eyeballing/rechecking the patch - TODO
+Created attachment 229791
+Proposed Patch
+(In reply to comment #10)
+
+1.) I get exceptions when trying to create a JLS4 AST for comment 0. In that case, we need a MALFORMED node and some fallback that drops unsupported constructs.
+
+java.lang.UnsupportedOperationException: Operation only supported in JLS8 and later AST
+	at org.eclipse.jdt.core.dom.ASTNode.unsupportedIn2_3_4(ASTNode.java:1916)
+	at org.eclipse.jdt.core.dom.PackageQualifiedType.<init>(PackageQualifiedType.java:104)
+	at org.eclipse.jdt.core.dom.ASTConverter.convertType(ASTConverter.java:3661)
+	at org.eclipse.jdt.core.dom.ASTConverter.convert(ASTConverter.java:893)
+...
+
+2.) When I turn the @NonNull into NormalAnnotations (append "()" or "(x=1)") or SingleMemberAnnotations (append "(1)"), then the source ranges of these nodes are missing the arguments list.
+
+I think the fix is to remove these lines 3300+2 from ASTConverter#annotateType(AnnotatableType, Annotation[]):
+	int start = typeAnnotation.sourceStart;
+	int end = typeAnnotation.sourceEnd;
+	annotation.setSourceRange(start, end - start + 1);
+
+Same problem in ASTConverter#annotateTypeParameter(..) at line 3333
+
+3.) In ASTConverter, "if (createPackageQualifiedType == true)" is a bit verbose.
+Created attachment 229842
+Proposed Patch
+
+Markus: Thanks for quick turn-around-time for the review. 
+
+- Now converts to a malformed QualifiedType instead of a PackageQT for ast levels less than 8. I found this conversion to be most suited for a malformed node. Please opine if you have better suggestions.
+
+- On experimenting along similar lines, found that there is an issue with thrownExceptions conversion and have raised a bug 405934.
+Created attachment 229889
+Proposed Patch
+
+Same as the previous patch with just changes for conflict resolution with the latest changes and a change of tags to 3.9 BETA_JAVA8
+Created attachment 229934
+Proposed Patch
+
+Corrected an elusive source range issue and resolved a conflict with yesterday's checkin.
+Patch looks good, few minor corrections needed:
+
+1. ASTConverter15Test requires JLS disclaimer in copyright
+2. Methods getQualifiedTypeWithSourceAndBinding and getSimpleTypeWithNameAndBinding are better named createQualifierType and createSimpleType respectively.
+3. Similarly look for better names for setSourceAnnotationsAndBindings methods.
+Created attachment 230000
+Proposed Patch
+
+Reworked to incorporate the comments.
+(In reply to comment #16)
+> Created attachment 230000 [details]
+> Proposed Patch
+> 
+> Reworked to incorporate the comments.
+
+Thanks Manoj, I have released the patch at :
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=d3d92e370789aaaed8a46c804d74e3cb2b4bb167
+
+Stil, I am not entirely happy with the names for methods setSourceAnnotationsAndBindings. But being private methods, we can live with it.
+The AST looks good now.
+
+Filed bug 406467 and bug 406469 for bindings and ASTRewrite. And I've adjusted the explanation in QualifiedType and added a few @see tags: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=372783581a5723abe8e5c388f38ff5c205e01380
+
+
+[1.8][dom ast] Incorrect conversion of JSR308 TYPE_USE annotations on qualified name
+
+
+
+Bug 418979: Improved Javadoc to include bug 404489 comment 4 
+
+Bug 404489: [1.8][dom ast] Incorrect conversion of JSR308 TYPE_USE annotations on qualified name 
+
+Fix for bug 404489 - [1.8][dom ast] Incorrect conversion of JSR308 TYPE_USE annotations on qualified name 

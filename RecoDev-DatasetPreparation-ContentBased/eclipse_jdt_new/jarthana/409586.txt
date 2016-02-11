@@ -1,0 +1,2481 @@
+Up to Java 7, every reference to a type had the same ITypeBinding, and the annotations could only come from the type's declaration. Now, reference type bindings can carry different TYPE_USE annotations, but this is not reflected in the ITypeBinding API.
+
+We need to find the right solution to identify TYPE_USE annotation from ITypeBinding.
+
+Up to Java 7, every reference to a type had the same ITypeBinding, and the annotations could only come from the type's declaration. Now, reference type bindings can carry different TYPE_USE annotations, but this is not reflected in the ITypeBinding API.
+
+We need to find the right solution to identify TYPE_USE annotation from ITypeBinding.
+I had an initial discussion with Andy in this direction.
+
+We basically identified two possible encodings:
+
+ - a deep encoding where type bindings are duplicated per set of type annotations,
+   thus every type binding already contains the correct annotations
+
+ - a shallow encoding, where annotations are kept separate from the type bindings
+   and extra API is needed for associating both.
+
+Internally in the compiler I'm using a deep encoding for null annotations,
+but this may be two heavy-weight for the general case.
+The main problem for clients of ITypeBinding is that equality is identity-based. When generics were added, this required massive changes everywhere in client code, since e.g. many (but not all) "==" checks had to be replaced by comparisons of ITypeBinding#getTypeDeclaration().
+
+I'm not sure if we really want the same treatment for TYPE_USE annotations. If we go the "deep encoding" route, then we also need some clear benefits. But in contrast to generics, the semantics of TYPE_USE annotations are largely undefined.
+
+If I e.g. have a "java.io.@NonNull FileNotFoundException", it's unclear whether - the supertype is "java.io.IOException" or "java.io.@NonNull IOException",
+- you can assign an "IOException" to an "@NonNull IOException",
+- etc.
+
+The current JSR 308 spec explicitly says it doesn't define any semantics for TYPE_USE annotations, so the interpretation is up to the concrete annotation type (or its consumers, if the annotation specification is incomplete). Note that the spec itself is not consistent about this, since it *does* specify the class file format, including attachment points of TYPE_USE annotations.
+
+For Java language tooling, this lack of semantics is a big problem, since the "semantically preserving" property of a refactoring is not well-defined any more. I.e. dropping all TYPE_USE annotations can be considered semantically preserving, since it doesn't directly affect executable bytecode.
+I preferred the second option that I had been discussing with Stephan:
+
+>- a shallow encoding, where annotations are kept separate from the type bindings
+>   and extra API is needed for associating both.
+
+I prototyped up a carrier object that held the type annotations for a binding and could be queried for the extra annotation data related to a binding (but it is fiddly).  I liked that consumers of type bindings who just don't care don't need to worry themselves about these things.
+
+Going down a fully general deep encoding route felt like a bunch of serious engineering that might disturb a lot of places.
+
+As Markus says the lack of semantic meaning for these things doesn't help the situation.
+(In reply to comment #3)
+> I prototyped up a carrier object that held the type annotations for a
+> binding and could be queried for the extra annotation data related to a
+> binding (but it is fiddly).
+
+Unfortunately, keeping type annotations externally and associating them later with ITypeBindings can't work. If the same AST contains type references "java.io.@NonNull IOException" and "java.io.IOException", then the resolved ITypeBindings for these references are either identical or distinct.
+
+If they are identical, then the existing ITypeBindings APIs work as before, but there's no way to distinguish them externally.
+
+If they are distinct, then there's no point in keeping anything "external", since the binding can already carry the additional information.
+
+Note that clients are not completely blocked, since they can always retain a reference to the originating ASTNode and reinsert the type annotations when they create ASTNodes out of an ITypeBinding. They can e.g. take the result of ImportRewrite#addImport(ITypeBinding, AST) and then insert copies of the type annotations from the original ASTNode "where it makes sense". Since the "where it makes sense" is currently unspecified, I don't think we should materialize this guesswork in JDT Core APIs.
+The javax.lang.model API has to answer the uncertainties mentioned in comment 2. In Java 8, TypeMirror extends the new AnnotatedConstruct, so we can write an annotation processor that asks these questions. The answer will just be a second opinion, though (not normative).
+Created attachment 232440
+AnnotationProcessor18 and TestAnnotationProcessor18
+
+(In reply to comment #5)
+> The javax.lang.model API has to answer the uncertainties mentioned in
+> comment 2. In Java 8, TypeMirror extends the new AnnotatedConstruct, so we
+> can write an annotation processor that asks these questions. The answer will
+> just be a second opinion, though (not normative).
+
+Attached AnnotationProcessor18 and TestAnnotationProcessor18 projects and used JDK8-b92 (jdk-8-ea-bin-b92-windows-x64-30_may_2013) for the build.
+
+AnnotationProcessor18 contains the CompileTimeAnnotationProcessor and two annotation types (with target as Field Decl and Type use).
+TestAnnotationProcessor18 contains different test classes.
+
+The annotation processing discovery does not support type-use annotations, hence the following two-step approach is followed:
+1. Get hold of an javax.lang.model.element.Element via a field declaration annotation.
+2. Use Element#asType() to get a TypeMirror for the type of the field. TypeMirror got a super-interface AnnotatedConstruct in JDK8, which exposes type-use annotations of the field type as well.
+
+The attached code can be used to repeat these experiments and play with these APIs. Follow these steps for executing the tests:
+1. Export the project AnnotationProcessor18 from Eclipse as AnnotationProcessor18.jar to location C:\TypeUse
+2. Open cmd prompt and go to C:\TypeUse\TestAnnotationProcessor18\src
+3. Set path to JDK8. Example:
+   set path=C:\JDKs\jdk-8-ea-bin-b92-windows-x64-30_may_2013\jdk8\jdk1.8.0\bin
+4. Try to compile the test classes:
+javac -classpath "..\bin;..\..\AnnotationProcessor18.jar" -processor my.annotation.processor.CompileTimeAnnotationProcessor test\custom\annotation\TestClass1a.java 
+
+The tests performed along with the results are given below:
+
+1. TestClass1a: 
+@FieldDecl java.io.@TypeUse FileNotFoundException ex;
+
+Field Type: (@my.annotation.TypeUse :: java.io.FileNotFoundException)
+Type-use annotation on field's type: @my.annotation.TypeUse()
+Super-type: java.io.IOException
+Type-use annotation on super-type: null
+
+2. TestClass1b: 
+@FieldDecl ArrayList<@TypeUse String> list;
+
+Field Type: java.util.ArrayList<(@my.annotation.TypeUse :: java.lang.String)>
+Super-type 1: java.util.AbstractList<(@my.annotation.TypeUse :: java.lang.String)>
+Super-type's type arg: (@my.annotation.TypeUse :: java.lang.String)
+  Type-use annotation on arg: @my.annotation.TypeUse()
+Super-type 2: java.util.List<(@my.annotation.TypeUse :: java.lang.String)>
+Super-type's type arg: (@my.annotation.TypeUse :: java.lang.String)
+  Type-use annotation on arg: @my.annotation.TypeUse()
+Super-type 3: java.util.RandomAccess
+Super-type 4: java.lang.Cloneable
+Super-type 5: java.io.Serializable
+
+3. TestClass1c: 
+@FieldDecl ArrayList<@TypeUse String> list = new ArrayList<@TypeUse String>(Arrays.asList("a", "b"));
+
+Pending - to see whether the return type of the get(int) method includes the TYPE_USE annotation.
+Created attachment 232476
+AnnotationProcessor18 and TestAnnotationProcessor18
+
+Attaching the updated projects.
+Created attachment 232527
+AnnotationProcessor18 and TestAnnotationProcessor18
+
+(In reply to comment #6)
+> Pending - to see whether the return type of the get(int) method includes the
+> TYPE_USE annotation.
+
+Created @TypeDecl with target as Type Declaration to get hold of the class extending ArrayList<@TypeUse String>.
+Updated annotation processor to display the return type of all the methods in that class.
+
+3. TestClass1c:
+@TypeDecl public class TestClass1c extends ArrayList<@TypeUse String> {}
+
+Return-type of get(int) is (@my.annotation.TypeUse :: java.lang.String)
+i.e. it includes the TYPE_USE annotation.
+My current understanding is:
+
+- our APT implementation requires the deep encoding.
+
+- JDT/UI will probably want the deep encoding at least in some situations
+
+
+Currently, the compiler uses a compact version of the deep encoding exclusively for @NonNull and @Nullable (using tagBits instead of references to annotations).
+
+
+I propose to add a configuration option to the compiler to generate bindings with deep encoding for all TYPE_USE annotations, when needed.
+For plain compilation this is not needed, but when APT or refactorings (e.g.) invoke the compiler they would (probably) enable this feature.
+With this option, ITypeBinding with deep encoding can be directly constructed from their counter parts (compiler bindings).
+
+
+As for the type identity problem: I would argue that by default it is correct to treat an annotated type as different from its unannotated variant when doing direct comparison - unless explicitly requesting a more liberal comparison. Maybe for DOM bindings the locations needing the unannotated version coincide with those already using ITypeBinding#getTypeDeclaration(), so we would simple augment the implementation of getTypeDeclaration() to also strip off any type annotations.
+
+In the compiler, the central function ReferenceBinding#isCompatibleWith() strips of any type annotations using a new method TypeBinding#unannotated(). Aside from isCompatibleWith() until now I only found one more code location in the compiler that needs to call unannotated() prior to a comparison. I expect a few more locations to need this, but I expect this number to be low.
+
+For more details on the deep encoding in the compiler see also bug 392099 comment 25.
+
+
+Internally, while constructing a BinaryTypeBinding I indeed use s.t. like a shallow encoding, aka external type annotations (TypeAnnotationWalker), but I agree with previous comments that this is not very useful for clients.
+(In reply to comment #9)
+
+> My current understanding is:
+> 
+> - our APT implementation requires the deep encoding.
+
+Jay, what does your reading of the APT API changes indicate ? Sight unseen, my reading would be that bindings are JDT implementation artifacts - is this a
+correct assessment ? Does the APT architecture expose bindings to an annotation
+processor - OIOW do any of the APIs pass along bindings to a processor ?   
+
+> - JDT/UI will probably want the deep encoding at least in some situations
+
+Markus, given this is a complex problem, we need to know what would be the hard
+requirements from your side.
+
+> Currently, the compiler uses a compact version of the deep encoding
+> exclusively for @NonNull and @Nullable (using tagBits instead of references
+> to annotations).
+
+I'll admit to some uneasiness over the present solution of creating ParameterizedTypeBindings. That being said I don't think this uneasiness is
+something that cannot be overcome by (a) testing our way to quality (b) resorting to simple renaming - ParametertizedTypeBinding -> (say) CustomizedTypeBinding 
+
+[...]
+
+> In the compiler, the central function ReferenceBinding#isCompatibleWith()
+> strips of any type annotations using a new method TypeBinding#unannotated().
+> Aside from isCompatibleWith() until now I only found one more code location
+> in the compiler that needs to call unannotated() prior to a comparison. I
+> expect a few more locations to need this, but I expect this number to be low.
+
+OK. This is what I meant by testing our way to quality above.
+(In reply to comment #9)
+
+> Currently, the compiler uses a compact version of the deep encoding
+> exclusively for @NonNull and @Nullable (using tagBits instead of references
+> to annotations).
+
+So are https://bugs.eclipse.org/bugs/show_bug.cgi?id=403457 and
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=403216 addressed satisfactorily
+by the current encoding ?
+(In reply to comment #11)
+> (In reply to comment #9)
+> 
+> > Currently, the compiler uses a compact version of the deep encoding
+> > exclusively for @NonNull and @Nullable (using tagBits instead of references
+> > to annotations).
+> 
+> So are https://bugs.eclipse.org/bugs/show_bug.cgi?id=403457 and
+> https://bugs.eclipse.org/bugs/show_bug.cgi?id=403216 addressed satisfactorily
+> by the current encoding ?
+
+Yes, after some fine tuning I could resolve both bugs.
+Actually, one location (for bug 403216) did require inserting a call to unannotated(),
+see bug 403216 comment 12 Action Item 1 resp. commit
+d72243e9032009ede789d14b49acc668f280d583
+(In reply to comment #10)
+
+> I'll admit to some uneasiness over the present solution of creating
+> ParameterizedTypeBindings. That being said I don't think this uneasiness is
+> something that cannot be overcome by (a) testing our way to quality (b)
+> resorting to simple renaming - ParametertizedTypeBinding -> (say)
+> CustomizedTypeBinding 
+
+Stephan, what would an orthodox solution look like here ? 
+
+Would we have to create an Annotated*Binding for every type in the TypeBinding 
+hierarchy to account for ==, isCompatibleWith, casts and instanceof checks all 
+over the place ? And from the points of view of the compiler, AST APIs and APT ?
+
+Alternatively, could type annotations be simply an attribute in the root
+class TypeBinding and we retain the exact same hierarchy and account for the
+deep encoding by munging various compatibleWith methods ?
+(In reply to comment #10)
+> Jay, what does your reading of the APT API changes indicate ? Sight unseen,
+> my reading would be that bindings are JDT implementation artifacts - is this
+> a
+> correct assessment ? Does the APT architecture expose bindings to an
+> annotation
+> processor - OIOW do any of the APIs pass along bindings to a processor ?   
+
+Even though JDT's APT implementation does not pass on binding to the client directly, it does so indirectly. For e.g., the equals method and hashCode method use the TypeBinding. As a result, the following test returns 'true' for the given two methods:
+
+method1.getReturnType().equals(method2.getReturnType())
+
+	public default @TypeUseAnnotation("default") ReturnType defaultMethod () {
+		return null;
+	}
+	public static @TypeUseAnnotation("static") ReturnType staticMethod () {
+		return null;
+	}
+
+Having said that, I am exploring the option of using Annotation.TypeUseBinding as reference binding and also use it to store the annotations by overriding ReferenceBinding#storedAnnotations(). But I am not entirely sure if this will work.
+(In reply to comment #13)
+> (In reply to comment #10)
+> 
+> > I'll admit to some uneasiness over the present solution of creating
+> > ParameterizedTypeBindings. That being said I don't think this uneasiness is
+> > something that cannot be overcome by (a) testing our way to quality (b)
+> > resorting to simple renaming - ParametertizedTypeBinding -> (say)
+> > CustomizedTypeBinding
+
+If we opt for renaming, how does InstantiatedReferenceBinding sound? 
+ 
+> Stephan, what would an orthodox solution look like here ? 
+
+I'm tempted to ask "in what religion?" :)
+ 
+> Would we have to create an Annotated*Binding for every type in the
+> TypeBinding 
+> hierarchy to account for ==, isCompatibleWith, casts and instanceof checks
+> all 
+> over the place ? And from the points of view of the compiler, AST APIs and
+> APT ?
+
+Strictly speaking, AnnotatedTypeBinding should be a role (dynamic mixin ...) that can be dynamically attached to any kind of type binding. For lack of language support that comes even near this model, yes, duplicating the entire hierarchy of TypeBinding could be seen as an orthodox model.
+ 
+> Alternatively, could type annotations be simply an attribute in the root
+> class TypeBinding and we retain the exact same hierarchy and account for the
+> deep encoding by munging various compatibleWith methods ?
+
+Regarding the attribute: yes, having this in the root class TypeBinding looks suitable to me. For null annotations this attribute is already in TypeBinding, its 'tagBits'.
+
+The next aspect is: participation in LookupEnvironment's mechanism for instantiation: the family of methods 'createParameterizedType', 'createArrayType', 'createRawType' and now: 'createAnnotatedType'. When we go for deep encoding of arbitrary type annotations on arbitrary types we may have to add one or two methods/overloads here, but if we're not introducing new *Binding classes, additions will be small. All different reasons for instantiating a type can easily be handled by the same mechanism.
+
+Regarding 'isCompatibleWith': yes, adding a stanza like we already have in ReferenceBinding should ensure we're implementing type compatibility the standard JLS way. For cases where the method 'unannotated()' performs non-trivial work, I'm thinking of caching the result. In that case the additional stanza should not be noticeable performance-wise.
+
+Up-to this point I'd say we have everything under control. Catching the remaining locations using reference comparison (==, !=) requires some more attention. I just filed Bug 415850 as a general measure to iron out regressions in this area.
+
+Does this answer your questions?
+(In reply to comment #15)
+
+Before you invest too much cycles analyzing the failures/errors tracked
+by Bug 415850, somethings to ponder:
+
+> (In reply to comment #13)
+
+> > Stephan, what would an orthodox solution look like here ? 
+> 
+> I'm tempted to ask "in what religion?" :)
+
+Emmadhamum sammadhame. Which when translated from my native tongue means
+"All religions are acceptable" :)
+
+> > Alternatively, could type annotations be simply an attribute in the root
+> > class TypeBinding and we retain the exact same hierarchy and account for the
+> > deep encoding by munging various compatibleWith methods ?
+> 
+> Regarding the attribute: yes, having this in the root class TypeBinding
+> looks suitable to me. For null annotations this attribute is already in
+> TypeBinding, its 'tagBits'.
+
+> The next aspect is: participation in LookupEnvironment's mechanism for
+> instantiation: the family of methods 'createParameterizedType',
+> 'createArrayType', 'createRawType' and now: 'createAnnotatedType'. 
+
+In this scheme of things, as I see it, we would not need createAnnotatedType
+at all. 
+
+What would it mean to modify all implementations of org.eclipse.jdt.internal.compiler.ast.TypeReference.getTypeBinding(Scope)
+to account for the presence of type annotations to create distinct bindings
+for the annotated type reference vs the naked type reference ? 
+
+Now, some subtypes relegate the real work to resolveType() which eventually
+finds it way to LE.create* methods. These would have to be modified suitably
+too, so that
+
+@Readonly int gets a distinct binding from plain unadorned int, while two
+two @Readonly int's get the same binding via caching in the LE. So on and
+so forth for every subtype of TypeBinding.
+
+Doesn't this scheme of things make
+
+   - Casts and instanceof checks become non-issues ?
+   - A PTB will only a PTB when it is actually a PTB thereby avoiding all
+identity crisis ? 
+   - I am even inclined to think isCompatibleWith in all its incarnations
+and overrides can completely escape any change.
+
+Do you want to take a shot at prototyping this ? (since you are the one
+aware of the current deep encoding in all its details ?)
+Question to the UI team: Are you OK with @Readonly String having a different
+binding from (just plain) String as long as ITypeBinding#isAssignmentCompatible
+answers the right answer ?
+(In reply to comment #17)
+> Question to the UI team: Are you OK with @Readonly String having a different
+> binding from (just plain) String as long as
+> ITypeBinding#isAssignmentCompatible
+> answers the right answer ?
+
+Went back and reread the comments trail. Comment#2-Comment#5 somewhat categorically state the position. Let us know if this still stands.
+
+Stephan, for null annotations, I would still like us to consider what I outlined
+in comment#16. I worry that the present approach of creating ParameterizedTypeBinding's is a bit worrisome - there is clearly an abstraction
+breakdown there.
+(In reply to comment #2)
+> The main problem for clients of ITypeBinding is that equality is
+> identity-based. When generics were added, this required massive changes
+> everywhere in client code, since e.g. many (but not all) "==" checks had to
+> be replaced by comparisons of ITypeBinding#getTypeDeclaration().
+> 
+> I'm not sure if we really want the same treatment for TYPE_USE annotations.
+> If we go the "deep encoding" route, then we also need some clear benefits.
+> But in contrast to generics, the semantics of TYPE_USE annotations are
+> largely undefined.
+
+Markus, I read the above to basically imply that a number of things may
+break unless adjusted for in the UI code if we resorted to deeper encoding,
+which we have for null annotations. Could you devise some experiments to
+see what if anything actually does break - so we have an early estimate of
+the work involved. TIA.
+(In reply to comment #16)
+> (In reply to comment #15)
+> 
+> Before you invest too much cycles analyzing the failures/errors tracked
+> by Bug 415850, 
+
+too late, almost done :)
+(this exercise also unearthed a few bugs that are only mildly related, so it was
+good to do this anyway)
+
+
+> > (In reply to comment #13)
+> Emmadhamum sammadhame. Which when translated from my native tongue means
+> "All religions are acceptable" :)
+
+:)
+
+ 
+> > The next aspect is: participation in LookupEnvironment's mechanism for
+> > instantiation: the family of methods 'createParameterizedType',
+> > 'createArrayType', 'createRawType' and now: 'createAnnotatedType'. 
+> 
+> In this scheme of things, as I see it, we would not need createAnnotatedType
+> at all. 
+> 
+> What would it mean to modify all implementations of
+> org.eclipse.jdt.internal.compiler.ast.TypeReference.getTypeBinding(Scope)
+> to account for the presence of type annotations to create distinct bindings
+> for the annotated type reference vs the naked type reference ? 
+
+While my approach didn't focus on doing this work specifically in 
+TypeReference.getTypeBinding() I have the impression that what you outline here
+very closely matches the effect of the current implementation. But let's not
+jump to conclusions.
+
+Yes: an annotated type reference has a TypeBinding instance which is different from 
+its naked type.
+ 
+> Now, some subtypes relegate the real work to resolveType() which eventually
+> finds it way to LE.create* methods. These would have to be modified suitably
+> too, so that
+> 
+> @Readonly int gets a distinct binding from plain unadorned int, while two
+> two @Readonly int's get the same binding via caching in the LE. So on and
+> so forth for every subtype of TypeBinding.
+
+Yes, again: two equally annotated type references of the same naked TypeBinding share
+the same instantiated / cached / annotated TypeBinding (caching done in LE).
+All occurrences of '@NonNull String' are represented using the same TypeBinding.
+
+> Doesn't this scheme of things make
+> 
+>    - Casts and instanceof checks become non-issues ?
+
+You mean casts in the compiler implementation, right (vs. compiling a cast expression)?
+
+For ArrayBinding this is already a non-issue: I'm using the same class for types
+with and without null annotations.
+
+>    - A PTB will only a PTB when it is actually a PTB thereby avoiding all
+> identity crisis ? 
+
+Ah, I think this is where your proposal differs from the current implementation.
+
+Yes, as long as PTB keeps its name, there is a mismatch between name and content,
+because I'm "abusing" this type to encode a ReferenceBinding-plus-type-annotations.
+
+However, during my implementation I was reminded that asking "t instanceof PTB" is 
+already a bad idea due to RawTypeBinding being a subclass of PTB. The better check is
+always t.isParameterizedType(), which also works in the presence of type annotations.
+
+>    - I am even inclined to think isCompatibleWith in all its incarnations
+> and overrides can completely escape any change.
+
+Where isCompatibleWith() relies on "==" we need to help it to recognize that
+'@Readonly String' and '@Interned String' should be compatible from a JLS pov
+although they're represented by different TypeBinding instances.
+
+
+> Do you want to take a shot at prototyping this ? (since you are the one
+> aware of the current deep encoding in all its details ?)
+
+Assuming that the core of your suggestion is to move away from "abusing" PTB,
+I drafted a new class AnnotatedReferenceBinding to use instead of PTB for an
+RB-plus-type-annotations. Alternatively, I could have selectively created
+STB or BTB, depending on the input, but that road looked muddier to me...
+
+I'll upload the patch in a minute.
+Created attachment 234757
+Experiment with AnnotatedReferenceBinding
+
+After some initial debugging I get
+- 2 regressions in NullTypeAnnotationTest
+- 26 regressions in NullAnnotationTest at 1.8
+
+I stopped debugging when I came to the following observation:
+
+- Using PTB we automatically get recognized as s.t. that has a significant erasure().
+  By also stripping annotations inside erasure() things like method overriding are
+  automatically recognized as desired.
+
+- Using AnnotatedReferenceBinding we do not participate in erasure() handling and
+  thus MethodVerifier15() comes up with lots of bogus errors.
+
+If we have to adjust all locations using erasure() then we have a long way to go.
+Of course this is only a finite set of locations which all *could* be adjusted to
+also handle AnnoatedReferenceBinding in the desired way, but the observation seems
+to confirms my gut feeling that types instantiated with type annotations are 
+more similar to PTB than to plain RB.
+(In reply to comment #20)
+
+> > Doesn't this scheme of things make
+> > 
+> >    - Casts and instanceof checks become non-issues ?
+> 
+> You mean casts in the compiler implementation, right (vs. compiling a cast
+> expression)?
+
+In what I had in mind, there will not be any new class at all. We would
+create different PTBs for List<String> and List<@NonNull String>, different
+BaseTypeBindings for int and @Positive int etc. So the Class identity of the
+actual type binding created would not change at all, but the instance identity
+would change.
+
+So I meant casting to a particular type binding would as is and instance of
+checks would continue to work as is for good or bad (the case of RTB)
+
+(In reply to comment #21)
+
+>   By also stripping annotations inside erasure() things like method
+> overriding are
+>   automatically recognized as desired.
+
+This could/would be done in the alternate proposal too.
+
+OK, let us wait for the results requests from Markus and also mull over this
+in the mean time.
+(Not a reply to comment 22)
+
+My current conclusion from discussion and experiment:
+
+  It seems by using ParameterizedTypeBinding for things like '@NonNull String' I have
+  raised intuitions that don't feel right.
+
+  However, during implementation I noticed that almost everything I needed for
+  annotated types is already available for parameterized types.
+
+Maybe we can reconcile the two sides by describing the common concepts behind 
+parameterized and annotated types:
+
+- In both cases we start with a class or interface that describes the structure of
+  a (big) set of objects.
+- Next we add further constraints to admit only a subset of those objects.
+- Each constrained type has a reference to its original unconstrained type
+- The unconstrained super set is regarded as a legacy type, which doesn't support all
+  desired type checking, but (unchecked) conversions exist between constrained and
+  unconstrained types (conversions being purely compile time issues, since runtime
+  structures are identical).
+- For full type safety the constraints have to match, too.
+- None of the constraints appear in the executable part of the bytecode, they all
+  get erased.
+
+As an aside: 
+  ArrayBinding is conceptually different from the above, because this
+  encodes a true type constructor, defining new structure. Yet, for encoding an
+  annotated array type the existing class ArrayBinding can conveniently be used
+  to encode the dimensions as well as the annotations on dimensions.
+
+  So currently I have:
+    ReferenceBinding         + type annotations => ParameterizedTypeBinding
+    ParameterizedTypeBinding + type annotations => ParameterizedTypeBinding
+    ArrayBinding             + type annotations => ArrayBinding
+  All types on the RHS are aware that they are built on top of some leaf/original,
+  and equal invocations are cached.
+
+
+If we can agree on similarity between parameterizing and annotating, what could be
+the common name for both? Some proposals (append -Binding if desired):
+ - TypeInvocation
+ - TypeInstantiation
+ - TypeIncarnation
+ - ConstrainedType
+(In reply to comment #22)
+> (In reply to comment #20)
+> 
+> > > Doesn't this scheme of things make
+> > > 
+> > >    - Casts and instanceof checks become non-issues ?
+> > 
+> > You mean casts in the compiler implementation, right (vs. compiling a cast
+> > expression)?
+> 
+> In what I had in mind, there will not be any new class at all. We would
+> create different PTBs for List<String> and List<@NonNull String>, different
+> BaseTypeBindings for int and @Positive int etc.
+
+For PTB and BaseTypeBinding I agree. 
+Just for the abstract ReferenceBinding I could not find an easy way of replication,
+that's why my sketch introduces AnnotatedTypeBinding.
+
+
+> So I meant casting to a particular type binding would as is and instance of
+> checks would continue to work as is for good or bad (the case of RTB)
+
+Right.
+
+In my experience even with "abusing" PTB the cast/instanceof business is not the
+hard part. I even think that asking kind() is more common in our implementation
+than "instanceof" (for type bindings). So, we should have everything under control.
+
+> (In reply to comment #21)
+> 
+> >   By also stripping annotations inside erasure() things like method
+> > overriding are
+> >   automatically recognized as desired.
+> 
+> This could/would be done in the alternate proposal too.
+
+Here you lost me.
+ 
+> OK, let us wait for the results requests from Markus and also mull over this
+> in the mean time.
+
+OK
+(In reply to comment #4)
+> (In reply to comment #3)
+> > I prototyped up a carrier object that held the type annotations for a
+> > binding and could be queried for the extra annotation data related to a
+> > binding (but it is fiddly).
+> 
+> Unfortunately, keeping type annotations externally and associating them
+> later with ITypeBindings can't work. If the same AST contains type
+> references "java.io.@NonNull IOException" and "java.io.IOException", then
+> the resolved ITypeBindings for these references are either identical or
+> distinct.
+> 
+> If they are identical, then the existing ITypeBindings APIs work as before,
+> but there's no way to distinguish them externally.
+
+I would assume the external "carrier object" that serves as the the auxiliary
+store for type annotations would have to be queried with the tuple of TypeBinding,
+ASTNode and a type path.
+Mindful though that the participants are still mulling over the questions/topics
+raised earlier, let me chime in with more thoughts:
+
+It helps to separate concerns here: the comment trail in the present bug
+has degenerated into scattered discussions, all over the place :)
+
+    1. What is the right thing to do in the compiler ?
+    2. What is the right thing to do in the AST APIs ? 
+    3. What is the right thing to do in APT ?
+    4. What is the right thing to do in null analysis ?
+
+1. This is the easiest: Nothing needs to change. We are nearly done with the 
+core compiler work for 308 and we have no major open issues there, proof of the
+pudding being the completion of the code generation project. Compiler internal 
+TypeBindings not carrying any 308 annotations is a non-issue for us - We are
+willing however, to consider changes if absolutely necessitated by [2,3,4]
+
+2. I'll cover this below.
+
+3. APT - AFAICS, the model API specification mandates deep encoding. If it is
+possible to accomplish this without causing any ripples in the compiler land,
+we should strive for that, further discussions can be moved to https://bugs.eclipse.org/bugs/show_bug.cgi?id=413613
+
+4. Null analysis: There is the class identity crisis issue there, we can move 
+the discussion on what if anything needs to happen to https://bugs.eclipse.org/bugs/show_bug.cgi?id=392099.
+
+Now turning to (2) AST APIs and ITypeBinding:
+
+It is still not categorically clear that clients internal and external
+would absolutely prefer to see ITypeBinding's carrying 308 annotations.
+(see last para comment#4): I am willing to prototype if there is a strong 
+expression of interest.
+
+A rough sketch is here:
+
+Today, DOM TypeBinding wrap the compiler type binding and get manufactured 
+most commonly via this sequence of events:
+
+    - the client code invokes resolveBinding(), resolveTypeBinding() or
+one of their cousins.
+    - this gets routed to the DefaultBindingResolver which grabs a
+handle to the compiler ASTNode by mapping from DOM AST node.
+    - From the compiler ASTNode we get the compiler binding and check
+to see if we have a known DOM TypeBinding for the compiler binding.
+If we do, then we are done, otherwise we construct a new DOM TypeBinding
+(wrapping the compiler binding), establish the compiler binding -> DOM
+binding mapping for future retrievals from a cache and return.
+    - Various queries on the returned DOM TypeBinding may result in further
+TypeBindings being created for example, querying a ITypeBinding#getSuperclass,
+these queries are answered by consulting the wrapped compiler bindings,
+which queries may result in further compiler binding which in turn get 
+wrapped by a DOM TypeBinding and returned and so on.
+
+Now I propose that in addition to wrapping the compiler binding, a DOM
+TypeBinding could also wrap the DOM ASTNode IFF the subtree rooted at that
+DOM node contains any type annotations. So the new sequence of events
+could be:
+
+    - the client code invokes resolveBinding(), resolveTypeBinding() or
+one of their cousins. (as before)
+    - this gets routed to the DefaultBindingResolver which grabs a
+handle to the compiler ASTNodes by mapping from DOM AST node. (as before)
+    - From the compiler ASTNode we get the compiler binding and check
+to see if we have known DOM TypeBindings for the compiler binding. Notice
+the plural here. So compiler binding => DOM binding in the new scheme of
+things is a one-many mapping.
+    - If there existed a prior mapping such that its wrapped ASTnode is null
+and the sub tree rooted at the current DOM ASTNode does not contain any
+type annotation, we are done.
+    - otherwise, if there existed a prior mapping such that the subtree
+rooted at the wrapped ASTNode matches the subtree rooted at the current
+DOM ASTNode, we are done.
+   - Otherwise, we construct a new DOM TypeBinding (wrapping the compiler binding and the DOM ASTNode IFF the subtree has type annotations or null),
+establish the compiler binding - DOM binding mapping for future retrievals 
+from a cache and return.
+    - With this scheme in place, when getAnnotations is called on the
+ITypeBinding, it can retrieve them from the wrapped DOM AST node, resolve them
+and return.
+
+This would require that the clients stop relying on == and != and for
+IBinding#equals method to be altered to compare binding keys if == fails. 
+
+I am sure a lot of details and special cases would need to be worked out,
+but this is the gist of the idea.
+
+This would have the side effect that 
+
+   @A @B String != @B @A String
+
+Also unless special provision is made, a type declarations's binding
+would differ from the uses of the type.
+
+This is really the same as what is outlined in the last passage of
+comment#4 as what a client could potentially do - already done by the
+Core APIs - As a cost, == and != can't be relied on any more and UI
+code will have to consistently change to using equals.
+(In reply to comment #26)
+Thanks for this writeup, Srikanth!
+
+I think we will soon need type annotations from bindings in JDT UI as well. Even for simple things like Add Import, I think users will expect that we eventually preserve type annotations. And it would also be good to show them in Javadoc hovers, which are also partly based on bindings.
+
+My gut feeling is that the workaround from comment 4 (keep a reference to the ASTNode) would soon lead us into a position where we have to repeat too many type calculations in UI code. We better make the decision about how to copy type annotations to related type bindings just in one place, and preferably the same as in APT (e.g. a type annotation on a generic type argument is carried over to places where a reference to the type variable shows up).
+
+However, for most equality checks on the Java language level, the annotations are irrelevant. So I agree with your proposal to change ITypeBindings#equals(Object) and ITypeBindings#isEqualTo(IBinding) for type bindings that carry type annotations. For AST levels < JLS8, this won't change anything: Since there are no type annotations, 'equals' and '==' stay the same.
+
+For full JLS8 support, we can fix '==' checks one by one when we really encounter problems.
+(In reply to comment #27)
+
+Thanks for weighing in, I'll work on a prototype later this week and next week.
+(In reply to comment #27)
+> (In reply to comment #26)
+> Thanks for this writeup, Srikanth!
+> 
+> I think we will soon need type annotations from bindings in JDT UI as well.
+> Even for simple things like Add Import, I think users will expect that we
+> eventually preserve type annotations. And it would also be good to show them
+> in Javadoc hovers, which are also partly based on bindings.
+
+While we may able to iron out the rough edges and come up with a solution the 
+present proposal is altogether ignoring type annotations on binary elements:
+
+class BinaryClass {
+    @TypeAnnot BinaryClass bc;
+    void foo() throws @Critical SomeException() {}
+}
+
+class SourceClass {
+    void foo(BinaryClass bc) {
+        bc.bc = new BinaryClass();
+        bc.foo();
+    }
+}
+
+would clients expect the ITypeBinding for bc.bc to carry the annotation TypeAnnot? Likewise @Critical to be exposed for the exceptions thrown by
+bc.foo() ? Today we don't encode the annotations on the binary elements
+from a class file.
+Comment#1 speaks of a deep and shallow encoding, with an unstated either-or
+model. One alternative is to go with both a deep encoded version and a non-encoded
+version, with existing binding capturing fields holding the unannotated version.
+(In reply to comment #29)
+
+> would clients expect the ITypeBinding for bc.bc to carry the annotation
+> TypeAnnot? Likewise @Critical to be exposed for the exceptions thrown by
+> bc.foo() ? 
+
+I assume that is a silly question with an obvious answer of "yes"
+
+>Today we don't encode the annotations on the binary elements
+> from a class file.
+
+Into the bindings. We have code to restore it from the class file into
+intermediate structures.
+I've scribbled a summary into bug 392099 comment 27, which could also provide some input for this discussion. As for terminology that comment distinguishes between issues of "binding identity" and "binding classification".
+
+In my understanding we agree that we need to accept the issue of binding identity, whereas the issue of binding classification is specific to the compiler. In fact ITypeBinding#isParameterizedType() should still give the correct result despite my tweaks regarding the underlying compiler bindings.
+
+
+From here I see two options:
+
+
+ (A) extend the deep encoding in the compiler to cover *all* type annotations (so far only null annotations). Mapping annotated compiler type bindings to ITypeBinding (and to TypeMirror) should then be easy.
+
+
+ (B) if I read Srikanth's recent comments correctly he suggests: maintain a separation between the naked compiler type bindings and an auxiliary object "nearby", to be used for constructing ITypeBinding representations of annotated types.
+
+
+Initially (comment 4 et al) we thought that such "nearby" location may not always be available, but reading comment 31 we might actually have hope. Maybe the creation of DOM bindings is a suitable boundary for converting separate-but-nearby encoding into full deep encoding:
+ - for types in any declaration we can certainly query the declaration for annotations
+ - for type references elsewhere we may be able to use another binding to provide annotation information:
+   - for the type of a field reference "o.f", we can store the auxiliary object in the
+     FieldBinding and construct the annotated type binding from this aux and the naked type
+   - the same for types in a method signature, IFF we know the parameter position.
+   - the same for super types and type arguments of a type, IFF we know position/rank
+   This would *not* easily allow us to individually query the annotations of a type
+   parameter or array dimension of a referenced type, i.e., the above types would have
+   to be reconstructed *in full* during compiler/DOM conversion. Example:
+   decl: List<@NonNull String> foo() { ... }
+   use:  o.foo()
+   -> asking for the return type of foo() must create a complete binding for
+      'List<@NonNull String>'. Answering 'List<String>' and adding the annotation
+      during a second query would cause great complications, due to lost context.
+
+
+Depending on our choice of (A) or (B) the implementation in bug 392099 can be used
+as the basis for our next step:
+
+
+For (A) I would straight-forwardly extend what we already have
+
+
+For (B) the class TypeAnnotationWalker could be used as a starting point. This class already supports to weave annotations (as read from a class file) into arbitrary type binding structures. So, part of the solution would be to store one instance of TypeAnnotationWalker per binding (type, field, method).
+Remaining tasks for this option:
+- generalize TypeAnnotationWalker to optionally work with source annotations
+  - change TypeAnnotationWalker#getAnnotationsAtCursor() to answer bindings
+  - pack source annotations into a TypeAnnotationWalker instance
+
+
+I think both (A) and (B) are equally viable IFF all requests for a DOM binding have the necessary context: position relative to the "nearby" binding holding the TypeAnnotationWalker. From DOM perspective I expect that all clients of DefaultBindingResolver.getTypeBinding(TypeBinding) need changes in order to pass this context information, but that may already be it.
+(In reply to comment #32)
+
+Thanks for the detailed comments Stephan, it is really helpful in understanding 
+the full problem landscape.
+
+> Initially (comment 4 et al) we thought that such "nearby" location may not
+> always be available, but reading comment 31 we might actually have hope.
+
+Could you clarify this ? What was the thought trail from comment#31 you
+are referring to ?
+(In reply to comment #33)
+> (In reply to comment #32)
+> > Initially (comment 4 et al) we thought that such "nearby" location may not
+> > always be available, but reading comment 31 we might actually have hope.
+> 
+> Could you clarify this ? What was the thought trail from comment#31 you
+> are referring to ?
+
+Now as I reread your comments I no longer know, what exact comment triggered this.
+I mean the idea that, e.g., a field binding can hold the annotation info for its type.
+Not sure you actually suggested this, maybe in comment 30? :)
+(In reply to comment #32)
+
+> From here I see two options:
+> 
+> 
+>  (A) extend the deep encoding in the compiler to cover *all* type
+> annotations (so far only null annotations). Mapping annotated compiler type
+> bindings to ITypeBinding (and to TypeMirror) should then be easy.
+> 
+> 
+>  (B) if I read Srikanth's recent comments correctly he suggests: maintain a
+> separation between the naked compiler type bindings and an auxiliary object
+> "nearby", to be used for constructing ITypeBinding representations of
+> annotated types.
+
+Stephan, I am not close minded about deep encoding at the compiler level 
+for all cases nor am I actively pushing for separation model: in fact I 
+readily acknowledge that we can kill three birds with one stone by resorting 
+to encode the type annotations into compiler bindings.
+
+My discomfort stems from some reservations about the present approach - I 
+would not classify them as fundamental objections per se. You make some
+persuasive arguments as to why what you have done makes sense or makes it 
+easier in some cases.
+
+I see some issues problems with the deep encoding:
+
+1. == and != issues: This can be solved. May be a good bit of work, but
+doable - we can even come up with a instrumented compiler that can be used
+to compile JDT/Core and emit warnings in places where == and != are used
+on type bindings and convert them to a call to isEqualTo (say)
+
+2. Casts and instanceof checks and other type identity checks: Good or
+bad, we have them all over the place. May be more compiler instrumentation
+to systematically catch these places and suitably modify them could be an idea.
+
+3. Here is something we haven't discussed:
+
+The "singleton" nature of typebinding's today ensures that a type's binding
+acts as a central repository for state - what are the problems we are likely
+to encounter by this shared state not being shared any more ? For example
+if I set some tag bit on the binding for @Readonly String, it is not going
+to reflect on the binding for String and vice versa, what are the implications
+of this ? Tagbits are just examples. What of the general problem of state
+duplication ? Perhaps, we should/could systematically comb through all
+the fields involved in the handful of classes and study what would be the
+impact.
+
+> Initially (comment 4 et al) we thought that such "nearby" location may not
+> always be available, but reading comment 31 we might actually have hope.
+> Maybe the creation of DOM bindings is a suitable boundary for converting
+> separate-but-nearby encoding into full deep encoding:
+
+May be, but you enumerate a formidable list of considerations in the next
+breath :)
+
+> Depending on our choice of (A) or (B) the implementation in bug 392099 can
+> be used
+> as the basis for our next step:
+> 
+> 
+> For (A) I would straight-forwardly extend what we already have
+
+Let us give ourselves a few more days before deciding ? I'll study PTB in a bit
+more detail ? At the end of it, it could well be that my discomfort could vanish 
+if we rename ParameterizedTypeBinding to be CustomizedTypeBinding and declare that to be a common abstraction for two ways a type can be customized: (a) by parameterizing a suitable type, (b) by annotating a type :)
+
+It would also be comforting if all fields of PTB are made private and where
+needed getters/setters are provided.
+
+I do see that PTB already is a better choice than coming up with a brand
+new wrapper type such as AnnotatedTypeBinding that would call for composition
+and delegation inasmuch as this is already in place via PTB#type. Also the
+notion of "erasure" being in place already helps.
+
+I guess what is sorely missed is the ability to "inherit from specific objects". 
+Java's inheritance model allows a type to subclass another and inherit behavior:
+So we are able to say a type X is the same as type Y, "but for certain behaviors
+and additional state", but objects of X and Y don't share any state whatsoever.
+
+It would be interesting if we were able to say "this new object I am creating
+is the same as that object, but for these additional state and behavior"
+
+A word on abstraction breakdown: It is not like there is no really egregious
+cases already. See that ParameterizedSingleTypeReference is a subtype of
+ArrayTypeReference and ParameterizedQualifiedTypeReference is a subtype of
+ArrayQualifiedTypeReference. Why on earth would that be the case ? :)
+(In reply to comment #35)
+
+> It would be interesting if we were able to say "this new object I am creating
+> is the same as that object, but for these additional state and behavior"
+
+Oh, the much maligned prototypal inheritance: http://en.wikipedia.org/wiki/Prototype-based_programming.
+
+class TypeBinding {
+
+    // ...
+    Annotation [] annotations;  // declaration site annotations.
+    Annotation [] getAnnotations() {
+        return this.annotations;
+    }
+
+    class AnnotatedTypeBinding overlays TypeBinding {
+        
+        @Override
+        Annotation [] annotations; // type use site annotations.
+        
+        @Override
+        Annotation [] getAnnotations() {
+            return this.annotations;
+    }
+}
+
+     // ...
+
+     SomeBinding declarationBinding = // ...
+     SomeBinding typeUseBinding = declarationBinding.new AnnotatedTypeBinding();
+(In reply to comment #35)
+> Stephan, I am not close minded about deep encoding at the compiler level 
+> for all cases nor am I actively pushing for separation model: in fact I 
+> readily acknowledge that we can kill three birds with one stone by resorting 
+> to encode the type annotations into compiler bindings.
+
+I agree on seeing this as an open question for some time. It looks like we have
+at least two good options, so no hard pushing into either direction from me.
+ 
+
+> 1. == and != issues: This can be solved. May be a good bit of work, but
+> doable - we can even come up with a instrumented compiler that can be used
+> to compile JDT/Core and emit warnings in places where == and != are used
+> on type bindings and convert them to a call to isEqualTo (say)
+
+Didn't we do s.t. similar already in the past? BTW, I'm sure some plug-in exists that 
+would support this kind of specific query over a body of Java code, probably using
+our own infra structure. Does anyone know?
+
+> 2. Casts and instanceof checks and other type identity checks: Good or
+> bad, we have them all over the place. May be more compiler instrumentation
+> to systematically catch these places and suitably modify them could be an
+> idea.
+
+I see them at the same level as kind() and isParameterizedType() queries etc.
+We should keep an eye on them but no reason for panic, right?
+
+> 3. Here is something we haven't discussed:
+> 
+> The "singleton" nature of typebinding's today ensures that a type's binding
+> acts as a central repository for state - what are the problems we are likely
+> to encounter by this shared state not being shared any more ?
+
+Good point. 
+
+> For example
+> if I set some tag bit on the binding for @Readonly String, it is not going
+> to reflect on the binding for String and vice versa, what are the
+> implications of this ? 
+
+This is actually the example where *not* sharing that bit is intended.
+
+> Tagbits are just examples. What of the general problem of state
+> duplication ? Perhaps, we should/could systematically comb through all
+> the fields involved in the handful of classes and study what would be the
+> impact.
+
+Put differently: can we get away with instantiating/customizing our type bindings
+only after the original is fully initialized / has all its state set?
+We already have one exception: In one situation I am creating 
+UnresolvedReferenceBinding with null annotation tagBits before we have all info for 
+that type, but that's a slightly different case, because then the real initialization
+happens while transferring state to a fresh new ReferenceBinding instance.
+
+So, yes, s.t. to look out for, but piecemeal initialization of TypeBindings doesn't
+seem to be a widespread pattern in the compiler.
+
+ 
+> > Initially (comment 4 et al) we thought that such "nearby" location may not
+> > always be available, but reading comment 31 we might actually have hope.
+> > Maybe the creation of DOM bindings is a suitable boundary for converting
+> > separate-but-nearby encoding into full deep encoding:
+> 
+> May be, but you enumerate a formidable list of considerations in the next
+> breath :)
+
+That list wasn't meant as detraction, I hold these steps to be doable.
+ 
+> Let us give ourselves a few more days before deciding ? I'll study PTB in a
+> bit more detail ?
+
+Sounds fine to me.
+
+> At the end of it, it could well be that my discomfort could vanish 
+> if we rename ParameterizedTypeBinding to be CustomizedTypeBinding and
+> declare that to be a common abstraction for two ways a type can be
+> customized: (a) by parameterizing a suitable type, (b) by annotating a type
+> :)
+
+you saw my proposals for a new name in comment 23 (at the end), right?
+ 
+> I guess what is sorely missed is the ability to "inherit from specific
+> objects". 
+> Java's inheritance model allows a type to subclass another and inherit
+> behavior:
+> So we are able to say a type X is the same as type Y, "but for certain
+> behaviors
+> and additional state", but objects of X and Y don't share any state
+> whatsoever.
+> 
+> It would be interesting if we were able to say "this new object I am creating
+> is the same as that object, but for these additional state and behavior"
+
+Now I talked you into wanting language support for roles :)
+When we meet at ECE I'll show you how roles are supported in Object Teams  :)
+
+> A word on abstraction breakdown: It is not like there is no really egregious
+> cases already. See that ParameterizedSingleTypeReference is a subtype of
+> ArrayTypeReference and ParameterizedQualifiedTypeReference is a subtype of
+> ArrayQualifiedTypeReference. Why on earth would that be the case ? :)
+
+I was always hoping you would explain those to me! :)
+In fact the situation of those is similar to AnnotatedParameterizedType
+or whatever combinations we could invent in this field.
+Is that what they call pragmatism?
+
+
+One more point to optionally consider: at some point in the future we may want to 
+support a configurable option to issue warnings when types in an assignment etc don't
+match in their type annotations. This could go a long way for a poor man's pluggable
+type system. Initially I considered this as a motivation for the deep encoding, but
+I'm sure this can be achieved in both approaches, actually.
+(In reply to comment #37)
+
+> > For example
+> > if I set some tag bit on the binding for @Readonly String, it is not going
+> > to reflect on the binding for String and vice versa, what are the
+> > implications of this ? 
+> 
+> This is actually the example where *not* sharing that bit is intended.
+
+Obviously yes and obviously no :) 
+
+BTW, I raised a bunch of bugs for null analysis using TYPE_USE annotations - 
+I know this is still work in progress and being firmed up as we speak. It is 
+quite likely some of the new bugs of duplicates of each other as well of known 
+existing bugs. I was not sure if you are inviting testing already, but didn't 
+want to lose the reports, but didn't have the energy to look through for 
+duplicates.
+(In reply to comment #38)
+> BTW, I raised a bunch of bugs for null analysis using TYPE_USE annotations - 
+> I know this is still work in progress and being firmed up as we speak. It is 
+> quite likely some of the new bugs of duplicates of each other as well of
+> known 
+> existing bugs. I was not sure if you are inviting testing already, but
+> didn't 
+> want to lose the reports, but didn't have the energy to look through for 
+> duplicates.
+
+It is early, indeed, but already these reports are very valuable.
+
+Specifically, null contract inheritance and checking for incompatible overrides is 
+not yet fully wired with null annotations.
+
+Detecting null annotations in illegal / useless positions is being handled one-by-one
+via bug 392238.
+
+Etc.
+
+I'll also give you notice when a stable milestone is reached.
+(In reply to comment #37)
+
+> > 3. Here is something we haven't discussed:
+> > 
+> > The "singleton" nature of typebinding's today ensures that a type's binding
+> > acts as a central repository for state - what are the problems we are likely
+> > to encounter by this shared state not being shared any more ?
+> 
+> Good point. 
+
+I think this is the overriding concern at this point. ==, !=, casts, instanceof,
+kind() and other RTTI mechanisms need not be discussed any further as we can
+catch those scenarios mechanically and adopt risk control measured.
+
+Let us study this independently and in parallel and share notes soon.
+(In reply to comment #37)
+
+> you saw my proposals for a new name in comment 23 (at the end), right?
+
+I called dibs 13 comments earlier ! (or according to wikipedia, I should
+say I called "Erster" or "meins".) :)
+(In reply to comment #37)
+> (In reply to comment #35)
+> > 1. == and != issues: This can be solved. May be a good bit of work, but
+> > doable - we can even come up with a instrumented compiler that can be used
+> > to compile JDT/Core and emit warnings in places where == and != are used
+> > on type bindings and convert them to a call to isEqualTo (say)
+
+That would fit nicely as an addition to the Introduce Indirection refactoring. (Whether anybody would ever discover it, though...)
+
+> Didn't we do s.t. similar already in the past? BTW, I'm sure some plug-in exists
+> that
+> would support this kind of specific query over a body of Java code, probably
+> using
+> our own infra structure. Does anyone know?
+
+Checker Framework has Interning checker, which based on a quick test warns about reference comparisons if the compared objects haven't been marked as interned. Additionally it can also warn about the converse, i.e. when equals-method is unnecessarily used on interned objects.
+(In reply to comment #41)
+I didn't claim to be first, this honor is wholeheartedly granted to you :)
+I just wanted to check whether my proposals have been considered
+(but maybe second proposals are invalid in the game, dunno).
+I am prototyping what I hope will be a very clean solution -  I expect to share
+a version of it by the end of the coming week. Stay tuned.
+(In reply to Srikanth Sankaran from comment #44)
+> I am prototyping what I hope will be a very clean solution -  I expect to
+> share
+> a version of it by the end of the coming week. Stay tuned.
+
+Request to hold any (null) annotations related commits for 2-3 days. I hope 
+to finish the implementation within then. Appreciate it. TIA.
+Created attachment 235070
+Patch - early stages.
+
+Many loose ends, but it is ready for a peek. I am uploading just so if my
+hard disk crashes, I don't have to start over :)
+
+Salient points:
+
+    - Implements deep encoding at the compiler binding level. I am convinced
+this is the only real option for us - it will allow us to kill three birds with
+one stone: DOM, APT and null analysis.
+
+    - No new types. We simply distinguish three types of personalities/roles for 
+type bindings. Thus far, declaration and type uses shared a binding, this is not
+possible anymore once type references get annotated. So we can talk of
+declaration bindings, unannotated ("stark naked") type uses and annotated type
+bindings. Of the three, bindings that denote declaration and those that are 
+stark naked continue to share the instance.
+
+   - Annotated type binding instances will be identical to each other if the
+annotations are the same (this uniqueness is only partly implemented at the
+time of the patch, but is do'able) 
+
+   class X /* 1 */ {
+       public X /* 2 */ x = (@NonNull X /* 3 */ ) null;
+       public X /* 4 */ x1 = (@NonNull X /* 5 */) null;
+       public X /* 6 */ x2 = (@Nullable X /* 7)) null;
+    }
+
+    Here 1,2,4,6 share the same binding instance, 3 and 5 are identical and
+7 is not == to others.
+
+    - Since a binding's classification does not change, instanceof, casts,
+RTTI routines will all work without change.
+
+    - Binding identity comparison is trivial. Two type bindings denote the
+same type if (t1 == t2 || t2.id == t2.id). If you start with any type binding
+t and derive t1, t2, t3 ... tn from t by annotating various components of
+t (but otherwise not change t in any way), then all these derivatives share
+the id field value with the original 't'.
+
+    - O(1) look up from annotated type to unannotated type. 
+
+    - Binary types support is not in place. PTB, RTB, WildcardBinding etc are
+not fully wired in.
+
+    - At various points, I have short-circuited the null analysis code for now.
+I will rewire once the implementation is complete and as a proof that the
+implementation is complete.
+Created attachment 235077
+Patch - early stages (merged with HEAD)
+
+Same patch as before, but applies on head cleanly now.
+Created attachment 235080
+Patch v 0.2
+
+Evolving solution. Simpler than the previous patch. Every type binding
+exports a "copy constructor" which is used by the look up environment to
+polymorphically split the types when needed, avoiding special treatment.
+
+PTB, RTB, STB, MTB, LTB, BaseTB, []B, work reasonably well.
+
+BinaryTB, URB, WB, TVB not hooked up.
+
+LookupEnvironment.createAnnotatedType - 2 overloads,
+UnannotatedTypesCollection,
+ASTNode.resolveAnnotations - the new overload,
+TypeReference.resolveAnnotations
+TypeBinding.copy() and its overrides are a good place to start for comprehending
+the attempt.
+
+Only minimally tested, I kicked off the tests for the heck of it, see about
+350 failures out of the first 13K tests at which point I aborted it.
+Are you thinking of making the deep encoding configurable, so that clients who don't
+care about type annotations can request this step to be skipped?
+What about java model, indexer etc. 
+Is it feasible to make type binding replication optional? 
+Maybe you're already doing this, I haven't checked ...
+(In reply to Stephan Herrmann from comment #49)
+> Are you thinking of making the deep encoding configurable, so that clients
+> who don't
+> care about type annotations can request this step to be skipped?
+> What about java model, indexer etc. 
+> Is it feasible to make type binding replication optional? 
+> Maybe you're already doing this, I haven't checked ...
+
+No, I hadn't thought that of that - good point, will do.
+(In reply to Srikanth Sankaran from comment #48)
+> Created attachment 235080 [details]
+> Patch v 0.2
+
+I know this is a work in progress and you have probably seen this already. But anyway, I was trying this patch out in APT and got this error:
+
+"TypeBinding#copy() should have been overridden"
+
+This is thrown from TypeBinding#copy(...)
+(In reply to Jayaprakash Arthanareeswaran from comment #51)
+> (In reply to Srikanth Sankaran from comment #48)
+> > Created attachment 235080 [details]
+> > Patch v 0.2
+> 
+> I know this is a work in progress and you have probably seen this already.
+> But anyway, I was trying this patch out in APT and got this error:
+> 
+> "TypeBinding#copy() should have been overridden"
+
+Thanks, this is a known issue - all type bindings should provide a copy
+constructor - not all of them do - there is a throw of ISE from the
+abstract root class.
+Created attachment 235119
+Patch v0.5
+
+
+
+    - Chugging along. Many pieces work, some still not there.
+    - Some tricky parts remain around unresolved type bindings, wildcard captures,
+      type equivalence/compatibility.
+    - BinaryTypeBinding hooked in, but restoration from class files not in place.
+    - ~90% tests pass
+    - Annotated bindings uniqueness not fully there due to this pre-existing
+code:
+
+/*
+ *  Used to guarantee annotation identity.
+ */
+public AnnotationBinding createAnnotation(ReferenceBinding annotationType, ElementValuePair[] pairs) {
+	if (pairs.length != 0) {
+		AnnotationBinding.setMethodBindings(annotationType, pairs);
+	}
+	return new AnnotationBinding(annotationType, pairs);
+}
+
+:) :)
+Created attachment 235172
+Patch v0.9
+
+Beginning to see the light at the end of the tunnel, hopefully it is not
+the headlights of the approaching train.
+
+    - Rewired null annotations support to use the new infrastructure. A lot
+of existing code specially handling null annotations go away with this change.
+The null mask bits would auto-magically show up on the bindings, piggy
+backing on the generalized support for type annotations. (see TypeBinding#setTypeAnnotations and ArrayBinding#setTypeAnnotations.)
+
+   - Type annotations restoration from class files not in place, but this is 
+next in line.
+
+   -  There are 68 failures in RunAllJava8Tests. These fall into three buckets
+(a) toString output of bindings differ from expected messages (b) something
+is broken about method verification - I get a bunch of bogus duplicate method
+errors. (c) Restoration from class files being not in place, some null tests
+are failing.
+
+Stephan, if you have the time, could you look at the method verifier issues ? 
+ProblemTypeAndMethodTest.test376550_11a is one good example. There are a bunch
+in GTT too.
+
+A note about annotated binding uniqueness: there are some trade offs here.
+Today annotation binding uniqueness is not there, so naturally it would be
+impossible to guarantee uniqueness between two references to @NonNull String 
+in the code. Unless we resolve annotations eagerly, we will not be able to
+guarantee annotation uniqueness. Perhaps we could do this only for marker
+annotations and get away with it since type annotations are most likely to
+be marker annotations ?
+Created attachment 235173
+Correct patch
+
+Sorry, attached the wrong file earlier, here you go.
+Created attachment 235178
+Latest patch
+
+(In reply to Srikanth Sankaran from comment #54)
+
+> Stephan, if you have the time, could you look at the method verifier issues
+> ? 
+> ProblemTypeAndMethodTest.test376550_11a is one good example. There are a
+> bunch
+> in GTT too.
+
+I have fixed this. We are down to 35 failures in RunAllJava8Tests, all but
+one because null analysis is not fully rewired. I'll get this done and ask
+for a review.
+Created attachment 235211
+More progress
+
+Chugging along. Fixes a few bugs and also takes care of transferring type
+annotations from SE7 locations to the type bindings. About 40 tests are
+failing. Under investigation.
+Stephan, looking at org.eclipse.jdt.core.tests.compiler.regression.NullTypeAnnotationTest.testCompatibility3a(): 
+
+Type annotation spec says that in:
+
+	@NonNull String[] return1(String[] dubious) {
+		return dubious;
+	}
+
+the @NonNull applies to String and not to [].
+
+This test is perhaps checking for compatibility with the old mode - This is
+something we cannot guarantee - (we have heard of a request from the UI team
+to copy the type use annotations at SE7 locations to the binding.)
+
+What do you think ?
+(In reply to Srikanth Sankaran from comment #58)
+> Stephan, looking at
+> org.eclipse.jdt.core.tests.compiler.regression.NullTypeAnnotationTest.
+> testCompatibility3a(): 
+> 
+> Type annotation spec says that in:
+> 
+> 	@NonNull String[] return1(String[] dubious) {
+> 		return dubious;
+> 	}
+> 
+> the @NonNull applies to String and not to [].
+
+Good catch. My intention was indeed (as stated in the comment) to test
+unsafe conversion regarding the array content (String).
+
+So, the expected error is wrong:
+
+"Null type safety (type annotations): The expression of type \'String[]\' needs unchecked conversion to conform to \'String @NonNull[]\'\n"
+
+The last part should obviously by \'@NonNull String[]\'. The message makes
+the misinterpretation clearly visible.
+
+At one point in my implementation I had a method pushAnnotationIntoType()
+which should re-interpret a SE5 annotation into a type annotation.
+I seem to recall this method became obsolete later, but perhaps that's when 
+I forgot about the array case.
+
+The wrong location is in http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/tree/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/lookup/SourceTypeBinding.java?h=BETA_JAVA8#n1741
+this should have special treatment for the array case.
+There must be similar locations for variables, too.
+
+
+> This test is perhaps checking for compatibility with the old mode - This is
+> something we cannot guarantee - (we have heard of a request from the UI team
+> to copy the type use annotations at SE7 locations to the binding.)
+> 
+> What do you think ?
+
+The mentioned code line in STB should re-interpret what the parser read as
+a declaration annotation and give it type annotation semantics (if target
+is TYPE_USE).
+
+So, re-interpretation must push an annotation from an array to its leaf type.
+Do you see the need for other such conversions? For inner classes this
+  @NonNull Outer.Inner
+is already reported as illegal, because it would indeed apply to Outer,
+which is not a useful position for null annotations.
+  @NonNull java.lang.String
+is even more illegal in J8 (vs. java.lang.@NonNull String).
+So it seems arrays are the only kind needing further conversion, right?
+Created attachment 235252
+Patch v0.9
+
+Nearly there. Hooked up support for restoring annotations from class files.
+Now there are 14 failures and 1 error while running AllJava8 tests and
+< 20 with the full suite of tests.
+
+For the record, and just to give the devil his due :), this implementation
+heavily relied on the existing one by Stephan. Other than the one lone idea 
+of maintaining a "proto" "type collection" with id'd types, the new 
+implementation is just a massage over the existing one, going from a very
+null analysis specific model to the generalized model. It made it a lot easier
+to look at a working implementation and generalize it rather than start
+from the scratch. Also the numerous tests that exist already helped catch
+problems - thanks!
+
+One further design note: Eventually, I ended up stashing a reference to
+the prototype type binding and delegating to it: Not for every type in
+the hierarchy, but only for STB's and BTB's. The reason for this being
+that otherwise, we will/could end up replicating too much state.
+For PTB's we most likely should replicate the state and not reuse the
+state from the prototype object:  Since List<@NonNull String>.add() should
+be seen to be different from List<@English String>.add() by a tool.
+
+Pending tasks:
+
+    - Address failures.
+    - Add support for annotation uniqueness - without this annotated type 
+uniqueness will fall flat. We may get away with just ensuring singletons for
+marker annotations - since the most common case use of type annotation is
+likely to be static analysis tools and these annotations are likely markers.
+    - Get help from UI team (Deepak ?) to implement a clean up for automatically
+changing ==s and !=s on TypeBinding hierarchy objects into 
+TypeBinding#equalsEquals and its counterpart. It was painful debugging and
+addressing the failures in the suite one by one searching for the == needle
+in the hay stack :)
+    - Scrutinize the changes for appropriateness when it comes to handling
+URBs in how they interact with the UnannotatedTypesCollection. Also wildcard capture handling, needs study.
+    - Deep encode only when requested by clients.
+   - Self review followed by review by Stephan.
+Created attachment 235285
+Patch v0.99
+
+Latest snapshot attached. There are exactly 25 failures with this patch. Despite
+the number (slightly) going up, this patch represents a significant step towards
+the final form. I don't expect any major design changes anymore except for one:
+I would like to model multidimensional arrays as array of arrays (as we do in
+DOM/AST). This would significantly simply the code in a bunch of places.
+
+Other than that I expect only bug fixes and no major changes.
+
+One interesting tidbit: The type annotation walker based code for restoring
+annotations from class files differs in subtle ways from how the compiler does
+things: in @Nonempty List<Strings>, what is the generic type ? Is it @List or
+List ? The compiler says it is List, while the class file reader code says it
+is @List :: This creates some challenges, but manageable ones.
+Stephan, per comment#60, I don't expect any major design/architecture changes.
+Could you start the review please ? I expect to wrap up the bug fixes for the
+25 failures in a couple of days, but the review can start already.
+
+I suggest two passes: One high level review after which this can be released to
+enable DOM/AST and APT work to proceed and a deeper round of review subsequently.
+Thanks!
+Created attachment 235324
+Latest patch
+
+Obligatory update at the end of the day (night). Down to 4 failures.
+
+Stephan, I have had to remaster a bunch of tests in NTAT, please take a look
+and let me know if I have messed up something in my sleep deprived state :)
+Created attachment 235326
+Real latest patch
+
+Last patch was bad as I had remastered a test case incorrectly. Fixed.
+Despite my best efforts to avoid rewriting everything I see :), this is
+ballooning up to be a big patch: 50+ files are modified with 4.8KLOC patch
+file size.
+I'm kind of sleepy, too, but the first thing striking me strange is the new bogus error in NTAT.testBinary05(): It seems you disabled flow analysis in this case. AllocationExpression.nullStatus(..) should always answer NON_NULL and that should satisfy the analysis. Not sure how you achieved to bypass this :)
+
+Wrong nullAnnotatedReadableName() in ArrayBinding is my bad, but the following change should fix this, change:
+  char[] leafTypeName = shortNames ? this.leafComponentType.shortReadableName() : this.leafComponentType.readableName();
+into
+  char[] leafTypeName = this.leafComponentType.nullAnnotatedReadableName(options, shortNames);
+
+Additional error in FlowAnalysisTest8 should be avoided, IMHO. I typically wipe all nullAnnotationTagBits after detecting the kind of error as we report first.
+
+Error messages in testBug416175()
+1.: mixing short and long names
+2.: I like "required \'@NonNull ? extends String\'" better than "required \'@NonNull capture#\'" when it's clear we're not interested in compatibility of the capture itself, only in null safety.
+
+so much for tonight...
+Created attachment 235340
+Final patch for review
+
+But for one disabled test which I plan to address in a separate bug,
+the implementation is complete and all tests pass. Any and all issues
+raised unless they are blockers, I plan to address in a separate pass.
+
+Stephan, please look through. If you can complete a round of high level
+review this week, that would be great: I am hoping to release it this week
+so APT and DOM work could benefit. 
+
+You can start your tour at:
+
+AnnotatableTypeSystem, UnannotatedTypeSystem and
+ASTNode.resolveAnnotations(BlockScope, Annotation[][], TypeBinding)
+
+and work your way through.
+
+Per earlier comment, I had to remaster a bunch of tests in NTAT. I have also
+left in a bunch of TODO's against your name.
+Jay, please look through this patch and start on the DOM bindings side of
+the work which is why Manju raised this bug. Also for APT.
+
+TypeBinding#getTypeAnnotations() is the accessor. ArrayBinding's have an
+internal encoding where the annotations for each dimension are null separated.
+So you get a flat array of annotation bindings and need to attribute it to
+dimensions properly.
+(In reply to Stephan Herrmann from comment #65)
+> I'm kind of sleepy, too, but the first thing striking me strange is the new
+> bogus error in NTAT.testBinary05(): It seems you disabled flow analysis in
+> this case. AllocationExpression.nullStatus(..) should always answer NON_NULL
+> and that should satisfy the analysis. Not sure how you achieved to bypass
+> this :)
+
+The flow analysis is intact, but the problem stems from the contradicting bits 
+still being left in (after proper complaint). The parameter is seen to be both 
+nullable and nonnull at the same time and it just takes a certain code path 
+because of the way the comparisons are made. Should be just a matter of 
+clearing the null bit after reporting.
+ 
+> Wrong nullAnnotatedReadableName() in ArrayBinding is my bad, but the
+> following change should fix this, change:
+
+Agreed.
+
+> Additional error in FlowAnalysisTest8 should be avoided, IMHO. I typically
+> wipe all nullAnnotationTagBits after detecting the kind of error as we
+> report first.
+
+Agreed.
+ 
+> Error messages in testBug416175()
+> 1.: mixing short and long names
+> 2.: I like "required \'@NonNull ? extends String\'" better than "required
+> \'@NonNull capture#\'" when it's clear we're not interested in compatibility
+> of the capture itself, only in null safety.
+
+Agreed. If the overall direction is unobjectionable, may I request you to
+follow up on these items post high level review and release of the patch ?
+
+I am in a bind having been bound to bindings for the past 2 weeks, sorry
+for the bad punning :)
+(In reply to Srikanth Sankaran from comment #67)
+> TypeBinding#getTypeAnnotations() is the accessor. ArrayBinding's have an
+> internal encoding where the annotations for each dimension are null
+> separated.
+> So you get a flat array of annotation bindings and need to attribute it to
+> dimensions properly.
+
+The ArrayBinding for the following code:
+    
+    java.lang.String @Marker [] [] @Marker []
+
+Has the following annotation bindings (the elements of the array)
+
+   [@Marker, null, null, @Marker, null]
+
+Is this as expected?
+(In reply to Jayaprakash Arthanareeswaran from comment #69)
+> (In reply to Srikanth Sankaran from comment #67)
+> > TypeBinding#getTypeAnnotations() is the accessor. ArrayBinding's have an
+> > internal encoding where the annotations for each dimension are null
+> > separated.
+> > So you get a flat array of annotation bindings and need to attribute it to
+> > dimensions properly.
+> 
+> The ArrayBinding for the following code:
+>     
+>     java.lang.String @Marker [] [] @Marker []
+> 
+> Has the following annotation bindings (the elements of the array)
+> 
+>    [@Marker, null, null, @Marker, null]
+> 
+> Is this as expected?
+
+Yes, the first null signals the end of annotations for the first [] -> @Marker
+second null signals the end of annotations for the second [] -> none
+third demarcates the end of annotations for the third [] -> @Marker
+
+The leaf component type's annotations can be retrieved by
+
+arrayBinding.leafComponentType().getTypeAnnotations() -> they should be empty
+in this example.
+(In reply to Srikanth Sankaran from comment #66)
+> Created attachment 235340 [details]
+> Final patch for review
+
+I noticed that this patch does not apply for NegativeTypeAnnotationTest due
+to some carriage return issues, please exclude this file and grab the changes
+manually.
+
+Pending tasks:
+
+    - Verify that annotated type binding uniqueness actually kicks in
+for marker annotated types. For others, we don't guarantee this. Perhaps
+we could extend this for single member annotations with default values,
+but this may not be worth it.
+
+    - Address the sole failure. I think TVB should cache the prototype
+and deflect - this is probably the reason for the failure in the disabled
+test GrammarCoverageTests308._test023()
+
+    - Change == and != to wrapper calls. We may not want to do this in
+a clean up after all, we need to scrutinize places that must actually use
+== and != 
+
+    - Deep encode only when requested by clients. Create an abstract class
+TypeSystem that is the parent of UTS and ATS and make LE use this instead
+of ATS directly.
+
+    - Make sure all TypeBinding classes implement copy constructors properly,
+in some of them clone directly does the work. For consistency we should
+change to one style.
+
+   - Self review followed by review by Stephan and address review comments.
+
+   - Change the way mutildimensional arrays are represented and move to
+a model of array of arrays - may be.
+
+I plan to address all this and any issues found in reviews in a separate pass
+so I don't have to keep posting new patches even as the review is going on.
+(In reply to Srikanth Sankaran from comment #71)
+
+>     - Address the sole failure. 
+
+For the record, the sole failing test is failing due to a bounds check
+failure (it should not) in this snippet:
+
+public interface I<U extends J<? extends I<U>>> {
+}
+interface J<T extends I<? extends J<T>>> {
+}
+class CI<U extends CJ<T, U> & @Marker J<@Marker T>,
+			T extends CI<U, T> & @Marker I<U>>
+	implements I<U> {
+}
+class CJ<T extends CI<U, T> & @Marker I<@Marker U>,
+			U extends CJ<T, U> & J<T>>
+	implements J<T> {
+}
+
+
+I say such programs should be banned :)
+(In reply to Srikanth Sankaran from comment #70)
+> Yes, the first null signals the end of annotations for the first [] ->
+> @Marker
+> second null signals the end of annotations for the second [] -> none
+> third demarcates the end of annotations for the third [] -> @Marker
+
+Just curious, can't the last one be avoided?
+
+Anyways, I have started working on the DOM side of things and plan to add the following to ITypeBinding:
+
+	public IAnnotationBinding[] getTypeUseAnnotations();
+
+I have verified that the object equality and non equality is already taken care of by the ASTConverter and the maps we use to store the bindings.
+
+Now, only one concern remains: The DOM's TypeBinding keeps references to a lot of things such as members, interfaces, methods etc. and most of these are arrays. The duplication is not a good thing. Srikanth, I think we should do something like the 'prototype' here as well. If we want to do that, is there a way we can get hold of the 'prototype' from the compiler ast?
+I can use public TypeBinding unannotated() can't I?
+(In reply to Srikanth Sankaran from comment #72)
+
+> I say such programs should be banned :)
+
+That was said in jest, but seriously that both eclipse and javac 8b100
+compile this program can be held to looseness in the spec:
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Target;
+
+@Target(ElementType.TYPE_USE)
+@interface TA {
+}
+@Target(ElementType.TYPE_USE)
+@interface TB {
+}
+
+public abstract class X<@TA T> {
+
+	@TB T t;
+}
+
+How can be there be an instantiation of T that is "only @TA annotated" and
+"only @TB annotated" at the same time. As such I think the language should
+ban type annotations on uses of type parameters and insist that they be
+consolidated and presented at the declaration site.
+
+I'll take this to the spec committee. (BTW during my review I found that
+my implementation in TVB is incomplete, I'll address it in follow up patch,
+post review)
+(In reply to Jayaprakash Arthanareeswaran from comment #73)
+> (In reply to Srikanth Sankaran from comment #70)
+> > Yes, the first null signals the end of annotations for the first [] ->
+> > @Marker
+> > second null signals the end of annotations for the second [] -> none
+> > third demarcates the end of annotations for the third [] -> @Marker
+> 
+> Just curious, can't the last one be avoided?
+
+Yes, but it leads to cleaner programs. Otherwise for multidimensional arrays,
+you will typically end up with some code inside the loop that processes it
+that will also have to be duplicated outside the loop.
+  
+> Now, only one concern remains: The DOM's TypeBinding keeps references to a
+> lot of things such as members, interfaces, methods etc. and most of these
+> are arrays. The duplication is not a good thing. Srikanth, I think we should
+> do something like the 'prototype' here as well. 
+
+Yes, you can. However, the prototype is not available for all types of
+compiler bindings. Only STB and BinaryTB have them. Certain types of
+bindings should NOT work with the prototypes and this concern drove the 
+choice in compiler implementation. 
+
+For example: if you have class X then @Nullable X and @NonNull X have the
+same methods, fields, member types, supertypes etc and so STB can (and does)
+store a handle to the prototype and retrieve it from there.
+
+But List<@NonNull String> and List<@Nullable String> should not share the
+methods, fields, etc because they should result in different methods,
+fields etc due to type variable substitution that includes the annotation.
+
+
+>If we want to do that, is
+> there a way we can get hold of the 'prototype' from the compiler ast?
+(In reply to Jayaprakash Arthanareeswaran from comment #74)
+
+> I can use public TypeBinding unannotated() can't I?
+
+Yes, but making allowance for the above. unannotated() returns the "stark
+naked" compiler binding (what we would have had for Java7).
+
+See that in the new scheme, the bindings for
+
+Map<@NonNull String, @Nullable String> != Map<@Interned String, @Readonly String> != @Readonly Map<@English String, @Latin String> 
+
+but their unannotated() binding would be ==.
+
+The bindings for
+
+List<@Readonly String> != List<@Interned Object>
+
+and their unannoted() binding would be different too.
+(In reply to Srikanth Sankaran from comment #76)
+
+> See that in the new scheme, the bindings for
+> 
+> Map<@NonNull String, @Nullable String> != Map<@Interned String, @Readonly
+> String> != @Readonly Map<@English String, @Latin String> 
+
+and two or more instances of @NonNull String should answers bindings that
+meet ==, but I still need to verify that it actually works: see first item
+in pending tasks from comment#71.
+
+This should save a lot of memory. 
+
+A caveat in the present implementation is that a @Readonly String from
+source code and @Readonly String form a class file will not share their
+bindings. This can be fixed though.
+(In reply to Srikanth Sankaran from comment #75)
+> (In reply to Srikanth Sankaran from comment #72)
+> 
+> > I say such programs should be banned :)
+> 
+> That was said in jest, but seriously that both eclipse and javac 8b100
+> compile this program can be held to looseness in the spec:
+> 
+> import java.lang.annotation.ElementType;
+> import java.lang.annotation.Target;
+> 
+> @Target(ElementType.TYPE_USE)
+> @interface TA {
+> }
+> @Target(ElementType.TYPE_USE)
+> @interface TB {
+> }
+> 
+> public abstract class X<@TA T> {
+> 
+> 	@TB T t;
+> }
+
+If you replace TA, TB with NonNull, Nullable respectively,
+do you see an error reported? (should, but I can't check right now).
+
+I read these as constraints that can be placed at various locations
+depending on how broadly you'd like to see these applied.
+
+One questions remains:
+- does @TA automatically apply at the declaration of "t"?
+  For null annotations I want this kind of "inheritance":
+  - if the type parameter is already constrained this applies to all uses
+  - if the type parameter is unconstrained each use may decide individually
+  I hold this to be similar to "@TX class C {}" which the spec
+  explicitly mentions as an abbreviation.
+In this light your example might have to be interpreted as accumulating
+annotations @TA and @TB => no problem needs to be reported.
+
+Obviously, conflicts like between @NonNull and @Nullable cannot be
+detected generically, it's our custom semantics to define two annotations
+as exclusive / contradictory.
+(In reply to Stephan Herrmann from comment #78)
+
+> I read these as constraints that can be placed at various locations
+> depending on how broadly you'd like to see these applied.
+
+Stephan, I think you missed the main point in my question: For the type
+variable case, how can there be an instantiation that is _only_ @TA annotated
+and _only_ @TB annotated at the same time ? 
+
+
+> One questions remains:
+> - does @TA automatically apply at the declaration of "t"?
+
+If we indeed say that annotations on _uses_ of type parameters do not
+make sense and these need to consolidated at the declaration site, then
+the value of the target element type TYPE_PARAMETER itself comes into
+question and should perhaps be discarded and replaced with TYPE_USE
+itself, in which case in makes sense to say that the annotations at the
+declaration site apply to all uses of the type variable.
+
+>   - if the type parameter is unconstrained each use may decide individually
+
+"Each use" is has to correspond to same type i.e the instantiating type ?
+ 
+> In this light your example might have to be interpreted as accumulating
+> annotations @TA and @TB => no problem needs to be reported.
+
+This is what I am labelling as looseness in spec. I think the language should
+insist that all such annotations be consolidated into a single site - the
+declaration site - rather than be scattered all over the place.
+
+> Obviously, conflicts like between @NonNull and @Nullable cannot be
+> detected generically, it's our custom semantics to define two annotations
+> as exclusive / contradictory.
+
+Even where they don't contradict, not allowing them to be scattered leads
+to cleaner programs.
+Obligatory joke for the review request:
+
+What is the difference between roast beef and pea soup ?
+
+(google for the answer) :)
+(In reply to Srikanth Sankaran from comment #79)
+> (In reply to Stephan Herrmann from comment #78)
+> 
+> > I read these as constraints that can be placed at various locations
+> > depending on how broadly you'd like to see these applied.
+> 
+> Stephan, I think you missed the main point in my question: For the type
+> variable case, how can there be an instantiation that is _only_ @TA annotated
+> and _only_ @TB annotated at the same time ? 
+
+I saw that, but it is not my interpretation of the code you showed.
+Instantiations of T would be constrained only by @TA.
+However, the type of 't' would be constrained by both annotations.
+
+Example:
+
+ Assume we have @Readonly for collections as a guarantee that none of the
+ update methods like set(..) are invoked via a reference of this type.
+ 
+ public class X<E, @Readonly T extends Collection<E>> {
+	public @NonNull T t;
+        public void setT(T t) { if (t != null) this.t = t; }
+ }
+
+ Now it is legal to instantiate X as
+    X<String, @Readonly List<String>> x = ...
+ The first constraint means I cannot
+    x.t.set("smuggled");
+ because invoking set() on any value of type T is illegal.
+
+ The T-instantiation of x is, however, unconstrained in terms of @NonNull.
+ See that setT() receives a value that has unknown nullness but after
+ a null check the value (additionally to being @Readonly) now also has the
+ @NonNull property and can be assigned to the field 't' where both 
+ constraints apply.
+
+ (The inverse case of swapping @Readonly and @NonNull is even more
+ interesting but that distracts from the point I want to make).
+
+In this example only @Readonly is established when instantiating T.
+The type of field 't' is considered to be '@NonNull @Readonly T' 
+which is a subset of '@Readonly T'. Assingments from '@Readonly T' to
+'@NonNull @Readonly T' require further checks.
+
+What questions elucidate the differences between our views?
+ - Does instantiation of the type variable have to meet all constraints
+   uncluding those at uses of the type variable?
+   I say: no.
+ - Do constraints from declaration and use of a type variable accumulate?
+   I say: yes.
+Am I missing another question?
+
+> If we indeed say that annotations on _uses_ of type parameters do not
+> make sense and these need to consolidated at the declaration site, then 
+...
+
+then we could not write:
+  class MyIterator<T> extends SomeIterator<T> {
+     @NonNull T getNextNonNull() {
+        T candidate = next();
+        while (candidate == null) candidate = candidate.next();
+        return candidate;
+     }
+  }
+This could be used to iterate over a collection that may contain nulls,
+but skip the nulls during iteration.
+When forcing the @NonNull on T's declaration this would not be possible.
+
+> >   - if the type parameter is unconstrained each use may decide individually
+> 
+> "Each use" is has to correspond to same type i.e the instantiating type ?
+
+"correspond" in terms of satisfying all known constraints.
+A use of a type variable my impose further constraints to specify a subset.
+  
+In terms of type checking the challenge seems to be in gradual enrichment
+of a type:
+  Foo f1 = ...
+  @NonNull Foo f2 = f1 != null ? f1 : NO_FOO;
+  @Readonly @NonNull Foo f3 = f2;
+etc.
+At each assignment the RHS is 'unspecified' in terms of the added annotation.
+For each enrichment the typesystem of that particular annotation has to 
+decide the rules. For nullness we require a null check.
+
+Enough prose, on to the review... :)
+I notice we have code like this in the DefaultBindingResolver:
+
+return getTypeBinding(this.scope.createArrayType(arrayBinding.leafComponentType, arrayType.getDimensions()));
+
+While I figured that I need to pass the annotations as well to use the new method, we seem to create a new ArrayBinding from an existing valid ArrayBinding. Anyone knows what's going on here?
+(In reply to Srikanth Sankaran from comment #66)
+> You can start your tour at:
+> 
+> AnnotatableTypeSystem, UnannotatedTypeSystem and
+> ASTNode.resolveAnnotations(BlockScope, Annotation[][], TypeBinding)
+> 
+> and work your way through.
+
+Preliminary impression from first look at these classes: there's most likely much more thought behind this than I can easily grasp from looking at the naked code.
+
+Questions start to pile up on my side, some of which could perhaps be proactively avoided by some code comments regarding the underlying design.
+Examples:
+- how are type ids managed?
+- what invariants govern UnannotatedTypeSystem#types and how are they ensured?
+- what is the meaning of methods UTS#{get,createType}
+  (I don't see any types being created)
+- what is the difference between ATS#createParameterizedType and
+  #createAnnotatedType given that both have mostly equivalent signatures.
+  i.e., if I create an annotated type with type arguments, isn't that 
+  a parameterized type?
+- ATS#createAnnotatedType looks like it could return the enclosing type
+  of the input type. Assumptions why this is not so remain implicit and are
+  hard to reproduce from the code.
+- the same method has a AnnotationBinding[][] parameter, what's the meaning
+  of these array dimensions?
+- what's the relationship between cache structures in LE, UTS and ATS?
+  It seems some of those in LE are now obsolete? Is there some invariant
+  about ATS#annotatedTypes being some kind of inverse of UTS#types?
+- are all elements in annotatedTypes actually annotated?
+- what are misplacedAnnotations?
+Specifically for all locations that throw IllegalStateException I could use some explanations why those situations are considered to be impossible.
+
+One more name to consider: "serializedAnnotations" makes me think of Serializable. How would "flattenAnnotations" sound instead?
+
+
+Don't you think some of these issues deserve a bit of documentation in the code? I'll leave these issues to the second phase of my review, proceeding with what understanding I have of these classes.
+(In reply to Stephan Herrmann from comment #83)
+
+> (In reply to Srikanth Sankaran from comment #66)
+> > You can start your tour at:
+> > 
+> > AnnotatableTypeSystem, UnannotatedTypeSystem and
+> > ASTNode.resolveAnnotations(BlockScope, Annotation[][], TypeBinding)
+> > 
+> > and work your way through.
+> 
+> Preliminary impression from first look at these classes: there's most likely
+> much more thought behind this than I can easily grasp from looking at the
+> naked code.
+> 
+> Questions start to pile up on my side, some of which could perhaps be
+> proactively avoided by some code comments regarding the underlying design.
+
+Fair enough, I'll a post a write up here as well a post an updated patch that
+differs only in having additional documentation. Should be there by midday
+tomorrow.
+During my first walk through the code I've collected some follow-up items into bug 417113.
+(In reply to Srikanth Sankaran from comment #72)
+> (In reply to Srikanth Sankaran from comment #71)
+> 
+> >     - Address the sole failure. 
+> 
+> For the record, the sole failing test is failing due to a bounds check
+> failure (it should not) in this snippet:
+> 
+> public interface I<U extends J<? extends I<U>>> {
+> }
+> interface J<T extends I<? extends J<T>>> {
+> }
+> class CI<U extends CJ<T, U> & @Marker J<@Marker T>,
+> 			T extends CI<U, T> & @Marker I<U>>
+> 	implements I<U> {
+> }
+> class CJ<T extends CI<U, T> & @Marker I<@Marker U>,
+> 			U extends CJ<T, U> & J<T>>
+> 	implements J<T> {
+> }
+
+Could this be related to bug 417113 comment 1?
+The reason why I think so is: prior to your patch I have a bit of wrapping code in Scope.substitute(Substitute,TypeBinding) which first unwraps the incoming type (unannotated()) and re-applies type annotations via LE#copyAnnotations().
+
+With your patch we no longer have the unwrapping/re-wrapping, so type annotations are suddenly considered during bound checks, whereas actually they should be checked in a separate phase (not affecting the core JLS checking).
+
+Either this can be fixed by re-inventing copyAnnotations() in terms of UTS and ATS, or we may be forced to weave unwrapping and rewrapping much more intimately into the substitution logic (I saw you already have one call to createAnnotatedType somewhere in Scope). I'd prefer the former.
+
+What do you think? Should we defer this to the follow-up bug?
+While I'm unearthing lots of details into bug 417113, I haven't found any show stoppers. 
+
+If some documentation appears sometime tomorrow (no hurry - I won't work on this tomorrow) I will take another look some time during the weekend, by which time I might actually finish the full review already.
+Created attachment 235453
+DOM side of the fix
+
+This provides a new API in ITypeBinding to access the type use bindings. The new tests added confirm that ASTConverter already takes care of creating distinct type bindings when there are annotations. I have also updated the TypeBinding#isEqualTo() to consider comparing compiler bindings prototypes as a quick way to check equality.
+
+Patch needs to be applied on top of Srikanth's latest patch. Probably not perfect, but JDT UI team can grab the patch and check whether it addresses their concerns.
+(In reply to Stephan Herrmann from comment #83)
+> (In reply to Srikanth Sankaran from comment #66)
+> > You can start your tour at:
+> > 
+> > AnnotatableTypeSystem, UnannotatedTypeSystem and
+> > ASTNode.resolveAnnotations(BlockScope, Annotation[][], TypeBinding)
+> > 
+> > and work your way through.
+> 
+> Preliminary impression from first look at these classes: there's most likely
+> much more thought behind this than I can easily grasp from looking at the
+> naked code.
+
+I will shortly upload a version that has better documentation, but still
+not fully there. But since it answers all questions raised here, I am hopeful
+it is clear enough to proceed.
+
+> Questions start to pile up on my side, some of which could perhaps be
+> proactively avoided by some code comments regarding the underlying design.
+> Examples:
+> - how are type ids managed?
+> - what invariants govern UnannotatedTypeSystem#types and how are they
+> ensured?
+
+This is now explained just above the class header for UTS.
+
+> - what is the meaning of methods UTS#{get,createType}
+>   (I don't see any types being created)
+
+Misnamed. These methods are merged and renamed to getUnannotatedType now.
+Basically it is a way to introduce a type to UTS so it can id stamp the
+type if not already done so, and if the type is annotated, to get the
+naked type.
+
+> - what is the difference between ATS#createParameterizedType and
+>   #createAnnotatedType given that both have mostly equivalent signatures.
+
+OK. The former is LE's version relocated into ATS and supplied with an
+additional argument. We could have retained LE's old method's signature
+and called it to create a parameterized type and then call getAnnotatedType
+to annotate it, or directly use the new variant to create a annotated
+parameterized type.
+
+The latter method is a private subroutine of ATS#getAnnotatedType which is
+capable of taking _any_ type of binding and applying some annotations to it.
+The extra arguments for enclosing type and type arguments are so that we
+don't fail to discriminate annotated instances of them and get the clone 
+to adopt them.
+
+(BTW, I have consistently renamed the create* methods to be get* methods.)
+ 
+>   i.e., if I create an annotated type with type arguments, isn't that 
+>   a parameterized type?
+
+Yes :) It is a annotated parametized type. 
+
+> - ATS#createAnnotatedType looks like it could return the enclosing type
+>   of the input type. 
+
+No. this is due to my needlessly overusing the variable enclosingType.
+I have fixed this, so what could be initially confusing to a reader is
+eliminated.
+
+> - the same method has a AnnotationBinding[][] parameter, what's the meaning
+>   of these array dimensions?
+
+This is documented in the code now. Anyway for the record here: when we
+see
+
+@Outer Outer.@Middle Middle.@Inner Inner, by construction, we first end
+up with the binding for Outer.Middle.Inner and then annotate various levels
+at one go. The 2 dimensional AnnotationBinding[][] parameter directly maps
+to the 2 dimensional Annotation[][] on a TypeReference and likewise dimension
+annotations on a TypeReference.
+
+> - what's the relationship between cache structures in LE, UTS and ATS?
+>   It seems some of those in LE are now obsolete? 
+
+Yes, the ones dealing with unique parameterized types, unique raw types,
+unique wildcard types and unique array types are moved into *TypeSystem
+from LE and are obsolete. I had forgotten to garbage collect. Done now.
+It is explained now in the code that UTS keeps track of only unannotated
+types and ATS only types that are annotated somehow.
+
+>Is there some invariant
+>   about ATS#annotatedTypes being some kind of inverse of UTS#types?
+
+ATS presents to the outside world the set of all types whether they are
+unannotated or otherwise. Internally it keeps track of only annotated types
+and delegates to UTS to keep track of unannotated types.
+
+> - are all elements in annotatedTypes actually annotated?
+
+Yes. Annotated somewhere, somehow. e.f List<@NonNull String> would be tracked
+by ATS, even though the annotations are not attached to List.
+
+> - what are misplacedAnnotations?
+
+Do you lie down in bed and cover yourself with the blanket ? Or do you
+cover yourself with the blanket and then lie down in bed ? :)
+
+The code that restores annotations from the class file behaves slightly
+differently compared to how the compiler behaves. When we see
+
+@NonEmpty List<String>, compiler uses List as the generic type and parameterizes
+that with String and then annotates that with @NonEmpty, while the class
+file reading code uses @NonEmpty List as the generic type and parameterizes
+that with String.
+
+For consistent treatment, I need to treat one of them as being "wrong" and
+repair it to be the other form. This is documented now.
+
+
+> Specifically for all locations that throw IllegalStateException I could use
+> some explanations why those situations are considered to be impossible.
+
+:) I have removed some of those places. What is left in should be self
+explanatory.
+
+> One more name to consider: "serializedAnnotations" makes me think of
+> Serializable. How would "flattenAnnotations" sound instead?
+
+I think you meant flattenedAnnotations. Done. Fixed.
+
+> Don't you think some of these issues deserve a bit of documentation in the
+> code? 
+
+Absolutely. Sorry I meant to go over this point during my own code review pass.
+(In reply to Stephan Herrmann from comment #86)
+
+> Could this be related to bug 417113 comment 1?
+> The reason why I think so is: prior to your patch I have a bit of wrapping
+> code in Scope.substitute(Substitute,TypeBinding) which first unwraps the
+> incoming type (unannotated()) and re-applies type annotations via
+> LE#copyAnnotations().
+> 
+> With your patch we no longer have the unwrapping/re-wrapping, so type
+> annotations are suddenly considered during bound checks, whereas actually
+> they should be checked in a separate phase (not affecting the core JLS
+> checking).
+
+> Either this can be fixed by re-inventing copyAnnotations() in terms of UTS
+> and ATS, or we may be forced to weave unwrapping and rewrapping much more
+> intimately into the substitution logic (I saw you already have one call to
+> createAnnotatedType somewhere in Scope). I'd prefer the former.
+> 
+> What do you think? Should we defer this to the follow-up bug?
+
+Yes, please. I would like us to bite the bullet and handle substitutions
+with annotations if that is not too unwieldly.
+
+OK. Let us move all further discussions on compiler binding encoding to
+bug 417113. I'll also post the patch with better documentation there,
+Comment on attachment 235340
+Final patch for review
+
+Please see latest patch at bug 417113. Compiler binding encoding work moved
+to there, we will retain the present bug for DOM bindings.
+(In reply to Jayaprakash Arthanareeswaran from comment #88)
+> Created attachment 235453 [details]
+> DOM side of the fix
+
+> Patch needs to be applied on top of Srikanth's latest patch. Probably not
+> perfect, but JDT UI team can grab the patch and check whether it addresses
+> their concerns.
+
+Thanks, I think you had good code originally in isEqualTo and I suggested
+a bum change: TypeBinding.equalsEquals and its counterpart will give the
+correct answer only within the same lookup environment. Across environments
+unequal type may end up with the same TypeBinding.id which is checked by
+TypeBinding.equalsEquals. So it can answer true for unequal types.
+
+I think you can call unannotated() on both and compare with == if first
+== fails and if the unannotated == fails, do a binding key comparison as
+before.
+For the record, the deep encoding implementation has been released 
+here: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=3b7e9a0f1d7c1bcba3808ca366020fd264fda3dd
+
+with several follow up actions logged at:
+
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=417113#c25 and
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=417295#c0 and
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=417295#c1.
+
+Many thanks to Stephan, Markus and Andy for weighing in with your
+valuable comments, questions etc.
+Assigning to Jay since he is handling the DOM part of the fix.
+
+Jay, we want all the tests in GrammarCoverageTests308 (40 tests in number)
+converted suitably so we are able to verify the DOM ITypeBinding carrying 
+the proper annotations.
+
+This should happen before the present bug is closed, but not necessarily 
+before the implementation is released. For that we will use code reviews +
+a "fair" amount of tests as the gating criteria.
+Created attachment 235525
+Updated patch
+
+Patch updated to sync with the latest of Srikanth's changes (committed in BETA_JAVA8). The new tests mostly worry about binding equality. Would be adding more tests (equivalent of GrammarCoverageTests308) for testing annotation bindings.
+
+In the meantime, it would be good if someone from the UI team takes a look at this and provide an early feedback.
+
+Another point to note is not all instances of ArrayBinding creation in DefaultBindingResolver have been replaced. Will do so if required after more testing.
+(In reply to Stephan Herrmann from comment #81)
+
+> What questions elucidate the differences between our views?
+>  - Does instantiation of the type variable have to meet all constraints
+>    uncluding those at uses of the type variable?
+>    I say: no.
+
+I agree with this explanation, Thanks for the examples, I have a better
+understanding now.
+Created attachment 235622
+Same as previous patch + Tests
+
+Added new tests in TypeBindingTests308. There are about 29 of them of which 5 are failing. Four of them look like bug 417388 and the last one is about the _type_'s qualifier type getting the same binding as the _type_. The problem is the DefaultBindingResolver maps the same compiler.ast.QualifiedTypeReference to both the _type_ and _type_'s qualifier. I need to figure out how we can extract the correct enclosing type binding from a given QualifiedTypeReference.
+(In reply to Jayaprakash Arthanareeswaran from comment #97)
+> The
+> problem is the DefaultBindingResolver maps the same
+> compiler.ast.QualifiedTypeReference to both the _type_ and _type_'s
+> qualifier. I need to figure out how we can extract the correct enclosing
+> type binding from a given QualifiedTypeReference.
+
+This may be same as bug 416886. I will take the patch and see if it addresses my concern.
+Created attachment 235702
+Updated tests
+
+Same patch with slightly modified tests. All but one test pass. The failing test scenario is mentioned in bug 417388, comment #7.
+(In reply to Jayaprakash Arthanareeswaran from comment #99)
+> Created attachment 235702 [details]
+> Updated tests
+> 
+> Same patch with slightly modified tests. All but one test pass. The failing
+> test scenario is mentioned in bug 417388, comment #7.
+
+This is up for review once the test failure is addressed. Some items that still require some attention:
+
+1. ITypeBinding#getTypeUseAnnotations returns null separated bindings for an array type. I would like the UI team to look at this and tell me if they would prefer it any other way, e.g. an array of bindings, where non array type bindings would only have their first element.
+
+2. Does someone know the answer to the question I posted on comment #82?
+(In reply to Jayaprakash Arthanareeswaran from comment #82)
+> I notice we have code like this in the DefaultBindingResolver:
+> 
+> return
+> getTypeBinding(this.scope.createArrayType(arrayBinding.leafComponentType,
+> arrayType.getDimensions()));
+> 
+> While I figured that I need to pass the annotations as well to use the new
+> method, we seem to create a new ArrayBinding from an existing valid
+> ArrayBinding. Anyone knows what's going on here?
+
+
+I was surprised to find that I was the last one changing these lines :)
+But with a bit of software archeology I see that the basic idea was 
+implemented 11 years ago ... so probably no-one will exactly remember ...
+
+One thing to note and relating to my findings in bug 342671 comment 13:
+we do mix the leafComponentType and the dimensions from different animals.
+Perhaps arrayBinding.dimensions() != arrayType.dimensions()
+I guess that might qualify for an explanation, wdyt?
+(In reply to Stephan Herrmann from comment #101)
+> (In reply to Jayaprakash Arthanareeswaran from comment #82)
+> > I notice we have code like this in the DefaultBindingResolver:
+> > 
+> > return
+> > getTypeBinding(this.scope.createArrayType(arrayBinding.leafComponentType,
+> > arrayType.getDimensions()));
+> > 
+> > While I figured that I need to pass the annotations as well to use the new
+> > method, we seem to create a new ArrayBinding from an existing valid
+> > ArrayBinding. Anyone knows what's going on here?
+> 
+> 
+> I was surprised to find that I was the last one changing these lines :)
+
+Just an very early sign of Alzheimer's :) Happens to me all the time, welcome
+to the club :)
+(In reply to Jayaprakash Arthanareeswaran from comment #99)
+> Created attachment 235702 [details]
+> Updated tests
+> 
+> Same patch with slightly modified tests. All but one test pass. The failing
+> test scenario is mentioned in bug 417388, comment #7.
+
+Srikanth, can you hold on to the review for some time. I just realized I overlooked ITypeBinding#getComponentType(). Looks like we can simply let the clients use that API to get to the inner (array) types of an array type and it's annotations. Which means the new API I added, ITypeBinding#getTypeUseAnnotation() only need to return the annotations at that level.
+(In reply to Srikanth Sankaran from comment #102)
+> (In reply to Stephan Herrmann from comment #101)
+> > I was surprised to find that I was the last one changing these lines :)
+
+Did I write that?
+:)
+ 
+> Just an very early sign of Alzheimer's :) Happens to me all the time, welcome
+> to the club :)
+
+The good thing: with git & bugzilla we don't have to admit our forgetting :)
+(In reply to Stephan Herrmann from comment #104)
+> (In reply to Srikanth Sankaran from comment #102)
+> > (In reply to Stephan Herrmann from comment #101)
+> > > I was surprised to find that I was the last one changing these lines :)
+> 
+> Did I write that?
+> :)
+
+:)
+
+http://www.ahajokes.com/age28.html :)
+
+[As a team, we don't seem to play by the rule of joke-a-review anymore, we
+should start over]
+Review comments: Overall patch looks good. Only (4) and (8) below
+are serious issues and for (8) there is a trivial fix.
+
+1. TypeBindingTests308 should be hooked into RunAllJava8Tests.
+
+2. Do we want to call getTypeUseAnnotations simply as getTypeAnnotations ?
+Type parameters declarations could be annotated with JSR308 and so it is
+not all type-use sites. On the compiler side, you still call getTypeAnnotations
+on a TVB even where it is a declaration annotation.
+
+3. In TypeBindingTests308.verifyAnnotationsOnBinding(ITypeBinding, String[])
+
+    for (int i = 0; i < annots.length; i++)
+length computation could be pulled up to the initializer.
+
+4. TypeBindingTests308.test006() the penultimate line which reads:
+
+Type type = param.getType();
+
+actually creates a single dimensional array, but the annotations returned are
+for a two dimensional array. We need to double check *everything* to do with
+array annotations *and* varargs/extra dimensions annotations after Manoj's 
+work for new array type gets released.
+
+5. TypeBindingTests308.test037 : FIXME should be removed.
+
+6. In tests such as test009 or test021, it would have been better to use
+different annotations rather than using the same annotation in multiple 
+places.
+
+7. ITypeBinding#getTypeUseAnnotations: javaadoc, first sentence is malformed;
+"Since SE8" --> we need to see what we use in other places and be consistent;
+"multiple instances of type bindings are created" ==> "may be created", since
+we store annotations on bindings only if ProcessAnnotations is true or if
+null analysis is enabled. Not sure if UI always enabled the former; @return
+should not mention list.
+
+8. The determination/capture of `prototype' is not correct or at the very least
+not consistent with how those terms are employed in the compiler implementation.
+unannotated() is not the same as prototype, for every type there is always
+an unannotated version, but prototypes are tracked in the compiler 
+implementation only when it makes sense to defect a method to the prototype. 
+(see comment#60).  Fortunately, this determination is trivial, in fact I was
+able to get rid a dozen lines of code and replace it with a single liner that
+works well with rest of implementation, patch will follow shortly.
+Created attachment 235776
+Same patch as before with just a change to prototype determination
+
+This is the exact same patch as earlier posted by Jay with just small changes:
+
+(1) I deleted the setPrototype() method and replaced its call site with:
+
+org.eclipse.jdt.internal.compiler.lookup.TypeBinding compilerPrototype = binding.prototype();
+		this.prototype = (TypeBinding) (compilerPrototype == null || compilerPrototype == binding ? null : resolver.getTypeBinding(compilerPrototype));
+
+(2) Deleted the prototypes map - we now reuse the existing bindings map of
+the BindingResolver to achieve the same effect.
+
+Passes Java8 tests + plus new tests except for the known issue with UTRs
+
+Jay, obligatory jokes for code review are awaited.
+(In reply to Timo Kinnunen from comment #42)
+> (In reply to comment #37)
+> > (In reply to comment #35)
+> > > 1. == and != issues: This can be solved. May be a good bit of work, but
+> > > doable - we can even come up with a instrumented compiler that can be used
+> > > to compile JDT/Core and emit warnings in places where == and != are used
+> > > on type bindings and convert them to a call to isEqualTo (say)
+> 
+> That would fit nicely as an addition to the Introduce Indirection
+> refactoring. (Whether anybody would ever discover it, though...)
+
+See bug 417803.
+
+> Checker Framework has Interning checker, which based on a quick test warns
+> about reference comparisons if the compared objects haven't been marked as
+> interned. Additionally it can also warn about the converse, i.e. when
+> equals-method is unnecessarily used on interned objects.
+
+Wouldn't that generate too many warnings than having a user annotate classes
+whose objects should not be compared ?
+(In reply to Srikanth Sankaran from comment #106)
+
+> unannotated() is not the same as prototype, for every type there is always
+> an unannotated version, but prototypes are tracked in the compiler 
+> implementation only when it makes sense to defect a method to the prototype. 
+> (see comment#60). 
+
+https://bugs.eclipse.org/bugs/show_bug.cgi?id=409586#c76 has more detailed
+explanation.
+Created attachment 235796
+Updated patch
+
+Patch updated with changes suggested by Srikanth. I also made two significant changes since the last patch.
+
+1. ITypeBinding#getTypeAnnotations - For array types, this method returns only the annotations that belong for this array and doesn't include the sub array's annottions.
+
+2. Fixed the TypeBindingTests308.test006() - the fix is in DefaultBindingResolver
+Patch looks good. Two changes: 
+
+(1) In org.eclipse.jdt.core.dom.DefaultBindingResolver.getTypeAnnotations(int, ArrayBinding):
+
+This line is dead code: if (dimensions == 0) return oldies;
+
+(2) Same method: array size should be 1 more than what it is.
+
+Follow up action: 
+
+After Manoj's patch is released, verify that array annotations, annotations
+on extra dimensions and varargs etc work fine if needed adding a couple of
+more tests.
+Created attachment 235813
+Updated patch
+
+Updated patch that addresses the failing test regarding UnionTypeReference. The only difference since the last patch is in ASTNode.java.
+
+Srikanth, can you please take a look at the patch also. Please note that I introduced the null check to deal with the following case. Perhaps this is same as the ones reported earlier?
+
+catch (@TypeUseAnnotation NullPointerException [] | @TypeUseAnnotation ArrayIndexOutOfBoundsException e) {
+		}
+(In reply to comment #108)
+> Wouldn't that generate too many warnings than having a user annotate classes
+> whose objects should not be compared ?
+
+In this case when moving away from interned objects all the warnings should indicate potential problems. Unannotated objects are treated as non-interned by default so the warnings would be for places where != or == are used for comparison. There's also an option to limit the check to a specific class or few. If this is a one-off refactoring then this should be enough, but I haven't looked into the codebase and so a grain of salt is called for.
+(In reply to Jayaprakash Arthanareeswaran from comment #112)
+> Created attachment 235813 [details]
+> Updated patch
+
+Released this with a minor change. The fix is here:
+
+http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=a8073c80a69f6c184e71b3ada3faf15faa3ff3ae
+Many thanks to all. For any issues discovered, please raise new CRs/ERs and do 
+not reopen this.
+
+
+[1.8][dom ast] Cannot identify TYPE_USE annotation from ITypeBinding
+
+
+
+Bug 409586 - [1.8][dom ast] Cannot identify TYPE_USE annotation from ITypeBinding 

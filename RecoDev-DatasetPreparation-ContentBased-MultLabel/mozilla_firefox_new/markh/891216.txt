@@ -1,0 +1,635 @@
+Created attachment 772450
+draft patch for multiple workers
+
+We need to support notifications and incoming calls/chats from more than one provider.  We also need to support providers without workers.
+
+Attached patch is a draft, passes tests.  May need some optimizing of SocialProvider.enabled use.
+
+Created attachment 772450
+draft patch for multiple workers
+
+We need to support notifications and incoming calls/chats from more than one provider.  We also need to support providers without workers.
+
+Attached patch is a draft, passes tests.  May need some optimizing of SocialProvider.enabled use.
+Comment on attachment 772450
+draft patch for multiple workers
+
+Review of attachment 772450:
+-----------------------------------------------------------------
+
+looks ok to me, although I'm very interested to see what the UX is around this.
+
+::: toolkit/components/social/MozSocialAPI.jsm
+@@ +209,5 @@
+>    targetWindow.addEventListener("unload", function () {
+>      // We want to close the port, but also want the target window to be
+>      // able to use the port during an unload event they setup - so we
+>      // set a timer which will fire after the unload events have all fired.
+> +    schedule(function () { if (port) port.close(); });
+
+move the 'if' check out of the schedule call (ie, no need to schedule anything if no port).  Is this really the only use of 'port' here?  If so, I'd also be inclined to move the fetch of the port to here too (and if not, you probably are missing some checks for the port being null?)
+
+::: toolkit/components/social/SocialService.jsm
+@@ +144,5 @@
+>      try {
+>        if (ActiveProviders.has(manifest.origin)) {
+>          let provider = new SocialProvider(manifest);
+>          providers[provider.origin] = provider;
+> +        provider.enabled = true;
+
+haven't thought about this much, but there's a red flag that both here and Social.jsm are explicitly setting provider.enabled
+
+::: toolkit/components/social/test/xpcshell/test_SocialService.js
+@@ +71,5 @@
+>    for (let i = 0; i < manifests.length; i++) {
+>      let providerIdx = providers.map(function (p) p.origin).indexOf(manifests[i].origin);
+>      let provider = providers[providerIdx];
+>      do_check_true(!!provider);
+> +    do_check_true(provider.enabled);
+
+oh dear - I'm very confused as to why provider.enabled has totally flipped its meaning (or so it seems.)  But the "problem" is probably just that you are enabling all providers by default - I wonder if we can avoid that somehow - but that probably will not be clear until some of the UX around this is sorted.
+(In reply to Mark Hammond (:markh) from comment #1)
+
+> looks ok to me, although I'm very interested to see what the UX is around
+> this.
+
+Currently UX is unchanged.  This simply starts the frameworker for any enabled provider (think enabled via addon manager, not SocialProvider.enabled) .
+
+> ::: toolkit/components/social/SocialService.jsm
+> @@ +144,5 @@
+> >      try {
+> >        if (ActiveProviders.has(manifest.origin)) {
+> >          let provider = new SocialProvider(manifest);
+> >          providers[provider.origin] = provider;
+> > +        provider.enabled = true;
+> 
+> haven't thought about this much, but there's a red flag that both here and
+> Social.jsm are explicitly setting provider.enabled
+
+Social.jsm isn't setting provider.enabled any longer.
+
+> ::: toolkit/components/social/test/xpcshell/test_SocialService.js
+> @@ +71,5 @@
+> >    for (let i = 0; i < manifests.length; i++) {
+> >      let providerIdx = providers.map(function (p) p.origin).indexOf(manifests[i].origin);
+> >      let provider = providers[providerIdx];
+> >      do_check_true(!!provider);
+> > +    do_check_true(provider.enabled);
+> 
+> oh dear - I'm very confused as to why provider.enabled has totally flipped
+> its meaning (or so it seems.)  But the "problem" is probably just that you
+> are enabling all providers by default - I wonder if we can avoid that
+> somehow - but that probably will not be clear until some of the UX around
+> this is sorted.
+
+Essentially, instances of SocialProvider only exist if the provider is enabled (ie. addon manager).  SocialProvider.enabled basically just turned on/off the worker, now the worker is always on.  SocialProvider.enabled needs some cleanup.
+note: this patch will also need to address anywhere we reload providers.  We did this before by disabling social and re-enabling, a hacky work around.  now we need a way to reload providers at any point without doing that.
+Created attachment 774315
+enable all frameworkers for all enabled providers
+
+patch addresses reload functionality for non-current providers.
+
+I decided to leave SocialProvider.enabled for now, it is useful for tests.  It should only be set within SocialService.jsm.
+https://tbpl.mozilla.org/?tree=Try&rev=c0b7736763b3
+Comment on attachment 774315
+enable all frameworkers for all enabled providers
+
+Review of attachment 774315:
+-----------------------------------------------------------------
+
+I think the "error listeners" etc are going to need work (and tests), which IMO should be done as part of this patch.  That's likely to be as simple as replacing Social.provider in the listener with Social._getProviderByOrigin(this.iframe.origin) (or something like that :)
+
+Some consideration needs to be given to error handling in this world too - currently we will only let the user know about a frameworker error if it's the "current" provider.  An error in another provider will mean the error is silent and impossible to recover from.  I guess it would be OK for this to be handled in a different bug though.
+
+As discussed, f+ for now in the hope we can also remove the concept of Social.provider in the meantime
+
+::: browser/base/content/browser-social.js
+@@ +91,5 @@
+> +          // be sure to unload the sidebar as it will not reload if the origin
+> +          // has not changed, it will be loaded in provider-set below. Other
+> +          // panels will be unloaded or handle reload.
+> +          SocialSidebar.unloadSidebar();
+> +          // FALL THROUGH to social:provider-set
+
+probably no real need to shout here :)
+
+::: browser/modules/Social.jsm
+@@ +110,3 @@
+>    },
+>  
+>    // Sets the current provider and enables it. Also disables the
+
+this comment is now wrong (about both 'enabling' and 'disabling')
+
+@@ +160,4 @@
+>        }
+>        if (topic == "provider-update") {
+>          // a provider has self-updated its manifest, we need to update our
+>          // cache and possibly reload if it was the current provider.
+
+comment needs updating - always reload.
+I would like to block this on bug 891218, at least until we determine that it's somehow not feasible.
+Created attachment 777850
+enable all frameworkers for all enabled providers
+
+feedback implemented, looks like error handling is being addressed in bug 894806
+(In reply to Shane Caraveo (:mixedpuppy) from comment #8)
+
+> looks like error handling is being addressed in bug 894806
+
+That's probably not true - 894806 will fix the problem that a provider error would always set Social.provider.errorState, even if it was a different provider in error.  What it will *not* do is make sure there is sane UI in that case.  Eg, how do we surface an error in a provider that has no visible UI?
+
+I guess we need a new bug for that?
+Created attachment 781834
+enable all frameworkers for all enabled providers
+Created attachment 789190
+enable all frameworkers for all enabled providers
+
+update to fix bitrot
+Gavin,
+  Shane and I were talking, in particular about the risks of bug 891218 (remote frameworker) not taking the 26 train.
+
+How would you feel about enabling multiple frameworkers behind a hidden pref, and have that pref only be enabled by default when bug 891218 lands?  This would allow "future" providers to toggle that pref before remote frameworkers land for the sake of development.
+sounds fine to me!
+Created attachment 790493
+enable all frameworkers for all enabled providers
+
+patch with pref
+
+https://tbpl.mozilla.org/?tree=Try&rev=496fc8e584d9
+Comment on attachment 790493
+enable all frameworkers for all enabled providers
+
+Review of attachment 790493:
+-----------------------------------------------------------------
+
+Looks pretty good, but some questions I have that I need to understand better.
+
+::: browser/modules/Social.jsm
+@@ +176,5 @@
+>          let provider = data;
+> +        SocialService.getOrderedProviderList(function(providers) {
+> +          Social._updateProviderCache(providers);
+> +          Services.obs.notifyObservers(null, "social:providers-changed", null);
+> +          provider.reload();
+
+I'd expect to reload before the notification - but I'm not sure why this notification needs to be sent at all, given provider.reload() sends a reload-specific notification.  It sounds like at least 1 providers-changed notification does work that really should be in a provider-reload handler?
+
+::: toolkit/components/social/SocialService.jsm
+@@ +144,5 @@
+>      try {
+>        if (ActiveProviders.has(manifest.origin)) {
+>          let provider = new SocialProvider(manifest);
+>          providers[provider.origin] = provider;
+> +        provider.enabled = SocialService.allowMultipleWorkers;
+
+can we move the initial set of the .enabled state, and the toggling of enabled state as the entire feature is toggled into Social.jsm?  Then later we can consider a delayed initialization of all providers other than the "current" one (and maybe even that current one can be delayed a short time)
+
+::: toolkit/components/social/test/browser/browser_SocialProvider.js
+@@ +21,5 @@
+> +      SocialService.removeProvider(p.origin, function() {
+> +        ok(!provider.enabled, "removing an enabled provider should have disabled the provider");
+> +        let port = provider.getWorkerPort();
+> +        ok(!port, "should not be able to get a port after removing the provider");
+> +        finish();
+
+set provider=null here?
+
+@@ +60,5 @@
+> +      workerURL: "http://test2.example.com/browser/toolkit/components/social/test/browser/worker_social.js"
+> +    };
+> +    SocialService.addProvider(manifest, function (provider2) {
+> +      ok(provider.enabled, "provider is initially enabled");
+> +      ok(provider2.enabled, "provider2 is initially enabled");
+
+how do we manage to get both providers enabled without that pref being toggled?
+
+::: toolkit/components/social/test/xpcshell/test_SocialService.js
+@@ +55,5 @@
+> +  runner.appendIterator(testGetProviderList(manifests, next, true));
+> +  runner.appendIterator(testGetProviderList(manifests, next, false));
+> +  runner.appendIterator(testEnabled(manifests, next, true));
+> +  runner.appendIterator(testEnabled(manifests, next, false));
+> +  
+
+whitespace nit.
+
+@@ +60,4 @@
+>    runner.next();
+>  }
+>  
+> +function setWorkerMode(multiple) {
+
+We should be storing (or hard-coding) the initial value, so we guarantee that even on test failure we reset the pref via registerCleanupFunction (or whatever it's called)
+
+@@ +86,2 @@
+>    let providers = yield SocialService.getProviderList(next);
+>    do_check_true(providers.length >= manifests.length);
+
+why not plain == (ie, we never expect more providers than manifests, do we?)
+
+@@ +93,3 @@
+>      do_check_eq(provider.workerURL, manifests[i].workerURL);
+>      do_check_eq(provider.name, manifests[i].name);
+>    }
+
+if multiprovider == false, don't we still expect 1 provider to be enabled?
+
+@@ +101,5 @@
+>    let providers = yield SocialService.getProviderList(next);
+>    do_check_true(providers.length >= manifests.length);
+>    do_check_true(SocialService.enabled);
+>    providers.forEach(function (provider) {
+> +    do_check_eq(provider.enabled, multiworker);
+
+ditto here
+
+@@ +123,5 @@
+>    });
+>  
+>    SocialService.enabled = true;
+>    do_check_true(SocialService.enabled);
+>    // Enabling the service should not enable providers
+
+this comment seems wrong now, and I'm still confused why there isn't one enabled.  I think I'm missing something in these tests...
+(In reply to Mark Hammond (:markh) from comment #15)
+> Comment on attachment 790493
+> enable all frameworkers for all enabled providers
+> 
+> Review of attachment 790493:
+> -----------------------------------------------------------------
+> 
+> Looks pretty good, but some questions I have that I need to understand
+> better.
+> 
+> ::: browser/modules/Social.jsm
+> @@ +176,5 @@
+> >          let provider = data;
+> > +        SocialService.getOrderedProviderList(function(providers) {
+> > +          Social._updateProviderCache(providers);
+> > +          Services.obs.notifyObservers(null, "social:providers-changed", null);
+> > +          provider.reload();
+> 
+> I'd expect to reload before the notification - but I'm not sure why this
+> notification needs to be sent at all, given provider.reload() sends a
+> reload-specific notification.  It sounds like at least 1 providers-changed
+> notification does work that really should be in a provider-reload handler?
+
+At this point, the provider instance is updated with the new manifest data, but UI is not.  Before anything, we have to update the provider cache.  The order of the other two is unimportant.  providers-changed just updates the provider menus.  provider.reload forces a reload of the provider being updated.  During that reload, if the provider is the selected provider, the other UI elements are updated (e.g. sidebar).  We could get away with not calling providers-changed, but if the provider rebranded (e.g. changed their logo) the menu's would not be updated with the new icon.  I think this reload section is fine as-is.
+
+
+> ::: toolkit/components/social/SocialService.jsm
+> @@ +144,5 @@
+> >      try {
+> >        if (ActiveProviders.has(manifest.origin)) {
+> >          let provider = new SocialProvider(manifest);
+> >          providers[provider.origin] = provider;
+> > +        provider.enabled = SocialService.allowMultipleWorkers;
+> 
+> can we move the initial set of the .enabled state, and the toggling of
+> enabled state as the entire feature is toggled into Social.jsm?  Then later
+> we can consider a delayed initialization of all providers other than the
+> "current" one (and maybe even that current one can be delayed a short time)
+
+Yeah, I'll look into trying it out that way.
+
+
+> @@ +60,5 @@
+> > +      workerURL: "http://test2.example.com/browser/toolkit/components/social/test/browser/worker_social.js"
+> > +    };
+> > +    SocialService.addProvider(manifest, function (provider2) {
+> > +      ok(provider.enabled, "provider is initially enabled");
+> > +      ok(provider2.enabled, "provider2 is initially enabled");
+> 
+> how do we manage to get both providers enabled without that pref being
+> toggled?
+
+it wasn't, I forgot to browser test the toolkit section with this latest iteration on the patch, that test was failing.
+
+
+> @@ +60,4 @@
+> >    runner.next();
+> >  }
+> >  
+> > +function setWorkerMode(multiple) {
+> 
+> We should be storing (or hard-coding) the initial value, so we guarantee
+> that even on test failure we reset the pref via registerCleanupFunction (or
+> whatever it's called)
+
+We don't need to store the original value, since it would be in the defaults.  We 
+only need to call clearUserPref.  But yes, it should ensure they are cleared at the end.
+
+
+> @@ +93,3 @@
+> >      do_check_eq(provider.workerURL, manifests[i].workerURL);
+> >      do_check_eq(provider.name, manifests[i].name);
+> >    }
+> 
+> if multiprovider == false, don't we still expect 1 provider to be enabled?
+
+no, toolkit doesn't enable the current provider, social.jsm in browser does.
+
+> @@ +123,5 @@
+> >    });
+> >  
+> >    SocialService.enabled = true;
+> >    do_check_true(SocialService.enabled);
+> >    // Enabling the service should not enable providers
+> 
+> this comment seems wrong now, and I'm still confused why there isn't one
+> enabled.  I think I'm missing something in these tests...
+
+same reason for the above comment, social doesn't enable the "current" provider.
+
+I think with our discussion from yesterday, I'm going to try to shift a lot of this around and do all the enabling/disabling from social.jsm.  That would leave the default state to be disabled (even with the pref turned on) when running any of the toolkit tests.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #16)
+> > ::: browser/modules/Social.jsm
+> > @@ +176,5 @@
+> > >          let provider = data;
+> > > +        SocialService.getOrderedProviderList(function(providers) {
+> > > +          Social._updateProviderCache(providers);
+> > > +          Services.obs.notifyObservers(null, "social:providers-changed", null);
+> > > +          provider.reload();
+> > 
+> > I'd expect to reload before the notification - but I'm not sure why this
+> > notification needs to be sent at all, given provider.reload() sends a
+> > reload-specific notification.  It sounds like at least 1 providers-changed
+> > notification does work that really should be in a provider-reload handler?
+> 
+> At this point, the provider instance is updated with the new manifest data,
+> but UI is not.
+
+But anything we fetch from the provider instance rather than the manifest would be out of date, right?  Eg, ambient icons in the current world come from the provider, and I don't think we can be certain that nothing else will be obtained that way in the future.
+
+>  Before anything, we have to update the provider cache.  The
+> order of the other two is unimportant.  providers-changed just updates the
+> provider menus.
+
+But that's an implementation detail that I don't think we should rely on.  It shouldn't be necessary to understand the current implemention of browser-social to know that this is OK, and conversely, if browser-social later does something different on providers-changed, we shouldn't be forced to revisit this code to make it right (and then track down what other code now relies on it)
+
+> We could get away with not
+> calling providers-changed, but if the provider rebranded (e.g. changed their
+> logo) the menu's would not be updated with the new icon.  I think this
+> reload section is fine as-is.
+
+Again, that's just a problem with the browser-social implementation, right?  If browser-social handled provider-updated correctly this wouldn't be an issue.
+
+I think I'd still like this changed - it should be "obviously" correct without regard for the current browser-social implementation.
+
+The rest of your comments sound great!
+Created attachment 791089
+WIP V2 patch
+
+This version moves management of the enabled state of providers into the browser module.  SocialService now remains (as before) fairly oblivious to the enabled state of providers.  Testing multiple workers will need to move into the browser tests given the way we startup now.
+Comment on attachment 791089
+WIP V2 patch
+
+Review of attachment 791089:
+-----------------------------------------------------------------
+
+Looks fine in general, just f- based on the XXX block in browser-social and lack of multiple worker specific tests - but everything else is looking great.
+
+::: browser/base/content/browser-social.js
+@@ +50,5 @@
+> +        // We cannot wait on the normal delayed startup finsished notification,
+> +        // since social.enabled is not set yet. Instead, we wait on provider-set
+> +        // in which case we know that social.enabled has been set and we can
+> +        // startup our other workers.
+> +        Services.obs.addObserver(function _delayedStartupObserver() {
+
+I don't think the window should be enabling providers.  Can't it be done in Social.jsm?
+
+@@ +61,5 @@
+> +            }
+> +          }, 5000)
+> +        }, "social:provider-set", false);
+> +      }
+> +      
+
+whitespace
+
+@@ +1062,5 @@
+>      const CACHE_PREF_NAME = "social.cached.ambientNotificationIcons";
+>      // provider.profile == undefined means no response yet from the provider
+>      // to tell us whether the user is logged in or not.
+>      if (!SocialUI.enabled ||
+> +        (!Social.provider.haveLoggedInUser() && Social.provider.profile !== undefined)) {
+
+I don't know why we did this in the past, but is it possible .haveLoggedInUser() will return true while Social.provider.profile is false?
+
+::: browser/modules/Social.jsm
+@@ +123,5 @@
+>    _setProvider: function (provider) {
+>      if (this._provider == provider)
+>        return;
+>  
+>      // Disable the previous provider, if any, since we want only one provider to
+
+I meant to add this to previous feedback, but this comment should be tweaked - probably just s/since/if/
+
+::: toolkit/components/social/MozSocialAPI.jsm
+@@ +87,5 @@
+>      Services.console.logStringMessage(msg);
+>      return;
+>    }
+>  
+> +  var port = provider.workerURL ? provider.getWorkerPort(targetWindow) : null;
+
+might as well make this 'let' while we are at it?
+
+::: toolkit/components/social/SocialService.jsm
+@@ -361,5 @@
+>        SocialServiceInternal.providerArray.forEach(function (p) p.enabled = false);
+>  
+>      SocialServiceInternal.enabled = enable;
+>      MozSocialAPI.enabled = enable;
+> -    Services.obs.notifyObservers(null, "social:pref-changed", enable ? "enabled" : "disabled");
+
+I expected to see this observer notification moved somewhere instead of just removed?  Did I miss it?
+
+::: toolkit/components/social/test/browser/browser_SocialProvider.js
+@@ +86,2 @@
+>      });
+> +  }
+
+I think we still want similar tests as above, but when allowMultipleProviders is true.
+(In reply to Mark Hammond (:markh) from comment #19)
+> Comment on attachment 791089
+> WIP V2 patch
+> 
+> Review of attachment 791089:
+> -----------------------------------------------------------------
+> 
+> Looks fine in general, just f- based on the XXX block in browser-social and
+> lack of multiple worker specific tests - but everything else is looking
+> great.
+
+Thus the feedback request rather than review.
+
+> ::: browser/base/content/browser-social.js
+> @@ +50,5 @@
+> > +        // We cannot wait on the normal delayed startup finsished notification,
+> > +        // since social.enabled is not set yet. Instead, we wait on provider-set
+> > +        // in which case we know that social.enabled has been set and we can
+> > +        // startup our other workers.
+> > +        Services.obs.addObserver(function _delayedStartupObserver() {
+> 
+> I don't think the window should be enabling providers.  Can't it be done in
+> Social.jsm?
+
+thread dispatch doesn't have a timeout, I'm sure there is some way to do that, but I wanted to get a working version first.
+
+> ::: toolkit/components/social/SocialService.jsm
+> @@ -361,5 @@
+> >        SocialServiceInternal.providerArray.forEach(function (p) p.enabled = false);
+> >  
+> >      SocialServiceInternal.enabled = enable;
+> >      MozSocialAPI.enabled = enable;
+> > -    Services.obs.notifyObservers(null, "social:pref-changed", enable ? "enabled" : "disabled");
+> 
+> I expected to see this observer notification moved somewhere instead of just
+> removed?  Did I miss it?
+
+we're actually not observing it anywhere, and social.jsm already had a pref observer on social.enabled.
+
+> ::: toolkit/components/social/test/browser/browser_SocialProvider.js
+> @@ +86,2 @@
+> >      });
+> > +  }
+> 
+> I think we still want similar tests as above, but when
+> allowMultipleProviders is true.
+
+With allowMultipleProviders only being in browser chrome, I was going to write new tests there.  toolkit no longer does any enabling, so the test there is just to make sure that we can run more than one at a time.
+(In reply to Mark Hammond (:markh) from comment #19)
+
+> @@ +1062,5 @@
+> >      const CACHE_PREF_NAME = "social.cached.ambientNotificationIcons";
+> >      // provider.profile == undefined means no response yet from the provider
+> >      // to tell us whether the user is logged in or not.
+> >      if (!SocialUI.enabled ||
+> > +        (!Social.provider.haveLoggedInUser() && Social.provider.profile !== undefined)) {
+> 
+> I don't know why we did this in the past, but is it possible
+> .haveLoggedInUser() will return true while Social.provider.profile is false?
+
+This is quite hacky and confusing.  It seems the logic boils down to:
+
+if not enabled or user was logged in but is not now:
+  clear icon cache and bail
+if user was never logged in:
+  get icons from cache
+else if user is logged in:
+  save current icons to cache
+
+
+Basically, if the provider never sets the user-profile the provider.profile is undefined.  otherwise it is always an object.
+Created attachment 791485
+Patch V2
+
+https://tbpl.mozilla.org/?tree=Try&rev=8f875d41c43a
+Comment on attachment 791485
+Patch V2
+
+Review of attachment 791485:
+-----------------------------------------------------------------
+
+I don't think the delayed load should be part of this bug (but do agree we should pursue it).  We have time to pursue it as things are pref'd off - the preference will only be set by provider developers, and they probably don't want a delay either.  One problem I have is that the delay is arbitrary, then we just load all providers immediately.  A better future approach might, for example, be to load them in sequence as each provider loads.
+
+Can you please open a couple of other bugs:
+
+* A new bug to look at delayed loading of providers.
+* A new bug to remove this pref (ie, to *actually* enable multiple providers, which depends on the first.
+(with both of them depending on this bug)
+
+Then remove the timer from this patch?
+(In reply to Mark Hammond (:markh) from comment #23)
+
+> I don't think the delayed load should be part of this bug (but do agree we
+> should pursue it).  
+
+> Then remove the timer from this patch?
+
+I think at least waiting on the first provider being set, or "browser-delayed-startup-finished", is a good idea to have in this patch (and is simple enough).  We can enhance that mechanism with the timer/etc in bug 906838.
+Created attachment 792413
+Patch V2
+
+patch without timer
+Comment on attachment 792413
+Patch V2
+
+meant to mark this for feedback...from mark :)
+Comment on attachment 792413
+Patch V2
+
+Review of attachment 792413:
+-----------------------------------------------------------------
+
+Looking good.  I think that delayed startup observer should be nuked and the "enabled after startup" path still isn't clear to me (I think it should end up taking the same basic path as the "enabled at startup" case).
+
+::: browser/base/content/test/social/browser_social_multiworker.js
+@@ +4,5 @@
+> +
+> +function test() {
+> +  waitForExplicitFinish();
+> +
+> +  Services.prefs.setIntPref("social.workerLoadDelay", 0);
+
+I think this pref is no longer necessary?
+
+@@ +50,5 @@
+> +        }
+> +      };
+> +      port.postMessage({topic: "test-init"});
+> +    }
+> +    
+
+whitespace (and a few lines down)
+
+@@ +65,5 @@
+> +    for (let p of Social.providers) {
+> +      ok(!p.enabled, "provider disabled");
+> +      ok(!p.getWorkerPort(), "worker disabled");
+> +    }
+> +    next();
+
+can we stick a few checkSocialUI calls in each of the tests here?
+
+::: browser/modules/Social.jsm
+@@ +162,5 @@
+>      if (SocialService.enabled) {
+>        // Retrieve the current set of providers, and set the current provider.
+>        SocialService.getOrderedProviderList(function (providers) {
+> +
+> +        // If we allow multiple workers: We don't need all the workers to start
+
+as discussed in IRC, I think most of this should move to bug 906838
+
+@@ +201,5 @@
+>        }
+> +    });
+> +  },
+> +
+> +  _loadAllWorkers: function() {
+
+I'm expecting to see this called in a path that is hit when social starts up as disabled and then becomes enabled.  Apart from Social.init(), the only other call I see is in a "provider-added" notification, but I didn't think that was called in that path?
+Created attachment 792949
+Patch V2
+Comment on attachment 792949
+Patch V2
+
+Review of attachment 792949:
+-----------------------------------------------------------------
+
+awesome!
+https://tbpl.mozilla.org/?tree=Try&rev=850cbd51d28a
+https://hg.mozilla.org/integration/fx-team/rev/373a93906539
+https://hg.mozilla.org/mozilla-central/rev/373a93906539
+
+
+enable frameworkers for all enabled providers
+
+
+
+bug 891216 multiple workers enabled, r=markh 

@@ -1,0 +1,304 @@
+Right now we leave the social sidebar loaded even when it is hidden, so that hiding/unhiding it remains quick. This might be the right tradeoff if people are frequently hiding/unhiding it, but if they are hiding the side bar for long periods of time (perhaps because they think that's how you disable social), keeping the sidebar document alive indefinitely uses up memory unnecessarily.
+
+A good compromise here would be to unload the sidebar after some amount of time, if it is hidden. What would be a good timeout?
+
+Right now we leave the social sidebar loaded even when it is hidden, so that hiding/unhiding it remains quick. This might be the right tradeoff if people are frequently hiding/unhiding it, but if they are hiding the side bar for long periods of time (perhaps because they think that's how you disable social), keeping the sidebar document alive indefinitely uses up memory unnecessarily.
+
+A good compromise here would be to unload the sidebar after some amount of time, if it is hidden. What would be a good timeout?
+In thinking about this, we should also consider some of the use cases that are coming up with a new provider.  They want to have status buttons and recommend button interact with the sidebar (showing it, or changing content within it).
+
+As well, in the case of unloading, we should handle the ux much better.  e.g. We can have our own content appear in the sidebar to indicate loading state or something, and use docshell swapping to swap in a new document when it's loaded (is that possible?).
+Well, one timeout we could use as a reference would be image.mem.min_discard_timeout_ms which currently defaults to 10000ms.
+
+http://mxr.mozilla.org/mozilla-central/source/modules/libpref/src/init/all.js#3588
+What about other provider content, such as the flyouts and toolbar panels?  
+
+Certainly the flyout panel should have the same lifetime as the sidebar, but even the toolbar items would seem to qualify for some "unload if not used for some period" heuristics.
+
+I guess we could also consider hooking into a "memory pressure" notification (IIRC, one exists) and immediately unload everything that isn't visible.
+> I guess we could also consider hooking into a "memory pressure" notification (IIRC, one exists) 
+> and immediately unload everything that isn't visible.
+
+We do, and it's not a bad idea to listen to it, but don't expect that to be fired particularly often.  Memory pressure is hard.  :-/
+Created attachment 672422
+Patch
+
+This unloads the sidebar if it has been hidden for 10 seconds.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #1)
+> In thinking about this, we should also consider some of the use cases that
+> are coming up with a new provider.  They want to have status buttons and
+> recommend button interact with the sidebar (showing it, or changing content
+> within it).
+
+That's a good point - providers might have expectations about the sidebar lifetime. That seems like something we can manage, though, and communicate clearly. We should try to prevent provider dependencies on the lifetime of anything besides the worker (which will definitely be alive any time the provider is enabled).
+Comment on attachment 672422
+Patch
+
+Review of attachment 672422:
+-----------------------------------------------------------------
+
+I was thinking that the timeout should be more around 20min than 10sec.. And we probably don't need a pref for this. We should also unload the flyout when we unload the sidebar.
+(In reply to :Felipe Gomes from comment #7)
+> Comment on attachment 672422
+> Patch
+> 
+> Review of attachment 672422:
+> -----------------------------------------------------------------
+> 
+> I was thinking that the timeout should be more around 20min than 10sec.. And
+> we probably don't need a pref for this. We should also unload the flyout
+> when we unload the sidebar.
+
+Can we explicitly consider what we're trading off here?
+
+We're looking at a three-second delay when opening the sidebar, if the window is unloaded.
+
+Keeping the window around for 20 minutes to save three seconds seems like over-compensating.
+
+How about 1 minute?
+I would rather consider user behavior than guess.  One minute would only benefit those who toggle on/off relatively quick, and 20min does seem like a long time.  I'll ask on our email list for feedback.
+Just for some context, do we have any metrics around the performance difference of immediate unload vs never unload?
+
+ * What is the memory footprint of the loaded sidebar?
+ * What is the memory footprint of the hidden loaded sidebar?
+ * What is the memory footprint of the unloaded sidebar?
+ * How much time are we saving by not unloading the sidebar on hidden?
+
+Thanks
+>  * What is the memory footprint of the unloaded sidebar?
+
+0.  But the social API still takes up some memory.
+
+>  * What is the memory footprint of the loaded sidebar?
+>  * What is the memory footprint of the hidden loaded sidebar?
+
+These are both the same; hiding save no memory.  But without unloading, I can't tell you what the exact figure is, because I don't know which compartments will go away when we unload the sidebar.  It's something less than ~50mb.
+Is there any testing I can do that might help inform the decision of what we do here with some metrics?
+(In reply to Justin Lebar [:jlebar] from comment #11)
+
+> It's something less than ~50mb.
+
+just a data point, not arguing for anything, my firefox typically runs right around 1GB (before and after running a socialapi enabled version), 50mb in one instance doesn't feel like a big win.  Of course a bunch of 50mb compartments add up...
+Anything under 1 minute is not useful. Users who toggle the sidebar on and off often when they want more screen space or to not be distracted for a moment will have no memory benefits for doing that, while also getting a big hit on snappiness and wasting cpu and network time (it's not simply saving 3 seconds, it's seeing the sidebar reload and thinking that Firefox is slow).
+
+IOW, releasing ~15mb of memory after 10sec vs. after 3min makes no difference for MemShrink, but makes a difference for Snappy.
+
+Now, the main goal of this bug is that when a user closes the sidebar to not use it again, they have a very valid expectation that that memory+cpu+network will not continue to be used, which I completely agree and is what this bug is about as I understand it. I believe that a timeout in the range of minutes is the most reasonable pick. (maybe 20min was a stretch but somewhere between 3 to 5 seems right to me)
+
+Also important to note is that for users who have closed the sidebar, newly opened windows will never even load the sidebar's content; it's only loaded on first show (this is already the case, independent of this patch).
+
+> * What is the memory footprint of the hidden loaded sidebar?
+
+My sidebar compartment which has been open for 4 hours is consuming 9.18mb at the moment.
+(In reply to Shane Caraveo (:mixedpuppy) from comment #13)
+> 50mb in one instance doesn't feel like a big win.  Of course a bunch of 50mb
+> compartments add up...
+
+I can provide data here.  From telemetry, mean memory usage on Windows is ~400mb, and 25% of people have memory usage under ~250mb.  So for the average user, 50mb is an increase by a factor of 1.125, and for 25% of our users, is is an increase by a factor of 1.25.
+
+50mb is perhaps a fair price to pay for a feature you're using.  But I do not think it's fair to let Firefox use 25% more memory for 20 minutes for a feature you've hidden.
+> My sidebar compartment which has been open for 4 hours is consuming 9.18mb at the moment.
+
+Are you sure that the sidebar uses only that one compartment?
+
+If so, we need to have an entirely different discussion about whether it's appropriate for completely  windowless Facebook code to use upwards of 30mb of memory.
+(In reply to Justin Lebar [:jlebar] from comment #15)
+> 50mb is perhaps a fair price to pay for a feature you're using.  But I do
+> not think it's fair to let Firefox use 25% more memory for 20 minutes for a
+> feature you've hidden.
+
+I think I agree with this assessment, Justin. Any performance regression would be exaggerated on lower resource systems.
+What do you think about 3min? It seems to me a fair trade between the two classes of users:
+ - users who hide the sidebar to no longer use it
+ - users who hide it quickly to toggle it on again after a while
+
+
+Do we have any similar timers in the code for other memory release situation where it's useful to keep something in memory for a while but later on it's discarded? (apart from the decoded images one that has been mentioned)
+> If so, we need to have an entirely different discussion about whether it's appropriate for 
+> completely  windowless Facebook code to use upwards of 30mb of memory.
+
+I probably shouldn't have mentioned Facebook in a public bug.  I guess we protect this now?
+> 50mb in one instance doesn't feel like a big win.
+
+It's easy to think that about a feature you're working on.  But if several people think that way, all of a sudden we're using way more memory.  (Firefox 4 had terrible memory consumption for exactly this reason.)
+
+Experience has taught us that being pessimistic about memory consumption of new features is more reliable than being optimistic.  That's why Justin is pushing on this bug.
+(In reply to Nicholas Nethercote [:njn] from comment #20)
+> > 50mb in one instance doesn't feel like a big win.
+> 
+> It's easy to think that about a feature you're working on.  But if several
+> people think that way, all of a sudden we're using way more memory. 
+> (Firefox 4 had terrible memory consumption for exactly this reason.)
+
+My comment was: 
+
+50mb in one instance doesn't feel like a big win.  Of course a bunch of 50mb compartments add up...
+
+As well, that is in context of my firefox instance running at a perpetual 1GB of memory use.
+
+> Experience has taught us that being pessimistic about memory consumption of
+> new features is more reliable than being optimistic.  That's why Justin is
+> pushing on this bug.
+
+And I think that is a good thing, I wasn't arguing or complaining, I was just stating my observation.  I watch firefox memory use on my system frequently out of habit, because it used to continually eat more memory until I was out.
+(In reply to Justin Lebar [:jlebar] from comment #19)
+> > If so, we need to have an entirely different discussion about whether it's appropriate for 
+> > completely  windowless Facebook code to use upwards of 30mb of memory.
+> 
+> I probably shouldn't have mentioned Facebook in a public bug.  I guess we
+> protect this now?
+
+The relationship is now public, as well as some screenshots (not widely advertised, but on the facebook site now), no need to make this confidential.
+> As well, that is in context of my firefox instance running at a perpetual
+> 1GB of memory use.
+
+Your experience is not universal, as jlebar's telemetry data showed.
+
+> I was just stating my observation.
+
+And I'm just pointing out that it's not a representative observation :)
+
+It sounds like we're in agreement that reducing memory consumption in general is desirable, though!  Which is good.
+I'm concerned of the use-case when the sidebar is opened again (either by the user, or by a recommend button if supported). Presumably the user wants something from the sidebar and would  not be happy to have to wait for anything to load again. I see one of the key values of the sidebar is its kind of constant speedy presence. By introducing a realod on reopen you could alter the UX of the sidebar.
+
+If this unloading is done the sidebar should at least get a signal before it is unloaded. This would give it a chance to use Storage and cache some data for eventual reloading.
+I think we have enough MemShrink and Snappy expertise and experience to determine what is more important to the average user (memory footprint vs snappiness). I would assume that having to reload the sidebar would likely be more visible and painful to the average user than a bump in memory usage (though I could be wrong). I'm certain there is a compromise to be made here and it's not an either or situation. However, I would propose we give beta testers the opportunity to provide us feedback before moving ahead with any changes here.
+
+We *might* be trying to solve a problem that doesn't need solving.
+This is a judgement call, and I don't think feedback from beta testers is going to help us make the initial decision here. Nor is anecdotal evidence about personal memory usage :)
+
+One of the concerns that led to the filing of this bug is that the only exposed way to entirely disable the feature is the entry in the Tools/App menu. Users looking to disable the feature may not find this menu item, and instead try to use the "show sidebar" menu option (which is more discoverable) to effectively achieve the same result (hide the most obtrusive part of the UI). Now this is obviously a separate issue (that I will file a different bug for so that we can discuss on its own merits). No matter what we do here that situation will not be ideal (there is overhead to having the worker and content panels stick around when the user doesn't want their associated functionality). But I think it should inform this decision, because fixing this bug can mitigate the severity of that particular problem scenario.
+
+We need to load the sidebar at startup no matter what, so we can't just treat "sidebar takes a long time to load" as an acceptable situation because we're keeping it loaded all the time. We need to work with providers to make sidebar loading as quick as possible no matter what we do here. Given that, I think the concerns about snappiness are largely orthogonal to our decision here, as long as we don't make common use cases significantly worse.
+
+My gut feeling is that frequently toggling the sidebar state on/off won't be a common user action. Anecdotal feedback from some dogfooders suggests that people either leave it open always, or leave it closed for long periods of time.
+
+So let's go with a very short ~10s timeout, to only handle the case of a temporary close (e.g. accidental toggle/experimenting with the menu item). It's easier to start aggressively and scale that back than it is to go in the other direction; we can always revisit if we get feedback about the need to reload the sidebar being too onerous, or if providers run into trouble with that behavior.
+Felipe brings up a good point about unloading the flyout at the same time as the sidebar - I think that makes sense, since the two are tied to each other. Should we roll that into this patch, or followup?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #27)
+> Felipe brings up a good point about unloading the flyout at the same time as
+> the sidebar - I think that makes sense, since the two are tied to each
+> other. Should we roll that into this patch, or followup?
+
+it's one line, I'd just roll it in.
+*** Bug 801506 has been marked as a duplicate of this bug. ***
+Created attachment 673660
+Patch v2
+
+Since bug 803255 will add more code to the unload function, I moved it to a separate function (which also helps to remove the duplicate code from the `if (!this.canShow)` branch.
+
+Also added the SocialFlyout.unload() call and threw in a disablehistory="true" to reduce the memory usage of the sidebar
+Comment on attachment 673660
+Patch v2
+
+Review of attachment 673660:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser-social.js
+@@ +930,5 @@
+>      let sbrowser = document.getElementById("social-sidebar-browser");
+>      sbrowser.docShell.isActive = !hideSidebar;
+>      if (hideSidebar) {
+>        this.dispatchEvent("socialFrameHide");
+> +      // If we've been disabled, unload the sidebar content immediatelly;
+
+s/immediatelly/immediately/
+(In reply to :Felipe Gomes from comment #30)
+> threw in a
+> disablehistory="true" to reduce the memory usage of the sidebar
+
+See bug 755116 - we *might* not want to do this.
+Ah ok, thanks for the info Mark. Yeah I think we shouldn't add it then, at least not now.. perhaps in the future.  I'll remove it from the patch before landing
+Comment on attachment 673660
+Patch v2
+
+>diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
+
+>       <browser id="social-sidebar-browser"
+>                type="content"
+>+               disablehistory="true"
+>                disableglobalhistory="true"
+
+disableglobalhistory disables a subset of what disablehistory does (just global vs. global+session), so you can remove the disableglobalhistory if you're adding disablehistory. But this has content-visible effects, like breaking history.back(), doesn't it? I'm not sure that that's the right tradeoff, given that the win from doing this isn't very well defined.
+(In reply to :Felipe Gomes from comment #33)
+> Ah ok, thanks for the info Mark. Yeah I think we shouldn't add it then, at
+> least not now.. perhaps in the future.  I'll remove it from the patch before
+> landing
+
+Oops, that'll teach me to comment on attachments before catching up on the bug.
+IIRC, the biggest issue with disabling history is that the history related functions (eg, replaceState) still appeared to exist but threw exceptions when used.  The code in question could handle it not existing, but not existing and failing.  I wonder if this is worth adding a test for (ie, that the history functions either don't exist or work if they do)?
+(In reply to Mark Hammond (:markh) from comment #36)
+> IIRC, the biggest issue with disabling history is that the history related
+> functions (eg, replaceState) still appeared to exist but threw exceptions
+> when used.  The code in question could handle it not existing, but not
+> existing and failing.  I wonder if this is worth adding a test for (ie, that
+> the history functions either don't exist or work if they do)?
+
+I think we already had this discussion in a different bug (which I can't find atm, unfortunately).
+
+I don't think it makes sense to disable session history for arbitrary web content, any more than it would make sense to disable any other web feature arbitrarily.  We don't get to pick and choose which features of the web we expose to pages.  history.replaceState is part of the spec, and just because this one page can handle its non-existence doesn't mean that we can remove it, any more than we could remove history.back, or the history object altogether.
+
+> disableglobalhistory disables a subset of what disablehistory does (just global vs. 
+> global+session), so you can remove the disableglobalhistory if you're adding disablehistory. But 
+> this has content-visible effects, like breaking history.back(), doesn't it?
+
+"Disabling global history" shouldn't in theory break history.back(), but perhaps our implementation does.
+(In reply to Justin Lebar [:jlebar] from comment #37)
+> (In reply to Mark Hammond (:markh) from comment #36)
+> I think we already had this discussion in a different bug (which I can't
+> find atm, unfortunately).
+
+Bug 755116.
+
+> I don't think it makes sense to disable session history for arbitrary web
+> content, any more than it would make sense to disable any other web feature
+> arbitrarily.  We don't get to pick and choose which features of the web we
+> expose to pages.  history.replaceState is part of the spec, and just because
+> this one page can handle its non-existence doesn't mean that we can remove
+> it, any more than we could remove history.back, or the history object
+> altogether.
+
+Agreed - sorry I wasn't clear.  I was pointing out what would break in this specific context if we did disable all history.  But we aren't going to do that.
+
+> > disableglobalhistory disables a subset of what disablehistory does (just global vs. 
+> > global+session), so you can remove the disableglobalhistory if you're adding disablehistory. But 
+> > this has content-visible effects, like breaking history.back(), doesn't it?
+> 
+> "Disabling global history" shouldn't in theory break history.back(), but
+> perhaps our implementation does.
+
+disabling "global history" doesn't break anything IIUC.  A blanket "disable history" may or may not break history.back(), but it certainly does break history.replaceState().  We already have global history disabled and I think we all agree we should not disable session history (which I think is the right term), and Felipe isn't going to check that part of his patch in.
+
+So nothing to see here, please move along :)  And apologies for my comment which was intended to clarify but obviously created more confusion!
+> Agreed - sorry I wasn't clear.
+
+Aha, I understand what you mean now.  Sorry I misunderstood!
+Created attachment 674396
+Remove and re-add sidebar to the DOM
+
+This implements a workaround for bug 803255. By removing and re-adding the sidebar to the DOM the non-visible document is properly released from memory. When we do that we also need to make sure to reattach the progress listener and set the isAppTab property of the new docshell again.
+For easier tracking purposes I'm posting this patch on this bug (which can land together with the earlier patch and will need to be uplifted), and will leave bug 803255 only for the platform fix.
+Comment on attachment 674396
+Remove and re-add sidebar to the DOM
+
+Let's get a bug on file to refactor the sidebar browser creation/initialization code so that things are a bit less confusing (i.e. it's clear that we're not going to hit any double-adding the progress listener cases).
+https://hg.mozilla.org/integration/mozilla-inbound/rev/047148d2783e
+Created attachment 674581
+patch for branches
+
+Posting the two patches folded into one, as landed (the better for the branches request)
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): social
+User impact if declined: sidebar will be kept loaded after made invisible
+Testing completed (on m-c, etc.): landed on inbound
+Risk to taking this patch (and alternatives if risky): touches the social sidebar ui code
+String or UUID changes made by this patch: none
+Comment on attachment 674581
+patch for branches
+
+a=me for a social-only fix
+https://hg.mozilla.org/mozilla-central/rev/047148d2783e
+https://hg.mozilla.org/releases/mozilla-aurora/rev/36bb45a3295a
+https://hg.mozilla.org/releases/mozilla-beta/rev/bec042f2934a
+Please remove [qa-] whiteboard tag and add verifyme keyword if there's some QA testing needed here. Otherwise we will skip verification.

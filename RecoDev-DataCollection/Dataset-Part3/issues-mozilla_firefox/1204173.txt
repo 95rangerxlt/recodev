@@ -1,0 +1,653 @@
+After experimenting with Fluxify, which is a Redux-like API with ability to emit events, we found out that we can do that with Redux itself with some middleware.
+
+This patch replaces fluxify with redux, and replaces its usage in the debugger tool, and changes var names to match what redux calls them.
+
+Right now, Debugger's middleware checks for certain actions, performs the reductions, and then emits specific events on the DebuggerController. James, maybe there's a better place for these events to be emitted?
+
+After experimenting with Fluxify, which is a Redux-like API with ability to emit events, we found out that we can do that with Redux itself with some middleware.
+
+This patch replaces fluxify with redux, and replaces its usage in the debugger tool, and changes var names to match what redux calls them.
+
+Right now, Debugger's middleware checks for certain actions, performs the reductions, and then emits specific events on the DebuggerController. James, maybe there's a better place for these events to be emitted?
+Created attachment 8660240
+1204173-redux.patch
+
+This also moves our external libs to vendor/*. For the special content/ directory rules for BrowserLoader, maybe there's some better way. Right now it's pretty confusing, but maybe because I lack knowledge of the debugger changes.
+
+This'll need a quick review of license information for including Redux. Also, I wonder if there any consumers of React to its previous address.
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=c07fe5816bb1
+Comment on attachment 8660240
+1204173-redux.patch
+
+Review of attachment 8660240:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/content/middleware.js
+@@ +6,5 @@
+> +const constants = require("./constants");
+> +
+> +function createDebuggerMiddleware (emit) {
+> +  return ({ dispatch, getState }) => next => action => {
+> +    let result = next(action);
+
+Not sure if this should wait in the event it's an async action before calling the switch statement below, like if we add the promisify middleware as default.
+
+@@ +9,5 @@
+> +  return ({ dispatch, getState }) => next => action => {
+> +    let result = next(action);
+> +
+> +    switch (action.type) {
+> +      case constants.UPDATE_EVENT_BREAKPOINTS:
+
+This does repeat some logic in the reducer, but another solution is to just have reducers modules expose a function that takes an emitter like
+
+module.exports = function (emit) {
+  return function (state=[], action) {
+    if (action.type === ENUM) { emit("EVENT", state) }
+  }
+}
+
+@@ +14,5 @@
+> +        emit("@redux:activeEventNames", getState().eventListeners.activeEventNames);
+> +        break;
+> +      case constants.FETCH_EVENT_LISTENERS:
+> +        if (action.status === "done") {
+> +          emit("@redux:listeners", getState().eventListeners.listeners);
+
+Prefixed the event names so it's clear they're coming from a redux action, especially if we move the redux proxy emitter to something like `window`. Hopefully it's obvious and encourages more using subscribers and state rather than continuing the legacy event model
+
+::: browser/devtools/shared/browser-loader.js
+@@ +71,2 @@
+>        if (!uri.startsWith(baseURI) &&
+> +          !/react/.test(uri)) {
+
+Right now this will load things from the initial directory, or any react lib, rather than a specific directory that is always loaded via BL. Not sure what the right solution is here -- what's the long term loader/env plan? Since we hardcode react's dev version, maybe we can just whitelist certain files that need to work with BL, specifying their dev versions if needed.
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #1)
+> Created attachment 8660240
+> 1204173-redux.patch
+> 
+> This also moves our external libs to vendor/*. For the special content/
+> directory rules for BrowserLoader, maybe there's some better way. Right now
+> it's pretty confusing, but maybe because I lack knowledge of the debugger
+> changes.
+
+I personally don't think it's confusing, and heads in the right direction of just working in a normal browser environment. To me it's super confusing that we even have to think about modules that don't have *any* access to the browser.
+
+I think this all stems from the fact that we load each tool in an iframe, so we're hesitant to load JS per iframe because we're reloading it multiple times. I don't love the iframe-approach, but we're not changing that any time soon, so I guess we do have to be careful when we load stuff in the window context.
+
+I'm fine moving stuff to vendor, and potentially just whitelisting the libraries that need to be loaded per-iframe. Long term, I believe we'll be doing a lot more React, and I suspect we'll have a fair amount of components that do manual DOM twiddling in lifecycle methods, which require the browser API. And you shouldn't have to pass `window` to every single component, that would be terrible.
+
+However, we probably don't want to load everything per-tool. I just had an idea: React has this thing called a "context": https://www.tildedave.com/2014/11/15/introduction-to-contexts-in-react-js.html. A context is an object that a parent component can create, and all descendant components can "tap into" the context to get the data. It should be very rarely used, but this could be a great use case. We could pass in `window` to the top-level Debugger component or whatever it rendering the tool, and all components that need access to the DOM can "tap into" the context object and do `const window = this.context.window` (the component needs to specify that it wants the context object, won't go into detail about that).
+
+That way React is really the only thing that needs to be loaded per-iframe, everything else (even components) is still globally loaded like we're doing right now.
+
+> ::: browser/devtools/shared/browser-loader.js
+> @@ +71,2 @@
+> >        if (!uri.startsWith(baseURI) &&
+> > +          !/react/.test(uri)) {
+> 
+> Right now this will load things from the initial directory, or any react
+> lib, rather than a specific directory that is always loaded via BL. Not sure
+> what the right solution is here -- what's the long term loader/env plan?
+> Since we hardcode react's dev version, maybe we can just whitelist certain
+> files that need to work with BL, specifying their dev versions if needed.
+
+Yeah, I'm changing this for now. I thought we may need to add browser-specific files a lot more, but we probably want to discourage it for now.
+Er I meant "I'm fine changing this for now".
+Comment on attachment 8660240
+1204173-redux.patch
+
+Review of attachment 8660240:
+-----------------------------------------------------------------
+
+It's the weekend so not going to actually change r? yet because I haven't looked at this too thoroughly, but had some thoughts.
+
+::: browser/devtools/debugger/content/middleware.js
+@@ +9,5 @@
+> +  return ({ dispatch, getState }) => next => action => {
+> +    let result = next(action);
+> +
+> +    switch (action.type) {
+> +      case constants.UPDATE_EVENT_BREAKPOINTS:
+
+I don't think we can separate out event emitting from the actual reducer logic. For example, see how I emit a `breakpoint-moved` event: https://github.com/jlongster/gecko-dev/blob/debugger-refactor-sources2/browser/devtools/debugger/content/stores/breakpoints.js#L56 I can only do this in the reducer but I specifically know how the state has transitioned. That single action may emit multiple events: `breakpoint-moved` and `breakpoint-updated`. Separating events is going to break down with more complex cases.
+
+I don't really think it's a big deal to sprinkle some event emitting in the reducer. I like the idea of prefixing the event name with something to discourage it, or doing stuff like that. But we're going to be migrating for a while, and there's a lot of complex cases and I think it's easier for now just to combine it in the reducer. We can easily remove the events later and the reducer doesn't have to change in any other way (it should still return new state, etc)
+
+I think we just need a top-level reducer that calls all the "child" reducers with the 3rd argument: `emitChange`. The top-level reducer would somehow become the event emitter, and UI code somehow has access to it (not entirely sure). Maybe something like:
+
+const topReducer = combineReducersWithEmitter(reducers);
+const store = createStore(topReducer);
+
+
+// Later in UI code
+topReducer.onChange('breakpoint-added', ...);
+
+
+Also, we're going to need a terse way to subscribe events, because there are going to be a lot of them. My `onChange` current allows you subscribe to multiple events at once by passing in the shape of the state you want to watch: https://github.com/jlongster/gecko-dev/blob/debugger-refactor-sources2/browser/devtools/debugger/content/views/sources-view.js#L27. It also allows you to pass in `this` and it will call all those methods with `this` context so you don't have to do `this.addBreakpoint = this.addBreakpoint.bind(this)` which is ugh.
+Sounds good w/r/t BrowserLoader -- so I guess this is just a move and later when doing more loader/iframe/toolbox work we can make more decisions then -- I'll hardcode some React stuff in browser-loader (rather than a loose /react/.test for a whitelist in that case.
+Now agreed that emitters shouldn't be separated from the reducer logic -- they're too bound and similar. Rather than doing a top-level reducer that acts on children reducers (I don't know how that works, seems like more cognitive overhead for new redux-ish users, to me right now anyway?), what if we expose reducers via:
+
+```
+module.exports = function createReducer (emitChange) {
+  return function reducer(state = initialState, action) {
+    switch(action.type) {
+      case constants.ADD_BREAKPOINT: {
+        const id = makeLocationId(action.breakpoint.location);
+
+        if(action.status === 'start') {
+          const existingBp = state.breakpoints.get(id);
+          const bp = existingBp || action.breakpoint;
+          bp.disabled = false;
+          bp.loading = true;
+          if('condition' in action) {
+            bp.condition = action.condition;
+          }
+          state.breakpoints.set(id, bp);
+          emitChange(existingBp ? "breakpoint-enabled" : "breakpoint-added", bp);
+        }
+      }
+    }
+  }
+}
+```
+
+Then in an aggregate reducers file (./content/reducers/index ?), we could just:
+
+const createEventListenerReducer = require("./event-listeners");
+module.exports = (emitter) => combineReducers({ eventListeners: createEventListenerReducer(emitter) });
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #6)
+> Sounds good w/r/t BrowserLoader -- so I guess this is just a move and later
+> when doing more loader/iframe/toolbox work we can make more decisions then
+> -- I'll hardcode some React stuff in browser-loader (rather than a loose
+> /react/.test for a whitelist in that case.
+
+Cool. I'm not sure my context idea will work, actually. Because you need React when *creating* a component (you need either React.createClass or React.Component). It all boils down to my beef with iframes: all things break when dealing with two different contexts, like `instanceof` checks. Passing an array in from the iframe and checking it in the devtools "parent" context with `array instanceof Array` is false. This is , imho, it's way more confusing. It's harder to do normal things you'd do in a webapp.
+
+But we'll deal with that when we get to it. I'm fine changing it for now.
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #7)
+> Now agreed that emitters shouldn't be separated from the reducer logic --
+> they're too bound and similar. Rather than doing a top-level reducer that
+> acts on children reducers (I don't know how that works, seems like more
+> cognitive overhead for new redux-ish users, to me right now anyway?), what
+> if we expose reducers via:
+> 
+> ```
+> module.exports = function createReducer (emitChange) {
+>   return function reducer(state = initialState, action) {
+>     switch(action.type) {
+>       case constants.ADD_BREAKPOINT: {
+>         const id = makeLocationId(action.breakpoint.location);
+> 
+>         if(action.status === 'start') {
+>           const existingBp = state.breakpoints.get(id);
+>           const bp = existingBp || action.breakpoint;
+>           bp.disabled = false;
+>           bp.loading = true;
+>           if('condition' in action) {
+>             bp.condition = action.condition;
+>           }
+>           state.breakpoints.set(id, bp);
+>           emitChange(existingBp ? "breakpoint-enabled" : "breakpoint-added",
+> bp);
+>         }
+>       }
+>     }
+>   }
+> }
+> ```
+> 
+> Then in an aggregate reducers file (./content/reducers/index ?), we could
+> just:
+> 
+> const createEventListenerReducer = require("./event-listeners");
+> module.exports = (emitter) => combineReducers({ eventListeners:
+> createEventListenerReducer(emitter) });
+
+That's not bad, but I think it's the same cognitive overhead for redux users. Redux users understand that `combineReducers` (the function provided by redux), combines multiple reducers into one that you pass to `createStore`. Every single redux user is already creating a new top-level reducer with `combineReducers` already. In our case we'd just use our own `combineReducers` and document that it adds a 3rd param. Personally I think it seem more confusing to define reducers this way because it's less like a normal redux reducer. (and now there's extra indentation :p)
+
+But I'm not going to push hard for that, if you think that's the best way I'm ~good~ \o/
+Good call, combineReducers is more simple than I thought so that should be easy.
+
+I'll make the change for a top-reducer for passing in an emitter into the reducers, and clean up browser loader's sloppy /react/.test with a more explicit white list.
+Created attachment 8660385
+1204173-redux.patch
+
+Made the above changes!
+Gerv, this patch adds MIT licensed Redux[0] library to Firefox Dev Tools -- any other considerations necessary?
+
+[0] https://github.com/rackt/redux
+Comment on attachment 8660385
+1204173-redux.patch
+
+Review of attachment 8660385:
+-----------------------------------------------------------------
+
+::: browser/devtools/shared/browser-loader.js
+@@ +22,5 @@
+>      DEBUG_JS_MODULES: true
+>    };
+>  }
+>  
+> +const ALWAYS_LOAD_AS_CONTENT = new Set([
+
+Could we take a different approach that doesn't involve a "magic" set to update?
+
+I feel like people will forget about this later.  Could we just treat the entire vendor directory this way?  If we end up with non-content stuff later, we can change at that point.
+
+::: browser/devtools/vendor/moz.build
+@@ +3,5 @@
+>  # This Source Code Form is subject to the terms of the Mozilla Public
+>  # License, v. 2.0. If a copy of the MPL was not distributed with this
+>  # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+>  
+> +EXTRA_JS_MODULES.devtools.vendor += [
+
+Could we put the vendor directory inside shared, since it's just another thing that's meant to be shared?
+
+See previous discussion at https://bugzilla.mozilla.org/show_bug.cgi?id=1177891#c28.
+We could move vendors to shared, I don't feel strongly. 
+
+Always loading via browser loader may be confusing -- debugger uses it and would get redux as browser env, but a tool that doesn't use BL would get it as a cjs module. Which may be fine. Maybe we should add cjs style deps to toolkit like our other cjs deps?
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #14)
+> We could move vendors to shared, I don't feel strongly. 
+
+The main point for me is that I think it's nice to keep the set of "top level" (where that means /browser/devtools today) directories down to just each tool and then a shared dir, as opposed to lots of little shared dirs for different purposes.  More specific meanings like this one can then contained inside shared.
+
+> Always loading via browser loader may be confusing -- debugger uses it and
+> would get redux as browser env, but a tool that doesn't use BL would get it
+> as a cjs module. Which may be fine. Maybe we should add cjs style deps to
+> toolkit like our other cjs deps?
+
+Hmm, I'm not sure what you mean here.
+(In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #15)
+> (In reply to Jordan Santell [:jsantell] [@jsantell] from comment #14)
+
+> > Always loading via browser loader may be confusing -- debugger uses it and
+> > would get redux as browser env, but a tool that doesn't use BL would get it
+> > as a cjs module. Which may be fine. Maybe we should add cjs style deps to
+> > toolkit like our other cjs deps?
+> 
+> Hmm, I'm not sure what you mean here.
+
+BrowserLoader loads anything from its root directory (specified on instatiation) within a browser context (with `window`, Web APIs, etc), as well as anything from the ./shared/content/* directory. Debugger uses this loader, and Memory tools do not -- if we put Redux in ./shared/vendor/* or whatever we want to be flagged to default to load in browser context with using BL, then Debugger would load it in browser context via window.Redux (or something), and Memory tools would load it via module.exports -- shouldn't be an issue if the third party library can be handled like this, but wouldn't work if a library only supports module.exports -- in which case, maybe should live in toolkit/devtools/*
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #16)
+> (In reply to J. Ryan Stinnett [:jryans] (use ni?) from comment #15)
+> > (In reply to Jordan Santell [:jsantell] [@jsantell] from comment #14)
+> 
+> > > Always loading via browser loader may be confusing -- debugger uses it and
+> > > would get redux as browser env, but a tool that doesn't use BL would get it
+> > > as a cjs module. Which may be fine. Maybe we should add cjs style deps to
+> > > toolkit like our other cjs deps?
+> > 
+> > Hmm, I'm not sure what you mean here.
+> 
+> BrowserLoader loads anything from its root directory (specified on
+> instatiation) within a browser context (with `window`, Web APIs, etc), as
+> well as anything from the ./shared/content/* directory. Debugger uses this
+> loader, and Memory tools do not -- if we put Redux in ./shared/vendor/* or
+> whatever we want to be flagged to default to load in browser context with
+> using BL, then Debugger would load it in browser context via window.Redux
+> (or something), and Memory tools would load it via module.exports --
+> shouldn't be an issue if the third party library can be handled like this,
+> but wouldn't work if a library only supports module.exports -- in which
+> case, maybe should live in toolkit/devtools/*
+
+Right, that was part of the intended meaning of the name ./shared/content: "these files are meant to be loaded in a window context".  With ./shared/vendor, there is no clear statement about window context or not.  Here are some more options on how to clarify it:
+
+* Assume a window context for ./shared/vendor, since most vendor libs we would use in tool UIs are likely to want window context (d3, React, etc.)
+* Be explicit with a new ./shared/vendor/content directory, which parallels the naming for the non-vendor window context scripts in ./shared/content
+
+In general, Gecko JS outside of DevTools tends to use a structure like the following in various folders:
+
+* <thing>/content: JS in a window context
+* <thing>/modules: JS in a module / CommonJS / JSM context
+
+In the past, DevTools has usually skipped these explicit folders, so we have less precedence for it.  I think folder names do help, to keep the divide more obvious.  See /browser/devtools/webide for a DevTools thing that uses these naming concepts.
+
+It's a bad idea to just dump the "modules" ones into toolkit/devtools: this means they are shipped to all server devices.  Scripts should only be in toolkit if are used by: A. server or B. client and server.  If a script is client only, it should remain in browser/devtools somewhere.
+
+Since we already have ./shared/content, it implies that scripts in ./shared/* (but not ./shared/content) are meant to be used as modules.  So, ./shared/vendor/content may be nice to continue the explicit naming, and then ./shared/vendor/* would be vendor modules (non-window context), if we also have such things.
+
+I know all these folders start making the paths a bit long, but personally I don't think that is too big of a deal.  We can also use relative paths to cut down on some of the length where desired.
+You need to add the license text to about:license (toolkit/content/license.html). Put an entry in the Contents in alphabetical order, then the text in the appropriate place formatted just like all the other entries. Make a separate patch, and set r? to me.
+
+Thanks,
+
+Gerv
+Created attachment 8661355
+1204173-license.patch
+Comment on attachment 8660385
+1204173-redux.patch
+
+Review of attachment 8660385:
+-----------------------------------------------------------------
+
+This is great, I really like where this is going and getting rid of fluxify. I still have several concerns but let me know what you think. I think my main concern is with using event emitters because that violates one of the core principles of flux which is to be totally synchronous (read more in the comment below). Because there's still a few concers, I'm r- but it should be easy to fix (or talk about at least)
+
+::: browser/devtools/debugger/content/actions/event-listeners.js
+@@ +112,5 @@
+>      });
+>    }
+>  }
+>  
+> +module.exports = { updateEventBreakpoints, fetchEventListeners };
+
++1 on separating out actions
+
+::: browser/devtools/debugger/content/reducers/event-listeners.js
+@@ +15,5 @@
+> +
+> +function update(state = initialState, action, emit) {
+> +  switch(action.type) {
+> +  case constants.UPDATE_EVENT_BREAKPOINTS:
+> +    state.activeEventNames = action.eventNames;
+
+Note that we aren't going to be able to use mutability for React components. Which is fine, but worth noting. This only works for events because events are published no matter what, but React will only render things that have changed.
+
+Luckily, once you write things this way, it's super easy to just convert the reducer to use immutability, and nothing else really has to care about it.
+
+::: browser/devtools/debugger/content/reducers/index.js
+@@ +14,5 @@
+> + *
+> + * @param {Function} emit
+> + * @return {Function}
+> + */
+> +module.exports = function (emit) {
+
+A lot of modules are going to need this. Can we move this into `shared`?
+
+I used to have `create-dispatcher.js` in shared, and `fluxify` provided a bunch of stuff. You've created `redux-bootstrap` and `redux-middlewares`. I think we should just create a `redux` folder in shared which contains all the redux-specific utility modules that we need.
+
+In that folder we can put `create-store.js` (I like this better than `redux-bootstrap`, it's more contained and specific), and a `middlewares` folder with them in individual files.
+
+We can also put this function in there somewhere, and call it something like `combineEmittingReducers`.
+
+Make this generic by receiving the reducers to combine, just like `combineReducers`. And we shouldn't export the combined reducers here, we should do it wherever we create the store.
+
+::: browser/devtools/debugger/content/views/event-listeners-view.js
+@@ +17,4 @@
+>  
+>    this._onCheck = this._onCheck.bind(this);
+>    this._onClick = this._onClick.bind(this);
+> +  this._onListeners = this._onListeners.bind(this);
+
+Ugh I hate doing this :( Can we just pass `this._onListeners.bind(this)` to the event handler?
+
+@@ +20,5 @@
+> +  this._onListeners = this._onListeners.bind(this);
+> +
+> +  this.Breakpoints = DebuggerController.Breakpoints;
+> +  this.controller = DebuggerController;
+> +  this.controller.on("@redux:listeners", this._onListeners);
+
+I want a better way to listen to events. Looks how terse fluxify was: https://github.com/jlongster/gecko-dev/blob/debugger-refactor-sources2/browser/devtools/debugger/content/views/sources-view.js#L27-L40 (tl;dr I kind of talked myself out of this feature, keep reading)
+
+Two important things: you can listen to multiple events at once, and you can pass the `this` context to call them on. This gets rid of all the terrible `this.onAdd = this.onAdd.bind(this)`.
+
+There are going to be a lot of various events while we transition, so this would really help. Shouldn't be too hard to make another util module in the `redux` (or whatever) folder that takes an event emitter and the special listener object. Something like:
+
+listenToChanges(this.controller, {
+  // special listener object here
+}, this);
+
+Also this highlights another big difference between fluxify and normal event emitter: in fluxify, all events were automatically namespaced. Say you have 3 reducers:
+
+{ foo, bar, baz }
+
+And `foo` sends a `@redux:fooChanged` event from its reducer. The only way that you can listen to this change to specify that event names specifically on *that* reducer:
+
+onChange({
+  foo: {
+    '@redux:fooChanged': this.fooChanged
+  }
+}, this)
+
+I could be convinced that this isn't needed, I suppose. We probably aren't going to conflict, and if so that's easy to fix, and this is all just temporary anyway until components are React-like.
+
+In fact, if events are namespaced I suppose it relieves some of the need for the `listenToChanges` special subscriber function. I still hate having to do the bind stuff. But I dunno, I kind of just talked myself out of that feature, it's not worth it if we don't namespace events.
+
+@@ +51,5 @@
+>     */
+>    destroy: function() {
+>      dumpn("Destroying the EventListenersView");
+>  
+> +    this.controller.off("@redux:listeners", this._onListeners);
+
+Do we really need to do this kind of stuff? It we know the event emitter is going to go away (not referenced by any global Firefox service, etc) we shouldn't need this.
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +2054,5 @@
+>  /**
+>   * Convenient way of emitting events from the panel window.
+>   */
+>  EventEmitter.decorate(this);
+> +EventEmitter.decorate(DebuggerController);
+
+I don't want to use EventEmitter for this. Here's why.
+
+One of the best things about this architecture is that *when* things happen is very well-defined. Async work kinda sucks because it's really hard to debug race conditions. So if state changes, and everything begins to rerender, but a component updating triggers another action (or the user simply is able to click something fast enough), then you could have components rerendering out-of-order or expecting the state to be a certain way but it isn't.
+
+You can't guarantee replay for debuggability anymore. It's no longer guaranteed that when an action is pumped through the system that the UI is in a specific state.
+
+With React and Flux, you don't do any async in the reducers or components. It's just straight-up "state changes -> the UI rerenders" in one complete tick of the event loop. Flux makes sure to rerender the UI *after* all the reducers are done updating the state, but it all happens in one tick. Fluxify worked this way too, even with event listeners. Check out my `dispatch` function, particularly `flushChanges`: https://github.com/mozilla/gecko-dev/blob/master/browser/devtools/shared/fluxify/dispatcher.js#L234
+
+That's why we can't use EventEmitter, because by definition it calls handlers on the next tick of the event loop, which is exactly not what we want. Luckily it's super easy to make our own. This is all it was in fluxify, and it would be simpler if we didn't do the special state listener shape that I talk about in another comment: https://github.com/mozilla/gecko-dev/blob/master/browser/devtools/shared/fluxify/dispatcher.js#L160-L188
+
+I like the idea of using the controller as the "emitter" though, since we can't use the redux store anymore.
+
+::: browser/devtools/debugger/debugger-view.js
+@@ +36,5 @@
+>    "chrome://browser/content/devtools/promisedebugger/promise-debugger.xhtml";
+>  
+> +const middlewareEmit = DebuggerController.emit.bind(DebuggerController);
+> +const createStore = require("devtools/shared/redux-bootstrap")();
+> +const reducers = require('./content/reducers/index')(middlewareEmit);
+
+2 things: I wouldn't call this a middleware, that would be confusing to other redux users. Middlewares are only used to "intercept" actions and turn them into other actions; they sit between action creators and the store. It's a well-defined term.
+
+You've just created your own `combineReducers`, so I'd just call it something like `combineEmittingReducers` (in the other comment I talked about abstracting it out). Don't export the reducers already combined, and do `const store = createStore(combineEmittingReducers(reducers))` below.
+
+::: browser/devtools/shared/redux-middleware.js
+@@ +48,5 @@
+>   * }
+>   * ```
+>   */
+> +const WAIT_UNTIL_NAME = "@@service/waitUntil";
+> +waitUntilService.NAME = WAIT_UNTIL_NAME;
+
+I really don't like setting arbitrary properties on functions. You only access the actual middleware once (when creating the store), so can we just export 2 properties: the name and the actual instance?
+
+Also why did you combine these into the same file? I like have them as separate files better. I named it a "service" for a reason: it's a special kind of middleware. There is this idea of "services" which are things are stateful, and you can target a service directly by sending an action type with its name. Userland code should never `require` a middleware, but it should require a `service` file. Making them separate files makes it a lot clearer what things actually depend on.
+Soooooo I was totally wrong about EventEmitter and jsantell is right: it's actually synchronous so it's totally fine if we use it.
+Comment on attachment 8660385
+1204173-redux.patch
+
+Review of attachment 8660385:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/content/reducers/index.js
+@@ +14,5 @@
+> + *
+> + * @param {Function} emit
+> + * @return {Function}
+> + */
+> +module.exports = function (emit) {
+
+Moved to shared lib, exporting `combineEmittingReducers(reducers, emit)`
+
+::: browser/devtools/debugger/content/views/event-listeners-view.js
+@@ +20,5 @@
+> +  this._onListeners = this._onListeners.bind(this);
+> +
+> +  this.Breakpoints = DebuggerController.Breakpoints;
+> +  this.controller = DebuggerController;
+> +  this.controller.on("@redux:listeners", this._onListeners);
+
+We talked about this on IRC -- EventEmitter is synchronous, alleviating a few concerns here. W/R/T .bind on functions, and declaring events more tersely, we can do whatever in follow ups, but I just want to follow what's there right now and not add more complexity to landing Redux
+
+@@ +51,5 @@
+>     */
+>    destroy: function() {
+>      dumpn("Destroying the EventListenersView");
+>  
+> +    this.controller.off("@redux:listeners", this._onListeners);
+
+Not sure, I think it depends on the tool...
+
+::: browser/devtools/debugger/debugger-controller.js
+@@ +2054,5 @@
+>  /**
+>   * Convenient way of emitting events from the panel window.
+>   */
+>  EventEmitter.decorate(this);
+> +EventEmitter.decorate(DebuggerController);
+
+EventEmitter is sync
+
+::: browser/devtools/debugger/debugger-view.js
+@@ +36,5 @@
+>    "chrome://browser/content/devtools/promisedebugger/promise-debugger.xhtml";
+>  
+> +const middlewareEmit = DebuggerController.emit.bind(DebuggerController);
+> +const createStore = require("devtools/shared/redux-bootstrap")();
+> +const reducers = require('./content/reducers/index')(middlewareEmit);
+
+Renaming these, and changing up this scaffolding a bit
+
+::: browser/devtools/shared/browser-loader.js
+@@ +22,5 @@
+>      DEBUG_JS_MODULES: true
+>    };
+>  }
+>  
+> +const ALWAYS_LOAD_AS_CONTENT = new Set([
+
+Changing this to just load vendor/ as content in BL
+
+::: browser/devtools/shared/redux-middleware.js
+@@ +48,5 @@
+>   * }
+>   * ```
+>   */
+> +const WAIT_UNTIL_NAME = "@@service/waitUntil";
+> +waitUntilService.NAME = WAIT_UNTIL_NAME;
+
+Breaking these into separate files; waitUntilService will expose a separate string constant
+
+::: browser/devtools/vendor/moz.build
+@@ +3,5 @@
+>  # This Source Code Form is subject to the terms of the Mozilla Public
+>  # License, v. 2.0. If a copy of the MPL was not distributed with this
+>  # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+>  
+> +EXTRA_JS_MODULES.devtools.vendor += [
+
+Done
+Created attachment 8661397
+1204173-redux.patch
+
+Made changes mentioned previously
+
+ https://treeherder.mozilla.org/#/jobs?repo=try&revision=03677970071e
+Comment on attachment 8661397
+1204173-redux.patch
+
+Review of attachment 8661397:
+-----------------------------------------------------------------
+
+Looks good to me! We can tweak it over the next few weeks as I move my debugger changes to it. Thanks!
+
+::: browser/devtools/debugger/content/reducers/event-listeners.js
+@@ -19,5 @@
+> - */
+> -function bindActionCreators(actionCreators, dispatch) {
+> -  let actions = {};
+> -  for (let k of Object.keys(actionCreators)) {
+> -    actions[k] = bindActionCreator(actionCreators[k], dispatch);
+
+This change is weird, like something is wrong in the patch format. Looks like it's moving `bindActionCreators.js` to `reducers/event-listeners.js` and then changed the whole file. Just want to make sure that git's history will be tracked correctly.
+
+::: browser/devtools/debugger/content/views/event-listeners-view.js
+@@ +288,5 @@
+>  
+> +  /**
+> +   * Called when listeners change.
+> +   */
+> +  _onListeners: function(_, listeners) {
+
+This is also going to be a sore spot for complex apps. I want to just pass a normal `render*` function in and not have to fill in the first parameter. Another reason to just have our own dumb event emitter...
+
+But it's fine for now.
+Comment on attachment 8661397
+1204173-redux.patch
+
+Review of attachment 8661397:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/content/reducers/event-listeners.js
+@@ -19,5 @@
+> - */
+> -function bindActionCreators(actionCreators, dispatch) {
+> -  let actions = {};
+> -  for (let k of Object.keys(actionCreators)) {
+> -    actions[k] = bindActionCreator(actionCreators[k], dispatch);
+
+Huh, weird, I'll be sure this is properly removed
+Comment on attachment 8661397
+1204173-redux.patch
+
+Review of attachment 8661397:
+-----------------------------------------------------------------
+
+::: browser/devtools/debugger/content/views/event-listeners-view.js
+@@ +288,5 @@
+>  
+> +  /**
+> +   * Called when listeners change.
+> +   */
+> +  _onListeners: function(_, listeners) {
+
+That's due to devtools' EventEmitter always emitting the event name as first argument -- any changes to things here are now under your control :D
+Created attachment 8661496
+1204173-redux.patch
+
+Increased threshold of file migration when making a patch from git, fixed that weird movement issue
+Gerv: bump on the license information review, would like to land this soon as it's a dependency for some fall dev edition release goals
+Comment on attachment 8661355
+1204173-license.patch
+
+Review of attachment 8661355:
+-----------------------------------------------------------------
+
+r=gerv with these nits fixed on checkin.
+
+Gerv
+
+::: toolkit/content/license.html
+@@ +4558,5 @@
+> +    <hr>
+> +
+> +    <h1><a id="redux"></a>Redux License</h1>
+> +
+> +    <p>This license applies to various files in the Mozilla codebase.</p>
+
+Are you able to be more specific?
+
+@@ +4561,5 @@
+> +
+> +    <p>This license applies to various files in the Mozilla codebase.</p>
+> +<pre>
+> +The MIT License (MIT)
+> +
+
+Remove the two lines above this comment - the blank one and the MIT one.
+Created attachment 8662986
+1204173-license.patch
+
+Thanks, Gerv; made the license changes
+https://hg.mozilla.org/integration/fx-team/rev/17d1d8bbae99
+https://hg.mozilla.org/integration/fx-team/rev/30fffdc35b41
+https://hg.mozilla.org/mozilla-central/rev/17d1d8bbae99
+https://hg.mozilla.org/mozilla-central/rev/30fffdc35b41

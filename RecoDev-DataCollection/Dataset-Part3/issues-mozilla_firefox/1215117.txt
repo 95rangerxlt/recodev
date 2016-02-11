@@ -1,0 +1,211 @@
++++ This bug was initially created as a clone of Bug #1209353 +++
+
+Going to break Bug 1209353 (console support for workers) into a couple of pieces.  This first one is about getting jsterm execution working.
+
++++ This bug was initially created as a clone of Bug #1209353 +++
+
+Going to break Bug 1209353 (console support for workers) into a couple of pieces.  This first one is about getting jsterm execution working.
+Created attachment 8674615
+MozReview Request: Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+
+Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+Eddy, here is my plan:
+
+I'd like to take advantage of the fact that this is preffed off by default and start landing this bit by bit.  This is the minimum needed to get basic REPL support in the console in a worker toolbox.  We are going to need further discussion about the approach for handling interaction with the Console API / Services from the worker thread, but I don't see any reason to hold up progress here so we can start getting this tested.
+
+I've got a few follow ups to this work in mind (getting autocompletion working, modifying values from the Variables View, error logging).  If you are happy with this approach, I will file those separate from this.
+Comment on attachment 8674615
+MozReview Request: Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+
+https://reviewboard.mozilla.org/r/22257/#review19911
+
+I definitely think that this is the right idea, but there are a couple of fundamental issues with this patch. r- for that.
+
+I realise that all this low-level protocol stuff is pretty mind boggling, so feel free to ping me on irc if you have any questions.
+
+::: devtools/server/actors/webconsole.js:1029
+(Diff revision 1)
+> +      // Workers don't have access to Cu.
+
+In it's current form, every call to maybeExport will return early if isWorker is true, so it would be slightly more efficient to lift this check outside the loop in which maybeExport is called.
+
+::: devtools/server/main.js:848
+(Diff revision 1)
+>            if (packet.type !== "message" || packet.id !== aId) {
+
+The type check is here because we were using the ThreadActor's response packet as the response the connection request (see my comment below).
+
+Note that the type field here pertains to the low-level protocol (i.e. we are looking for a debugger protocol message that is multiplexed on the low level protocol). Change this to the name of the 'connected' packet.
+
+::: devtools/server/main.js:852
+(Diff revision 1)
+>            message = packet.message;
+
+This error check won't be necessary if we don't use the ThreadActor's response packet as the response to the connection request.
+
+::: devtools/server/main.js:858
+(Diff revision 1)
+> +          if (message.type === "actors-created") {
+
+Unless we heavily use these values in the code below (and we don't), this assignment is entirely redundant, since all we do with these values is assign them again to the response packet.
+
+I would just change this to return early if the type field is *not* what we expect (similarly to the check right below this one, which is now redundant).
+
+::: devtools/server/main.js:863
+(Diff revision 1)
+>            if (message.type !== "paused") {
+
+This check is only here because we used the response to ThreadActor.onAttach as the response to the connection request, but several other notifications are sent as a result of the call to onAttach first.
+
+Since we won't be using the response to ThreadActor.onAttach as the response to the connection request anymore, this check won't be necessary.
+
+::: devtools/server/worker.js:86
+(Diff revision 1)
+> +      type: "actors-created",
+
+The worker debugger API only has a single postMessage/onmessage channel. However, in theory, multiple clients can connect to the same worker.
+
+To allow for this, we've created a low-level protocol, that sits below the normal debugger protocol, and is used for setting up/tearing down connections, multiplexing messages, and doing rpc calls back to the server.
+
+Originally, the connection process consisted of two steps. During the first step, we obtained a thread actor. During the second step, we would attach to the thread actor.
+
+To save a round trip to the worker, I ended up merging these two steps into one, and made the ThreadActor's response packet the response to the connection request. This is kind of a hack, since conceptually speaking its not safe to use the debugger protocol before the connection is complete.
+
+Now that more than one actor is created during the connection, I think we should revert back to the original way we did things. Your solution here is a step in that direction, but has two issues with it:
+
+1. We should not send the 'actors-created' packet 
+   using the normal debugger protocol. The
+   connection is not complete until after we send
+   a response to the main thread. This should be
+   done using the low-level protocol, since it is
+   responsible for setting up the connection.
+   
+   Concretely, this means you should use
+   postMessage directly instead of   
+   connection.send. Style nit: please use   
+   'connected' as the packet type instead of 
+   'actors-created'.
+
+2. The 'connected' packet is send before we
+   attach to the thread actor. This just happens 
+   to work, because onAttach does not do anything
+   asynchronous, but that is not a safe 
+   assumption, since request handlers are allowed
+   to be asynchronous.
+   
+   You have a couple of options here:
+   a. Do not send the 'connected' packet until
+      ThreadActor.onAttach is complete.
+   b. OR once connectToWorker receives the
+      'connected' packet, make it send an
+      onAttach request to the threadActor,
+      and wait for it to complete before
+      resolving its result promise.
+   c. OR make WorkerActor.onConnect not
+      return an attached threadActor, and
+      make the client responsible for
+      attaching to it.
+      
+  My preference here would be c: in the long
+  term I want to redesign WorkerActor so that
+  it works almost exactly like TabActor.  
+  WorkerActor.onConnect should behave the same
+  as TabActor.onAttach, and the latter does not
+  return an attached ThreadActor either.
+  
+  If doing c. sounds like too much work for you,
+  then either a. or b. will be fine too.
+
+::: devtools/server/worker.js:93
+(Diff revision 1)
+>      // This will cause a packet to be sent over the connection to the parent.
+
+This comment is no longer relevant, since we won't be using the response to ThreadActor.onAttach as the response to our connection request anymore.
+
+::: devtools/shared/webconsole/client.js:297
+(Diff revision 1)
+> +    // The evaluation request could have come from a worker and the result
+
+The server on the main thread acts as a client for the servers on the worker threads. Any notification packets sent by an actor in a worker thread will therefore be received by the server on the main thread, which then forwards it to its client.
+
+As a result, the client on the main thread can now receive notification packets from multiple webconsole actors: the one on the main thread, and the ones on the worker threads. Checking the from field of the packet is the correct way to distinguish between these.
+
+Your comment is a bit confusing in its current form: evaluation requests always originate on the main thread. The main thread server forwards these requests to the appropriate server in a worker thread. The result/notification packet always originates on the worker thread.
+
+Please clarify the comment. Otherwise, this looks good.
+Comment on attachment 8674615
+MozReview Request: Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+
+Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+Thanks for the feedback in Comment 3.  I believe these changes address your comments and I've attempted to go with the preferred approach, 2c.  Specifically, I'm now doing a separate call to attach the thread in devtools/shared/client/main.js in the WorkerClient.attachThread method.
+
+You can see the changes since the last version at: https://reviewboard.mozilla.org/r/22257/diff/1-2/
+Comment on attachment 8674615
+MozReview Request: Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+
+https://reviewboard.mozilla.org/r/22257/#review20467
+
+::: devtools/server/worker.js:85
+(Diff revisions 1 - 2)
+> -    connection.send({
+> +    // Step 5: Notifiy the parent that the actors are created.
+
+I would prefer to word this as 'send a response packet to the parent to notify it that a connection has been established.'
+
+::: devtools/shared/client/main.js:1353
+(Diff revisions 1 - 2)
+> +    // The connect call does not also attach the thread, as of 44+.
+
+What does 44+ mean here?
+
+::: devtools/shared/webconsole/client.js:297
+(Diff revision 1)
+> +    // The evaluation request could have come from a worker and the result
+
+Don't forget to remove this comment before landing.
+
+Yeah, this is exactly what I meant. Great job!
+(In reply to Eddy Bruel [:ejpbruel] from comment #6)
+> Comment on attachment 8674615
+> MozReview Request: Bug 1215117 - Make console input field work inside a
+> worker toolbox;r=ejpbruel
+> 
+> https://reviewboard.mozilla.org/r/22257/#review20467
+> 
+> ::: devtools/server/worker.js:85
+> (Diff revisions 1 - 2)
+> > -    connection.send({
+> > +    // Step 5: Notifiy the parent that the actors are created.
+> 
+> I would prefer to word this as 'send a response packet to the parent to
+> notify it that a connection has been established.'
+> 
+
+Alright, I'll update that wording.
+
+> ::: devtools/shared/client/main.js:1353
+> (Diff revisions 1 - 2)
+> > +    // The connect call does not also attach the thread, as of 44+.
+> 
+> What does 44+ mean here?
+
+Firefox 44+, it's just a backwards compat note.  It's possible that we don't need it if we aren't needing to support worker debugging against older servers in the frontend.
+Comment on attachment 8674615
+MozReview Request: Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+
+Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+(In reply to Brian Grinstead [:bgrins] from comment #8)
+> Comment on attachment 8674615
+> MozReview Request: Bug 1215117 - Make console input field work inside a
+> worker toolbox;r=ejpbruel
+> 
+> Bug 1215117 - Make console input field work inside a worker
+> toolbox;r=ejpbruel
+
+Rebased, updated comments as suggested and had an e10s test fix.  Here's a fresh try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=eb36f15d094f
+Comment on attachment 8674615
+MozReview Request: Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
+
+https://reviewboard.mozilla.org/r/22257/#review20737
+https://hg.mozilla.org/integration/fx-team/rev/0e616440737c
+https://hg.mozilla.org/mozilla-central/rev/0e616440737c

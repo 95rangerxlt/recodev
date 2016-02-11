@@ -1,0 +1,231 @@
+We shouldn't spend time thumbnail pages that wont show up in the top pages.
+
+We shouldn't spend time thumbnail pages that wont show up in the top pages.
+The thumbnail service is there for broader use than only by the new tab page.
+What other then panorama uses it?
+See http://mxr.mozilla.org/mozilla-central/search?string=.getThumbnailURL for all current uses on mozilla-central. On top of that, new features can start using the service any time. Add-ons can use it too.
+
+Also, please don't reopen just because you had a question. :/
+"add-ons could in theory use it" isn't a great argument for us doing performance-intensive work that we would otherwise be able to avoid. I agree that we need to factor the cost of having this service not be generic enough (and thus encouraging people to re-implement its functionality, possibly poorly) when making the tradeoff, but I don't believe that the current behavior is optimal, so it's best not to outright shoot down ideas for trying to improve it.
+(In reply to Dão Gottwald [:dao] from comment #3)
+> Also, please don't reopen just because you had a question. :/
+
+Let's reach consensus before we close out this bug. I have quantified that snapshot is a sizable source of jank. Snapshoting a page takes can take 50-200ms.
+Just the snapshot or does this include the write to disk? I have just r?-ed a patch that moves the write of the main thread and improves its efficiency, plus might very slightly improve the speed of snapshoting itself (that remains to be confirmed).
+Perhaps we could alter the semantics of getThumbnailURL so that the thumbnail for a page is effectively shapshot + written only if either that page is in the top N or getThumbnailURL has already been called for that URL reasonably recently. This would effectively remove most snapshots and this should eventually work for all URLs that "deserve" a snapshot.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #4)
+> "add-ons could in theory use it" isn't a great argument for us doing
+> performance-intensive work that we would otherwise be able to avoid.
+
+We couldn't otherwise avoid it. Add-ons were only the last aspect of my argument.
+(In reply to Dão Gottwald [:dao] from comment #8)
+> We couldn't otherwise avoid it. Add-ons were only the last aspect of my
+> argument.
+
+We control mozilla-central and the callers of getThumbnailURL there, so that shouldn't be a limiting factor in what is possible to improve.
+Why is this in Places?
+*** Bug 884458 has been marked as a duplicate of this bug. ***
+We currently have a method called PageThumbs.addExpirationFilter() that allows components to register a listener that is called when we expire thumbnails. The listeners are called and we expect them to return a list of URLs they want to keep thumbnails for. about:newtab returns a list of 25 links starting with the ones currently shown on the grid. Panorama returns the list of open tabs.
+
+I think we should rename this so that it's not an expiration filter anymore but rather a list of sites we're supposed to create thumbnails for. The list would need to be updated rather often as features like Panorama may return a different one depending on what tabs were closed or opened.
+
+Features that have different requirements and show thumbnails for different sites would then just add themselves and provide their list of URLs when asked.
+Created attachment 804135
+expiration filters -> capture filters
+
+Tim, this does what your comment 12 suggests.
+Comment on attachment 804135
+expiration filters -> capture filters
+
+Review of attachment 804135:
+-----------------------------------------------------------------
+
+The approach itself looks good to me but I'm a little worried that there's now a lot more overhead than before. We currently expire thumbnails maybe once per hour, we request the lists of thumbnails to keep and then go and delete files. The new approach would mean that every time we check whether to capture a thumbnail or not we request those lists.
+
+Should we somehow cache them and only re-request them after a certain expiration time? Should CaptureFilter API clients be required to periodically update their stored lists? They should know best when their lists are invalidated.
+
+Maybe we shouldn't worry about that too much? All the clients we currently have seem to not do much work to generate those lists so maybe we're fine.
+
+::: toolkit/components/thumbnails/PageThumbs.jsm
+@@ +758,5 @@
+> +      function filterCallback(filterURLs) {
+> +        let urlMap = new Map();
+> +        for (let url of filterURLs) {
+> +          urlMap.set(url, true);
+> +        }
+
+Should use a Set here:
+
+let urlSet = new Set(filterURLs);
+
+...
+
+aURLs.some(url => urlSet.has(url))
+See https://wiki.mozilla.org/User:Roc/ScreenCaptureAPI for additional efforts on the topic.
+That's covered by bug 720575.
+Created attachment 827216
+make consumers register their filters with PageThumbs
+
+I had the same thought, Tim, so this patch inverts the previous one.  Instead of PageThumbs asking consumers for filters, this makes consumers give their filters to PageThumbs.  Then on capture it's only O(1) to consult the set of filtered-in URLs to determine whether the capture is OK.
+
+Need to update the tests next if this is OK.
+Comment on attachment 827216
+make consumers register their filters with PageThumbs
+
+I still don't think this is very reasonable, but if you really want to pursue this plan, you need to update at least another two consumers on mozilla-central: http://mxr.mozilla.org/mozilla-central/search?string=getThumbnailURL&find=/browser/
+Not sure if browser/metro/base/content/startui/TopSitesView.js is covered by the NewTabUtils.jsm change.
+(In reply to Dão Gottwald [:dao] from comment #18)
+> I still don't think this is very reasonable
+
+I would actually be OK with simply modifying gBrowserThumbnails to skip capture for URLs that aren't in NewTabUtils.links.getLinks().
+The two other consumers Dao mentions are Panorama and tab previews.  Both expect all open pages to have thumbnails.  In light of those two consumers, this bug doesn't make much sense: it's never the case that there are no thumbnail consumers.  Panorama and tab previews potentially need a thumbnail of every tab you visit, so there's no work to be done here.
+
+On the other hand, the larger point is to not capture thumbnails if they're not going to be used.  If you never use Panorama or tab previews, as most people apparently do not, then it's wasteful to capture every page.
+
+What do you think about capturing missing thumbnails on demand in both Panorama and tab previews?  Then they'd work like about:newtab.  If they show only open tabs, then they could use the foreground service, although capturing many tabs in the foreground would potentially block the UI.  Or they could use the background service, but that would be slower, and some pages would not appear as they do in open tabs.
+Given that ctrl+tab previews are off by default and Panorama is seldom used, I think we should try to optimize for the common case. If that means a degraded experience on first-use of those features (e.g. while thumbnails are fetched in the background), I think that's acceptable.
+We know when these feature are used. It seems that when they're active, they could tell the service to capture images for all tabs. I thought this was the idea behind the API introduced here.
+What do you think should happen the first time you use them?  In the first-run case specifically, is the last paragraph in comment 20 reasonable?
+
+So:
+
+* gBrowserThumbnails attempts to capture every open tab like it does now, but
+  PageThumbs declines filtered-out URLs.
+* When a feature is presented to the user for the first time, it sets up its
+  capture filter.
+* Whenever a feature is presented to the user, including but not only for the
+  first time, it captures missing thumbnails through either the background or
+  foreground service.
+So, just a short recap. We have four features that use the thumbnail service and two patterns:
+
+The two new tab pages use .getThumbnailUrl() to show thumbnails of most-visited pages and can deal with missing thumbnails. For the list of visible but missing thumbnails they request a background capture.
+
+Now OTOH Panorama and Ctrl+Tab previews will capture their own thumbnails using .drawWindow(), even if activated late in the browsing session. Both of those features however cannot get thumbnails for tabs that are [pending=true] (tabs restored by sessionstore that haven't actually been loaded yet).
+
+We could solve this differently by keeping the current expiration filter mechanism and changing Panorama and Ctrl+Tab previews to use PageThumbs API methods that capture and store images on disk. That way we could bypass the NewTabUtils.getLinks() filter applied by browser-thumbnails.js.
+
+Both of the latter features have missing thumbnails when activated with pending tabs, the only thing we can do about that would be to fetch thumbnails using the background service which could possibly be quite a lot of requests, especially with Panorama. This could be fixed by loading these pages once so maybe we shouldn't care too much about that.
+
+More food for thought: this would make browser-thumbnails.js quite specialized for capturing pictures only for our newtab pages and would beg the question whether we should be capturing thumbnails in the foreground by default at all. PageThumbs could be separated into a capturing API and a storage API that only stores and retrieves thumbnails. Capturing could be explicitly requested by features and add-ons like Panorama and Ctrl+Tab previews that want up-to-date thumbnails.
+(In reply to Tim Taubert [:ttaubert] from comment #24)
+> Both of the latter features have missing thumbnails when activated with
+> pending tabs, the only thing we can do about that would be to fetch
+> thumbnails using the background service which could possibly be quite a lot
+> of requests, especially with Panorama. This could be fixed by loading these
+> pages once so maybe we shouldn't care too much about that.
+
+I have about 500 tabs open, most of which are unloaded... How would this be handled by Panorama with your suggested fix? I'm not sure I understand it.
+The bottom line is that thumbnail consumers either go and capture missing thumbnails on demand, ultimately resorting to the background service; or we maintain the status quo of capturing all tabs because we never know when some consumer might need a thumbnail.
+
+Assuming we don't want any consumers to have missing thumbnails.
+Created attachment 8341516
+proof of concept: gBrowserThumbnails captures top sites, Panorama bg-captures missing thumbnails
+
+This is a rough proof of concept where gBrowserThumbnails._shouldCapture() returns true only for top sites and Panorama loads missing thumbnails using the background service.  It modifies BackgroundPageThumbs's capture methods to return an object with a cancel() method that cancels the capture if it's stilled queued when cancel() is called.  Panorama uses it to cancel all queued captures when it's hidden.  When it's shown again, it resumes capturing.  This patch is a little messy but it gets the idea across.
+
+Ctrl-Tab tab previews would work the same way, but this patch doesn't change them.
+I'll post what Gavin and I talked about today regarding the latest patch.
+
+The experience when loading thumbnails in the background in Panorama is actually not as bad as I was expecting.  (Tim, I'd really like your thoughts.)  I think it's probably viable.  But, I don't use Panorama so I don't have habits to disrupt.
+
+The Ctrl-Tab tab previews experience is worse, for me at least.  The latest patch doesn't bg-load thumbnails in that case, but it does mean that most of my Ctrl-Tab previews are missing.  I use Ctrl-Tab and for me it's very transient, so it's unlikely that there's time for most thumbnails to load while it's visible on-screen.  What's worse, the bezel that the previews are contained in is transparent, so you can see through the missing thumbnail tiles.  (That could be fixed with placeholder thumbnails.)  Gavin thinks we should just remove the feature altogether.  I'll post to firefox-dev about it.
+So, this bug's summary says "...when there are no thumbnail service consumers". I don't understand why we're even talking about the background service when Ctrl-Tab and Panorama (when used) should just tell the thumbnail service that they want thumbnails for all open tab. If that's not an option, then it seems that the thumbnail service is so crippled at this point that "thumbnail service" becomes a misnomer.
+(In reply to Dão Gottwald [:dao] from comment #29)
+> (when used)
+
+(In reply to Drew Willcoxon :adw from comment #23)
+> What do you think should happen the first time you use them?
+I should note that tab-previews uses two methods for retrieving thumbnails: It relies on thumbnails stored by the thumbnail service for pending=true pages, and it captures all other pages itself. The second case isn't necessarily a problem in the context of this discussion because it only happens when the feature is enabled. The problem is the first case, since we want to stop capturing and storing thumbnails unnecessarily.
+
+I think the first case can be worked around without removing the feature altogether and even without changing how it works.  (ctrlTab.init() could background-load thumbnails for the small number of pending=true pages in its list that don't have stored thumbnails.)  Maybe the feature should be removed, but I don't think this bug by itself is a good reason.
+
+Also note that it's already possible for tab-previews to have missing thumbnails even without the patch here.
+Gavin and I talked about this bug again.  How ctrlTab only captures when it's enabled; it captures thumbnails for non-pending pages; blank thumbnails already happen for pending=true pages that gBrowserThumbnails declined to capture; and the effect of fewer cached thumbnails would be a higher likelihood of more blank thumbnails for pending=true pages, which is not a big deal.  We agreed that given all of that, removing or changing ctrlTab isn't necessary for this bug.  (But there are two follow-up opportunities: cache captured thumbnails so they're available later, like Tim says in comment 24, and background-capture missing thumbnails for pending=true pages.)
+
+As I'm writing that, I realize that the same reasoning applies to Panorama.  So maybe there's no need to touch it, either.  Just live with more blank thumbnails for pending=true pages, and leave background-capture as a possible follow-up.
+(In reply to Drew Willcoxon :adw from comment #30)
+> (In reply to Dão Gottwald [:dao] from comment #29)
+> > (when used)
+> 
+> (In reply to Drew Willcoxon :adw from comment #23)
+> > What do you think should happen the first time you use them?
+
+You just get blank thumbnails.
+
+I think the important part here is to allow consumers to tell the service to keep thumbnails for all open tabs.
+
+For Ctrl-Tab or other consumers that display a limited number of thumbnails, it might also make sense to background-capture upon first use, but you really wouldn't want this every time Ctrl-Tab is invoked. For Panorama or other consumers that might want to display thumbnails for lots of tabs, I'm skeptical that background-capturing is the right thing to do even for the first use -- even if it doesn't bring down your system, it seems excessive.
+Created attachment 8346068
+make gBrowserThumbnails capture/store only top sites
+
+I've come around to the same view, at least for this bug.  This patch simply changes gBrowserThumbnails to only capture and store top sites.  Consumers of the thumbnail services remain free to use them to store whatever they'd like.  Tim, I'll leave the feedback? on the previous patch for you to clear or +/- as you'd like.
+
+A possible modification would be for gBrowserThumbnails to fall back to capturing and storing all pages if Panorama or Ctrl-Tab has been used.  Maybe that's what you mean, Dão, when you say allowing consumers to tell the service to keep thumbnails for all open tabs.  But I'm not sure that's necessary, since both features capture thumbnails when they need them.  The only time they need stored thumbnails is for pending tabs, like we've discussed, and we're OK with blank thumbnails.  But if we want to do that, I think it would be better for each feature to use PageThumbs to store when they capture instead of having gBrowserThumbnails store everything.
+Comment on attachment 8346068
+make gBrowserThumbnails capture/store only top sites
+
+Review of attachment 8346068:
+-----------------------------------------------------------------
+
+I like shifting responsibility to features themselves. Before we could land this we however need to fix Panorama and Ctrl+Tab to capture *and* store thumbnails. Panorama currently captures a lot of thumbnails, on every MozAfterPaint - that is, when the feature is shown. It would make sense to maybe have a lower stale time for Panorama than we have for about:newtab though. Ctrl+Tab would need to capture and store images when tabs load as well.
+
+Thinking about this more it might be beneficial if we had namespaces for thumbnails. Panorama could use PageThumbs.jsm to capture and store thumbnails in its own folder. It could as well register its own timer and call PageThumbs.expire() by passing a list of thumbnails to keep. And we could thus get rid of ExpirationFilters. The great thing is that every component requiring thumbnails can implement its own policy and on the side of PageThumbs we could also keep a canvas cache this is cleared on MozAfterPaint (or the like) in case multiple features would issue multiple drawWindow() calls for the same state.
+
+::: browser/base/content/browser-thumbnails.js
+@@ +122,5 @@
+>    },
+>  
+>    _shouldCapture: function Thumbnails_shouldCapture(aBrowser) {
+> +    // Capture only if it's a top site in about:newtab.
+> +    if (!NewTabUtils.links.getLinks().some(l => l == aBrowser.currentURI.spec))
+
+Using .indexOf() might be a tad faster/more explicit here?
+
+::: toolkit/modules/NewTabUtils.jsm
+@@ +620,5 @@
+>    getLinks: function Links_getLinks() {
+>      let pinnedLinks = Array.slice(PinnedLinks.links);
+>  
+>      // Filter blocked and pinned links.
+> +    let links = (this._links || []).filter(function (link) {
+
+Another way to fix this would be to call populateCache() right before getLinks() which would make _shouldCapture() async though. The populateCache() API sucks (sorry) but I didn't have enough time fix this, otherwise getLinks() would just return a promise.
+Comment on attachment 8346068
+make gBrowserThumbnails capture/store only top sites
+
+Review of attachment 8346068:
+-----------------------------------------------------------------
+
+Cancelling review for now based on Tim's comments.
+Created attachment 8349131
+make gBrowserThumbnails capture/store only top sites v2
+
+(In reply to Tim Taubert [:ttaubert] from comment #35)
+> Before we could land this we however need to fix Panorama and Ctrl+Tab
+> to capture *and* store thumbnails.
+
+Could you explain why?  I don't agree.  If a higher likelihood of missing thumbnails for pending pages is the reason, we can live with that for now.  I'd be happy to work on a follow-up bug that stores thumbnails.
+
+> Thinking about this more it might be beneficial if we had namespaces for
+> thumbnails.
+
+All of this seems out of scope for this bug.
+
+> Using .indexOf() might be a tad faster/more explicit here?
+
+Changed.
+
+> Another way to fix this would be to call populateCache() right before
+> getLinks() which would make _shouldCapture() async though.
+
+It's much simpler to not assume _links is nonnull, and breaking this implicit assumption makes the API stronger IMO.  So I didn't change this part.
+https://hg.mozilla.org/integration/fx-team/rev/194f941f2064
+Backed out in https://hg.mozilla.org/integration/fx-team/rev/912a0f7924f0 for breaking m-bc: https://tbpl.mozilla.org/php/getParsedLog.php?id=32659587&tree=Fx-Team
+The three failing tests rely on gBrowserThumbnails._shouldCapture() returning true, so I had to modify them to make it return true by adding visits and repopulating NewTabUtils's link cache.
+
+https://hg.mozilla.org/integration/fx-team/rev/f552ce04bc36
+And out again in https://hg.mozilla.org/integration/fx-team/rev/3c4e2a76f567 for other m-bc bustage:
+
+https://tbpl.mozilla.org/php/getParsedLog.php?id=32741121&tree=Fx-Team
+https://hg.mozilla.org/integration/fx-team/rev/1c7b312a2a85
+https://hg.mozilla.org/mozilla-central/rev/1c7b312a2a85

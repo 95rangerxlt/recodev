@@ -1,0 +1,273 @@
+For bug 850984, we want to be able to send different search params depending on tablet or not.
+
+I'm wondering if it'd make sense to extend that actually using different search urls, like using mobile vs desktop site on wikipedia for phones and tablets.
+
+Not sure if we should tie this to the system-info's tablet property, or if this would be more like media queries?
+
+For bug 850984, we want to be able to send different search params depending on tablet or not.
+
+I'm wondering if it'd make sense to extend that actually using different search urls, like using mobile vs desktop site on wikipedia for phones and tablets.
+
+Not sure if we should tie this to the system-info's tablet property, or if this would be more like media queries?
+This is already possible from client code using the "purpose" argument.
+
+The mobile search plugin can specify e.g.:
+<Url type="text/html" method="GET" template="https://www.example.com/search">
+  <Param name="q" value="{searchTerms}"/>
+  <MozParam name="tablet" condition="purpose" purpose="tablet" value="true"/>
+  <MozParam name="tablet" condition="purpose" purpose="nontablet" value="false"/>
+</Url>
+
+and then the mobile search code can do something like:
+let isTablet = checkIsTablet();
+let submission = searchEngine.getSubmission(searchTerm, null, isTablet ? "tablet" : "nontablet");
+// use submission.uri/postData, etc.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #1)
+> This is already possible from client code using the "purpose" argument.
+> 
+> The mobile search plugin can specify e.g.:
+> <Url type="text/html" method="GET" template="https://www.example.com/search">
+>   <Param name="q" value="{searchTerms}"/>
+>   <MozParam name="tablet" condition="purpose" purpose="tablet" value="true"/>
+>   <MozParam name="tablet" condition="purpose" purpose="nontablet"
+> value="false"/>
+> </Url>
+> 
+> and then the mobile search code can do something like:
+> let isTablet = checkIsTablet();
+> let submission = searchEngine.getSubmission(searchTerm, null, isTablet ?
+> "tablet" : "nontablet");
+> // use submission.uri/postData, etc.
+
+This is cool. I had no idea. I don't know that we can use it though. The one example we have of "tablet" vs "mobile" search engines have different template URLs. See https://bugzilla.mozilla.org/show_bug.cgi?id=850984#c18
+We might be able to abuse the "type" though
+(In reply to Mark Finkle (:mfinkle) from comment #3)
+> We might be able to abuse the "type" though
+
+No, that would be a bad idea. I guess we could try making a very parameterized template string.
+(In reply to Mark Finkle (:mfinkle) from comment #4)
+> (In reply to Mark Finkle (:mfinkle) from comment #3)
+> > We might be able to abuse the "type" though
+> 
+> No, that would be a bad idea. I guess we could try making a very
+> parameterized template string.
+
+Also a bad idea.
+Hmm. What's the issue with abusing "type"? Your search code could be something like:
+
+var searchType = isTablet() ? "application/x-moz-tabletURL" : null;
+var submission = Services.search.currentEngine.getSubmission(searchTerm, searchType);
+if (!submission)
+  submission = Services.search.currentEngine.getSubmission(searchTerm, null);
+
+and have the baidu plugin use:
+<Url type="application/x-moz-tabletURL" template="http://www.baidu.com/baidu?tn=monline_4_dg&ie=utf-8&wd={searchTerms}"/>
+<Url type="text/html" template="http://m.baidu.com/s?from=1000969a&word={searchTerms}"/>
+
+Since you seem to not use nsSearchSuggestions and instead roll-your own suggestion stuff, you should be able to do the same for that getSubmission call too.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #6)
+> Hmm. What's the issue with abusing "type"? Your search code could be
+> something like:
+> 
+> var searchType = isTablet() ? "application/x-moz-tabletURL" : null;
+> var submission = Services.search.currentEngine.getSubmission(searchTerm,
+> searchType);
+> if (!submission)
+>   submission = Services.search.currentEngine.getSubmission(searchTerm, null);
+
+This would work where we call getSubmission ourselves, but this won't work for keyword searches entered through the urlbar, which is probably the majority of our searches.
+
+Could we pass along a flag to loadURIWithFlags? Or is there a way for us to tweak the search service for mobile? Neither of these options seem great.
+(In reply to :Margaret Leibovic from comment #7)
+> Could we pass along a flag to loadURIWithFlags? Or is there a way for us to
+> tweak the search service for mobile? Neither of these options seem great.
+
+Indeed. One slightly cleaner hack would be to add a mechanism through which you can override the submission used for keyword search (e.g. through an nsIObserver notification), but that has the downside that it would make it possible for add-ons to alter that behavior again, something that we tried to avoid by getting rid of keyword.URL in bug 738818 :(
+
+Maybe a search service hack is needed here after all...
+Created attachment 754943
+WIP v1
+
+> Maybe a search service hack is needed here after all...
+
+Wish granted
+Created attachment 754953
+WIP v2
+
+This one actually works
+Created attachment 754955
+test hack
+
+I used this as a way to test the hack. I checked two ways:
+* Simple keyword in URLBar search. This should hit here: http://mxr.mozilla.org/mozilla-central/source/docshell/base/nsDefaultURIFixup.cpp#357
+* Explicit search by tapping the search engine in the Awesomescreen list
+
+Both methods used the "phonesearch" URL and showed the hacked Wikipedia results.
+I can move the sysInfo code into an isTablet getter to skip getting the service on every call.
+I can also put the code in an #ifdef MOZ_FENNEC block, but I kinda don't want to do that.
+Moar testing:
+* Using on tablet with a "phonesearch" but no "tabletsearch" falls back to "text/html". 
+* Using on phone with a "tabletsearch" but no "phonesearch" falls back to "text/html".
+Comment on attachment 754953
+WIP v2
+
+Review of attachment 754953:
+-----------------------------------------------------------------
+
+::: toolkit/components/search/nsSearchService.js
+@@ +2507,5 @@
+>    // from nsISearchEngine
+>    getSubmission: function SRCH_ENG_getSubmission(aData, aResponseType, aPurpose) {
+> +    if (!aResponseType) {
+> +      let sysInfo = Cc["@mozilla.org/system-info;1"].getService(Ci.nsIPropertyBag2);
+> +      if (sysInfo.get("tablet")) {
+
+I think it would be nice to cache this in an isTablet() getter, as you mentioned.
+
+@@ +2520,5 @@
+> +          aResponseType = "application/x-moz-phonesearch";
+> +        else
+> +          aResponseType = URLTYPE_SEARCH_HTML;
+> +      }
+> +      Services.console.logStringMessage("Search: response type = " + aResponseType);
+
+nsSearchService has a LOG() utility built in that will log things in debug mode.
+Comment on attachment 754953
+WIP v2
+
+Gross, but I guess I don't see better short term options.
+
+Can you make this #ifdef ANDROID, and put most of the grossness in an _uglyAndroidFallback helper, such that the beginning of getSubmission looks like:
+
+#ifdef ANDROID
+if (!aResponseType) {
+  aResponseType = this._uglyAndroidFallback();
+}
+#endif
+if (!aReponseType) {
+  aResponseType = URLTYPE_SEARCH_HTML;
+}
+Created attachment 755761
+patch v1
+
+Impl'd as you suggested, without the "gross" and "ugly" bits :)
+
+I find it beautiful, and after testing on phones and tablets, it still works. I am looking into an Android-safe way to test this. I think we have xpcshell tests working, but I don't know if that would exercise anything beyond what is already tested. getting a submission by a non-default response type is already tested.
+
+Maybe a robocop test?
+Hmm, xpcshell tests will not work anyway. The sysinfo "tablet" depends on JNI calls to the Java code, but that is not running with xpcshell. It will need robocop, or Nick Alexander's new JS test system.
+Comment on attachment 755761
+patch v1
+
+nits: You could put the _mobileResponseType implementation behind an #ifdef ANDROID too (maybe rename it _defaultMobileResponseType?), and simplify the logic to if (tablet && supportsResponseType) {...} else if (supportsResponseType {...}.
+
+remove the logStringMessage for landing
+Created attachment 758806
+robo-shell test
+
+I used Nick Alexander's new "xpcshell test using robocop" framework to make this test. Try run is green:
+https://tbpl.mozilla.org/?tree=Try&rev=a167ea87c088
+
+And yes, the test is actually run:
+11 INFO TEST-INFO | testDeviceSearchEngine | testDeviceSearchEngine.js - Observer: engine-changed for Test search engine
+12 INFO TEST-INFO | testDeviceSearchEngine | testDeviceSearchEngine.js - Observer: engine-added for Test search engine
+13 INFO TEST-PASS | testDeviceSearchEngine | testDeviceSearchEngine.js - [check_submission : 24] http://example.com/search?q=foo == http://example.com/search?q=foo
+14 INFO TEST-PASS | testDeviceSearchEngine | testDeviceSearchEngine.js - [check_submission : 24] http://example.com/search/tablet?q=foo == http://example.com/search/tablet?q=foo
+15 INFO TEST-PASS | testDeviceSearchEngine | testDeviceSearchEngine.js - [check_submission : 24] http://example.com/search/phone?q=foo == http://example.com/search/phone?q=foo
+16 INFO TEST-INFO | testDeviceSearchEngine | testDeviceSearchEngine.js - Device: phone
+17 INFO TEST-PASS | testDeviceSearchEngine | testDeviceSearchEngine.js - [check_submission : 24] http://example.com/search/phone?q=foo == http://example.com/search/phone?q=foo
+1
+Comment on attachment 758806
+robo-shell test
+
+Review of attachment 758806:
+-----------------------------------------------------------------
+
+Sweet, this is pretty cool.
+
+I wonder if we can come up with a list of features that could use some test coverage with this new framework, then file some mentor bugs for them. Writing tests is a great way to figure out how things work (although we need to make sure they're not too hard to get running locally).
+
+::: mobile/android/base/tests/testDeviceSearchEngine.js
+@@ +17,5 @@
+> +
+> +  if (engine.name != "Test search engine")
+> +    return;
+> +
+> +  function check_submission(aExpected, aSearchTerm, aType, aPurpose) {
+
+You never call check_submission with an aPurpose argument, so you could just hard-code null into the .getSubmission call below to simplify the signature of this function.
+
+@@ +22,5 @@
+> +    do_check_eq(engine.getSubmission(aSearchTerm, aType, aPurpose).uri.spec,
+> +                base + aExpected);
+> +  }
+> +
+> +  let base = "http://example.com/search";
+
+It's confusing that you're declaring base here, but it's only used above here in check_submission. Can you declare it above there, or not even use a local variable, since it's only used once?
+
+@@ +39,5 @@
+> +  } else {
+> +    do_print("Device: phone");
+> +    check_submission("/phone?q=foo", "foo", null);
+> +  }
+> + 
+
+Nit: whitespace
+
+@@ +44,5 @@
+> +  do_test_finished();
+> +};
+> +
+> +add_task(function test_default() {
+> +  let search = Services.search; // Cause service initialization
+
+No need to declare a variable, right?
+(In reply to :Margaret Leibovic from comment #20)
+
+> > +  function check_submission(aExpected, aSearchTerm, aType, aPurpose) {
+> 
+> You never call check_submission with an aPurpose argument, so you could just
+> hard-code null into the .getSubmission call below to simplify the signature
+> of this function.
+
+Remove aPurpose (it came from the desktop xpcshell test I based this on)
+
+> > +    do_check_eq(engine.getSubmission(aSearchTerm, aType, aPurpose).uri.spec,
+> > +                base + aExpected);
+> > +  }
+> > +
+> > +  let base = "http://example.com/search";
+> 
+> It's confusing that you're declaring base here, but it's only used above
+> here in check_submission. Can you declare it above there, or not even use a
+> local variable, since it's only used once?
+
+Just added the string into check_submission
+
+> > +add_task(function test_default() {
+> > +  let search = Services.search; // Cause service initialization
+> 
+> No need to declare a variable, right?
+
+No, but it's used below and was brought in from the desktop test, so I kept it. Keeps the "initialization" line from looking weird.
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/6b7cddb67921
+remote:   https://hg.mozilla.org/integration/mozilla-inbound/rev/ea85e5a2e7c0
+(In reply to Mark Finkle (:mfinkle) from comment #21)
+> > > +  let search = Services.search; // Cause service initialization
+
+OMG this line won't die. The comment is no longer true and this keeps being copied all over the place (see bug 860560 comment 21, bug 862401 comment 42 :)
+
+I snapped and removed it:
+https://hg.mozilla.org/integration/mozilla-inbound/rev/01eefd251a9a
+https://hg.mozilla.org/mozilla-central/rev/6b7cddb67921
+https://hg.mozilla.org/mozilla-central/rev/ea85e5a2e7c0
+
+
+add mechanism for using different search URLs for tablet vs. non-tablet
+
+
+
+Bug 861164 - use different search URLs for tablet vs. non-tablet r=gavin 
+
+Bug 861164 - use different search URLs for tablet vs. non-tablet [tests] r=margaret 

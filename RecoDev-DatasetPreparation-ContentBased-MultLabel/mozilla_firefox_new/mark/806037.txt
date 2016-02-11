@@ -1,0 +1,335 @@
+See bug 799600 comment 10 and later.  Basically our same-origin checks aren't best practice and our url resolution code might suffer the same problems.
+
+I propose we add new methods to provider objects:
+
+* isUrlInOrigin(url, allowLocalUrls):
+
+  Checks if a URL is the same origin as the provider, or is allowLocalUrls is set, a data: or similar URL which is valid for use by a provider.  This would use  nsIScriptSecurityManager.checkSameOriginURI() for the origin check and nsINetUtil's URIChainHasFlags() method to check for local urls.
+
+Not specifically mentioned in that bug, but related:
+
+* isValidProviderUrl(url):
+
+  Checks if a URL is valid for use by a provider.  This will *not* perform the same origin checks, but encapsulates the code at http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser-social.js?mark=484,487#484
+
+* resolveUrl():
+
+  Resolves a potentially relative URL to the providers origin.  Does not fail if already an absolute URL in a different origin.
+
+Thoughts, reactions, comments?
+
+See bug 799600 comment 10 and later.  Basically our same-origin checks aren't best practice and our url resolution code might suffer the same problems.
+
+I propose we add new methods to provider objects:
+
+* isUrlInOrigin(url, allowLocalUrls):
+
+  Checks if a URL is the same origin as the provider, or is allowLocalUrls is set, a data: or similar URL which is valid for use by a provider.  This would use  nsIScriptSecurityManager.checkSameOriginURI() for the origin check and nsINetUtil's URIChainHasFlags() method to check for local urls.
+
+Not specifically mentioned in that bug, but related:
+
+* isValidProviderUrl(url):
+
+  Checks if a URL is valid for use by a provider.  This will *not* perform the same origin checks, but encapsulates the code at http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser-social.js?mark=484,487#484
+
+* resolveUrl():
+
+  Resolves a potentially relative URL to the providers origin.  Does not fail if already an absolute URL in a different origin.
+
+Thoughts, reactions, comments?
+Created attachment 676059
+Better origin checks and uri resolution
+
+This adds 2 new methods to a provider object:
+
+* checkMayLoad(uri, allowIfInheritsPrincipal) - a wrapper for the nsIPrincipal method of the same name.
+
+* resolveUri(url, allowDifferentOrigin, allowIfInheritsPrincipal) - resolves a URI for the provider and allows the origin of the resulting URI to be checked.
+
+There is also a provider.principal attribute added which is an nsIPrincipal based on the origin - see below for why provider.origin can't currently be removed.
+
+Most of the changes should be fairly obvious - one "interesting" one is:
+
+-      // resolve potentially relative URLs then check the scheme is acceptable.
+-      url = Services.io.newURI(Social.provider.origin, null, null).resolve(url);
+-      let uri = Services.io.newURI(url, null, null);
+-      if (!uri.schemeIs("http") && !uri.schemeIs("https") && !uri.schemeIs("data")) {
+-        return reportError('images["' + sub + '"] does not have a valid scheme');
+-      }
+-      promptImages[sub] = url;
++      // resolve potentially relative URLs but allow images to be from a
++      // different origin.
++      let imgUri = Social.provider.resolveUri(url, true);
++      promptImages[sub] = imgUri.spec;
+
+This no longer implements a "whilelist" for acceptable protocol images - the existing check doesn't really seem worthwhile.
+
+Try at https://tbpl.mozilla.org/?tree=Try&rev=a67367634bc8
+
+Sadly alot of "provider.origin" references still exist, and this is due to the origin being used as a "key" to uniquely identify a provider.  I was 1/2 tempted to replace all of these with "provider.key" to make it clear how it is being used and make it slightly harder to use it as an origin in unsafe ways - maybe in a followup?
+Comment on attachment 676059
+Better origin checks and uri resolution
+
+>diff --git a/browser/base/content/browser-social.js b/browser/base/content/browser-social.js
+
+>@@ -475,23 +475,20 @@ let SocialShareButton = {
+
+>     for (let sub of ["share", "unshare"]) {
+
+>+      // resolve potentially relative URLs but allow images to be from a
+>+      // different origin.
+
+Hmm, it's a bit odd for this validation code to be handled by the front-end, but I guess all of share message handling is in the front-end at the moment. Seems like maybe we should abstract that away into the SocialProvider/workerAPI at some point, but our boundaries here aren't really very well defined at the moment. Not really related to this patch at all, just an observation.
+ 
+>diff --git a/toolkit/components/social/SocialService.jsm b/toolkit/components/social/SocialService.jsm
+
+>+  let secMan = Cc["@mozilla.org/scriptsecuritymanager;1"].getService(Ci.nsIScriptSecurityManager);
+
+Services.scriptSecurityManager
+
+>+  checkMayLoad: function checkMayLoad(uri, allowIfInheritsPrincipal) {
+>+    if (uri instanceof String) {
+
+I don't think this works as intended (|"" instanceof String| is false). You probably want to use typeof?
+
+>+      let uri = Services.io.newURI(uri, null, null);
+
+Also "let" is block-scope, so I'm not sure what this does exactly :)
+
+>+  /**
+>+   * Resolve partial URLs for a provider and optionally check same origin.
+
+The "optionally check same origin" part seems confusing to include in this function (and the extra boolean parameters don't help). Can't callers who want that just also call checkMayLoad as needed? Makes the behavior at the call site more obvious.
+
+Otherwise this looks great, thanks for cleaning this up.
+Created attachment 676462
+feedback comments addressed + tests
+Comment on attachment 676462
+feedback comments addressed + tests
+
+>diff --git a/browser/base/content/browser-social.js b/browser/base/content/browser-social.js
+
+>+      // resolve potentially relative URLs but there is no same-origin check
+>+      // for images to help providers utilize content delivery networks...
+>+      let imgUri = Social.provider.resolveUri(url);
+>+      if (!imgUri) {
+
+I agree that we don't need a same-origin check, but I think we may still need a scheme check, to protect against e.g. "javascript:" URIs being passed here... Probably the same code added in bug 776606 (see how "portrait" is handled in SocialService.jsm), but I'm not sure that's correct either (we might instead want a checkLoadURI call with DISALLOW_INHERIT_PRINCIPAL). Adding such a method to SocialProvider might make sense, but I think the hard part is distinguishing it from checkMayLoad. Maybe rename checkMayLoad as checkSameOrigin, and then make checkMayLoad the looser "can load" check needed here?
+
+r- for this issue only, but this otherwise looks wonderful. A few other minor comments:
+
+>diff --git a/toolkit/components/social/MozSocialAPI.jsm b/toolkit/components/social/MozSocialAPI.jsm
+
+> function attachToWindow(provider, targetWindow) {
+
+>+  if (!provider.checkMayLoad(targetDocURI, true)) {
+
+So passing "true" here is a behavior change that fixes bug 799600, AFAICT - I guess that bug should depend on this one?
+
+> function openChatWindow(chromeWindow, provider, url, callback, mode) {
+
+>+  let fullURL = provider.resolveUri(url);
+
+nit: fullURI ('URI' typically implies nsIURI, while 'URL' typically implies a string). Same comment applies elsewhere in this file.
+
+>diff --git a/toolkit/components/social/SocialService.jsm b/toolkit/components/social/SocialService.jsm
+
+>   this.origin = input.origin;
+>+  let originUri = Services.io.newURI(input.origin, null, null);
+
+Perhaps we should only keep a reference to the nsIURI created here, rather than keeping it as a string (to save having to create one each time in resolveUri). But that would involve changing a bunch of other code that uses provider.origin, so no need to do that here (but maybe file a bug if you agree that it's a good idea).
+
+>+  checkMayLoad: function checkMayLoad(uri, allowIfInheritsPrincipal) {
+
+>+    if (typeof uri == "string")
+>+      uri = Services.io.newURI(uri, null, null);
+
+This might want to try/catch and return false if newURI throws (i.e. the passed-in URL isn't valid)?
+
+>+   * Resolve partial URLs for a provider and optionally check same origin.
+
+Need to update the comment to reflect removal of the optional same-origin check.
+
+>diff --git a/toolkit/components/social/WorkerAPI.jsm b/toolkit/components/social/WorkerAPI.jsm
+
+>-                  if (nUri.scheme != pUri.scheme)
+>-                    nUri.scheme = pUri.scheme;
+
+This code would allow a provider whose origin was https://example.com/ to open a link from http://example.com/page.html (note difference in scheme), but the new code won't. Is that a problem? I don't know why we added that scheme-munging code, I don't see mention of it in bug 774506. Maybe Facebook relies on this?
+
+>diff --git a/toolkit/components/social/test/xpcshell/test_SocialService.js b/toolkit/components/social/test/xpcshell/test_SocialService.js
+
+>+function testCheckMayLoad(manifests, next) {
+
+This could use a test that checks that checkMayLoad returns false for data: URIs when you pass false for allowIfInheritsPrincipal.
+Shane - can you remember what the code at http://mxr.mozilla.org/mozilla-central/source/toolkit/components/social/WorkerAPI.jsm#105 is for?
+
+It seems like it should not be necessary - if it was, it would mean a provider is sending a URL that is invalid due to having an incorrect scheme - but you might recall more details.  It also looks as though it would prevent a data: URL being used.
+
+If we can't remember, I feel it would be OK to remove that check in aurora (possibly) and nightly (definitely) under the assumption we'd pick up the breakage before it got too widespread - thoughts?
+(In reply to Mark Hammond (:markh) from comment #5)
+> Shane - can you remember what the code at
+> http://mxr.mozilla.org/mozilla-central/source/toolkit/components/social/
+> WorkerAPI.jsm#105 is for?
+> 
+> It seems like it should not be necessary - if it was, it would mean a
+> provider is sending a URL that is invalid due to having an incorrect scheme
+> - but you might recall more details.  It also looks as though it would
+> prevent a data: URL being used.
+
+I don't think data urls in that instance need to be supported, however the scheme check is probably unnecessary.  I don't recall the specific details around that.
+
+> If we can't remember, I feel it would be OK to remove that check in aurora
+> (possibly) and nightly (definitely) under the assumption we'd pick up the
+> breakage before it got too widespread - thoughts?
+
+I cant see why there would be any breakage by removing the scheme check.  I'd go for removing it.
+It looks to me like maybe it was there to force links to be https:// if they were passed as http:// - that's not something that we should enforce, I think, but we may want to poke Facebook if the links they're passing aren't https:// (I haven't checked).
+Created attachment 685995
+updated based on review
+
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #4)
+> Comment on attachment 676462
+
+> I agree that we don't need a same-origin check, but I think we may still
+> need a scheme check, to protect against e.g. "javascript:" URIs being passed
+> here... 
+
+I believe we determined with bz's help that a check against javascript isn't necessary.  I added a comment in the code indicating the scheme check isn't necessary as javascript: urls are evaluated in a sandbox.
+
+> So passing "true" here is a behavior change that fixes bug 799600, AFAICT -
+> I guess that bug should depend on this one?
+
+Done.  On a bit of a whim, I also changed the flyout open code to allow data: URLs (ie, it now passes true as the second param to checkMayLoad - obviously I can revert that if necessary, but data: URLs for flyouts seems reasonable.  (FWIW, we have no same-origin check for ambient content but do for flyouts - that seems somewhat inconsistent).  We also have a same-origin check for chat windows, but I doubt data: URLs would be valuable there...
+
+> nit: fullURI ('URI' typically implies nsIURI, while 'URL' typically implies
+> a string). Same comment applies elsewhere in this file.
+
+Done.
+
+> >diff --git a/toolkit/components/social/SocialService.jsm b/toolkit/components/social/SocialService.jsm
+> 
+> >   this.origin = input.origin;
+> >+  let originUri = Services.io.newURI(input.origin, null, null);
+> 
+> Perhaps we should only keep a reference to the nsIURI created here, rather
+> than keeping it as a string (to save having to create one each time in
+> resolveUri). 
+
+I'm not sure when I changed it, but the current version of resolveUri uses this.principal.URI rather than this.origin.
+
+> This might want to try/catch and return false if newURI throws (i.e. the
+> passed-in URL isn't valid)?
+...
+> Need to update the comment to reflect removal of the optional same-origin
+> check.
+
+Both done.
+
+> This code would allow a provider whose origin was https://example.com/ to
+> open a link from http://example.com/page.html (note difference in scheme),
+> but the new code won't. Is that a problem? I don't know why we added that
+> scheme-munging code, I don't see mention of it in bug 774506. Maybe Facebook
+> relies on this?
+
+They do :(  So this version of the patch still does that "fixup" and I opened bug 815970 to remove it.
+
+> This could use a test that checks that checkMayLoad returns false for data:
+> URIs when you pass false for allowIfInheritsPrincipal.
+
+done.
+Also, assume I'll add a test for the ambient "scheme swapping" code...
+Comment on attachment 685995
+updated based on review
+
+There was a trivial try-failure and I'm currently adding more tests, so cancelling request for now.
+Created attachment 686405
+Includes a test for the workarounds in bug 815970
+
+Please see comments in previous patch.
+
+Try run at https://tbpl.mozilla.org/?tree=Try&rev=e1d785cdf1e1
+Comment on attachment 686405
+Includes a test for the workarounds in bug 815970
+
+>diff --git a/toolkit/components/social/MozSocialAPI.jsm b/toolkit/components/social/MozSocialAPI.jsm
+
+> function attachToWindow(provider, targetWindow) {
+>+  // If the loaded document isn't from the provider's origin (or a protocol
+>+  // that inherits the principal), don't attach the mozSocial API.
+>   let targetDocURI = targetWindow.document.documentURIObject;
+>+  if (!provider.checkMayLoad(targetDocURI, true)) {
+
+I just realized that allowing data: URIs here might actually introduce a risk when switching multiple providers. Can we avoid changing that behavior in this bug (i.e. pass false here), and move that to a followup?
+
+>         let url = targetWindow.document.documentURIObject.resolve(toURL);
+>+        let fullURI = provider.resolveUri(url);
+
+Hrm, resolving both against the documentURIObject and the provider seems redundant. Is there any point in the resolveURI call here?
+
+>+        if (!provider.checkMayLoad(fullURI, true))
+>           return;
+
+Similarly, I would like to defer allowing of data: URIs to another bug so that we can double check that it's safe.
+
+>diff --git a/toolkit/components/social/SocialService.jsm b/toolkit/components/social/SocialService.jsm
+
+>+  checkMayLoad: function checkMayLoad(uri, allowIfInheritsPrincipal) {
+
+I know you're just mirroring the nsIPrincipal method name, but I find it confusing. Can we re-name this isSameOrigin? That's a better indication of what this is really checking. We're currently using this in places where I'm not sure it makes sense - letting providers load non-same-origin resources is not necessarily a problem (e.g. we're already doing it for icons), so we'll need to audit its callers, and it having an accurate name will help with that.
+
+>+   * Resolve partial URLs for a provider.
+
+>+   * @param {string} uri
+
+url
+
+>diff --git a/toolkit/components/social/test/browser/browser_workerAPI.js b/toolkit/components/social/test/browser/browser_workerAPI.js
+
+>+  testNotificationLinks: function(next) {
+>+    // We cheat a little in this test and just use the workerapi directly
+>+    // instead of bouncing messages via the worker.
+
+It wouldn't be that hard to avoid cheating, would it?
+
+>+    // and restore the monkey-patch
+>+    window.openUILinkIn = oldopenUILinkIn;
+
+Could do this in a cleanup function, to be extra safe and not mess other tests up if something in this test throws for whatever reason.
+
+r=me with those addressed.
+I guess we already have bug 799600, which could morph into "allow data URIs in more places".
+Created attachment 695933
+As landed, based on review comments
+
+All review comments addressed.  Landed as
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/251ac29afd1b
+backed out due to browser chrome failures on all platforms and future pushes:
+http://hg.mozilla.org/integration/mozilla-inbound/rev/50f9c3a11728
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #12)
+> >         let url = targetWindow.document.documentURIObject.resolve(toURL);
+> >+        let fullURI = provider.resolveUri(url);
+> 
+> Hrm, resolving both against the documentURIObject and the provider seems
+> redundant. Is there any point in the resolveURI call here?
+
+It looks like you addressed this by removing the resolve() against the document URI, rather than removing the resolveUri call, which probably explains the test failures. I think it makes slightly more sense to resolve these against the document URI than the provider origin, but I guess it's arbitrary.
+
+one other nit: can we make the method name resolveURI (upper case URI)?
+Created attachment 696152
+As re-landed
+
+Let's try this again!  This patch fixes the test failures and uses resolveURI.
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/e078df6b1316
+https://hg.mozilla.org/mozilla-central/rev/e078df6b1316
+
+
+rationalize provider origin checks and url resolution.
+
+
+
+Bug 806037 - use nsIPrincipal for origin checks.  r=gavin 
+
+Bug 806037 - use nsIPrincipal for origin checks.  r=gavin 

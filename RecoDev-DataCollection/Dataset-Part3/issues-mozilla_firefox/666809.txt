@@ -1,0 +1,352 @@
+SecurityUI touches content through .docShell and .contentWindow, and attaches itself to the docshell.. This will probably need some big changes
+
+SecurityUI touches content through .docShell and .contentWindow, and attaches itself to the docshell.. This will probably need some big changes
+Fennec already added changes needed to support SecurityUI
+I implemented parts of this based on Metro code. https://hg.mozilla.org/projects/larch/rev/12321e1769ca
+Created attachment 747511
+working patch rebased to trunk
+
+So I rebased the patch from larch and moved some of the logic in its own jsm, because there is no browser-parent.js on trunk. With this patch the browser UI works correctly and some random addon (Cipherfox) that uses .securityUI as well. I left some comments in the patch that hopefully have a better solution.
+
+I didn't look very hard but tooltipText seems unused.
+Hey Justin, can you take a look at this? Otherwise jaws said bsmith might be interested in this as well?
+Comment on attachment 747511
+working patch rebased to trunk
+
+I haven't looked closely at the new code or message passing stuff, but I had a few comments about the browser.js code:
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+>-    var location = gBrowser.contentWindow.location;
+
+>+    // XX is this correct? currentURI has some slightly different semantics.
+>+    let uri = gBrowser.currentURI;
+
+I don't know of any cases where these would differ, so I think this is fine.
+
+>+      uri = Services.uriFixup.createExposableURI(uri);
+
+>   checkIdentity : function(state, location) {
+
+You should change the argument name is it's now a URI ("uri").
+
+>     this._lastLocation = location;
+
+Similarly, _lastLocation should be renamed.
+
+>       // Check whether this site is a security exception. XPConnect does the right
+>       // thing here in terms of converting _lastLocation.port from string to int, but
+>       // the overrideService doesn't like undefined ports, so make sure we have
+>       // something in the default case (bug 432241).
+>       // .hostname can return an empty string in some exceptional cases -
+>       // hasMatchingOverride does not handle that, so avoid calling it.
+>       // Updating the tooltip value in those cases isn't critical.
+
+These comments need updating (the first no longer applies).
+
+>+      if (this._lastLocation.host &&
+>+          this._overrideService.hasMatchingOverride(this._lastLocation.host,
+
+Getting .host can throw for some URIs (e.g. data: URIs, about: URIs), so you need to protect against that somehow.
+
+>                                                     (this._lastLocation.port || 443),
+
+.port will never be undefined - it may throw, or may return -1. Need to confirm how hasMatchingOverride deals with that.
+Created attachment 753971
+v2
+
+Updated this patch to address your review comments. Thank you very much for taking a look.
+
+The biggest change here is the QI to nsINestedURI. This is required for view-source, which otherwise has no host. Sadly this sometimes changes about: URIs to moz-safe-about so that is handled as well.
+Comment on attachment 753971
+v2
+
+>diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+
+>+    // XX is this correct? currentURI has some slightly different semantics.
+
+As mentioned, this is fine :)
+
+>     try {
+>+      uri = Services.uriFixup.createExposableURI(uri);
+>+
+>+      // Get the inner URI, for example for view-source:
+>+      uri.QueryInterface(Ci.nsINestedURI);
+>+      uri = uri.innermostURI;
+>+
+>+      uri = Services.uriFixup.createExposableURI(uri);
+
+Not all URIs are nsINestedURIs, so that QI will often throw. Better to just use an instanceof check rather than relying on try/catch for flow control. But it's not clear to me why we actually want the behavior change here (why use the innermost URI?).
+
+>   getEffectiveHost : function() {
+
+>     try {
+>       let baseDomain =
+>+        Services.eTLD.getBaseDomainFromHost(this._lastUri.host);
+>       return this._IDNService.convertToDisplayIDN(baseDomain, {});
+>     } catch (e) {
+>+      // If something goes wrong (e.g. host is an IP address) just fail back
+>       // to the full domain.
+>+      return this._lastUri.host;
+
+Don't you also need to protect against this throwing?
+
+>+      // XXX is this still true for URI, or wouldn't they just throw?
+>+      // We already handled that above.
+>+
+>+      // .host can return an empty string in some exceptional cases -
+
+No, it's not true for nsIURI.
+
+>+      if (this._lastUri.host) {
+
+i.e. I don't think this will ever return null/empty string (rather it will throw, or return a hostname).
+
+>+          // XX Need to verify if there are URIs that work with .host, but not port!
+
+Can we even fall into this branch (IDENTITY_MODE_DOMAIN_VERIFIED) with non-https URIs?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #7)
+> Comment on attachment 753971
+> v2
+> 
+> >diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+> 
+> >+    // XX is this correct? currentURI has some slightly different semantics.
+> 
+> As mentioned, this is fine :)
+> 
+> >     try {
+> >+      uri = Services.uriFixup.createExposableURI(uri);
+> >+
+> >+      // Get the inner URI, for example for view-source:
+> >+      uri.QueryInterface(Ci.nsINestedURI);
+> >+      uri = uri.innermostURI;
+> >+
+> >+      uri = Services.uriFixup.createExposableURI(uri);
+> 
+> Not all URIs are nsINestedURIs, so that QI will often throw. Better to just
+> use an instanceof check rather than relying on try/catch for flow control.
+> But it's not clear to me why we actually want the behavior change here (why
+> use the innermost URI?).
+Good suggestion. I totally forgot that instanceof works.
+For view-source URIs .host throws, so we want the innermost URI and check that, because this is the actual location. Maybe we should special case view-source? Besides about: (where getting the innermost URI makes no sense) I see no other use of nested URIs.
+> 
+> >   getEffectiveHost : function() {
+> 
+> >     try {
+> >       let baseDomain =
+> >+        Services.eTLD.getBaseDomainFromHost(this._lastUri.host);
+> >       return this._IDNService.convertToDisplayIDN(baseDomain, {});
+> >     } catch (e) {
+> >+      // If something goes wrong (e.g. host is an IP address) just fail back
+> >       // to the full domain.
+> >+      return this._lastUri.host;
+> 
+> Don't you also need to protect against this throwing?
+No, because we would never end up calling this function. That is why I introduced the new "unknown" check in checkIdentity.
+> 
+> >+      // XXX is this still true for URI, or wouldn't they just throw?
+> >+      // We already handled that above.
+> >+
+> >+      // .host can return an empty string in some exceptional cases -
+> 
+> No, it's not true for nsIURI.
+> 
+> >+      if (this._lastUri.host) {
+> 
+> i.e. I don't think this will ever return null/empty string (rather it will
+> throw, or return a hostname).
+> 
+> >+          // XX Need to verify if there are URIs that work with .host, but not port!
+> 
+> Can we even fall into this branch (IDENTITY_MODE_DOMAIN_VERIFIED) with
+> non-https URIs?
+I am not sure, I would need to dig deeper into how ssl & co works.
+Any behavior changes re: view-source and nested URIs are probably best left to a separate bug - I don't think it's necessary for what you're doing here, right?
+It would change behavior in all builds, not just e10s. I however don't think that most people care about the security of view-source and stuff like that. Fixing this in a followup is okay.
+Ideally/eventually, content should not have any idea about securityUI and there should be no references to the securityUI within the content. The reason is that the security UI is supposed to be secure, so it should be managed purely in the parent process, while the child process is considered to be always insecure, and so it should not be able to influence the security UI in any way. I think that, in order to do this correctly, we need to have a corresponding object in the parent process for every docshell in the child process. Do we have that already? If not, we may have to defer making the security UI actually secure in e10s to another bug.
+This is of course right and we need to file a followup to fix this. While investigating this, I came across this very similar note in bug 568502 comment 12.
+(In reply to Brian Smith (:bsmith) from comment #11)
+> I think that, in order to do this correctly, we need
+> to have a corresponding object in the parent process for every docshell in
+> the child process. Do we have that already? 
+
+AFAIK, still not.  I was raising this request (question) from the very beginning of e10s efforts.  But there were always a "way around" and doc shell now lives just in the content process.
+Comment on attachment 753971
+v2
+
+Review of attachment 753971:
+-----------------------------------------------------------------
+
+Looks good. Gavin's comments still stands, but I don't see anything else that needs attention. Of course, we need to file a follow-up to make this all actually independent of the child..
+
+Feedback+, no XX or TODOs left on a patch to land!
+
+::: browser/base/content/browser.js
+@@ +4058,5 @@
+>          gURLBar.removeAttribute("level");
+>      }
+>  
+> +    // XX is this correct? currentURI has some slightly different semantics.
+> +    let uri = gBrowser.currentURI;
+
+yeah this change is fine
+
+@@ +6621,5 @@
+> +            if (this._lastUri.port > 0)
+> +              port = this._lastUri.port;
+> +          } catch (e) {}
+> +
+> +          if (this._overrideService.hasMatchingOverride(host, iData.cert, {}, {}))
+
+missing port parameter?
+
+::: toolkit/modules/RemoteSecurityUI.jsm
+@@ +12,5 @@
+> +Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> +
+> +function RemoteSecurityUI(browser)
+> +{
+> +    this._browers = browser;
+
+typo, but unused?
+
+::: toolkit/modules/RemoteWebProgress.jsm
+@@ +105,5 @@
+>        }
+>        break;
+>  
+>      case "Content:SecurityChange":
+> +      // Hack: We need to lazily resolve the securityUI.
+
+why lazily? the getter/constructor seems to do all work immediatelly
+
+@@ +109,5 @@
+> +      // Hack: We need to lazily resolve the securityUI.
+> +      if (this._browser.securityUI)
+> +        this._browser._securityUI._update(aMessage.json.state, aMessage.json.status);
+> +
+> +      // The state passed in from the remote process is not correct, _update fixes that.
+
+Better to say "The state passed might not be correct due to checks performed on the chrome side. _update fixes that" and before the call to _update
+Comment on attachment 753971
+v2
+
+Review of attachment 753971:
+-----------------------------------------------------------------
+
+Thank you both for reviewing. Going to create a new patch.
+
+::: browser/base/content/browser.js
+@@ +4058,5 @@
+>          gURLBar.removeAttribute("level");
+>      }
+>  
+> +    // XX is this correct? currentURI has some slightly different semantics.
+> +    let uri = gBrowser.currentURI;
+
+great
+
+@@ +4063,4 @@
+>      try {
+> +      uri = Services.uriFixup.createExposableURI(uri);
+> +
+> +      // Get the inner URI, for example for view-source:
+
+So this should still be removed, right? I will file a followup to investigate this.
+
+@@ +6621,5 @@
+> +            if (this._lastUri.port > 0)
+> +              port = this._lastUri.port;
+> +          } catch (e) {}
+> +
+> +          if (this._overrideService.hasMatchingOverride(host, iData.cert, {}, {}))
+
+.. Thanks!
+
+::: toolkit/modules/RemoteWebProgress.jsm
+@@ +105,5 @@
+>        }
+>        break;
+>  
+>      case "Content:SecurityChange":
+> +      // Hack: We need to lazily resolve the securityUI.
+
+Notice that we are using ._securityUI, which is only created after we touched .securityUI. And something like wrappedJSObject wouldn't work, because of double wrapping.
+Created attachment 756858
+v3
+Comment on attachment 756858
+v3
+
+Review of attachment 756858:
+-----------------------------------------------------------------
+
+Looks good to me, but I'd like if you could get Gavin to r+ the changes around the createExposableURI et al that were discussed before
+Comment on attachment 756858
+v3
+
+Review of attachment 756858:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +6588,5 @@
+>        tooltip = gNavigatorBundle.getFormattedString("identity.identified.verifier",
+>                                                      [iData.caOrg]);
+>  
+> +
+> +      let host = this._lastUri.host;
+
+Worth a comment mentioning that this is garanteed not to throw when newMode == this.IDENTITY_MODE_DOMAIN_VERIFIED
+
+::: toolkit/content/widgets/remote-browser.xml
+@@ +19,5 @@
+> +        <getter><![CDATA[
+> +          if (!this._securityUI) {
+> +            let jsm = "resource://gre/modules/RemoteSecurityUI.jsm";
+> +            let RemoteSecurityUI = Components.utils.import(jsm, {}).RemoteSecurityUI;
+> +            this._securityUI = new RemoteSecurityUI(this);
+
+"this" can be removed
+
+::: toolkit/modules/RemoteWebProgress.jsm
+@@ +106,5 @@
+>        break;
+>  
+>      case "Content:SecurityChange":
+> +      // Hack: We need to lazily resolve the securityUI.
+> +      if (this._browser.securityUI)
+
+I would make this not an if(), and explain the hack (can't access the underlying object inside the wrapper, but must trigger the getter to create it etc.)
+Comment on attachment 756858
+v3
+
+Review of attachment 756858:
+-----------------------------------------------------------------
+
+::: browser/base/content/browser.js
+@@ +6465,5 @@
+> +    try {
+> +      uri.host;
+> +    } catch (e) { unknown = true; }
+> +
+> +    if (uri.scheme == "chrome" || uri.scheme == "about") {
+
+This needs an additional uri.spec != "about:blank", so that it falls into the "unknown" case.
+Created attachment 770369
+v4
+
+I am sorry looks like previously I just ignored the orange test failures. Like I said in the previous comment I added the about:blank check. I also had to fuzz around a bit in some other test, because that one relied on lastLocation and lastUri has some different behavior.
+(In reply to Tom Schuster [:evilpie] from comment #4)
+> Hey Justin, can you take a look at this? Otherwise jaws said bsmith might be
+> interested in this as well?
+
+Bleh, I'm just not going to have time for this. 
+
+My two areas of concern are:
+
+1) The existing securityUI stuff is just awful (bug 832835). Please don't make it worse. :)
+
+2) We should be very very careful to make sure what's shown/loaded in a content process is never out-of-sync with the UI indicated by the chrome process.
+
+I'm sure bsmith has similar concerns, so I'm happy to have him look at things instead.
+https://hg.mozilla.org/mozilla-central/rev/14de59ee10a9

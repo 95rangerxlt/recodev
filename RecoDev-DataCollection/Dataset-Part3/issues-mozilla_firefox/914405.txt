@@ -1,0 +1,236 @@
+Cleopatra profile attached.
+
+Cleopatra profile attached.
+Created attachment 801894
+Completely untested.
+Created attachment 801899
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects.
+
+This one has a test. One.
+screenshot of js stack: http://cl.ly/image/363C3R0U0Z22
+Okay, that does look like the function my patch affects. So perhaps my guess as to the cause was right.
+
+There's a serious underlying problem here: we have no measurements of Debugger's performance. Does it make code slower than simply disabling IonMonkey and relying on BaselineCompiler would? How much does it cost to set an onEnterFrameHook? An onStep hook? A breakpoint? Or, as in this case, to put a compartment in debug mode? We have no idea. And if we made a change that made one of those operations significantly slower or faster, we would have no idea.
+I'm glad to see a way to get the Debugger.Object for the window global without putting the compartment in debug mode. Thank you Jim!
+
+Dietrich, do you get any long pauses with the patch Jim attached?
+Created attachment 802473
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects.
+
+Updated with slightly more tests.
+
+Jason, can you think of anything else I should cover here?
+Comment on attachment 802473
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects.
+
+Mihai, could you look at the webconsole.js part of the patch?
+https://tbpl.mozilla.org/?tree=Try&rev=9cc180bb163e
+Comment on attachment 802473
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects.
+
+Review of attachment 802473:
+-----------------------------------------------------------------
+
+This is looking good, but please also search for the other addDebuggee() occurrences in the console actor. Also, please look into makeDebuggeeValue() - do we need the try-catch anymore?
+
+I also wanted to ask if should we continue to use the _dbgGlobals map, or is makeGlobalObjectReference() fast enough to use it whenever needed?
+
+Thank you!
+Comment on attachment 802473
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects.
+
+Review of attachment 802473:
+-----------------------------------------------------------------
+
+::: js/src/jit-test/tests/debug/makeGlobalObjectReference.js
+@@ +9,5 @@
+> +assertEq(dbg.hasDebuggee(g), false);
+> +assertEq(gw.unsafeDereference(), g);
+> +assertEq(gw, gw.makeDebuggeeValue(g));
+> +
+> +dbg.addDebuggee(gw);
+
+Another thing to try here is
+
+  let gw2 = dbg.addDebuggee(g);
+  assertEq(gw2, gw);
+
+and:
+  assertEq(dbg.hasDebuggee(gw), true);
+
+And I'd feel more comfortable if we were testing it against real WindowProxy objects, in a Chrome mochitest or something. (Separately, I'm going to try to get jit-tests running in the browser so we don't have to constantly go run a Chrome mochitest. Maybe not this week though.)
+Created attachment 803864
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects, to simplify the web console.
+
+Now with a mochitest, and with simplifications to webconsole.js.
+Comment on attachment 803864
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects, to simplify the web console.
+
+Review of attachment 803864:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/server/tests/mochitest/test_makeGlobalObjectReference.html
+@@ +38,5 @@
+> +    // 'DO' stands for 'Debugger.Object'.
+> +    var g1iDO = dbg.makeGlobalObjectReference(g1o);
+> +    ok(!dbg.hasDebuggee(g1o), "makeGlobalObjectReference does not add g1o as debuggee");
+> +
+> +    // Inner and outer windows are ===, so this works anyway.
+
+This comment isn't right. === would distinguish inner and outer windows. See js::StrictlyEqual and operator==(const JSObject &lhs, const JSObject &rhs).
+
+It must be that at some point under JSCompartment::wrap(JSContext *cx, MutableHandleObject obj, HandleObject existingArg) we outerize the referent before wrapping it.
+
+Maybe we should just explicitly outerize in DebuggerObject_unsafeDereference? That's the intent; I'm surprised it doesn't.
+
+@@ +45,5 @@
+> +    // However, Debugger distinguishes inner and outer windows. Yes, this
+> +    // means we have two distinct D.O instances whose referents are ===.
+> +    // Love the web.
+> +    var g1oDO = g1iDO.makeDebuggeeValue(g1o);
+> +    ok(g1iDO !== g1oDO, "makeDebuggeeValue doesn't innerize");
+
+Excellent test! The comment is not quite right though.
+
+@@ +47,5 @@
+> +    // Love the web.
+> +    var g1oDO = g1iDO.makeDebuggeeValue(g1o);
+> +    ok(g1iDO !== g1oDO, "makeDebuggeeValue doesn't innerize");
+> +    ok(g1iDO.unsafeDereference() === g1oDO.unsafeDereference(),
+> +       "inner and outer window D.Os' referents are ===");
+
+Again, the string here is a bit inaccurate.
+
+@@ +70,5 @@
+> +      ok(g2g1oDO !== g1oDO, "g2's cross-compartment wrapper for g1o gets its own D.O");
+> +      ok(g2g1oDO.unwrap() === g1oDO,
+> +         "unwrapping g2's cross-compartment wrapper for g1o gets the right D.O");
+> +      ok(dbg.makeGlobalObjectReference(g2g1oDO) === g1iDO,
+> +         "makeGlobalObjectReference unwraps cross-compartment wrappers, and innerizes");
+
+You're right, I like these tests very much.
+Comment on attachment 803864
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects, to simplify the web console.
+
+Review of attachment 803864:
+-----------------------------------------------------------------
+
+This is looking good. I like these simplifications!
+
+One remaining concern: in WCA_evalWithDebugger() you switch dbgWindow to this.dbg.makeGlobalObjectReference(this.window), which looks right. However, you did not change the |if (bindSelf) { ... }| block. In the case where the |global| for the |bindSelf| object is not the same as |this.window|, we change |dbgWindow| to be the D.O of the |global| of the |bindSelf| object. Shouldn't the |dbg.addDebuggee/removeDebugge()| dance in that code block also change into a simpler/safer |dbgWindow = dbg.makeGlobalObjectReference(global)| ? Please correct me if I am wrong.
+
+Thank you!
+(In reply to Jason Orendorff [:jorendorff] from comment #12)
+> > +    // Inner and outer windows are ===, so this works anyway.
+> 
+> This comment isn't right. === would distinguish inner and outer windows. See
+> js::StrictlyEqual and operator==(const JSObject &lhs, const JSObject &rhs).
+> 
+> It must be that at some point under JSCompartment::wrap(JSContext *cx,
+> MutableHandleObject obj, HandleObject existingArg) we outerize the referent
+> before wrapping it.
+
+You are right!
+http://dxr.mozilla.org/mozilla-central/source/js/xpconnect/wrappers/WrapperFactory.cpp#l139
+
+I was lazy and asked about === and inner/outer objects in #jsapi, instead of reading the code; this is my just desserts.
+
+> Maybe we should just explicitly outerize in
+> DebuggerObject_unsafeDereference? That's the intent; I'm surprised it
+> doesn't.
+
+We decided on IRC to document and assert that unsafeDereference does outerize; I'll do that in a follow-up bug.
+
+I fixed the comments and strings.
+Outerization follow-up is bug 916321.
+(In reply to Mihai Sucan [:msucan] from comment #13)
+> Comment on attachment 803864
+> Define makeGlobalObjectReference, a quick way to get D.O's referring to
+> global objects, to simplify the web console.
+> 
+> Review of attachment 803864:
+> -----------------------------------------------------------------
+> 
+> This is looking good. I like these simplifications!
+> 
+> One remaining concern: in WCA_evalWithDebugger() you switch dbgWindow to
+> this.dbg.makeGlobalObjectReference(this.window), which looks right. However,
+> you did not change the |if (bindSelf) { ... }| block. In the case where the
+> |global| for the |bindSelf| object is not the same as |this.window|, we
+> change |dbgWindow| to be the D.O of the |global| of the |bindSelf| object.
+> Shouldn't the |dbg.addDebuggee/removeDebugge()| dance in that code block
+> also change into a simpler/safer |dbgWindow =
+> dbg.makeGlobalObjectReference(global)| ? Please correct me if I am wrong.
+> 
+> Thank you!
+
+I'm sorry --- you asked me to look at the other addDebuggee calls, but I spaced out on that completely. Now I think there are *no* addDebuggee calls left at all, which is surprising, but seems correct, since you never actually set any hooks. Testing my patch now.
+Created attachment 804984
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects, to simplify the web console.
+
+Revised, with drastic webconsole simplifications.
+
+Once I run the webconsole mochitests, I'll request re-review from Mihai.
+Created attachment 805714
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects, to simplify the web console.
+
+Okay, this one looks like it's okay. Will request a final review from Mihai if the Try server likes it.
+https://tbpl.mozilla.org/?tree=Try&rev=e539f77651f5
+Okay, that try run looks like there's nothing relevant. What do you think, Mihai?
+Comment on attachment 805714
+Define makeGlobalObjectReference, a quick way to get D.O's referring to global objects, to simplify the web console.
+
+Review of attachment 805714:
+-----------------------------------------------------------------
+
+Patch looks good. Thanks for the updates. r+
+
+Having seen the try push results, I am surprised about the failures in browser_bug_638949_copy_link_location.js. They seem to only show in this try push. I haven't seen this before.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/bba922f6d4f3
+
+I'm not sure what to make of the copy_link_location failure either. It seems unlikely to be related, but...
+*** Bug 880177 has been marked as a duplicate of this bug. ***
+Oh, this is excellent! Is there a chance of having the API backported to Aurora, for Firebug's sake?
+(In reply to Jim Blandy :jimb from comment #22)
+> I'm not sure what to make of the copy_link_location failure either. It seems
+> unlikely to be related, but...
+
+Funny you should say that...
+
+Backed out in https://hg.mozilla.org/integration/mozilla-inbound/rev/8a78aee1766d for turning m-bc jobs orange with copy_link_location failures:
+https://tbpl.mozilla.org/php/getParsedLog.php?id=28003318&tree=Mozilla-Inbound
+(In reply to Wes Kocher (:KWierso) from comment #25)
+> (In reply to Jim Blandy :jimb from comment #22)
+> > I'm not sure what to make of the copy_link_location failure either. It seems
+> > unlikely to be related, but...
+> 
+> Funny you should say that...
+> 
+> Backed out in
+> https://hg.mozilla.org/integration/mozilla-inbound/rev/8a78aee1766d for
+> turning m-bc jobs orange with copy_link_location failures:
+> https://tbpl.mozilla.org/php/getParsedLog.php?id=28003318&tree=Mozilla-
+> Inbound
+
+Okay, I guess this patch really does break the copy_link_location test. Hum.
+Mihai, this problem doesn't occur on Linux. Are you able to reproduce it? I've looked through the patch and the test, and I can't see why in the world it would affect it.
+(In reply to Jim Blandy :jimb from comment #27)
+> Mihai, this problem doesn't occur on Linux. Are you able to reproduce it?
+> I've looked through the patch and the test, and I can't see why in the world
+> it would affect it.
+
+I was able to reproduce the bug. It seems that the text being copied into the clipboard sometimes includes whitespaces...
+
+Will submit a patch.
+Created attachment 806607
+fix for browser_bug_638949_copy_link_location.js
+
+hopefully this will be green.
+
+try push: https://tbpl.mozilla.org/?tree=Try&rev=4b2ab8120370
+Those try runs look good; re-landed the patch.
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f1da44d5e9c6
+https://hg.mozilla.org/integration/mozilla-inbound/rev/aeac5a20e57a
+https://hg.mozilla.org/mozilla-central/rev/f1da44d5e9c6
+https://hg.mozilla.org/mozilla-central/rev/aeac5a20e57a

@@ -1,0 +1,224 @@
+In this attached image, there are three big areas going, for around 400ms each. The first chunk (PresShell::Flush (Flush_Style)->RestyleTracker::ProcessRestyles) we get a marker ("Styles"), but the second two chunks we do not.
+
+Reading all sorts of information about our layout internals, and digging through code completely new to me (so please tear apart my assumptions):
+
+Why do we use the same area for "Styles" marker as the Gecko Profiler in PresShell::Flush for Flush_Style, but we mark "Reflow" in PresShell::DoReflow, rather than PresShell::Flush (Flush_Layout)[0]? The two giant gaps in the timeline are half Flush_Layout and half Flush_InterruptibleLayout (is this sync vs async layouts?) My understanding from reading around is Flush_Layout means it has to layout now, whereas the interruptible version can do it later if it takes too long[1]? Is DoReflow actually where the reflow is occuring? In which case, what are Flush_[Interruptible]Layout? Because those need marked somehow!
+
+[0] http://mxr.mozilla.org/mozilla-central/source/layout/base/nsRefreshDriver.cpp#1712
+[1] https://wiki.mozilla.org/Gecko:Overview#Dynamic_change_handling_along_the_rendering_pipeline
+
+In this attached image, there are three big areas going, for around 400ms each. The first chunk (PresShell::Flush (Flush_Style)->RestyleTracker::ProcessRestyles) we get a marker ("Styles"), but the second two chunks we do not.
+
+Reading all sorts of information about our layout internals, and digging through code completely new to me (so please tear apart my assumptions):
+
+Why do we use the same area for "Styles" marker as the Gecko Profiler in PresShell::Flush for Flush_Style, but we mark "Reflow" in PresShell::DoReflow, rather than PresShell::Flush (Flush_Layout)[0]? The two giant gaps in the timeline are half Flush_Layout and half Flush_InterruptibleLayout (is this sync vs async layouts?) My understanding from reading around is Flush_Layout means it has to layout now, whereas the interruptible version can do it later if it takes too long[1]? Is DoReflow actually where the reflow is occuring? In which case, what are Flush_[Interruptible]Layout? Because those need marked somehow!
+
+[0] http://mxr.mozilla.org/mozilla-central/source/layout/base/nsRefreshDriver.cpp#1712
+[1] https://wiki.mozilla.org/Gecko:Overview#Dynamic_change_handling_along_the_rendering_pipeline
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #0)
+> In this attached image
+
+I think you forgot to attach it.
+Created attachment 8605072
+missingreflow.png
+
+You're right! Here's the image.
+And same profile data as in bug 1164333: https://bugzilla.mozilla.org/attachment.cgi?id=8605063 (need to load it via build today or newer due to deduping patch)
+As far as I remember, nsPresShell::DoReflow is called for both interruptible and uninterruptible reflows, and interruptible reflows can be interrupted (doh) (not postponed), that might be the gap you're seeing. I'm not sure.
+Looking at the profile, it looks like we're indeed missing something at the marker level.
+Currently using Chrome's sync layout demo[0], we see currently the JS frame, followed by a recalc style (PresShell::Flush_Style). We should see a bunch of recalc style within the JS frame, which is what chrome[2] has. Tracking PresShell::DoProcessRestyles (technically, ProcessOneRestyle) shown here as ProcessStyle[3] gives us the cascading recalculating of styles we expect. Also the RestyleHint and ChangeHint can be displayed[4], and there are more interesting results, but still have to figure them out.
+
+So if this ProcessStyles marker is what we want for recalculating styles, we have to figure out what our current "Styles" marker means.
+
+
+[0] https://developer.chrome.com/devtools/docs/demos/too-much-layout/index
+[1] http://i.imgur.com/yMJLBKc.png
+[2] http://i.imgur.com/MWLDwH1.png
+[3] http://i.imgur.com/3GkTx7L.png
+[4] http://i.imgur.com/uh0WoRT.png
+Created attachment 8606384
+1164338-stylemarkers.patch
+
+Pinging for feedback from Patrick, since you did the original Styles markers, and heycam, heard you'd be a good source to ping from layout :)
+
+Updated bug name as I think it's our restyle marker not accurately describing restyles.
+
+Right now our "Styles" marker is called when we flush our styles. We should be tracking anytime a restyle has to occur, and many times, that's outside of Flush_Styles (which is always[?] called async, and may contain one or two ProcessOneRestyles). Sync restyles are handled in ProcessOneRestyle, so moved the Style marker to be there instead, as Flush_Styles only happens when lazily (I think?)
+
+We also have the restyle and change hints here -- useful? Hard to tell yet. Something about this marker causes content to just die without a log or an error, so still gotta look into it more, but this is the general idea, and matches what "recalculate style" is in chrome.
+
+Look at these other examples in Chrome/FF (with/without this patch):
+http://www.phpied.com/files/reflow/relayout.html
+http://www.phpied.com/files/reflow/restyle.html
+Tom -- I'm getting JSContext initialization failures when capturing a stack on a TimelineMarker:
+Assertion failure: !initialized(), at ../../dist/include/js/RootingAPI.h:1080¬
+
+I'm doing the same thing as in the console.timeStamp markers, but maybe a docshell is dying somewhere along the way? Wanted to run this by you to see if you've seen this before.
+Created attachment 8606561
+1164338.patch
+
+Removing the stack capturing from the AddDetails fixed the issue -- TimelineMarkers itself safely handles this, and we only need the start stack.
+
+Follow up for tests of the new properties
+
+Clearing NI? for Tom
+Created attachment 8606567
+1164338-test.patch
+
+Tests
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=f9608e27e9a5
+Comment on attachment 8606561
+1164338.patch
+
+(In reply to Jordan Santell [:jsantell] [@jsantell] from comment #7)
+> Updated bug name as I think it's our restyle marker not accurately
+> describing restyles.
+> 
+> Right now our "Styles" marker is called when we flush our styles. We should
+> be tracking anytime a restyle has to occur, and many times, that's outside
+> of Flush_Styles (which is always[?] called async, and may contain one or two
+> ProcessOneRestyles). Sync restyles are handled in ProcessOneRestyle, so
+> moved the Style marker to be there instead, as Flush_Styles only happens
+> when lazily (I think?)
+
+Yes, so if nothing explicitly flushes styles (e.g. calling getComputedStyle() for some element whose style we just changed), then we'll do so off the next refresh driver tick.  But either way, we'll end up under RestyleTracker::DoProcessRestyles -> ProcessOneRestyle for any restyles.  So having the marker there should capture both explicit style flushes and ones that are done by the refresh driver.
+
+> We also have the restyle and change hints here -- useful? Hard to tell yet.
+> Something about this marker causes content to just die without a log or an
+> error, so still gotta look into it more, but this is the general idea, and
+> matches what "recalculate style" is in chrome.
+
+The nsRestyleHint lets you know how much work needs to be done to handle the restyle.  For example eRestyle_StyleAttribute is relatively cheap, while eRestyle_Subtree is more expensive.  So I think it could be useful to expose what kind of restyle work we needed to do.
+
+An nsChangeHint represents what work we need to do in response to a style recomputation (such as repainting a frame, or doing layout of a frame).  The nsChangeHint that we pass in here is a value which means "assume that we need to do at least this much work", but a lot of the time is 0.  I don't think it's that useful to show.  The result of restyling a single element (which is record down in ElementRestyler::CaptureChange, when we append an entry to mChangeList with the ourChange change hint) is probably more useful information, but since that's a per-element thing, it's not a single value that you could expose for the whole operation under ProcessOneRestyle.
+Thanks for the feedback, heycam -- I can remove the nsChangeHint -- adding the restyling result can be added in a different bug, ideally with the associated element(s) if possible.
+Comment on attachment 8606561
+1164338.patch
+
+Review of attachment 8606561:
+-----------------------------------------------------------------
+
+Those changes look good to me. Great work Jordan.
+But you need a layout peer to review them. When I first implemented this, smaug did the review.
+Comment on attachment 8606567
+1164338-test.patch
+
+Review of attachment 8606567:
+-----------------------------------------------------------------
+
+Shouldn't the new test be in toolkit instead, next to /toolkit/devtools/server/tests/browser/browser_timeline.js ?
+It doesn't make a big difference anyway, but actor tests are usually there, close to the corresponding source files.
+It also makes sense to have all browser mochitests for one given tool close to each other, so I'm not going to cancel the review just for this. The code looks good to me.
+
+Also maybe the changes in the other patch will need a new test in /docshell/test/browser/browser_timelineMarkers*
+(In reply to Patrick Brosset [:pbrosset] [:patrick] from comment #15)
+> Comment on attachment 8606567
+> 1164338-test.patch
+> 
+> Review of attachment 8606567:
+> -----------------------------------------------------------------
+> 
+> Shouldn't the new test be in toolkit instead, next to
+> /toolkit/devtools/server/tests/browser/browser_timeline.js ?
+> It doesn't make a big difference anyway, but actor tests are usually there,
+> close to the corresponding source files.
+> It also makes sense to have all browser mochitests for one given tool close
+> to each other, so I'm not going to cancel the review just for this. The code
+> looks good to me.
+> 
+> Also maybe the changes in the other patch will need a new test in
+> /docshell/test/browser/browser_timelineMarkers*
+
+Did see some comments on not checking for individual markers in those tests, referencing bug 1066474, but looks like that's no longer an issue.
+
+We have a few other tests for marker propagation mostly (do markers make it to the timeline actor with correct props), and those should probably be all moved into toolkit/devtools/server/tests -- I'll make another bug for that, we have a few outstanding bugs for cleaning up our tests everywhere. Thanks!
+Created attachment 8607153
+1164338-test.patch
+
+Removed the changeHint from the tests. Created bug 1165994 for moving marker tests to server side
+Created attachment 8607155
+1164338-style-markers.patch
+
+Removed changeHint from the marker -- pinging Smaug for a review now. If there's someone better to review this, please let me know :) this moves our "Recalculating Styles" marker to be more accurate, rather than marking when we flush styles, and more in sync with what Webkit considers "Recalculating Styles".
+
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=1512de3a6097
+Comment on attachment 8607155
+1164338-style-markers.patch
+
+heycam might be better reviewer for this.
+(r+ for the .webidl change anyhow)
+Thanks for the quick look, Olli :)
+Comment on attachment 8607155
+1164338-style-markers.patch
+
+Review of attachment 8607155:
+-----------------------------------------------------------------
+
+::: layout/base/RestyleTracker.cpp
+@@ +111,5 @@
+> +
+> +  virtual void AddDetails(mozilla::dom::ProfileTimelineMarker& aMarker) override
+> +  {
+> +    if (GetMetaData() == TRACING_INTERVAL_START) {
+> +      aMarker.mRestyleHint.Construct(GetRestyleHintString());
+
+I guess you can't pass mRestyleHint in here directly?
+
+@@ +228,5 @@
+>    PROFILER_LABEL("RestyleTracker", "ProcessRestyles",
+>      js::ProfileEntry::Category::CSS);
+>  
+> +  bool isTimelineRecording = false;
+> +  nsDocShell* docShell = static_cast<nsDocShell*>(mRestyleManager->PresContext()->GetDocShell());
+
+Please wrap at 80 columns.
+
+@@ +346,5 @@
+> +        if (isTimelineRecording) {
+> +          mozilla::UniquePtr<TimelineMarker> marker =
+> +            MakeUnique<RestyleTimelineMarker>(docShell,
+> +                                             TRACING_INTERVAL_START,
+> +                                             data->mRestyleHint);
+
+Indenting is off by one space (and in three other similar blocks below).
+Created attachment 8607253
+1164338-style-markers.patch
+
+Updated indentation, limited to 80chars per line, removed extra method. 
+
+Thanks all!
+remote:   https://hg.mozilla.org/integration/fx-team/rev/e8679898fa3a
+remote:   https://hg.mozilla.org/integration/fx-team/rev/0787f6ae2337
+https://hg.mozilla.org/mozilla-central/rev/e8679898fa3a
+https://hg.mozilla.org/mozilla-central/rev/0787f6ae2337
+Comment on attachment 8607153
+1164338-test.patch
+
+
+Approval Request Comment
+[Feature/regressing bug #]: 1167252, the new performance tool
+[User impact if declined]: Won't ship the performance tool
+[Describe test coverage new/current, TreeHerder]: There are try pushes in Bug 1167252 with all patches needing uplift
+[Risks and why]: Requesting uplift for the accumulated changes in the performance tool since the 40 merge date, so these changes haven't had the full 6 weeks to bake.  Risks are generally contained within devtools, specifically within the performance panel.
+[String/UUID change made/needed]: None
+Comment on attachment 8607253
+1164338-style-markers.patch
+
+
+Approval Request Comment
+[Feature/regressing bug #]: 1167252, the new performance tool
+[User impact if declined]: Won't ship the performance tool
+[Describe test coverage new/current, TreeHerder]: There are try pushes in Bug 1167252 with all patches needing uplift
+[Risks and why]: Requesting uplift for the accumulated changes in the performance tool since the 40 merge date, so these changes haven't had the full 6 weeks to bake.  Risks are generally contained within devtools, specifically within the performance panel.
+[String/UUID change made/needed]: None
+https://hg.mozilla.org/releases/mozilla-aurora/rev/668917d1cb31
+https://hg.mozilla.org/releases/mozilla-aurora/rev/903c90590b5d
+Note: I had verbal confirmation for these uplifts from Sylvestre even before he's flagged them as a+.  See https://bugzilla.mozilla.org/show_bug.cgi?id=1167252#c26
+Comment on attachment 8607253
+1164338-style-markers.patch
+
+Change approved to skip one train as part of the spring campaign.
+Comment on attachment 8607153
+1164338-test.patch
+
+Change approved to skip one train as part of the spring campaign.

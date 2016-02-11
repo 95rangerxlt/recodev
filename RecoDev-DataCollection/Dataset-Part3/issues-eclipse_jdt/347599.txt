@@ -1,0 +1,107 @@
+Created attachment 196865
+Refactoring#dispose() method
+
+C++ refactorings must hold a lock on C++ index. Currently it is pretty hard to determine when the lock should be released. Under normal circumstances the lock has to be released at the end of createChange method, but in case of errors it may have to be released in checkFinalConditions or checkInitialConditions. The situation is further complicated by possibility that check*Conditions and createChange methods may be called multiple times. This life cycle uncertainty makes reliable release of C++ index in CDT refactorings virtually impossible.
+
+The proposed solution is to add org.eclipse.ltk.core.refactoring.Refactoring#dispose() method and call that method before the refactoring object goes out of scope. C++ rafactorings would override the dispose method and release the index lock there.
+
+The attached patch adds dispose method to Refactoring class and calls to this method to PerformRefactoringHistoryOperation and RefactoringHistoryWizard. There are more places where dispose calls should be added, but none of these places would cause problems even with a missing dispose call since they don't deal with refactorings that override the dispose method.
+
+The patch is intended for Eclipse 3.8.
+
+Created attachment 196865
+Refactoring#dispose() method
+
+C++ refactorings must hold a lock on C++ index. Currently it is pretty hard to determine when the lock should be released. Under normal circumstances the lock has to be released at the end of createChange method, but in case of errors it may have to be released in checkFinalConditions or checkInitialConditions. The situation is further complicated by possibility that check*Conditions and createChange methods may be called multiple times. This life cycle uncertainty makes reliable release of C++ index in CDT refactorings virtually impossible.
+
+The proposed solution is to add org.eclipse.ltk.core.refactoring.Refactoring#dispose() method and call that method before the refactoring object goes out of scope. C++ rafactorings would override the dispose method and release the index lock there.
+
+The attached patch adds dispose method to Refactoring class and calls to this method to PerformRefactoringHistoryOperation and RefactoringHistoryWizard. There are more places where dispose calls should be added, but none of these places would cause problems even with a missing dispose call since they don't deal with refactorings that override the dispose method.
+
+The patch is intended for Eclipse 3.8.
+Moving to JDT/UI.
+I'll have a look for 3.8. To asses the impact of this API change, we'd need a patch that adds the necessary dispose() calls everywhere in the SDK. Furthermore, the Javadoc has to tell that dispose() has only been added in version 3.6, so that implementers know that dispose() may not be called reliably by older code.
+
+Eventually, we'd also need an entry in the porting guide (probably in /org.eclipse.jdt.doc.isv/porting/3.8/recommended.html).
+
+However, I'm not yet convinced that this is the best way to solve the C++ index lock problem. The problem is that Refactoring objects don't have a clear lifecycle at the beginning (e.g. should the index lock be taken when the refactoring is created, or when it is initialized) and also after createChange(..) has successfully returned. So, forcing refactoring executors to call dispose() now is a breaking change. Furthermore, e.g. an Undo operation will also change the workspace, so I'm sure the C++ index also needs some resource management there.
+
+Up to now, refactoring operations always took a workspace look, see e.g. RefactoringWizardOpenOperation#run(Shell, String, IRunnableContext) and PerformChangeOperation. I think a better approach would be to use ISchedulingRules to ensure the C++ index is properly synchronized. For that, we could add a getSchedulingRule() method to Refactoring whose default implementation would return the workspace rule. The C++ index could also use the workspace scheduling rule. If it uses a private rule, C++ refactorings could return a MultiRule.
+(In reply to comment #2)
+> I'll have a look for 3.8. To asses the impact of this API change, we'd need a
+> patch that adds the necessary dispose() calls everywhere in the SDK.
+> Furthermore, the Javadoc has to tell that dispose() has only been added in
+> version 3.6, so that implementers know that dispose() may not be called
+> reliably by older code.
+
+I'll be happy to expand the patch as soon as we reach agreement in principle.
+
+> Eventually, we'd also need an entry in the porting guide (probably in
+> /org.eclipse.jdt.doc.isv/porting/3.8/recommended.html).
+
+Will do this too as soon as the skeleton of the document is created.
+
+> However, I'm not yet convinced that this is the best way to solve the C++
+> index lock problem.
+
+C++ index uses a single writer/multiple readers locking scheme that cannot be reduced to ISchedulingRule or to ILock. C++ refactorings need to hold a reader index lock between checkInitialConditions and createChange calls. C++ AST contains proxy objects backed by the index database. A reader index lock has to be held for the duration of the AST lifespan. It is very important to hold the lock continually without releasing it between checkInitialConditions and createChange calls. Otherwise the ASTs of files participating in refactoring would have to be built multiple times, which is expensive.
+
+Undo doesn't present a problem since it doesn't involve AST access and therefore doesn't require an index lock.
+
+> So, forcing refactoring executors to call dispose() now is a breaking change.
+
+From the API standpoint this is true, but from the practical standpoint, existing refactoring executors that don't yet comply with the new requirement to call dispose() cannot possibly cause any problems.
+Hi Markus, what do you think of Sergey's last comment?
+(In reply to comment #3)
+I'm currently working on an extended patch that adds the dispose() calls throughout the SDK. It's quite a bit of work, so to avoid wasted effort, Markus, please let me know ASAP if you still have doubts regarding the general approach.
+> Markus, please let me know ASAP if you still have doubts regarding the general
+> approach.
+Sergey, Markus is currently on vacation, so please be patient.
+(In reply to comment #6)
+> Sergey, Markus is currently on vacation, so please be patient.
+
+Hi, Dani, do you mind expressing your opinion on this issue?
+(In reply to comment #7).
+> Hi, Dani, do you mind expressing your opinion on this issue?
+
+The problem is that the execution of dispose() will be completely depending on clients to call it and hence implementers of dispose() will get no guarantee that the method will be called. Seeing the method sends the wrong signal that heavy state will be reliably cleaned up which is not the case. That we have to fix several places in the SDK indicates that others will also have to do a considerable amount of work to get a predictable behavior.
+
+Without spending more time to look into the problem I can't offer another solution at this point. For now I suggest you wait until Markus found time to investigate it deeper as offered in comment 2. Note that this will probably be in September or October as we are currently fully booked with Java 7 work.
+Created attachment 200134
+RefactoringContext class and supporting framework
+
+Consistently calling Refactoring#dispose() method across JDT code turned out to be pretty hard. One complicating factor is QuickAssistProcessor.RefactoringCorrectionProposal class that wraps a refactoring. This effectively forces all correction proposals to also be treated as disposable.
+
+To minimize ripple effect of the change I've introduced a new class, RefactoringContext. This class is disposable and can be subclassed to hold resources that have to be explicitly released. Refactoring class remains unchanged. Refactorings that don't depend on explicitly released resources may continue to operate without worrying about the refactoring context. Only the code paths involving refactoring objects instantiated by refactoring descriptors had to be modified. This is necessary because refactorings instantiated by refactoring descriptors are not limited to JDT and may include CDT ones that need a place to put resources that have to be explicitly released.
+
+I'll appreciate if you can review this patch promptly since a large chunk of CDT refactoring work depends on it.
+Hi Markus,
+How, when 3.7.1 is out, could you please review the patch. We need it applied to be able to continue work on CDT refactorings. Thanks.
+Please, please, please, take a look at the patch. CDT refactoring work will be in trouble if we won't get this patch into 3.8M3.
+I can't promise it for this week, but I'll review it next week for sure.
+(In reply to comment #12)
+Thanks!
+Sorry for the late review, EGit is slowing me down sooo much.
+
+The direction looks good, but I'm missing support for RefactoringContext in PerformRefactoringOperation, RefactoringWizard, and RefactoringWizardOpenOperation. I assume you already use these classes, but your refactoring starters create the RefactoringContext externally and also call the dispose() method afterwards.
+
+For API completeness, I think we should also offer PerformRefactoringOperation(RefactoringContext, int), RefactoringWizard(RefactoringContext, int), and RefactoringWizard#getRefactoringContext() (returns null if no context available). RefactoringWizardOpenOperation should also take care of calling dispose() if the wizard was created on a RefactoringContext.
+
+
+The change in RefactoringTest doesn't make sense. The goal of the
+"if (DESCRIPTOR_TEST)" branch is to re-create the refactoring from the change and then run it again.
+
+The other test changes look a bit arbitrary. They only touch places where refactoring descriptors are involved, but not direct invocations. And we know that none of the existing refactorings actually use a real RefactoringContext. I also don't want to add RenameSupport#dispose() now, knowing that the implementation doesn't need this change (by the same argument, you didn't add dispose support to RefactoringCorrectionProposal).
+
+
+==> I'm going to add the missing APIs, clean up some other small things, and remove the changes in JDT UI that are not necessary. That will also bring down your contribution to less than 250 lines, so we don't have the IP overhead.
+Pushed the combined work to master:
+commit 5069473db6dbd0efa3a10205b2e449dbb5060b6a
+
+Sergey, please verify.
+Comment on attachment 200134
+RefactoringContext class and supporting framework
+
+Only released parts of this patch (<250 lines).
+
+Thanks for your work, Sergey!

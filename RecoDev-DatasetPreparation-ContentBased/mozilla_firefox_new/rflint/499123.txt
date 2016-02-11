@@ -1,0 +1,153 @@
+Created attachment 383910
+WIP
+
+This combines the various JS nsIAboutModule implementations we have in browser/ into a single C++ implementation. The goal is to reduce component registration costs during startups backed by the fastload cache and trips to disk for those which aren't.
+Still trying to get some reliable perf data for this, but in the warm case it looks like it shaves off about 25-40ms.
+
+Created attachment 383910
+WIP
+
+This combines the various JS nsIAboutModule implementations we have in browser/ into a single C++ implementation. The goal is to reduce component registration costs during startups backed by the fastload cache and trips to disk for those which aren't.
+Still trying to get some reliable perf data for this, but in the warm case it looks like it shaves off about 25-40ms.
+nice win. there's a bug about "loading js xpcom is unnecessarily slow", but i can't find it, grr.
+Created attachment 390932
+Patch
+Comment on attachment 390932
+Patch
+
+
+>+NS_IMETHODIMP
+>+AboutRedirector::NewChannel(nsIURI *aURI, nsIChannel **result) 
+>+{
+>+  NS_ENSURE_ARG_POINTER(aURI);
+>+  NS_ASSERTION(result, "must not be null");
+>+
+>+  nsresult rv;
+>+
+>+  nsCAutoString path;
+>+  rv = aURI->GetPath(path);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  PRInt32 f = path.FindChar('#');
+>+  if (f >= 0)
+>+    path.SetLength(f);
+>+
+>+  PRInt32 g = path.FindChar('?');
+>+  if (g >= 0)
+>+    path.SetLength(g);
+
+can re-use f here?
+
+ditto for GetURIFlags()
+
+>+
+>+  ToLowerCase(path);
+>+
+>+  nsCOMPtr<nsIIOService> ioService = do_GetIOService(&rv);
+>+  if (NS_FAILED(rv))
+>+    return rv;
+>+
+>+  for (int i = 0; i < kRedirTotal; i++) {
+>+    if (!strcmp(path.get(), kRedirMap[i].id)) {
+>+      nsCOMPtr<nsIChannel> tempChannel;
+>+      rv = ioService->NewChannel(nsDependentCString(kRedirMap[i].url),
+>+                                 nsnull, nsnull, getter_AddRefs(tempChannel));
+>+      if (NS_FAILED(rv))
+>+        return rv;
+
+NS_ENSURE_SUCCESS(rv, rv); for same result in a single line
+
+and ditto for the other instances following
+
+>diff --git a/browser/components/about/Makefile.in b/browser/components/about/Makefile.in
+>new file mode 100644
+>--- /dev/null
+>+++ b/browser/components/about/Makefile.in
+
+>+DEPTH		= ../../..
+>+topsrcdir	= @top_srcdir@
+>+srcdir		= @srcdir@
+>+VPATH		= @srcdir@
+
+nit: indent prob
+
+>-PROT_Application.prototype.getURIFlags = function(uri) {
+>-  // We don't particularly *want* people linking to this from
+>-  // untrusted content, but given that bad sites can cause this page
+>-  // to appear (e.g. by having an iframe pointing to known malware),
+>-  // we should code as though this is explicitly possible.
+>-  return Ci.nsIAboutModule.ALLOW_SCRIPT |
+>-         Ci.nsIAboutModule.URI_SAFE_FOR_UNTRUSTED_CONTENT;
+>-}
+
+don't recall if you did port this comment, but please do. and any other comments in the removed code that might be useful.
+
+first pass looks ok, r=me.
+Created attachment 391203
+Patch v2
+Comment on attachment 391203
+Patch v2
+
+>diff --git a/browser/components/about/AboutRedirector.cpp b/browser/components/about/AboutRedirector.cpp
+
+>+  { "blocked", "chrome://browser/content/safebrowsing/blockedSite.xhtml",
+>+    // We don't particularly *want* people linking to this from untrusted 
+>+    // content, but given that bad sites can cause this page to appear (e.g.
+>+    // by having an iframe pointing to known malware), we should code as though
+>+    // this is explicitly possible.
+>+    nsIAboutModule::URI_SAFE_FOR_UNTRUSTED_CONTENT |
+>+    nsIAboutModule::ALLOW_SCRIPT },
+
+This comment doesn't really make sense... URI_SAFE_FOR_UNTRUSTED_CONTENT at its base determines whether the page is linkable. That it also controls whether we give the pages chrome privs is an implementation detail of this specific nsIAboutModule, so if we wanted it to be unlinkable and also not have chrome privs, we could do that.
+Comment on attachment 391203
+Patch v2
+
+>diff --git a/browser/components/about/AboutRedirector.cpp b/browser/components/about/AboutRedirector.cpp
+
+I think you should use hg cp and maintain the license headers for this file, since it's largely unchanged from the original (same applies to the header). Probably also worth a comment that points to the original, since it's still around.
+
+>+#include "nsStringAPI.h"
+
+this include doesn't appear to be necessary?
+
+>+AboutRedirector::NewChannel(nsIURI *aURI, nsIChannel **result) 
+
+>+  nsCAutoString path;
+>+  rv = aURI->GetPath(path);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>
+>+  PRInt32 f = path.FindChar('#');
+>+  if (f >= 0)
+>+    path.SetLength(f);
+>+
+>+  f = path.FindChar('?');
+>+  if (f >= 0)
+>+    path.SetLength(f);
+>+
+>+  ToLowerCase(path);
+
+Probably wouldn't hurt to put this in a static method, rather than duplicating in GetURIFlags.
+
+>diff --git a/browser/components/feeds/src/Makefile.in b/browser/components/feeds/src/Makefile.in
+
+>-REQUIRES = xpcom string necko caps js xpconnect mimetype
+>+REQUIRES = xpcom string necko xpconnect mimetype
+
+why still xpconnect?
+
+r=me with those and the comment change from comment 5 adressed. For the sake of simplicity, we should probably just leave things as-is and omit the comment, I think. Can file a followup on making about:blocked non-linkable/non-chrome (would mean adding a separate bool to RedirEntry, I guess).
+Created attachment 395522
+As checked in
+http://hg.mozilla.org/mozilla-central/rev/3e0d12affe42
+Comment on attachment 395522
+As checked in
+
+a192=beltzner
+http://hg.mozilla.org/releases/mozilla-1.9.2/rev/3b4fc1fe7163
+
+
+Coalesce browser about: pages
+
+perf
+
+Bug 499123 - Coalesce browser about: pages. r=dietrich/gavin 

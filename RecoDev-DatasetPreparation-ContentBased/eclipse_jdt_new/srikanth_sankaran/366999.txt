@@ -1,0 +1,237 @@
+Build Identifier: Version: 3.8.0 Build id: I20111209-1447
+
+
+java version "1.7.0_04-ea"
+Java(TM) SE Runtime Environment (build 1.7.0_04-ea-b04)
+Java HotSpot(TM) Server VM (build 23.0-b06, mixed mode)
+
+in case it matters:
+I set my default VM-options in eclipse to: -XX:-UseLoopPredicate
+
+if you comment the sysout-line in finally, or have no nested try-resource it works.
+
+source:
+
+package ecerr;
+
+import java.io.BufferedReader;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class VerErr {
+
+  static class C
+      implements Closeable {
+    @Override
+    public void close() throws IOException {
+      //
+    }
+  }
+
+  int run() throws IOException {
+    int lcnt = 0;
+    try (C c = new C();) {
+      try (final BufferedReader br =
+          new BufferedReader(new FileReader(new File("logging.properties")))) {
+        String s;
+        while ((s = br.readLine()) != null)
+          lcnt++;
+        return lcnt;
+      }
+    } finally {
+      System.out.println("read " + lcnt + " lines");
+    }
+  }
+
+  public static void main(final String[] args) throws IOException {
+    new VerErr().run();
+  }
+}
+
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. compile and run the given class in eclipse-ide
+
+Build Identifier: Version: 3.8.0 Build id: I20111209-1447
+
+
+java version "1.7.0_04-ea"
+Java(TM) SE Runtime Environment (build 1.7.0_04-ea-b04)
+Java HotSpot(TM) Server VM (build 23.0-b06, mixed mode)
+
+in case it matters:
+I set my default VM-options in eclipse to: -XX:-UseLoopPredicate
+
+if you comment the sysout-line in finally, or have no nested try-resource it works.
+
+source:
+
+package ecerr;
+
+import java.io.BufferedReader;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class VerErr {
+
+  static class C
+      implements Closeable {
+    @Override
+    public void close() throws IOException {
+      //
+    }
+  }
+
+  int run() throws IOException {
+    int lcnt = 0;
+    try (C c = new C();) {
+      try (final BufferedReader br =
+          new BufferedReader(new FileReader(new File("logging.properties")))) {
+        String s;
+        while ((s = br.readLine()) != null)
+          lcnt++;
+        return lcnt;
+      }
+    } finally {
+      System.out.println("read " + lcnt + " lines");
+    }
+  }
+
+  public static void main(final String[] args) throws IOException {
+    new VerErr().run();
+  }
+}
+
+
+Reproducible: Always
+
+Steps to Reproduce:
+1. compile and run the given class in eclipse-ide
+sorry forgot: it also works with return-type void of run-method
+looks like I'm not awake today - here is my stacktrace:
+
+Exception in thread "main" java.lang.VerifyError: Inconsistent stackmap frames at branch target 86 in method ecerr.VerErr.run()I at offset 78
+	at java.lang.Class.getDeclaredMethods0(Native Method)
+	at java.lang.Class.privateGetDeclaredMethods(Class.java:2442)
+	at java.lang.Class.getMethod0(Class.java:2685)
+	at java.lang.Class.getMethod(Class.java:1620)
+	at sun.launcher.LauncherHelper.getMainMethod(LauncherHelper.java:488)
+	at sun.launcher.LauncherHelper.checkAndLoadMain(LauncherHelper.java:480)
+A possible workaround until this bug is fixed. Use -XX:-UseSplitVerifier
+In this case, the problem comes from the initialization range of the secret return value variable. It is not properly added after the value is stored. I'll propose a patch shortly.
+I am running tests. If successful, I will post the patch.
+Created attachment 208747
+Proposed fix + regression test
+
+All tests are green. More testing might be required though. Srikanth, I let you review it. It makes sense for me to "expose" the local as soon as it is stored. The initialization range looks better with the fix (you need to hack the code to expose synthetic locals).
+If ok, this will need to be backported to 3.7.2 and 3.6.2+ with Java 7.
+(In reply to comment #6)
+
+> All tests are green. More testing might be required though. Srikanth, I let you
+> review it. It makes sense for me to "expose" the local as soon as it is stored.
+> The initialization range looks better with the fix (you need to hack the code
+> to expose synthetic locals).
+
+Thanks for the patch Olivier. I agree with the change and the patch
+looks good. 
+
+I am still puzzled as to why this would show up only now with TWR. Will
+continue to experiment.
+(In reply to comment #8)
+
+> I am still puzzled as to why this would show up only now with TWR. Will
+> continue to experiment.
+
+i.e Given the fix has nothing to do with TWR per se, why is it that we are
+encountering this problem only now ?  Is it that the problem could be reproduced
+with plain try statements but hasn't surfaced so far due to the automatic
+fall back used by JDK6 ?
+(In reply to comment #9)
+> i.e Given the fix has nothing to do with TWR per se, why is it that we are
+> encountering this problem only now ?  Is it that the problem could be
+> reproduced
+> with plain try statements but hasn't surfaced so far due to the automatic
+> fall back used by JDK6 ?
+This is also what I think. The problem can only be reproduced if there is a try/catch/finally with a return statement inside the try block that returns a value.
+It should not be too difficult to extract a test case that is not related to the TWR.
+Smaller test case:
+
+public class X implements AutoCloseable {
+    @Override public void close() {
+    }
+  static int run()  {
+    int i = 0;
+    try (X x = new X(); X xx = new X()) {
+        return i;
+    } finally {
+    	i = 0;
+    }
+  }
+  public static void main(final String[] args)  {
+      run();
+  }
+}
+
+Problem disappears if finally block is empty, or if there is a single resource.
+OK, I know why this problem does not show up with plain try blocks.
+As a part of the fix for https://bugs.eclipse.org/bugs/show_bug.cgi?id=169017,
+we have some code change in org.eclipse.jdt.internal.compiler.ast.TryStatement.generateSubRoutineInvocation(BlockScope, CodeStream, Object, int, LocalVariableBinding) that "pulls up" the
+variable range to make it correct (codeStream.addVariable(secretLocal);)
+		
+The new code generation for resource closures happens to have been coded
+ahead of this pull up, thereby messing up the ranges.
+
+However, I do think that the proposed patch does the more appropriate thing
+when it comes to ensuring the ranges are correct, i.e exposing them as soon
+as they are initialized is the right approach.
+
+It is also consistent with what we do for other scenarios where we manage secret
+synthetics (cf ForeachStatement, SwitchStatement, SynchronizedStatement, 
+TryStatement etc)
+Released fix and tests for 3.8 M5 via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=cc0019928c0ad43743cfd13562c67921889017a2
+
+This is the same fix as provided by Olivier, but I also went ahead and
+deleted the second addVariable method call arising from 
+TryStatement.generateSubRoutineInvocation that is referred to in comment#12
+Ayush, the commit http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=cc0019928c0ad43743cfd13562c67921889017a2 needs to be back ported too.
+Dani, we need this back ported to 3.7.2 and probably to 
+3.7.2+java7 also. It is long standing latent bug that is
+triggered by new code generated for TWR. Fix is clean.
+(In reply to comment #15)
+> Dani, we need this back ported to 3.7.2 and probably to 
+> 3.7.2+java7 also.
+You mean 3.6.2+Java7, right?
+
++1 to backport.
+Released in 3.7 maintenance via commit cb25beb53fbe8773b2156963a511ad0ad5ad6862
+Released in 3.6.2+Java7 branch via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=R3_6_maintenance_Java7&id=bf6d70c82b170588606e6351c5eee3349eb951a1
+(In reply to comment #18)
+> Released in 3.6.2+Java7 branch via
+> http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=R3_6_maintenance_Java7&id=bf6d70c82b170588606e6351c5eee3349eb951a1
+
+Please not that you still need to do the build input manually (as in contrast to 3.7.2), see bug 364676.
+Verified for 3.7.2 RC2 with build M20120118-0800
+Verified for 3.8M5 using I20120122-2000
+(In reply to comment #3)
+> A possible workaround until this bug is fixed. Use -XX:-UseSplitVerifier
+
+For posterity's sakes recording here that this workaround does work
+at least as of Sun JVM 7b147. However, it is NOT supposed to work and 
+does not with IBM JVM.
+
+
+VerifyError: Inconsistent stackmap frames
+
+
+
+R3_7_maintenance - Fixed bug 366999: VerifyError: Inconsistent stackmap frames 
+
+R3_6_maintenance_Java7 - Fixed bug 366999: VerifyError: Inconsistent stackmap frames 
+
+Fixed bug 366999: VerifyError: Inconsistent stackmap frames 

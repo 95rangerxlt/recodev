@@ -1,0 +1,123 @@
+The code introduced in bug 923856 looks like this:
+
+    if (/^application\/(\w+[\.-]?)+\+(xml|json)/.test(aMimeType)) {
+      return true;
+    }
+
+in current Firefox builds this is throwing an exception because Yarr gives up after 1000000 iterations in the regexp interpreter when aMimeType is "application/vnd.google.safebrowsing-chunk".  Sadly, this happens a lot: every time we contact the safebrowsing database.  Once per chunk.  So I timed how long this regexp takes to run on that string:
+
+    var perf = window.performance;
+    try {
+      var start = perf.now();
+      var result = /^application\/(\w+[\.-]?)+\+(xml|json)/.test("application/vnd.google.safebrowsing-chunk");
+    } catch (e) {
+      var end = perf.now();
+      alert(end - start);
+    }
+
+and the answer is about 50ms on current trunk before it throws.
+
+The reason this is throwing is that the regexp doesn't match (because aMimeType doesn't contain "xml" or "json" in it, or a "+" for that matter).  So the regexp execution starts backtracking, trying to match the (\w+[\.-]?)+ pattern against the string in various ways and hoping that after that the "\+" will match.
+
+As a thought experiment, let's think about the different ways (\w+[\.-]?)+ can match an alphanumeric string with n characters in it.  The answer is the number of partitions of the string (if we ignore the optional .- bits, which add more options), which is 2^(n-1).  So in this case, we're matching against "vnd.google.safebrowsing-chunk" which has length 29, so we're going to try something like 2^28 different matches.  In practice I think Yarr actually tries 2^29, but in either case it takes way too long.  ;)
+
+And the real issue is that the regexp is wrong, in my opinion.  It should be something more like this, if you want "dot or dash separated words":
+
+    if (/^application\/\w+(?:[.-]\w+)*\+(xml|json)/.test(aMimeType)) {
+      return true;
+    }
+
+That will return false in .05ms for the "application/vnd.google.safebrowsing-chunk" case and will return true in the same amount of time for "application/vnd.google.safebrowsing-chunk+json"....
+
+The code introduced in bug 923856 looks like this:
+
+    if (/^application\/(\w+[\.-]?)+\+(xml|json)/.test(aMimeType)) {
+      return true;
+    }
+
+in current Firefox builds this is throwing an exception because Yarr gives up after 1000000 iterations in the regexp interpreter when aMimeType is "application/vnd.google.safebrowsing-chunk".  Sadly, this happens a lot: every time we contact the safebrowsing database.  Once per chunk.  So I timed how long this regexp takes to run on that string:
+
+    var perf = window.performance;
+    try {
+      var start = perf.now();
+      var result = /^application\/(\w+[\.-]?)+\+(xml|json)/.test("application/vnd.google.safebrowsing-chunk");
+    } catch (e) {
+      var end = perf.now();
+      alert(end - start);
+    }
+
+and the answer is about 50ms on current trunk before it throws.
+
+The reason this is throwing is that the regexp doesn't match (because aMimeType doesn't contain "xml" or "json" in it, or a "+" for that matter).  So the regexp execution starts backtracking, trying to match the (\w+[\.-]?)+ pattern against the string in various ways and hoping that after that the "\+" will match.
+
+As a thought experiment, let's think about the different ways (\w+[\.-]?)+ can match an alphanumeric string with n characters in it.  The answer is the number of partitions of the string (if we ignore the optional .- bits, which add more options), which is 2^(n-1).  So in this case, we're matching against "vnd.google.safebrowsing-chunk" which has length 29, so we're going to try something like 2^28 different matches.  In practice I think Yarr actually tries 2^29, but in either case it takes way too long.  ;)
+
+And the real issue is that the regexp is wrong, in my opinion.  It should be something more like this, if you want "dot or dash separated words":
+
+    if (/^application\/\w+(?:[.-]\w+)*\+(xml|json)/.test(aMimeType)) {
+      return true;
+    }
+
+That will return false in .05ms for the "application/vnd.google.safebrowsing-chunk" case and will return true in the same amount of time for "application/vnd.google.safebrowsing-chunk+json"....
+Actually, the second paren should be non-capturing too, I would think.
+Very nice explanation and good catch bz. Thank you! Let's land this.
+Created attachment 8361817
+bug961097-1.diff
+
+Thanks bz!
+Comment on attachment 8361817
+bug961097-1.diff
+
+If you're OK with things like "application/foo-+xml", then why not "application/-foo+xml"?  That is, why not just: /^application\/[\w.-]+\+(?:xml|json)$/ ?  Also, may want to update the comment...
+Created attachment 8361866
+bug961097-2.diff
+
+Good question. Should we be relaxed about matching these mimetypes? The comment mentions application/foo-xml, but the regex we have only allows +xml. Did a google search and found that some JSONs have been served as application/x-json (one example).
+
+Updated the test and the regex as I see fit: allow only +xml suffix, but allow both -json and +json suffixes. Also disallow application/-foo-json or anything that doesnt start/end with a word character, as you suggested.
+
+Do note this check is used for the network monitor where it is not critical to accurately identify xml/json documents (we cant rely on mimetypes for anything like this).
+Comment on attachment 8361866
+bug961097-2.diff
+
+> [\.-]
+
+Pretty sure '.' is not special in character classes so needs no escaping here.
+
+r=me.  Thank you!
+Hi 
+
+A bit late here, and thank you for the informative comment Boris
+@Mihai, seems like you got this. Let me know and I can follow this up (I introduced this in bug 923856).
+
+Thanks
+
+Thomas
+Thank you Boris for the r+.
+
+(In reply to Thomas Andersen from comment #7)
+> Hi 
+> 
+> A bit late here, and thank you for the informative comment Boris
+> @Mihai, seems like you got this. Let me know and I can follow this up (I
+> introduced this in bug 923856).
+
+No worries, thanks for your quick followup here.
+
+Landed the patch: https://hg.mozilla.org/integration/fx-team/rev/6b6ae7e9afa0
+https://hg.mozilla.org/mozilla-central/rev/6b6ae7e9afa0
+Were not going to track this as it does not seem like its warranted.
+I've tried to reproduce this issue with Nightly from 2014-01-17 on both Windows and Linux machines, without success. I've also looked over bug 923856 (which is indeed fixed), but didn't figure out how to replicate this issue.
+Mihai, could you please provide STR in order to reproduce and properly verify this fix?
+(In reply to Alexandra Lucinet, QA Mentor [:adalucinet] from comment #11)
+> I've tried to reproduce this issue with Nightly from 2014-01-17 on both
+> Windows and Linux machines, without success. I've also looked over bug
+> 923856 (which is indeed fixed), but didn't figure out how to replicate this
+> issue.
+> Mihai, could you please provide STR in order to reproduce and properly
+> verify this fix?
+
+I doubt this is verifiable through user actions. We have automated tests and the jank mentioned was only 50ms - hard to notice.
+
+Thanks for testing!
+*** Bug 959039 has been marked as a duplicate of this bug. ***

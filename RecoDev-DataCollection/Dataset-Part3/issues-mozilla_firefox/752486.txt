@@ -1,0 +1,144 @@
+Created attachment 621582
+patch v1
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#4733
+
+Calling gFormSubmitObserver.panelIsOpen() causes layout flushes:
+
+#0  PresShell::FlushPendingNotifications (this=0x7fd14a3149f0, aType=Flush_Style)
+    at /home/tim/workspace/fx-team/layout/base/nsPresShell.cpp:3755
+#1  0x00007fd154a61ca8 in nsBoxObject::GetFrame (this=0x7fd1320f6700, aFlushLayout=false)
+    at /home/tim/workspace/fx-team/layout/xul/base/src/nsBoxObject.cpp:156
+#2  0x00007fd154a60de8 in nsPopupBoxObject::GetMenuPopupFrame (this=<optimized out>)
+    at /home/tim/workspace/fx-team/layout/xul/base/src/nsPopupBoxObject.cpp:69
+#3  0x00007fd154a60ffd in nsPopupBoxObject::GetPopupState (this=0x7fd1320f6700, aState=...)
+    at /home/tim/workspace/fx-team/layout/xul/base/src/nsPopupBoxObject.cpp:241
+
+This is unfortunate because this is always called onLocationChange that is when switching tabs or navigating in a tab.
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#887
+
+Created attachment 621582
+patch v1
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#4733
+
+Calling gFormSubmitObserver.panelIsOpen() causes layout flushes:
+
+#0  PresShell::FlushPendingNotifications (this=0x7fd14a3149f0, aType=Flush_Style)
+    at /home/tim/workspace/fx-team/layout/base/nsPresShell.cpp:3755
+#1  0x00007fd154a61ca8 in nsBoxObject::GetFrame (this=0x7fd1320f6700, aFlushLayout=false)
+    at /home/tim/workspace/fx-team/layout/xul/base/src/nsBoxObject.cpp:156
+#2  0x00007fd154a60de8 in nsPopupBoxObject::GetMenuPopupFrame (this=<optimized out>)
+    at /home/tim/workspace/fx-team/layout/xul/base/src/nsPopupBoxObject.cpp:69
+#3  0x00007fd154a60ffd in nsPopupBoxObject::GetPopupState (this=0x7fd1320f6700, aState=...)
+    at /home/tim/workspace/fx-team/layout/xul/base/src/nsPopupBoxObject.cpp:241
+
+This is unfortunate because this is always called onLocationChange that is when switching tabs or navigating in a tab.
+
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#887
+It's unclear to me why accessing panel.state should flush layout. Can this be fixed at a lower level?
+(In reply to Dão Gottwald [:dao] from comment #1)
+> It's unclear to me why accessing panel.state should flush layout. Can this
+> be fixed at a lower level?
+
+According to Boris:
+
+* 12% of non-painting time is style flushes triggered by nsPopupBoxObject::GetPopupState
+  * One callsite is the gFormSubmitObserver.panelIsOpen calls we make onLocationChange
+  * Can we get the popup state without flushing?  Unclear.
+
+Seems like this is expected when determining the current state of a popup. Sounds like it may be hard to fix this at a lower level?
+> Sounds like it may be hard to fix this at a lower level?
+
+To me it sounds like nobody has looked into it.
+
+We access popups' state property pretty often and I always expected it to be cheap.
+(In reply to Dão Gottwald [:dao] from comment #3)
+> > Sounds like it may be hard to fix this at a lower level?
+> To me it sounds like nobody has looked into it.
+
+I hope someone from the platform team can do that?
+
+> We access popups' state property pretty often and I always expected it to be
+> cheap.
+
+Yes, fair point. It's rather unexpected that this causes layout flushes. There are lots of other places where this is used (although they might not be as "critical" as tab switching or navigating).
+popup.state flushes, as most methods that go through a box object do, because the state is stored on the frame, and the method needs to ensure that the frame is up to date.
+
+Note that only the frame tree is flushed (frames are created by the frame constructor), layout is not done.
+> To me it sounds like nobody has looked into it.
+
+Oh, I looked into it.  It's only doable if we change the meaning of the return value.  Whether it's OK to do _that_ is what's unclear.
+
+For example, if a popup is "open" but has a parent whose style has been set to display:none but that style change hasn't been processed yet, what should getting the popup state on the popup return?  Should it return "open", or should it return the state the popup will have once the style change is processed (which is "closed")?  Right now we do the latter, because the basic premise is that the fact that style change processing is actually lazy should be invisible to script.
+
+Alternately, if a popup is supposed to be opened by the style change that will do that hasn't been processed yet, should .state return "open" or not?
+And to be clear, the access to the .state itself is cheap.  It's only expensive if there are pending style changes.  Which means that making lots of accesses in a row is no worse than making one access (as long as you're not doing any DOM/style mutations in between), but making one access at the wrong time can be bad.
+(In reply to Boris Zbarsky (:bz) from comment #6)
+> Oh, I looked into it.  It's only doable if we change the meaning of the
+> return value.  Whether it's OK to do _that_ is what's unclear.
+
+I don't think we should do that by default. We could maybe introduce a different property that returns the state without flushing.
+
+OTOH we could listen for popupshowing/hiding events and use those to track the popup state, right? Provided we don't care about the given popup's ascendants states.
+
+(In reply to Boris Zbarsky (:bz) from comment #7)
+> And to be clear, the access to the .state itself is cheap.  It's only
+> expensive if there are pending style changes.  Which means that making lots
+> of accesses in a row is no worse than making one access (as long as you're
+> not doing any DOM/style mutations in between), but making one access at the
+> wrong time can be bad.
+
+Yes, but as we can't really know if it's the wrong time we should not flush if we don't actually care about the popup being shown/hidden by parentNodes, should we?
+
+While it would be definitely nice to have these performance gains this feels a lot like a workaround until there's a better core solution to this problem - like suspending reflows while switching tabs or anything similar.
+> We could maybe introduce a different property that returns the state without flushing.
+
+That would certainly be pretty easy.
+
+> OTOH we could listen for popupshowing/hiding events and use those to track the popup
+> state, right?
+
+I _think_ so, but enn would know for sure.
+
+> this feels a lot like a workaround until there's a better core solution to this problem
+
+There is no way to solve the problem in core here without an API change.  The current API relies on the invariant that any query about state that depends on style or layout will flush out style or layout as needed before returning an answer.
+Created attachment 646246
+Patch, remove panelIsOpen check
+
+Not sure why this code needs to check is the popup is open just to hide it. When no popups are open, hidePopup does a few quick checks and returns. Maybe Mounir has some insight.
+Comment on attachment 646246
+Patch, remove panelIsOpen check
+
+>   panel: null,
+> 
+>   init: function()
+>   {
+>     this.panel = document.getElementById('invalid-form-popup');
+>   },
+> 
+>-  panelIsOpen: function()
+>-  {
+>-    return this.panel && this.panel.state != "hiding" &&
+>-           this.panel.state != "closed";
+>-  },
+
+>     // Hide the form invalid popup.
+>-    if (gFormSubmitObserver.panelIsOpen()) {
+>-      gFormSubmitObserver.panel.hidePopup();
+>-    }
+>+    gFormSubmitObserver.panel.hidePopup();
+
+You should probably still null-check gFormSubmitObserver.panel.
+https://hg.mozilla.org/mozilla-central/rev/6d9745a02c2d
+Comment on attachment 646246
+Patch, remove panelIsOpen check
+
+Review of attachment 646246:
+-----------------------------------------------------------------
+
+I assume my feedback is no longer needed given that the patch has landed.
+
+Sorry for the delay, I was on vacation.

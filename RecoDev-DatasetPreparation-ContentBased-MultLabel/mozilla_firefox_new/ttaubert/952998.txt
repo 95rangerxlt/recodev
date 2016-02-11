@@ -1,0 +1,162 @@
+We currently collect sessionStorage data for every frame and subframe contained in a tab's session history. This is quite problematic for sites like Google Search that store a lot of data in sessionStorage but are mostly hidden in some tab's previous history entries.
+
+I thus propose saving sessionStorage data only for the current frameTree, i.e. the currently shown page, including its subframes that finished loading before the "load" event was fired.
+
+At the same time, we can remove the "browser:purge-session-history" observer as purging the session history does never involve the current history entry. This could still be done by loading about:blank.
+
+We currently collect sessionStorage data for every frame and subframe contained in a tab's session history. This is quite problematic for sites like Google Search that store a lot of data in sessionStorage but are mostly hidden in some tab's previous history entries.
+
+I thus propose saving sessionStorage data only for the current frameTree, i.e. the currently shown page, including its subframes that finished loading before the "load" event was fired.
+
+At the same time, we can remove the "browser:purge-session-history" observer as purging the session history does never involve the current history entry. This could still be done by loading about:blank.
+Created attachment 8351273
+0002-Bug-952998-Use-FrameTree-to-collect-DOMSessionStorag.patch
+https://tbpl.mozilla.org/?tree=Try&rev=b4a52080ce1e
+What were the results here? Any improvement?
+(In reply to Dietrich Ayala (:dietrich) from comment #3)
+> What were the results here? Any improvement?
+
+This certainly results in storing less DOMSessionStorage data. Only after this lands we can see whether telemetry values for collection time [1] and file size [2] decrease, which they should just because we discard more data than before.
+
+[1] http://telemetry.mozilla.org/#nightly/29/FX_SESSION_RESTORE_COLLECT_DATA_MS
+[2] http://telemetry.mozilla.org/#nightly/29/FX_SESSION_RESTORE_FILE_SIZE_BYTES
+Comment on attachment 8351273
+0002-Bug-952998-Use-FrameTree-to-collect-DOMSessionStorag.patch
+
+Review of attachment 8351273:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/FrameTree.jsm
+@@ +165,5 @@
+> +   * Applies the given function |cb| to all frames stored in the tree. Use this
+> +   * method if |map()| doesn't suit your needs and you want more control over
+> +   * how data is collected.
+> +   *
+> +   * @param cb (function)
+
+Nit: Could you document the args passed to |cb|?
+
+::: browser/components/sessionstore/src/SessionStorage.jsm
+@@ +19,5 @@
+> +  try {
+> +    let uri = Services.io.newURI(doc.documentURI, null, null);
+> +    return ssm.getDocShellCodebasePrincipal(uri, docShell);
+> +  } catch (e) {
+> +    // This throws for invalid URLs.
+
+Please make sure that you're catching only for invalid URLs. Catch all clauses are generally to be avoided.
+
+@@ +69,2 @@
+>      let data = {};
+> +    let visited = new Set();
+
+"visited" is a little terse. Maybe |visitedOrigins|?
+
+::: browser/components/sessionstore/test/browser_sessionStorage.js
+@@ +18,5 @@
+>    // Flush to make sure chrome received all data.
+>    SyncHandlers.get(browser).flush();
+>  
+>    let {storage} = JSON.parse(ss.getTabState(tab));
+> +  is(storage["http://example.com"].test, "inner-value",
+
+Could you randomize a little these values to ensure that we don't have false positives caused by some weird persistence?
+
+@@ +28,5 @@
+>    yield modifySessionStorage(browser, {test: "modified"});
+>    SyncHandlers.get(browser).flush();
+>  
+>    let {storage} = JSON.parse(ss.getTabState(tab));
+> +  is(storage["http://example.com"].test, "inner-value",
+
+Why don't we also modify the inner-value?
+
+::: browser/components/sessionstore/test/content.js
+@@ +33,5 @@
+>    }
+>  });
+>  
+> +addMessageListener("ss-test:purgeDomainData", function ({data: domain}) {
+> +  Services.obs.notifyObservers(null, "browser:purge-domain-data", domain);
+
+That's in content?
+I have high hopes for this patch, by the way.
+(In reply to David Rajchenbach Teller [:Yoric] (please use "needinfo?") from comment #5)
+> ::: browser/components/sessionstore/src/SessionStorage.jsm
+> @@ +19,5 @@
+> > +  try {
+> > +    let uri = Services.io.newURI(doc.documentURI, null, null);
+> > +    return ssm.getDocShellCodebasePrincipal(uri, docShell);
+> > +  } catch (e) {
+> > +    // This throws for invalid URLs.
+> 
+> Please make sure that you're catching only for invalid URLs. Catch all
+> clauses are generally to be avoided.
+
+doc.documentURI should always be valid. getDocShellCodebasePrincipal() says that it "might throw" in the current code. I removed the try-catch completely because it points to a deeper issue should that fail.
+
+> ::: browser/components/sessionstore/test/browser_sessionStorage.js
+> @@ +18,5 @@
+> >    // Flush to make sure chrome received all data.
+> >    SyncHandlers.get(browser).flush();
+> >  
+> >    let {storage} = JSON.parse(ss.getTabState(tab));
+> > +  is(storage["http://example.com"].test, "inner-value",
+> 
+> Could you randomize a little these values to ensure that we don't have false
+> positives caused by some weird persistence?
+
+Done.
+
+> @@ +28,5 @@
+> >    yield modifySessionStorage(browser, {test: "modified"});
+> >    SyncHandlers.get(browser).flush();
+> >  
+> >    let {storage} = JSON.parse(ss.getTabState(tab));
+> > +  is(storage["http://example.com"].test, "inner-value",
+> 
+> Why don't we also modify the inner-value?
+
+Done.
+
+> ::: browser/components/sessionstore/test/content.js
+> @@ +33,5 @@
+> >    }
+> >  });
+> >  
+> > +addMessageListener("ss-test:purgeDomainData", function ({data: domain}) {
+> > +  Services.obs.notifyObservers(null, "browser:purge-domain-data", domain);
+> 
+> That's in content?
+
+AFAIU we will be notified in the content process. If that assumption doesn't hold we can easily fix this later.
+https://hg.mozilla.org/integration/fx-team/rev/3f6e82f8f9f8
+(In reply to Tim Taubert [:ttaubert] from comment #7)
+> > > +    let uri = Services.io.newURI(doc.documentURI, null, null);
+
+Looks like you want doc.documentURIObject?
+(In reply to :Gavin Sharp (email gavin@gavinsharp.com) from comment #9)
+> (In reply to Tim Taubert [:ttaubert] from comment #7)
+> > > > +    let uri = Services.io.newURI(doc.documentURI, null, null);
+> 
+> Looks like you want doc.documentURIObject?
+
+Yeah, I forgot about that. Thanks :)
+
+Pushed a small follow-up:
+
+https://hg.mozilla.org/integration/fx-team/rev/1e870df73ef5
+https://hg.mozilla.org/mozilla-central/rev/3f6e82f8f9f8
+https://hg.mozilla.org/mozilla-central/rev/1e870df73ef5
+Unfortunately, we did not have measurements on DOMSessionStorage when bug 952998 landed. http://raluca-elena.github.io/telemetry-dashboard/#filter=nightly%2F32%2FFX_SESSION_RESTORE_TOTAL_DOM_STORAGE_SIZE_BYTES!nightly%2F31%2FFX_SESSION_RESTORE_TOTAL_DOM_STORAGE_SIZE_BYTES!nightly%2F30%2FFX_SESSION_RESTORE_TOTAL_DOM_STORAGE_SIZE_BYTES!nightly%2F29%2FFX_SESSION_RESTORE_TOTAL_DOM_STORAGE_SIZE_BYTES&aggregates=Mean&evoOver=Builds&locked=false&sanitize=true&renderhistogram=undefined seems to indicate that it may have increased a little since then.
+
+On the other hand, http://raluca-elena.github.io/telemetry-dashboard/#filter=nightly%2F32%2FFX_SESSION_RESTORE_FILE_SIZE_BYTES!nightly%2F31%2FFX_SESSION_RESTORE_FILE_SIZE_BYTES!nightly%2F30%2FFX_SESSION_RESTORE_FILE_SIZE_BYTES!nightly%2F29%2FFX_SESSION_RESTORE_FILE_SIZE_BYTES!nightly%2F28%2FFX_SESSION_RESTORE_FILE_SIZE_BYTES&aggregates=Mean&evoOver=Builds&locked=false&sanitize=true&renderhistogram=undefined seems to confirm that the patch contributed to nicely shrink down sessionstore.js
+
+
+Use FrameTree to collect DOMSessionStorage data
+
+perf
+
+Bug 952998 - Use FrameTree to collect DOMSessionStorage data r=yoric
+
+Bug 952998 - Follow-up to fix test and use document.documentURIObject rs=Unfocused

@@ -1,0 +1,148 @@
+As studied in bug 913899, there is a chance that we can lose data written with OS.File. We need a plan of action.
+
+As studied in bug 913899, there is a chance that we can lose data written with OS.File. We need a plan of action.
+Note that data will not be corrupted.
+In the worst case scenario I can imagine, we will lose ~15 seconds of browsing.
+Created attachment 802991
+Ensure that we don't quit while  writing sessionstore.js
+
+Followup to the discussion/patch started on bug 913899. WIP.
+Created attachment 804347
+Ensure that we don't quit while  writing sessionstore.js, v2
+Comment on attachment 804347
+Ensure that we don't quit while  writing sessionstore.js, v2
+
+Now that the blocker is landing, we can move this to r?.
+Tim, I seem to remember that the next uplift is Monday, so I'll need a quick review if we want to land this in FF26.
+Comment on attachment 804347
+Ensure that we don't quit while  writing sessionstore.js, v2
+
+Review of attachment 804347:
+-----------------------------------------------------------------
+
+Sorry for the delay. Conferences and stuff.
+
+I'd be much happier if SessionFile could decide on its own when to close and when not. How about this:
+
+After every SessionFile.write() call we check whether nsIAppStartup.shuttingDown and if that's true we close. That would allow a single write being issued after quit-application has been fired (which would be triggered by uninit()).
+
+That way the SessionStore and SessionSaver could just continue doing their thing without dealing with worker shutdown problems.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +558,5 @@
+>      }
+>  
+>      // save all data for session resuming
+>      if (this._sessionInitialized) {
+> +      SessionSaver.run({ closeAfterWrite: true });
+
+Calling SessionSaver with 'closeAfterWrite' reveals a little too much of how saving files is implemented. SessionStore.jsm is just interested in saving its session data and shouldn't know about 'closing'.
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +166,5 @@
+> +
+> +  /**
+> +   * |false| once close() has been called
+> +   */
+> +  _isOpen: true,
+
+We have a function called close() and are checking whether we're closed in write(). Maybe call this 'isClosed'?
+
+@@ +311,5 @@
+>    };
+>  })();
+> +
+> +// Since writes proceed off main thread, ensure that we cannot be
+> +// interrupted while writing.
+
+Would be great to mention that otherwise our SessionWorker is killed on shutdown before it may have had a chance to write.
+Comment on attachment 804347
+Ensure that we don't quit while  writing sessionstore.js, v2
+
+Review of attachment 804347:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +258,5 @@
+>          TelemetryStopwatch.cancel("FX_SESSION_RESTORE_WRITE_FILE_LONGEST_OP_MS", refObj);
+>          Cu.reportError("Could not write session state file " + this.path
+>                         + ": " + ex);
+>        }
+> +      this.writeInProgress = null;
+
+We should only clear this field if (this.writeInProgress == promise). Otherwise there's a new pending write that overwrite the field. If we now shut down there's nothing that makes us wait.
+(In reply to Tim Taubert [:ttaubert] from comment #6)
+> We should only clear this field if (this.writeInProgress == promise).
+> Otherwise there's a new pending write that overwrite the field. If we now
+> shut down there's nothing that makes us wait.
+
+Actually, let's just not overwrite |this.writeInProgress| with |null|, this will simplify things.
+(In reply to Tim Taubert [:ttaubert] from comment #5)
+> Comment on attachment 804347
+> Ensure that we don't quit while  writing sessionstore.js, v2
+> 
+> Review of attachment 804347:
+> -----------------------------------------------------------------
+> 
+> Sorry for the delay. Conferences and stuff.
+> 
+> I'd be much happier if SessionFile could decide on its own when to close and
+> when not. How about this:
+> 
+> After every SessionFile.write() call we check whether
+> nsIAppStartup.shuttingDown and if that's true we close. That would allow a
+> single write being issued after quit-application has been fired (which would
+> be triggered by uninit()).
+
+With this, the first write started after nsIAppStartup has decided that we should quit is also the last. Smells like data loss if we have pending e10s collections. I'm not sure we wish to take the chance.
+
+Let me think of alternatives.
+We collect data synchronously when quit-application-requested is fired. And we write that data when quit-application is fired. There shouldn't be data loss, right?
+Created attachment 805255
+Ensure that we don't quit while writing sessionstore.js, v3
+
+Ok, let's go for the simple strategy. It might not be sufficient once we have e10s, but it should hold until then.
+Comment on attachment 805255
+Ensure that we don't quit while writing sessionstore.js, v3
+
+Review of attachment 805255:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +244,5 @@
+>                         + ": " + ex);
+>        }
+> +      // At this stage, we are done writing. If shutdown has started,
+> +      // we will want to stop receiving write instructions.
+> +      if (this.Services.startup.shuttingDown) {
+
+Nit: this.Services? Just Services?
+Created attachment 805261
+Ensure that we don't quit while writing sessionstore.js, v4
+
+Same one, minus typo.
+Try: https://tbpl.mozilla.org/?tree=Try&rev=784bcb0fff4b
+Pushed:
+
+https://hg.mozilla.org/integration/fx-team/rev/476f2fb1d0b4
+
+Backed out for wrong bug number:
+
+https://hg.mozilla.org/integration/fx-team/rev/fa21884ec85f
+
+Pushed again:
+
+https://hg.mozilla.org/integration/fx-team/rev/661b76876e39
+https://hg.mozilla.org/mozilla-central/rev/661b76876e39
+Comment on attachment 805261
+Ensure that we don't quit while writing sessionstore.js, v4
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): Bug 794091.
+User impact if declined: Rare case of data loss (sessionstore.js missing some data).
+Testing completed (on m-c, etc.): This has been on m-c for about one week.
+Risk to taking this patch (and alternatives if risky): This is a simple patch, so I don't think it will fail. However, if for some reason I have messed up that patch, we could theoretically have shutdown freezes.
+String or IDL/UUID changes made by this patch: None.
+tracking in case this does have any unexpected fallout.
+https://hg.mozilla.org/releases/mozilla-aurora/rev/fa50f923db95
+I believe that this shouldn't be tracked anymore, shouldn't it?

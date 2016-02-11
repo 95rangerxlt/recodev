@@ -1,0 +1,556 @@
+
+
+
+This is the main runnable we use to send messages between a worker and its parent:
+https://dxr.mozilla.org/mozilla-central/source/dom/workers/WorkerPrivate.cpp?from=WorkerPrivate.cpp#594
+
+This is where we deserialize the structured clone data: https://dxr.mozilla.org/mozilla-central/source/dom/workers/WorkerPrivate.cpp?from=WorkerPrivate.cpp#632
+
+This is where we serialize it: https://dxr.mozilla.org/mozilla-central/source/dom/workers/WorkerPrivate.cpp?from=WorkerPrivate.cpp#2803
+
+The runnable inherits from StructuredCloneHelper. Each runnable has a dispatch method that is called when it is put on the event queue, and a run method that is called when it is handled. Note that cloning happens before dispatch.
+
+Here's the run method for MessageEventRunnable: https://dxr.mozilla.org/mozilla-central/source/dom/workers/WorkerPrivate.cpp?from=WorkerPrivate.cpp&offset=0#674
+
+DispatchDOMEvent is called when the MessageEventRunnable is handled to emit a DOM event in the worker, that is *not* the method called when the runnable is dispatched. The default implementation of Dispatch is a method on WorkerPrivate: https://dxr.mozilla.org/mozilla-central/source/dom/workers/WorkerPrivate.cpp?from=WorkerRunnable.h&offset=0#2203 which then calls WorkerRunnable::Dispatch: https://dxr.mozilla.org/mozilla-central/source/dom/workers/WorkerRunnable.cpp?from=Workerrunnable.cpp#105
+Created attachment 8660798
+v1
+
+Hey Eddy, I need some help here.
+
+It'd be really nice if we could only show relevant worker markers in the performance tool, and not from all over the content process. That means we should be able to identify which docshell a worker event (for example) belongs to.
+
+Take a look at the changes in WorkerPrivate.cpp. So far it seems that no matter what I do, `aTarget->GetOwner()` is always null. Do you happen to know why? Do you happen to know a better way of identifying a docshell?
+Comment on attachment 8660798
+v1
+
+Talked with Victor about this on irc.
+*** Bug 1185059 has been marked as a duplicate of this bug. ***
+Created attachment 8669668
+v9000
+
+Ok, this was a bit less trivial than initially thought.
+
+Eddy, can you please take a look at the WorkerPrivate changes?
+
+Jordan, frontend stuff.
+
+And Tom... I'm sorry :) 
+I had to reorganize the existing architecture a bit. The previous implementation from bug 1200119 didn't take into account the fact that the ObservedDocShells linked list in TimelineConsumers (in other words, the place where we store markers for each docshell) was not iterable off the main thread, because these objects contain a pointer to a docshell, which apparently can't be accessed. We also have ObservedDocshell dereferences to nsDocShell everywhere (because of our overloading of *). 
+
+Because of this, GetKnownDocShells was useless off the main thread, so adding markers to all observed docshells could not be done.
+
+To fix this, I repurposed OTMTMarkerObserver to a straight-forward MarkersStorage interface (since ObservedDocShell was extending that anyway), and using that as the linked list typename in TimelineConsumers. This lets us iterate over all potentially interested "timelines" (or whatever else) off the main thread, since MarkersStorage doesn't have the notion of docshells. Now that I think about it, these two notions should have no connection whatsoever, and the new design imposes this.
+
+Furthermore, we have previously failed to take into consideration the fact that we'll have *separate* TimelineConsumers classes for each process. Even though the linked list there is static, the memory is cloned on each fork so there's going to be a separate instance for each process. This makes checks to stuff like "IsEmpty" incorrect if an interested party fails to know whether or not it's in the correct process. This is especially obvious when dealing with code that may be running both on the parent process, and in the chrome process or anywhere else. I have made TimelineConsumers into a singleton that makes sure only the chrome and content processes can access it, and only their main threads.
+
+A final change was more ergonomic than anything else: changed the marker's Equals pure virtual method into a simple virtual method on the AbstractTimelineMarker class. It's a bit annoying to implement it in every subclass, when in the vast majority of cases the current simple equality check suffices.
+
+Lastly, "SetCustomTime" was added as a private method to the AbstractTimelineMarker, because time is stored as a DOMHighResTimeStamp on markers, and their constructors should *only* accept TimeStamp instances). This restriction makes sure consumers don't have to think about epochs or how to measure time, but it makes implementing Clone methods difficult (since we can't instantiate TimeStamps from a DOMHighResTimeStamp).
+Comment on attachment 8669668
+v9000
+
+Review of attachment 8669668:
+-----------------------------------------------------------------
+
+Some notes on strings, docs and follow ups. This is great. +++
+
+::: browser/locales/en-US/chrome/browser/devtools/markers.properties
+@@ +29,5 @@
+>  marker.label.garbageCollection.nonIncremental=Non-incremental GC
+>  marker.label.cycleCollection=Cycle Collection
+>  marker.label.cycleCollection.forgetSkippable=CC Graph Reduction
+>  marker.label.timestamp=Timestamp
+> +marker.label.worker=Web Worker
+
+Are these markers for all types of workers? (chrome, audio, service, regular) From what I can tell, "Web Workers"[0] are the general classification to distinguish it being a web API, but all types of workers are simply called "Workers", so maybe that'd be a better name.
+
+[0] https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API
+
+::: devtools/client/performance/modules/markers.js
+@@ +124,5 @@
+>      colorName: "graphs-red",
+>      label: L10N.getStr("marker.label.cycleCollection.forgetSkippable"),
+>      fields: Formatters.CycleCollectionFields,
+>    },
+> +  "Worker": {
+
+Should add this to devtools/client/performance/docs/markers.md, can clarify the enum values of the workerOperation as well.
+
+Need to add the compositing markers to the docs as well, can handle in this bug or follow up
+
+@@ +128,5 @@
+> +  "Worker": {
+> +    group: 1,
+> +    colorName: "graphs-orange",
+> +    label: L10N.getStr("marker.label.worker"),
+> +    fields: Formatters.WorkerFields
+
+We should not allow OTMT work to be nested or nest markers. The main thread worker serial/deserialization can be, though. Not perfect, since we don't have much infrastructure for any OTMT things here. Some compositor markers the same deal, I think. We should have a follow up for categorizing OTMT markers so we can
+
+1) style them differently (chrome does outlines with transparent fills)
+2) do not interfere with MT nesting
+
+This would be easy if, for example, we had marker types for MT and OTMT, but in this case, they're all labeled "Worker" -- like we'd need some sort of map before hand to determine what kind of marker it should be, as nestable rules and colors are per marker-type basis. Blah
+Created attachment 8670173
+v9001
+
+Addressed Jordan's comments. Filed bugs 1211839, 1211838 and 1211841.
+Filed bug 1211842 for filtering worker markers by docshell. Eddy, this isn't urgent, but whenever you have some time, I'd much appreciate some help with that.
+Comment on attachment 8669668
+v9000
+
+Review of attachment 8669668:
+-----------------------------------------------------------------
+
+I don't know the TimelineConsumers API very well, but the WorkerPrivate changes look good to me.
+
+That said, I am not an official peer for the worker code, so this needs a superreview from someone who is, like khuey.
+
+::: dom/workers/WorkerPrivate.cpp
+@@ +653,5 @@
+> +      TimelineConsumers::Get().AddOTMTMarkerForAllObservedDocShells(start);
+> +      TimelineConsumers::Get().AddOTMTMarkerForAllObservedDocShells(end);
+> +      TimelineConsumers::Get().GetLock().Unlock();
+> +    }
+> +
+
+Why do we need an explicit reset here? UniquePtr is an RAII class afaik, so won't it release its pointer automatically once it goes out of scope?
+Comment on attachment 8669668
+v9000
+
+Review of attachment 8669668:
+-----------------------------------------------------------------
+
+Probably needs docshell peer review; and maybe even other reviews for the other platform bits.
+(Previous projects I've worked on had a rule that if an API change was approved then the fallout
+could be considered approved without requiring extra approvals; but I don't know if Mozilla work
+that way)
+
+Also webidl changes need special approval.
+
+::: docshell/base/timeline/MarkersStorage.cpp
+@@ +23,5 @@
+> +Mutex&
+> +MarkersStorage::GetLock()
+> +{
+> +  return mLock;
+> +};
+
+Extraneous semicolon.
+
+::: docshell/base/timeline/TimelineConsumers.cpp
+@@ +16,5 @@
+> +  // Using this class is not supported yet for other processes other than
+> +  // parent or content. To avoid accidental checks to methods like `IsEmpty`,
+> +  // which would probably always be true in those cases, assert here.
+> +  // Remember, there will be different singletons available to each process.
+> +  MOZ_ASSERT(XRE_IsContentProcess() || XRE_IsParentProcess());
+
+Do we know that TimeStamp will be consistent between two processes?  I would assume it isn't, but I don't really know.  This only matters if we're displaying markers from two processes on the same timeline.
+
+::: docshell/base/timeline/TimelineMarker.h
+@@ +23,2 @@
+>  
+> +  explicit TimelineMarker(const char* aName,
+
+I don't think either of these constructors need "explicit".
+Created attachment 8674387
+memory leak fix
+
+This was literally hitler.
+Created attachment 8674389
+busy work
+Created attachment 8674391
+memory leak fix
+Created attachment 8674451
+memory leak fix
+
+more assertions. sorry for the spam.
+Created attachment 8674452
+v9002
+
+Addressed all comments.
+Comment on attachment 8674389
+busy work
+
+LGTM
+Comment on attachment 8674451
+memory leak fix
+
+Review of attachment 8674451:
+-----------------------------------------------------------------
+
+r+ with some comments. Looks good overall, but needs a superreview from a platform peer, just in case.
+
+::: docshell/base/timeline/TimelineConsumers.cpp
+@@ +43,5 @@
+> +  }
+> +
+> +  // Note: We don't simply check sInstance for null-ness here, since otherwise
+> +  // this can resurrect the TimelineConsumers pretty late during shutdown.
+> +  static bool firstTime = true;
+
+Isn't this redundant, since you already return early here above when we are in shutdown? If this is not redundant, this could use a comment as to why not.
+
+@@ +50,5 @@
+> +    firstTime = false;
+> +    sInstance = new TimelineConsumers();
+> +
+> +    if (sInstance->Init()) {
+> +      ClearOnShutdown(&sInstance);
+
+I believe ClearOnShutdown adds a shutdown observer to null out your sInstance variable. Since you're already adding yourself as a shutdown observer, couldn't you null out the variable there?
+
+@@ +63,5 @@
+> +}
+> +
+> +TimelineConsumers::~TimelineConsumers()
+> +{
+> +  Cleanup();
+
+In Init() below, you are adding yourself to the observer service using a strong reference. Consequently, the observer service will keep you alive as long as it still has you as an observer.
+
+I don't know exactly how long the observer services holds on to its observers, but if we get here, then the call to Cleanup() should be redundant. If it's not redundant, we shouldn't have gotten here in the first place, since the observer service is still keeping us alive.
+
+You should be able to get away with removing the call to Cleanup() completely, but I would double check this with someone from platform.
+(In reply to Eddy Bruel [:ejpbruel] from comment #17)
+> Comment on attachment 8674451
+> memory leak fix
+> 
+> Review of attachment 8674451:
+> -----------------------------------------------------------------
+> 
+> r+ with some comments. Looks good overall, but needs a superreview from a
+> platform peer, just in case.
+
+Thanks for the review. Comments below.
+
+> 
+> ::: docshell/base/timeline/TimelineConsumers.cpp
+> @@ +43,5 @@
+> > +  }
+> > +
+> > +  // Note: We don't simply check sInstance for null-ness here, since otherwise
+> > +  // this can resurrect the TimelineConsumers pretty late during shutdown.
+> > +  static bool firstTime = true;
+> 
+> Isn't this redundant, since you already return early here above when we are
+> in shutdown? If this is not redundant, this could use a comment as to why
+> not.
+> 
+
+`sInShutdown` would only be set after a TimelineConsumers gets instantiated. The observer is added in the constructor. This is to make sure we'll always return null while in shutdown (I have no idea how soon or how late `ClearOnShutdown` is called).
+
+> @@ +50,5 @@
+> > +    firstTime = false;
+> > +    sInstance = new TimelineConsumers();
+> > +
+> > +    if (sInstance->Init()) {
+> > +      ClearOnShutdown(&sInstance);
+> 
+> I believe ClearOnShutdown adds a shutdown observer to null out your
+> sInstance variable. Since you're already adding yourself as a shutdown
+> observer, couldn't you null out the variable there?
+> 
+
+This handles a completely separate thing. The else branch handles the case where the singleton couldn't be initialized, in which case we remove it immediately to prevent access.
+
+> @@ +63,5 @@
+> > +}
+> > +
+> > +TimelineConsumers::~TimelineConsumers()
+> > +{
+> > +  Cleanup();
+> 
+> In Init() below, you are adding yourself to the observer service using a
+> strong reference. Consequently, the observer service will keep you alive as
+> long as it still has you as an observer.
+> 
+> I don't know exactly how long the observer services holds on to its
+> observers, but if we get here, then the call to Cleanup() should be
+> redundant. If it's not redundant, we shouldn't have gotten here in the first
+> place, since the observer service is still keeping us alive.
+
+This is handling the case where we manually destroy the object on a failed init. See above.
+Created attachment 8677106
+otmt-worker-marker.patch
+
+Addressed all comments and unified the patches. I have also resorted to a stricter cleanup policy for TimelineConsumers as per comment 17 and 19. The destructor is now default and observers removed only on failed init.
+
+Green try: 
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=85b8d23830d9
+Comment on attachment 8677106
+otmt-worker-marker.patch
+
+Please take a look at ProfileTimelineMarker.webidl
+Comment on attachment 8677106
+otmt-worker-marker.patch
+
+Any reason workerOperation uses unsigned short as type and not enum?
+webidl enum would be more "webby" and internally just an integer is stored, and the possible enum values would be available from ProfileTimelineMarkerBinding.h.
+(In reply to Olli Pettay [:smaug] from comment #21)
+> Comment on attachment 8677106
+> otmt-worker-marker.patch
+> 
+> Any reason workerOperation uses unsigned short as type and not enum?
+> webidl enum would be more "webby" and internally just an integer is stored,
+> and the possible enum values would be available from
+> ProfileTimelineMarkerBinding.h.
+
+I didn't know that existed. Thanks!
+Created attachment 8677440
+v529
+
+Made `workerOperation` an enum.
+Comment on attachment 8677440
+v529
+
+As per IRC discussion, need to update some methods and make them thread safe.
+Created attachment 8677542
+v530
+
+This should take care of everything. Famous last words :)
+
+There's a fast path taken for the majority of our usecases, which uses separate a separate storage and only accessible from the main thread. To avoid dealing with contention, a different storage is used for our off the main thread needs. See explanations below about how all of this TimelineConsumers craziness works.
+
+This patch has 16 lines of context so everything should be clearly visible.
+
+High level overview:
+
+MarkersStorage
+==============
+A `MarkersStorage` is an abstract class defining a place where timeline markers may be held. It defines an interface with 4 pure virtual functions to highlight how this storage can be interacted with:
+- `AddMarker`: adding a marker from the main thread only
+- `AddOTMTMarker`: adding a marker off the main thread only
+- `ClearMarkers`: clearing all accumulated markers (both from the main thread and off it)
+- `PopMarkers`: popping all accumulated markers (both from the main thread and off it).
+
+Note on why we handle on/off the main thread markers separately: since most of our markers will come from the main thread, we can be a little more efficient and avoid dealing with multithreading scenarios until all the markers are actually cleared or popped in `ClearMarkers` or `PopMarkers`. Main thread markers may only be added via `AddMarker`, while off the main thread markers may only be added via `AddOTMTMarker`. Clearing and popping markers will yield until all operations involving off the main thread markers finish. When popping, the markers accumulated off the main thread will be moved over. We expect popping to be fairly infrequent (every few hundred milliseconds, currently we schedule this to happen every 200ms).
+
+ObservedDocShell
+================
+The only implementation of a MarkersStorage we have right now is an ObservedDocShell.
+
+ObservedDocShells accumulate markers that are *mostly* about a particular docshell. At a high level, for example, an ObservedDocshell would be created when a timeline tool is opened on a page. It is reasonable to assume that most operations which are interesting for that particular page happen on the main thread. However certain operations may happen outside of it, yet are interesting for its developers, for which markers can be created as well (e.g. web audio stuff, service workers etc.). It is also reasonable to assume that a docshell may sometimes not be easily accessible from certain parts of the platform code, but for which markers still need to be created.
+
+Therefore, the following scenarios arise:
+
+a). creating a marker on the main thread about a particular dochsell
+
+b). creating a marker on the main thread without pinpointing to an affected docshell (unlikely, but allowed; in this case such a marker would have to be stored in all currently existing ObservedDocShells)
+
+c). creating a marker off the main thread about a particular dochsell (impossible; docshells can't be referenced outside the main thread AFAICT, in which case some other type of identification mechanism needs to be put in place).
+
+d). creating a marker off the main thread without pinpointing to a particular docshell (same path as c. here, such a marker would have to be stored in all currently existing ObservedDocShells).
+
+An observed docshell (in other words, "a docshell for which a timeline tool was opened") can thus receive both main thread and off the main thread markers. Cross-process markers are unnecessary at the moment.
+
+TimelineConsumers
+=================
+A TimelineConsumer is a singleton that facilitates access to ObservedDocShells. This is where ObservedDocShells can register/unregister via the `AddConsumer` and `RemoveConsumer` methods.
+
+All markers may only be stored via this singleton. Certain helper methods are available
+* Main thread only
+ - AddMarkerForDocShell(nsDocShell*, const char*, MarkerTracingType)
+ - AddMarkerForDocShell(nsDocShell*, const char*, const TimeStamp&, MarkerTracingType)
+ - AddMarkerForDocShell(nsDocShell*, UniquePtr<AbstractTimelineMarker>&&);
+* Any thread
+ - AddMarkerForAllObservedDocShells(const char*, MarkerTracingType);
+ - AddMarkerForAllObservedDocShells(const char*, const TimeStamp&, MarkerTracingType);
+ - AddMarkerForAllObservedDocShells(UniquePtr<AbstractTimelineMarker>&);
+
+The "main thread only" methods deal with point a). described above. The "any thread" methods deal with points b). and d).
+Comment on attachment 8677542
+v530
+
+
+
+
+
+
+> ObservedDocShell::ObservedDocShell(nsDocShell* aDocShell)
+>-  : OTMTMarkerReceiver("ObservedDocShellMutex")
+>+  : MarkersStorage("ObservedDocShellMutex")
+>   , mDocShell(aDocShell)
+> {
+>   MOZ_ASSERT(NS_IsMainThread());
+>+  mTimelineMarkers = new nsTArray<UniquePtr<AbstractTimelineMarker>>();
+>+  mOffTheMainThreadTimelineMarkers = new nsTArray<UniquePtr<AbstractTimelineMarker>>();
+
+I wonder why heap allocation is needed here. Why not just 
+nsTArray<UniquePtr<AbstractTimelineMarker>> as member variable.
+
+>+  // Move all of our off the main thread markers.
+>+  mTimelineMarkers->AppendElements(Move(*mOffTheMainThreadTimelineMarkers));
+>+  mOffTheMainThreadTimelineMarkers = new nsTArray<UniquePtr<AbstractTimelineMarker>>();
+
+You leak mOffTheMainThreadTimelineMarkers here, not the contents of it, but the object itself, right. AppendElements just
+moves the content and then you override the existing mOffTheMainThreadTimelineMarkers with a pointer to a new array.
+So, as far as I see, you don't need  mOffTheMainThreadTimelineMarkers = new nsTArray<UniquePtr<AbstractTimelineMarker>>(); at all.
+
+
+>+
+>+  // Main thread only.
+>+  nsTArray<UniquePtr<AbstractTimelineMarker>>* mTimelineMarkers;
+>+
+>+  // Off the main thread only.
+>+  nsTArray<UniquePtr<AbstractTimelineMarker>>* mOffTheMainThreadTimelineMarkers;
+So, unclear why these are *
+
+>+already_AddRefed<TimelineConsumers>
+>+TimelineConsumers::Get()
+...
+>+  // Note: We don't simply check `sInstance` for null-ness here, since otherwise
+>+  // this can resurrect the TimelineConsumers pretty late during shutdown.
+>+  // We won't know if we're in shutdown or not though, because the singleton
+>+  // could have been destroyed or just never instantiated, so in the previous
+>+  // conditional `sInShutdown` would be false.
+>+  static bool firstTime = true;
+>+  if (firstTime) {
+>+    firstTime = false;
+So this isn't thread safe method on first run.
+I'm not familiar enough with the use of this code to know whether it matters.
+
+>+TimelineConsumers::HasConsumer(nsDocShell* aDocShell)
+>+{
+>+  MOZ_ASSERT(NS_IsMainThread());
+>+  if (!aDocShell) {
+>+    return false;
+>+  }
+>+  bool isTimelineRecording = false;
+>+  aDocShell->GetRecordProfileTimelineMarkers(&isTimelineRecording);
+>+  return isTimelineRecording;
+>+}
+>+
+>+bool
+>+TimelineConsumers::HasConsumer(nsIDocShell* aDocShell)
+>+{
+>+  MOZ_ASSERT(NS_IsMainThread());
+>+  if (!aDocShell) {
+>+    return false;
+>+  }
+>+  bool isTimelineRecording = false;
+>+  aDocShell->GetRecordProfileTimelineMarkers(&isTimelineRecording);
+>+  return isTimelineRecording;
+>+}
+
+Why we need these both. the nsIDocShell version should be enough, given that nsDocShell is_an nsIDocShell
+
+
+>+  ProfileTimelineWorkerOperationType operationType = NS_IsMainThread()
+>+    ? ProfileTimelineWorkerOperationType::SerializeDataOnMainThread
+>+    : ProfileTimelineWorkerOperationType::SerializeDataOffMainThread;
+>+
+>+  UniquePtr<AbstractTimelineMarker> start = MakeUnique<WorkerTimelineMarker>(
+>+    operationType, MarkerTracingType::START);
+so here and elsewhere we shouldn't allocate anything unless we actually want to use 
+WorkerTimelineMarker object. malloc/free aren't exactly cheap operations.
+
+
+
+Would like to see another patch fixing those issues. interdiff would be really nice given the size of the patch.
+(In reply to Olli Pettay [:smaug] from comment #26)
+> Comment on attachment 8677542
+> v530
+> 
+> 
+> 
+> 
+> 
+> 
+> > ObservedDocShell::ObservedDocShell(nsDocShell* aDocShell)
+> >-  : OTMTMarkerReceiver("ObservedDocShellMutex")
+> >+  : MarkersStorage("ObservedDocShellMutex")
+> >   , mDocShell(aDocShell)
+> > {
+> >   MOZ_ASSERT(NS_IsMainThread());
+> >+  mTimelineMarkers = new nsTArray<UniquePtr<AbstractTimelineMarker>>();
+> >+  mOffTheMainThreadTimelineMarkers = new nsTArray<UniquePtr<AbstractTimelineMarker>>();
+> 
+> I wonder why heap allocation is needed here. Why not just 
+> nsTArray<UniquePtr<AbstractTimelineMarker>> as member variable.
+> 
+
+These used to be auto class member variables, but because of AppendElements below, I changed them to manually managed heaps. I thought a Move() is basically releasing ownership of the object in question. But if for `AppendElements` this is only for the array contents, and not the entire array itself, then yes: heap allocation is unnecessary as well as creating a new array.
+
+> >+  // Move all of our off the main thread markers.
+> >+  mTimelineMarkers->AppendElements(Move(*mOffTheMainThreadTimelineMarkers));
+> >+  mOffTheMainThreadTimelineMarkers = new nsTArray<UniquePtr<AbstractTimelineMarker>>();
+> 
+> You leak mOffTheMainThreadTimelineMarkers here, not the contents of it, but
+> the object itself, right. AppendElements just
+> moves the content and then you override the existing
+> mOffTheMainThreadTimelineMarkers with a pointer to a new array.
+> So, as far as I see, you don't need  mOffTheMainThreadTimelineMarkers = new
+> nsTArray<UniquePtr<AbstractTimelineMarker>>(); at all.
+> 
+
+Indeed, I seem to have misunderstood what Move() does here.
+
+> 
+> >+
+> >+  // Main thread only.
+> >+  nsTArray<UniquePtr<AbstractTimelineMarker>>* mTimelineMarkers;
+> >+
+> >+  // Off the main thread only.
+> >+  nsTArray<UniquePtr<AbstractTimelineMarker>>* mOffTheMainThreadTimelineMarkers;
+> So, unclear why these are *
+> 
+
+See above.
+
+> >+already_AddRefed<TimelineConsumers>
+> >+TimelineConsumers::Get()
+> ...
+> >+  // Note: We don't simply check `sInstance` for null-ness here, since otherwise
+> >+  // this can resurrect the TimelineConsumers pretty late during shutdown.
+> >+  // We won't know if we're in shutdown or not though, because the singleton
+> >+  // could have been destroyed or just never instantiated, so in the previous
+> >+  // conditional `sInShutdown` would be false.
+> >+  static bool firstTime = true;
+> >+  if (firstTime) {
+> >+    firstTime = false;
+> So this isn't thread safe method on first run.
+> I'm not familiar enough with the use of this code to know whether it matters.
+> 
+
+Indeed it is not. I also don't think it really matters, but it makes sense to make it though.
+
+> 
+> >+  ProfileTimelineWorkerOperationType operationType = NS_IsMainThread()
+> >+    ? ProfileTimelineWorkerOperationType::SerializeDataOnMainThread
+> >+    : ProfileTimelineWorkerOperationType::SerializeDataOffMainThread;
+> >+
+> >+  UniquePtr<AbstractTimelineMarker> start = MakeUnique<WorkerTimelineMarker>(
+> >+    operationType, MarkerTracingType::START);
+> so here and elsewhere we shouldn't allocate anything unless we actually want
+> to use 
+> WorkerTimelineMarker object. malloc/free aren't exactly cheap operations.
+> 
+> 
+
+Ok.
+
+> 
+> Would like to see another patch fixing those issues. interdiff would be
+> really nice given the size of the patch.
+
+Of course.
+Created attachment 8678086
+interdiff.patch
+
+Addressed comments. Also cleaned up #includes a little bit and removed all other nsDocShell/nsIDocShell duplicated methods.
+https://hg.mozilla.org/integration/fx-team/rev/f95c614295a0
+https://hg.mozilla.org/mozilla-central/rev/f95c614295a0
+I've added these to the list of markers: https://developer.mozilla.org/en-US/docs/Tools/Performance/Waterfall#Markers
+
+Do we need anything else here?
+lgtm!
+
+
+Add markers for workers' message passing and serialization/deserialization
+
+dev-doc-complete
+
+Bug 1202657 - Add markers for workers' message passing and serialization/deserialization, r=smaug, jsantell, tromey, ejpbruel 

@@ -1,0 +1,153 @@
+This example produces compilation errors while it shouldn't:
+
+interface I {
+	void bar(String t);
+}
+class X<T> implements I {
+	public void bar(String t) {}
+	X(String x) {}
+	X(T x) {}
+	public void one(X<I> c){}
+	public void two() {
+		one(new X<>((String s) -> { })); // 1. Three errors
+		X<I> i = new X<>((String s) -> { }); // 2. Error - Comment out the previous line to see this error go away.
+		one (i);
+	}
+}
+
+Interestingly, when the first statement is commented out, the second one compiles alright.
+
+This example produces compilation errors while it shouldn't:
+
+interface I {
+	void bar(String t);
+}
+class X<T> implements I {
+	public void bar(String t) {}
+	X(String x) {}
+	X(T x) {}
+	public void one(X<I> c){}
+	public void two() {
+		one(new X<>((String s) -> { })); // 1. Three errors
+		X<I> i = new X<>((String s) -> { }); // 2. Error - Comment out the previous line to see this error go away.
+		one (i);
+	}
+}
+
+Interestingly, when the first statement is commented out, the second one compiles alright.
+We are reporting the error at (1) twice, because the diamond is resolved twice: first as the argument to the containing message send *before* we have a candidate binding for 'one', second after the binding for 'one' has been determined, which gives the target type for the diamond. => Should we put the first resolve into silent mode similar to ReferenceExpression??
+
+The difference in the second line seems to stem from details inside Scope.mostSpecificMethodBinding(). In both cases I see two candidate methods for the diamond invocation:
+  <init>(I)
+  <init>(String)
+
+In one situation <init>(I) is picked as the result, in the other situation we end up with (count == 0) and return a ProblemMethodBinding. I have no clue what produces this difference. Let me know if hints point towards anything related to inference. Otherwise I'll pass this one ...
+FWIW, I was working from my workspace version which gives these errors:
+
+---------- 
+1. ERROR in X.java (at line 10) 
+   one(new X<>((String s) -> { })); // 1. Three errors 
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^ 
+The constructor X(String) is ambiguous 
+---------- 
+2. ERROR in X.java (at line 10) 
+   one(new X<>((String s) -> { })); // 1. Three errors 
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^ 
+The constructor X<I>(String) is ambiguous 
+---------- 
+3. ERROR in X.java (at line 11) 
+   X<I> i = new X<>((String s) -> { }); // 2. Error - Comment out the previous line to see this error go away. 
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^ 
+The constructor X<I>(String) is ambiguous 
+----------\n"
+(In reply to Stephan Herrmann from comment #2)
+> FWIW, I was working from my workspace version which gives these errors:
+
+Stephan, did you mean your TI branch? On BETA_J8's head, this is what I see:
+
+Multiple markers at this line
+	- The constructor X((String s) -> { }) is undefined
+	- The target type of this expression must be a functional interface
+	- The method one(X<I>) in the type X<T> is not applicable for the 
+	 arguments (X)
+It seems the status of this bug has changed back-and-forth a bit.
+
+Here's what I observe today:
+
+The influence between lines 10 and 11 is via the call enclosingScopesHaveErrors() at LambdaExpression.java:674
+
+The error in line 10 sets ignoreFurtherInverstigation on the enclosing MethodDeclaration.
+
+This causes the call LambdaExpression.isCompatibleWith() on an unrelated lambda to answer false.
+
+Srikanth, I stumbled over this particular line before. Can you think of a less drastic way of checking whatever needs to be checked here?
+
+I'll continue investigating why line 10 is flagged in the first place, but from here-on both issues are independent.
+(In reply to Stephan Herrmann from comment #4)
+
+> Srikanth, I stumbled over this particular line before. Can you think of a
+> less drastic way of checking whatever needs to be checked here?
+
+I have in mind to tackle this via https://bugs.eclipse.org/bugs/show_bug.cgi?id=424290 - I am considering a full pass like analyzeCode() that will work
+safely even when there are resolve errors. This will come a bit late though
+I don't expect to be able to start work on it in the next 10 days, perhaps
+even later.
+
+
+> I'll continue investigating why line 10 is flagged in the first place, but
+> from here-on both issues are independent.
+
+Sounds good.
+Released via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=243454d9ddff3b98b1fa12e536cfddbd176702ef :
+
+- tests (one simplified & passing; one disabled)
+
+- code to improve resilience by reusing existing inference results, rather than relying on FE.isCompatibleWith(). 
+This avoids the secondary errors.
+Srikanth: to analyse the issue around enclosingScopesHaveErrors() using the given test, the added lines in AllocationExpression.inferElidedTypes() may need to be disabled.
+
+(In reply to Srikanth Sankaran from comment #5)
+> (In reply to Stephan Herrmann from comment #4)
+> 
+> > Srikanth, I stumbled over this particular line before. Can you think of a
+> > less drastic way of checking whatever needs to be checked here?
+> 
+> I have in mind to tackle this via
+> https://bugs.eclipse.org/bugs/show_bug.cgi?id=424290 - I am considering a
+> full pass like analyzeCode() that will work
+> safely even when there are resolve errors. This will come a bit late though
+> I don't expect to be able to start work on it in the next 10 days, perhaps
+> even later.
+
+Should we remove the call to enclosingScopesHaveErrors() for now? I think the interdependence between unrelated errors is worse than failing to respect a runaway error during shape analysis?
+(In reply to Stephan Herrmann from comment #6)
+
+> Should we remove the call to enclosingScopesHaveErrors() for now? I think
+> the interdependence between unrelated errors is worse than failing to
+> respect a runaway error during shape analysis?
+
+Actually, that piece was put in place to avoid NPE/CCE/whatever. I think it
+will come back to bite us if we remove the call. For the time being it is OK
+to have secondary spurious errors I think.
+Phew, a significant piece was still missing to type check this:
+
+    one(new X<>((String s) -> { }));
+
+Reason: the diamond couldn't be inferred/resolved while resolved as an argument of MessageSend "one", because at that point it had neither target type (from outside), nor a useful argument type (from inside). Subsequently "one" couldn't be resolved without a proper argument type :(  -- and this one doesn't involve inference so resolving must succeed immediately.
+
+Solution: just like with other poly expressions (LE, RE) also a diamond must be resolved in several steps, realized by ripping apart AE.resolveType. Between these parts some state is stored as LE.suspendedResolutionState.
+
+Released via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=efe1773a267b3bdb803164d9b413b69c3685878f
+
+This also changed state in two other tests: more errors:
+  "The constructor X<String>(String) is ambiguous". 
+In bug 401850 we kind of expected this, to be revisited when finalizing More Specific Method Inference.
+
+
+[1.8] Cannot infer type for diamond type with lambda on method invocation
+
+
+
+Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation 
+
+Bug 424205 - [1.8] Cannot infer type for diamond type with lambda on method invocation WIP - avoiding unnecessary complex work 

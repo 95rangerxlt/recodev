@@ -1,0 +1,413 @@
+« 
+(In reply to David Rajchenbach Teller [:Yoric] from comment #105)
+> Well, we want bug reports so that we can fix these issues, or report them to
+> add-on authors if they are using deprecated code. Also, we would like add-on
+> authors to receive this error message if their add-on contain deprecated
+> code.
+
+Then the error message needs to say something to that effect.
+
+I didn't realize this was a problem that needed to be reported, and I certainly got no indication from the failure or the error message that it was a problem with my add-on. My add-on was not even in the call stack.
+
+If we are deprecating or changing interfaces and we need to make add-on authors aware, then we need better messages.
+»
+Source: https://bugzilla.mozilla.org/show_bug.cgi?id=722332#c106
+
+« 
+(In reply to David Rajchenbach Teller [:Yoric] from comment #105)
+> Well, we want bug reports so that we can fix these issues, or report them to
+> add-on authors if they are using deprecated code. Also, we would like add-on
+> authors to receive this error message if their add-on contain deprecated
+> code.
+
+Then the error message needs to say something to that effect.
+
+I didn't realize this was a problem that needed to be reported, and I certainly got no indication from the failure or the error message that it was a problem with my add-on. My add-on was not even in the call stack.
+
+If we are deprecating or changing interfaces and we need to make add-on authors aware, then we need better messages.
+»
+Source: https://bugzilla.mozilla.org/show_bug.cgi?id=722332#c106
+Thanks David. I appreciate it.
+
+Can you give me an idea of what could cause this? I'd like to try to recreate it so I could figure out what exactly happened.
+
+What are some of the side effects that could happen from nsiBrowserSearchservice being async?
+This error message is triggered by any attempt to use a method of |nsIBrowserSearchService| other than |init| before |init| has completed (or before it has ever been called).
+
+For the moment, this is purely a deprecation warning. However, we are progressively reimplementing |nsIBrowserSearchService| to make most of its initialization asynchronous, and part of it off-main-thread. Sooner or later, we will end up with an efficient asynchronous initialization and a very inefficient fallback for compatibility with older add-ons – inefficient because it uses obsolete and slow I/O functions, and also because it blocks the main thread. At this point, the warning will mean that we are using the inefficient fallback instead of the efficient initializer.
+I think the problem you're going to run into is add-ons that add search engines at startup.
+
+Is there a way for an add-on to add a search engine async? Or know when the init is finished?
+Just call |init()| yourself and pass a callback. |nsIBrowserSearchService| is smart enough to initialize only once and inform observers as soon as initialization is complete – or immediately if initialization is already complete.
+So it appears that while I thought this error was because of my add-on, I was wrong. The current Firefox nightly shows this error at every fresh profile creation...
+Good to know, thanks.
+Got a complete stack:
+Timestamp: 8/30/12 10:41:25 PM
+Error: Search service falling back to synchronous initialization at SRCH_SVC__ensureInitialized@resource:///components/nsSearchService.js:2501
+@resource:///components/nsSearchService.js:3465
+AHU_loadDefaultSearchEngine@resource:///components/nsBrowserContentHandler.js:814
+@resource:///components/nsBrowserContentHandler.js:565
+dch_handle@resource:///components/nsBrowserContentHandler.js:793
+
+Source File: resource:///components/nsSearchService.js
+Line: 2502
+Created attachment 657017
+Prototype error fix
+
+Issue seems to be related to the new home page.
+Created attachment 657018
+Reformulating the warning
+Comment on attachment 657017
+Prototype error fix
+
+You probably need to bind(this) onSearchInit?
+
+If the home page is loaded before the callback fires, the home page will be broken. We probably need to protect against that somehow, though I'm not sure what we'd do...
+(I would say "that will never happen in practice", but I'm not actually sure that's true... we can end up loading about:home pretty early in startup, and if search service IO hangs...)
+Created attachment 657139
+Prototype error fix, v2
+Created attachment 657160
+Adapting about:home
+
+Attaching a workaround for about:home, to ensure that the search engine can be configured even if nsSearchService.init takes long. For the moment, I have hard-coded an initialization time limit to 15s.
+
+Now, I have not prevented the search bar from appearing immediately. If a user manages to outrace initialization and enter a search term before initialization is complete, nothing happens, but pressing return/clicking "search" once initialization is complete performs as expected.
+
+This was tested by adding a simulated 5sec initialization delay, which barely gives me time to select the right tab, select the search field, enter "foobar", press return.
+
+As the race condition only appears on first startup after creating a profile, it might be reasonable to consider the risk minor.
+ideally once bug 749477 is done, we could asynchronously get the default search engine and set an attribute in the body when available, the page may listen for the attribute and setup the engine info on its change. The patch basically already does something like that waiting for the last set attribute and is mostly done (just one thing to debug, related to double listeners).  Personally I'd prefer taking that change than a looping workaround, I may debug that issue and have it ready by monday evening, provided the issue is not too bad.
+What's the timeframe of this bug?
+(In reply to Marco Bonardo [:mak] from comment #14)
+> What's the timeframe of this bug?
+
+I do not think there is much of an emergency. Afaict, the message appears only once, when you create a new profile in a debug-enabled version of FF. I believe that we can live with this for a time.
+> Afaict, the message appears only once, when you create a new profile in a debug-enabled version of FF.
+
+No, it appears in release builds. That's why I opened the bug initially. Components.utils.reportError puts the error on the regular Error Console.
+My bad. In that case, we should probably remove the reportError until we have a fix.
+Comment on attachment 657018
+Reformulating the warning
+
+Let's also comment out the reportError() for now, given that we don't have our own callers in order.
+Comment on attachment 657160
+Adapting about:home
+
+We should wait for bug 749477 here, as Marco suggests.
+OK I have a patch up there, the change I will make to it, before asking for review, is to have the page wait for the search attributes on body, the browser code at that point could be adapted here to just set those attributes asynchronously when they are available, the page will just wait.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/7db266145ac5
+Comment on attachment 657018
+Reformulating the warning
+
+Checked-in per email request. I commented out the reportError line (with a note giving this bug number) per comment 18.
+https://hg.mozilla.org/mozilla-central/rev/7db266145ac5
+fwiw, bug 749477 landed, so this should be fixable by modifying:
+http://mxr.mozilla.org/mozilla-central/source/browser/modules/AboutHomeUtils.jsm
+and the code in BrowserOnAboutPageLoad
+http://mxr.mozilla.org/mozilla-central/source/browser/base/content/browser.js#2492
+Bug 749477 took this code out of the first startup path, AFAICT, so this bug's summary isn't really accurate anymore, I think.
+
+AboutHomeUtils still doesn't use the asynchronous initialization API, but it's not alone in that regard :/
+Created attachment 686939
+fix AboutHomeUtils
+
+This adjusts AboutHomeUtils such that it uses the async initialization API. This requires a change from a AboutHomeUtils.defaultSearchEngine getter to a AboutHomeUtils.getSearchEngineInfo(callback) method.
+
+Seems like we have no tests for this module or functionality?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #26)
+> Seems like we have no tests for this module or functionality?
+
+we have http://mxr.mozilla.org/mozilla-central/source/browser/base/content/test/browser_aboutHome.js test that is ready to gain more tests, but doesn't have deep testing of search engine stuff, it just has some basic checks.
+We may even add an xpcshell test specific for the module to the modules/test/unit/ folder I just added in bug 791447
+Comment on attachment 686939
+fix AboutHomeUtils
+
+Review of attachment 686939:
+-----------------------------------------------------------------
+
+The approach looks good to me, should just work out of the box.
+
+A minimal test added to browser_aboutHome.js to actually check this method returns something meaningful should be easy to add.
+
+::: browser/base/content/browser.js
+@@ +2506,5 @@
+>  
+>      // Inject search engine and snippets URL.
+>      let docElt = document.documentElement;
+>      docElt.setAttribute("snippetsURL", AboutHomeUtils.snippetsURL);
+> +    AboutHomeUtils.getSearchEngineInfo(function (info) {
+
+nit: aInfo
+
+@@ +2512,5 @@
+> +        return;
+> +      docElt.setAttribute("searchEngineName",
+> +                          info.name);
+> +      docElt.setAttribute("searchEngineURL",
+> +                          info.searchURL);
+
+nit: these could probably be onelined now
+
+::: browser/modules/AboutHomeUtils.jsm
+@@ +18,5 @@
+> +this.AboutHomeUtils = {
+> +  /**
+> +   * Returns an object containing the name and searchURL of the original default
+> +   * search engine.
+> +   */
+
+real javadoc would be appreciated
+/**
+ * Get information about the original default search engine.
+ *
+ * @param aCallback
+ *        Invoked once information is available, gets an object
+ *        containing name and searchURL for the engine, or null
+ *        in case of failure.
+ */
+
+@@ +19,5 @@
+> +  /**
+> +   * Returns an object containing the name and searchURL of the original default
+> +   * search engine.
+> +   */
+> +  getSearchEngineInfo: function (callback) {
+
+nit: aCallback
+
+do we still require to name each method? (I seem to remember some recent change to js regarding this) If so should likely be AHU_getSearchEngineInfo
+
+@@ +21,5 @@
+> +   * search engine.
+> +   */
+> +  getSearchEngineInfo: function (callback) {
+> +    if (!callback)
+> +      return;
+
+this should throw new Error(), there's no valid reason to invoke the method without a callback
+Releasing the bug since I'm not writing the patches.
+Created attachment 725587
+fix AboutHomeUtils
+
+This addresses the previous comments. I think we're already good on test coverage. browser_aboutHome already relies on searchEngineURL being set for tests to pass (via promiseBrowserAttributes), which covers testing that getSearchEngineInfo works. That also covers someone potentially changing the default engine to use POST in the future, since callback will return null and we won't set those attributes (and the reportError will indicate the problem in the log).
+Comment on attachment 725587
+fix AboutHomeUtils
+
+Review of attachment 725587:
+-----------------------------------------------------------------
+
+::: browser/modules/AboutHomeUtils.jsm
+@@ +19,5 @@
+> +  get snippetsVersion() STARTPAGE_VERSION,
+> +
+> +  /**
+> +   * Get information about the original default search engine.
+> +   * 
+
+nit: trailing space
+
+@@ +46,5 @@
+> +
+> +      callback({
+> +        name: defaultEngine.name,
+> +        searchURL: submission.uri.spec
+> +      });
+
+a difference compared to the previous behavior is that before the information was stored in lazy getters, that means it was collected only once a session.
+This new versions recollects the search engine info everytime about:home is visited. I wonder if it wouldn't be better to keep the lazy behavior storing a _searchEngineInfo cache, considered it's unlikely we care to support dynamic updating of them in the same session.
+Comment on attachment 725587
+fix AboutHomeUtils
+
+Clearing for tracking purpose, please reflag when answering my questions
+(In reply to Marco Bonardo [:mak] from comment #32)
+> I wonder if it wouldn't be better to keep the lazy behavior storing
+> a _searchEngineInfo cache, considered it's unlikely we care to support
+> dynamic updating of them in the same session.
+
+We may be doing exactly that as a result of bug 738818, actually, so I think I want to leave this as-is.
+Comment on attachment 725587
+fix AboutHomeUtils
+
+(fixed the trailing whitespace locally)
+Actually this patch directly conflicts with the latest one in bug 738818, I see now. It probably makes more sense to just fix this there, then (though it would be nice to split out the about:home changes into their own patch).
+Comment on attachment 725587
+fix AboutHomeUtils
+
+Review of attachment 725587:
+-----------------------------------------------------------------
+
+Fine, if you want to move the patch there, or just keep it here, I don't care.
+I only care there will be a layer of caching so that we won't have to cycle through a bunch of code in the search service everytime about:home is loaded.
+(In reply to Marco Bonardo [:mak] (Away Mar 27 - Apr 2) from comment #37)
+> I only care there will be a layer of caching so that we won't have to cycle
+> through a bunch of code in the search service everytime about:home is loaded.
+
+Since the current approach for bug 738818 means that there will potentially be a different search engine selected after every load, we can't cache this value. In fact we need to go further and add a listener to handle change in the engine while about:home is open. Getting the search information is pretty cheap, though, so I don't see this as a problem.
+Re-basing this on top of bug 738818 and bug 860119.
+Created attachment 763670
+patch
+Comment on attachment 763670
+patch
+
+I should probably get a re-review on this given the changes.
+Comment on attachment 763670
+patch
+
+Review of attachment 763670:
+-----------------------------------------------------------------
+
+LGTM! Sorry for the late review, I couldn't get to it before I went on holiday :(
+
+I hope you don't mind.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f900daf35771
+Backed out for suspicion of causing OSX mochitest-1 leaks.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/ed0f9a85b697
+
+https://tbpl.mozilla.org/php/getParsedLog.php?id=25083623&tree=Mozilla-Inbound
+https://tbpl.mozilla.org/php/getParsedLog.php?id=25079125&tree=Mozilla-Inbound
+something is wrong here, though the code using Storage is hit only on migration.
+First there is bug 887868, we use the wrong statement type.
+Second we do
+ statement.executeAsync({
+...
+       handleCompletion: function handleCompletion(aReason) {
+         statement.finalize();
+when instead we should do
+ createAsyncStatement();
+ try { 
+   executeAsync()
+ }
+ finally {
+   statement.finalize(); // (yes, finalize just after execute, this is correct!)
+   db.asyncClose();
+ }
+
+That said, I don't know if this will help with the leak.
+The only difference I see is, apart from the async code path, is that `Object.freeze()` is not used for the returned object. I do not think that that would have any impact, just sayin'...
+Similar-looking Windows leak:
+https://tbpl.mozilla.org/php/getParsedLog.php?id=25089450&tree=Mozilla-Inbound
+(In reply to Ryan VanderMeulen [:RyanVM UTC-4] from comment #44)
+> Backed out for suspicion of causing OSX mochitest-1 leaks.
+> https://hg.mozilla.org/integration/mozilla-inbound/rev/ed0f9a85b697
+
+Looks like this backout did resolve the intermittent leaks we were seeing.
+The leak might be related to the fact that AboutHomeUtils now (temporarily) keeps a reference to the initialization callback, and thus the browser chrome window. There might be some weird references between AboutHomeUtils/browser.js/search service that didn't previously exist.
+*** Bug 988017 has been marked as a duplicate of this bug. ***
+This was bit-rotted by bug 899222, but the same issue still exists in AboutHome.jsm. Patch should be even simpler than what I had.
+Created attachment 8400107
+Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization, v1
+
+Patch unbitrotted.
+Comment on attachment 8400107
+Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization, v1
+
+A Task might clean up some of this logic, but this looks fine.
+https://tbpl.mozilla.org/?tree=Try&rev=4d946dfa5c2a
+Created attachment 8405394
+Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization, v2
+
+One test was intermittently failing since it was dependent on the order of execution of the handlers of AboutHomeSearchEvent.
+
+The current change forces AboutHomeSearchEvent to be fired only after the search service has been initialized.
+
+https://tbpl.mozilla.org/?tree=Try&rev=15d131a392ee
+"AboutHomeSearchEvent1" is a horribly confusing name :)
+
+The event names are too confusing here, let's clarify how this stuff works.
+
+- aboutHome.js sends AboutHomeSearchEvent when a search is triggered by the user.
+- content.js listens for AboutHomeSearchEvent, and in turn fires AboutHome:Search
+- AboutHome.jsm listens for AboutHome:Search, and triggers & records the search.
+
+browser_aboutHome listens for AboutHomeSearchEvent, and then uses an executeSoon to ensure that it runs after the chrome code that records the search. That seems already broken, since I don't think anything guarantees AboutHome:Search is processed before that executeSoon fires. This might explain why this test is flakier since bug 899222 (though I don't see any orange bugs about it).
+
+The original patch makes AboutHome.jsm wait for search engine initialization before triggering the search (essentially delaying by another spin of the event loop), further ensuring that the executeSoon isn't sufficient.
+
+Your latest patch fixes this by introducing another message (confusingly called AboutHomeSearchEvent, with the original AboutHomeSearchEvent renamed to AboutHomeSearchEvent1) that goes from AboutHome.jsm back up to aboutHome.js once the recording is complete, and makes the test use that to determine when to check the search counts.
+
+I think the problem with that is that AboutHomeSearchEvent in your patch can end up being fired against the search provider's content document (the search page load races with the message processing, the AboutHome:SearchComplete handler in content.js just uses the currently loaded document). That's not good.
+
+It sounds like we want a test-specific solution here somehow. The name of the event fired by aboutHome.jsm when everything is done should be very descriptive (e.g. "AboutHomeSearchTriggered") and should not be fired against the content document. A message manager message from AboutHome.jsm to the appropriate message manager is probably sufficient, and the test can just register a listener for that rather than registering a DOM event listener on the content document.
+Felipe, could you point me out to the best way to register a message listener within a mochitest? If I register a message listener through the global message manager within the mochitest (browser_aboutHome.js), and I send a message from AboutHome.jsm to browser_aboutHome.js either with sendAsyncMessage or broadcastAsyncMessage, the registered message listener is not called.
+Roberto, your global listener won't get that message because it's going in the other direction: the global listener will get all messages coming from the content to the parent process, but what you need is a listener on the content side to see the message sent from the parent.
+
+To do that, you need to load some extra code (in a frame script) which will then add a listener for your message. An example is here: http://mxr.mozilla.org/mozilla-central/source/browser/base/content/test/social/browser_social_workercrash.js#54
+
+be sure to use false as the second param so that this script is only loaded for the tab of your test, and not all later tabs.
+
+If the code is small enough that you don't want to create a separate file for it (although that's not a prob), you can use a "data:text/javascript," URL.
+Created attachment 8408190
+Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization, v3
+Comment on attachment 8408190
+Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization, v3
+
+Review of attachment 8408190:
+-----------------------------------------------------------------
+
+::: browser/modules/AboutHome.jsm
+@@ +197,5 @@
+> +          let submission = engine.getSubmission(data.searchTerms, null, "homepage");
+> +          window.loadURI(submission.uri.spec, null, submission.postData);
+> +
+> +          // Used for testing
+> +          let browser = aMessage.target.getTabBrowser();
+
+aMessage.target is already the <browser>, so you don't need to go to tabbrowser and back to it. All you need is:
+
+let mm = aMessage.target.messageManager;
+Created attachment 8412564
+Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization, v4
+Comment on attachment 8412564
+Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization, v4
+
+Please rename "browser_aboutHome_helper.js" to just "aboutHome_content_script.js" or somesuch. The "browser_" prefix indicates "this is a browser chrome test file", and that file isn't.
+
+The DOM event dance that the content script does is unnecessary, and not e10s friendly (since the test's event listener lives in the parent process). A better approach is to just send another message back across the message manager.
+
+I'll attach an interdiff that addresses these comments, and request feedback.
+Created attachment 8412853
+additional diff on top of v4 with suggested changes
+
+(This test is already e10s-unfriendly for a lot of other reasons, FWIW, but not going to touch that here.)
+
+This applies on top of the v4 patch.
+Created attachment 8412856
+patch v5
+Comment on attachment 8412853
+additional diff on top of v4 with suggested changes
+
+Looks good. https://tbpl.mozilla.org/?tree=Try&rev=a3c7624c81e3
+https://hg.mozilla.org/integration/fx-team/rev/948ac73a8cc0
+backed out for test failures like https://tbpl.mozilla.org/php/getParsedLog.php?id=38709534&tree=Fx-Team
+This is likely to have actually been bug 1003109. Jobs are still pending/running, but as long as there are no failures here:
+https://tbpl.mozilla.org/?tree=Fx-Team&rev=77abda00ae6e
+
+That were actually fixed by the backout here:
+https://tbpl.mozilla.org/?tree=Fx-Team&rev=7de28e99eb68
+
+Then this patch can reland.
+To clarify:
+
+s/That were actually fixed by the backout here/That are now showing as green on the following try link/
+Ed, I don't see the same failures in my fresh try build: https://tbpl.mozilla.org/?tree=Try&rev=60e8f680aa93.
+Yeah looking like comment 68 was correct; I've relanded :-)
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/45cde2fa5cb2
+https://hg.mozilla.org/mozilla-central/rev/45cde2fa5cb2
+
+
+"Search service falling back to synchronous initialization" when about:home is loaded before the search bar initialization
+
+
+
+Bug 785487 - Clarifying nsSearchService incorrect initialization error message. r=gavin 
+
+Bug 785487: have AboutHomeUtils use the asynchronous search API, r=mikedeboer 
+
+Backed out changeset f900daf35771 (bug 785487) for suspicion of causing OSX mochitest-1 leaks. 
+
+Bug 785487 - Have AboutHomeUtils use the asynchronous search service initialization API and adjust browser_aboutHome.js accordingly. r=felipe, r=gavin 
+
+Backed out changeset 948ac73a8cc0 (bug 785487) for test failures on a CLOSED TREE 
+
+Bug 785487 - Have AboutHomeUtils use the asynchronous search service initialization API and adjust browser_aboutHome.js accordingly. r=felipe, r=gavin 

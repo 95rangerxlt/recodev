@@ -1,0 +1,234 @@
+This is a follow up for bug 977443
+
+ActorRegistryActor actor that is used to register new actors needs to support multiprocess browser.
+
+Honza
+
+This is a follow up for bug 977443
+
+ActorRegistryActor actor that is used to register new actors needs to support multiprocess browser.
+
+Honza
+Created attachment 8532698
+bug1107888-1.patch
+
+Patch attached.
+
+- just one child process supported
+- we might want to support more child processes in a followup
+
+Honza
+Comment on attachment 8532698
+bug1107888-1.patch
+
+Review of attachment 8532698:
+-----------------------------------------------------------------
+
+I would like to prevent adding actor-specific code within child.js, see my comment about that.
+And hopefully you don't need to register the actor in addChildActors!
+
+::: toolkit/devtools/server/actors/actor-registry.js
+@@ +14,2 @@
+>  const { XPCOMUtils } = require("resource://gre/modules/XPCOMUtils.jsm");
+>  XPCOMUtils.defineLazyModuleGetter(this, "NetUtil", "resource://gre/modules/NetUtil.jsm");
+
+I missed that during the previous review but using require() for a JSM, this is weird!
+You don't need XPCOMUtils, you can do: loader.lazyImporter(this, "NetUtil", "resource://gre/modules/NetUtil.jsm");
+
+@@ +15,5 @@
+>  XPCOMUtils.defineLazyModuleGetter(this, "NetUtil", "resource://gre/modules/NetUtil.jsm");
+>  
+> +const { devtools } = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+> +const { registerActor, unregisterActor, registerActorInChild, unregisterActorInChild} =
+> +  devtools.require("devtools/server/actors/utils/actor-registry-utils");
+
+You don't need to import `devtools`, you already have access to require in this module.
+
+::: toolkit/devtools/server/actors/utils/actor-registry-utils.js
+@@ +8,5 @@
+> +
+> +let { Cu, CC, Ci, Cc } = require("chrome");
+> +
+> +const { XPCOMUtils } = require("resource://gre/modules/XPCOMUtils.jsm");
+> +XPCOMUtils.defineLazyModuleGetter(this, "DebuggerServer", "resource://gre/modules/devtools/dbg-server.jsm");
+
+Same comment here, you don't need XPCOMUtils and also, the best way to retrieve DebuggerServer from actors is:
+  const { DebuggerServer } = require("devtools/server/main");
+
+::: toolkit/devtools/server/child.js
+@@ +61,5 @@
+> +    unregisterActor(msg.data.options);
+> +  });
+> +
+> +  addMessageListener("debug:register-actor-in-child", onRegisterActorInChild);
+> +  addMessageListener("debug:unregister-actor-in-child", onUnregisterActorInChild);
+
+I wish there wouldn't be any actor-actor specifics in child.js but only generic things.
+We talked about having something similar to what rpl did but the otherway around: DebuggerServer.setupInChilds().
+Otherwise actors are going to pile up random stuff here :s
+
+// Here I just took setupParent from rpl and tuned it a bit
+let onSetupInChild = DevToolsUtils.makeInfallible(msg => {
+  let { module, setupChild } = msg.json;
+  let m, fn;
+
+  try {
+    m = require(module);
+
+    if (!setupChild in m) {
+      dumpn("ERROR: module '" + module + "' does not export '" + setupChild + "'");
+      return false;
+     }
+
+      m[setupChild].apply(m, msg.args);
+
+      return true;
+    } catch(e) {
+      let error_msg = "exception during actor module setup running in the child process: ";
+      DevToolsUtils.reportException(error_msg + e);
+      dumpn("ERROR: " + error_msg + " \n\t module: '" + module + "' \n\t setupChild: '" + setupChild + "'\n" +
+            DevToolsUtils.safeErrorString(e));
+      return false;
+    }
+});
+addMessageListener("debug:setup-in-child", onSetupInChild);
+
+And in toolkit/devtools/server/main.js, you could add such helper method:
+
+const globalmm = Cc["@mozilla.org/globalmessagemanager;1"].
+getService(Ci.nsIMessageListenerManager);
+DebuggerServer.setupInChild = (args) => {
+  globalmm.broadcastAsyncMessage("debug:setup-in-child", args);
+};
+
+And from actor-utils, you would call:
+  DebuggerServer.setupInChild({
+    module: "devtools/server/actors/utils/actor-actor-utils",
+    setupInChild: "registerActor",
+    args: [sourceText, fileName, options]
+  });
+
+You might even be able to get rid of actor-actor-utils by calling setupInChild only if (!DebuggerServer.isInChildProcess) {}.
+
+::: toolkit/devtools/server/main.js
+@@ +413,5 @@
+> +        prefix: "actorRegistry",
+> +        constructor: "ActorRegistryActor",
+> +        type: { global: true }
+> +      });
+> +    }
+
+Why are you registering it in child? you shouldn't need it
+and for security reason you don't want to load it if restrictPrivileges is true!
+
+@@ +765,4 @@
+>        let { NetworkMonitorManager } = require("devtools/toolkit/webconsole/network-monitor");
+>        netMonitor = new NetworkMonitorManager(aFrame, actor.actor);
+>  
+> +      events.emit(DebuggerServer, "debug:new-child-process", { mm: mm });
+
+You don't need to prefix with `debug:` for internal events.
+Created attachment 8534949
+bug1107888-2.patch
+
+All fixed, thanks for the review!
+
+Couple of comments:
+
+> You might even be able to get rid of actor-actor-utils by calling
+> setupInChild only if (!DebuggerServer.isInChildProcess) {}.
+I simplified the module, but I kept it, so setupInChild can point to a simple module with helper setup method.
+
+
+>> + events.emit(DebuggerServer, "debug:new-child-process", { mm: mm });
+> You don't need to prefix with `debug:` for internal events.
+I was thinking about extensions here so, that event doesn't have to be just internal thing.
+
+Honza
+Comment on attachment 8534949
+bug1107888-2.patch
+
+Review of attachment 8534949:
+-----------------------------------------------------------------
+
+(In reply to Jan Honza Odvarko [:Honza] from comment #3)
+> Created attachment 8534949
+> 
+> >> + events.emit(DebuggerServer, "debug:new-child-process", { mm: mm });
+> > You don't need to prefix with `debug:` for internal events.
+> I was thinking about extensions here so, that event doesn't have to be just
+> internal thing.
+
+But here this event is dispatched on DebuggerServer, it's not a global observer service notification.
+In order to listen to it, you will have to do: event.on(DebuggerServer, "debug:new-child-process");
+`debug:` is redundant.
+
+
+Otherwise it looks good now, here is a try run:
+  https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=41eb4a33fb44
+
+::: toolkit/devtools/server/child.js
+@@ +14,5 @@
+>    let Cu = Components.utils;
+>    let { devtools } = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+>    const DevToolsUtils = devtools.require("devtools/toolkit/DevToolsUtils.js");
+> +  const { DebuggerServer, ActorPool } = Cu.import("resource://gre/modules/devtools/dbg-server.jsm", {});
+> +  const { dumpn } = DevToolsUtils;
+
+Could you move this line one line up?
+  const DevToolsUtils = devtools.require("devtools/toolkit/DevToolsUtils.js");
+  const { dumpn } = DevToolsUtils;
+Created attachment 8534989
+bug1107888-3.patch
+
+New patch attached.
+
+> In order to listen to it, you will have to do: event.on(DebuggerServer,
+> "debug:new-child-process"); `debug:` is redundant.
+Good point, done.
+
+> Could you move this line one line up?
+Done
+
+Honza
+One more question (we might want to have another report for it)
+
+If an extension wants to use DebuggerServer.setupInChild/Parent, what module URL should be specified? (internaly devtools.require is used). Shouldn't we allow to pass custom loader into the methods?
+
+Honza
+hum unfortunately it is going to be hard as you won't be able to pass a load instance cross processes.
+Also addons should only be using actors setupInParent/Child should be kept as an internal API.
+Addon modules won't even be available on remote targets... (like phones)
+(In reply to Alexandre Poirot [:ochameau] from comment #4)
+> Otherwise it looks good now, here is a try run:
+>   https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=41eb4a33fb44
+I am seeing one failure related to Gaia integration, is that a random thing?
+
+
+(In reply to Alexandre Poirot [:ochameau] from comment #7)
+> addons should only be using actors setupInParent/Child should be kept
+> as an internal API.
+True
+
+Honza
+(In reply to Jan Honza Odvarko [:Honza] from comment #8)
+> (In reply to Alexandre Poirot [:ochameau] from comment #4)
+> > Otherwise it looks good now, here is a try run:
+> >   https://treeherder.mozilla.org/ui/#/jobs?repo=try&revision=41eb4a33fb44
+> I am seeing one failure related to Gaia integration, is that a random thing?
+
+Yes, you should be able to checkin your patch.
+Created attachment 8544648
+bug1107888-4.patch
+
+Patch rebase
+Honza
+https://hg.mozilla.org/integration/fx-team/rev/11b650affda0
+https://hg.mozilla.org/mozilla-central/rev/11b650affda0
+
+
+e10s support for dynamic actor registration
+
+
+
+Bug 1107888 - e10s support for dynamic actor registration. r=ochameau 

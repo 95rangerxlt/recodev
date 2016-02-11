@@ -1,0 +1,150 @@
+The `Output()` function in nsBrowserApp.cpp [1] attempts to call `NS_ConvertUTF8toUTF16` which fails if XPCOM has not been initialized.  `Output()` is called in 2 locations without XPCOM loaded: [2] and [3].  Since these are both error conditions, it is unlikely that this will affect users, but it is definitely a bug as the intended error dialogs will never be displayed.
+
+[1] https://mxr.mozilla.org/mozilla-central/source/browser/app/nsBrowserApp.cpp?rev=a15d75939cd5#40
+[2] https://mxr.mozilla.org/mozilla-central/source/browser/app/nsBrowserApp.cpp?rev=a15d75939cd5#200
+[3] https://mxr.mozilla.org/mozilla-central/source/browser/app/nsBrowserApp.cpp?rev=a15d75939cd5#200
+
+The `Output()` function in nsBrowserApp.cpp [1] attempts to call `NS_ConvertUTF8toUTF16` which fails if XPCOM has not been initialized.  `Output()` is called in 2 locations without XPCOM loaded: [2] and [3].  Since these are both error conditions, it is unlikely that this will affect users, but it is definitely a bug as the intended error dialogs will never be displayed.
+
+[1] https://mxr.mozilla.org/mozilla-central/source/browser/app/nsBrowserApp.cpp?rev=a15d75939cd5#40
+[2] https://mxr.mozilla.org/mozilla-central/source/browser/app/nsBrowserApp.cpp?rev=a15d75939cd5#200
+[3] https://mxr.mozilla.org/mozilla-central/source/browser/app/nsBrowserApp.cpp?rev=a15d75939cd5#200
+Created attachment 634757
+Patch v1 - Use MultiByteToWideChar instead of NS_ConvertUTF8toUTF16 (which can't be called before XPCOM is loaded), generate the output message before converting it (so all parts of it get converted).
+
+Initial (untested) patch.  I'm working on this in the elm branch and will be landing there since this is affecting work on Win8/Metro and likely isn't affecting m-c development.
+Created attachment 637272
+Patch v2 - Fix whitespace.
+Comment on attachment 637272
+Patch v2 - Fix whitespace.
+
+Review of attachment 637272:
+-----------------------------------------------------------------
+
+::: browser/app/nsBrowserApp.cpp
+@@ +46,5 @@
+> +  char msg[2048];
+> +  vsnprintf(msg, sizeof(msg), fmt, ap);
+> +
+> +  wchar_t wide_msg[2048];
+> +  MultiByteToWideChar(CP_UTF8,
+
+I don't think you need this conversion, just call MessageBoxA() instead.
+(In reply to Jim Mathies [:jimm] from comment #3)
+> Comment on attachment 637272
+> Patch v2 - Fix whitespace.
+> 
+> Review of attachment 637272:
+> -----------------------------------------------------------------
+> 
+> ::: browser/app/nsBrowserApp.cpp
+> @@ +46,5 @@
+> > +  char msg[2048];
+> > +  vsnprintf(msg, sizeof(msg), fmt, ap);
+> > +
+> > +  wchar_t wide_msg[2048];
+> > +  MultiByteToWideChar(CP_UTF8,
+> 
+> I don't think you need this conversion, just call MessageBoxA() instead.
+
+Some of the strings passed to `Output()` can contain UTF8 because they include paths or command-line args (which were converted to UTF8 as part of our `wmain` [1]).  For those strings to display correctly, I believe we need to convert to `wchar_t` and use `MessageBoxW`
+
+[1] https://mxr.mozilla.org/mozilla-central/source/toolkit/xre/nsWindowsWMain.cpp?rev=e5ee585148d5#73
+Comment on attachment 637272
+Patch v2 - Fix whitespace.
+
+Review of attachment 637272:
+-----------------------------------------------------------------
+
+::: browser/app/nsBrowserApp.cpp
+@@ +43,5 @@
+>    va_start(ap, fmt);
+>  
+>  #if defined(XP_WIN) && !MOZ_WINCONSOLE
+> +  char msg[2048];
+> +  vsnprintf(msg, sizeof(msg), fmt, ap);
+
+I know this is just a debug routine but we should still be safe here. vsnprintf won't write a terminating null character if the output is larger than sizeof(msg). So let's manually add a null char after the call at the end of the buffer.
+Created attachment 642135
+Patch v3
+
+This patch addresses the issue jimm mentioned in the review comments.  It also fixes an issue where, if `MOZ_WINCONSOLE` is defined and true, we would have called `vfprintf` on a UTF-8 encoded string.
+
+It turns out that this `Output` function is implemented in 6 different places:
+  https://mxr.mozilla.org/mozilla-central/source/xulrunner/stub/nsXULStub.cpp?rev=a15d75939cd5#51
+  https://mxr.mozilla.org/mozilla-central/source/b2g/app/nsBrowserApp.cpp?rev=a15d75939cd5#36
+  https://mxr.mozilla.org/mozilla-central/source/browser/app/nsBrowserApp.cpp?rev=601e2a3564ac#41
+  https://mxr.mozilla.org/mozilla-central/source/mobile/xul/app/nsBrowserApp.cpp?rev=a15d75939cd5#43
+  https://mxr.mozilla.org/mozilla-central/source/toolkit/xre/nsAppRunner.cpp#342
+  https://mxr.mozilla.org/mozilla-central/source/xulrunner/app/nsXULRunnerApp.cpp?rev=3f408698a03f#38
+
+I'll file a follow-up bug to consolidate this logic (and fix the issues that are present in the other implementations).
+
+I've filed bug 773865 about the fact that the `MOZ_WINCONSOLE` branch will never be built.
+This has run through tryserver:
+  https://tbpl.mozilla.org/?tree=Try&rev=835bf60b8dd6
+I needed to run the patch in bug 773865 through try, so this one is actually running through try again:
+  https://tbpl.mozilla.org/?tree=Try&rev=25459b473e77
+https://hg.mozilla.org/integration/mozilla-inbound/rev/f72108b85036
+(In reply to Tim Abraldes (:timA) (:tabraldes) from comment #6)
+> I'll file a follow-up bug to consolidate this logic (and fix the issues that
+> are present in the other implementations).
+
+Could you cc me on this bug if/when it gets filed?
+https://hg.mozilla.org/mozilla-central/rev/f72108b85036
+(In reply to Jim Mathies [:jimm] from comment #10)
+> (In reply to Tim Abraldes (:timA) (:tabraldes) from comment #6)
+> > I'll file a follow-up bug to consolidate this logic (and fix the issues that
+> > are present in the other implementations).
+> 
+> Could you cc me on this bug if/when it gets filed?
+
+Filed bug 777974
+Comment on attachment 642135
+Patch v3
+
+>+#ifndef XP_WIN
+>+  vfprintf(stderr, fmt, ap);
+> #else
+>-  vfprintf(stderr, fmt, ap);
+[This is what happens when you switch the if and else clauses...]
+
+>-  MessageBoxW(NULL, msg, L"XULRunner", MB_OK | MB_ICONERROR);
+>+  MessageBoxW(NULL, wide_msg, L"Firefox", MB_OK
+[Is this change correct? Most of the time Output is invoked by the -app switch to emulate XULRunner.]
+(In reply to neil@parkwaycc.co.uk from comment #13)
+> Comment on attachment 642135
+> Patch v3
+> 
+> >+#ifndef XP_WIN
+> >+  vfprintf(stderr, fmt, ap);
+> > #else
+> >-  vfprintf(stderr, fmt, ap);
+> [This is what happens when you switch the if and else clauses...]
+> 
+> >-  MessageBoxW(NULL, msg, L"XULRunner", MB_OK | MB_ICONERROR);
+> >+  MessageBoxW(NULL, wide_msg, L"Firefox", MB_OK
+> [Is this change correct? Most of the time Output is invoked by the -app
+> switch to emulate XULRunner.]
+
+Seems like it's not correct, but I don't think showing "XULRunner" in every case is correct either.  Users who don't know what XULRunner is would be confused by an error dialog that mentions it.  In bug 777974 I'm including an "app name" parameter in the `Output` function; we can pass "XULRunner" when "-app" is present on the command line and "Firefox" otherwise.
+(In reply to Tim Abraldes from comment #14)
+> (In reply to from comment #13)
+> > (From update of attachment 642135)
+> > >-  MessageBoxW(NULL, msg, L"XULRunner", MB_OK | MB_ICONERROR);
+> > >+  MessageBoxW(NULL, wide_msg, L"Firefox", MB_OK
+> > [Is this change correct? Most of the time Output is invoked by the -app
+> > switch to emulate XULRunner.]
+> Seems like it's not correct, but I don't think showing "XULRunner" in every
+> case is correct either.  Users who don't know what XULRunner is would be
+> confused by an error dialog that mentions it.  In bug 777974 I'm including
+> an "app name" parameter in the `Output` function; we can pass "XULRunner"
+> when "-app" is present on the command line and "Firefox" otherwise.
+Or read the app name from application.ini and use XULRunner as a fallback?
+
+
+Clean up `Output()` function in nsBrowserApp.cpp on Windows
+
+
+
+bug 762310. Use MultiByteToWideChar instead of NS_ConvertUTF8toUTF16 (which can't be called before XPCOM is loaded), generate the output message before converting it (so all parts of it get converted). r=jimm 

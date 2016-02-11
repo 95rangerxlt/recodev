@@ -1,0 +1,269 @@
+If a tab is closed with the Console still open, leaks occur:
+
+ => mAllocCount:          30241
+ => mReallocCount:         3583
+ => mFreeCount:           24761  --  LEAKED 5480 !!!
+ => mShareCount:          33677
+ => mAdoptCount:           2553
+ => mAdoptFreeCount:       2551  --  LEAKED 2 !!!
+
+If a tab is closed with the Console still open, leaks occur:
+
+ => mAllocCount:          30241
+ => mReallocCount:         3583
+ => mFreeCount:           24761  --  LEAKED 5480 !!!
+ => mShareCount:          33677
+ => mAdoptCount:           2553
+ => mAdoptFreeCount:       2551  --  LEAKED 2 !!!
+do you have a test for this?
+
+The answer, if the patch on bug 574127 does not fix this is somewhere in here:
+
+  /**
+   * When a display is being destroyed, unregister it first
+   *
+   * @param string aId
+   * @returns void
+   */
+  unregisterDisplay: function HS_unregisterDisplay(aId)
+  {
+    // Remove children from the output. If the output is not cleared, there can
+    // be leaks as some nodes has node.onclick = function; set and GC can't
+    // remove the nodes then.
+    HUDService.clearDisplay(aId);
+
+    // remove HUD DOM node and
+    // remove display references from local registries get the outputNode
+    var outputNode = this.mixins.getOutputNodeById(aId);
+    var parent = outputNode.parentNode;
+    var splitters = parent.querySelectorAll("splitter");
+    var len = splitters.length;
+    for (var i = 0; i < len; i++) {
+      if (splitters[i].getAttribute("class") == "hud-splitter") {
+        splitters[i].parentNode.removeChild(splitters[i]);
+        break;
+      }
+    }
+    // remove the DOM Nodes
+    parent.removeChild(outputNode);
+    // remove our record of the DOM Nodes from the registry
+    delete this._headsUpDisplays[aId];
+    // remove the HeadsUpDisplay object from memory
+    this.deleteHeadsUpDisplay(aId);
+    // remove the related storage object
+    this.storage.removeDisplay(aId);
+    // remove the related window objects
+    delete this.windowRegistry[aId];
+
+    let displays = this.displays();
+
+    var uri  = this.displayRegistry[aId];
+    var specHudArr = this.uriRegistry[uri];
+
+    for (var i = 0; i < specHudArr.length; i++) {
+      if (specHudArr[i] == aId) {
+        specHudArr.splice(i, 1);
+      }
+    }
+    delete displays[aId];
+    delete this.displayRegistry[aId];
+  },
+Even with the patch in bug 574127, you can leak by opening a tab, navigating to google.com, opening the console, reloading, closing the tab, and then closing Firefox. The problem is that the "this" parameter in HUD_SERVICE.onTabClose() is getting set to the global object whenever the event listener is called.
+(In reply to comment #1)
+> do you have a test for this?
+> 
+> The answer, if the patch on bug 574127 does not fix this is somewhere in here:
+> 
+>   /**
+>    * When a display is being destroyed, unregister it first
+>    *
+>    * @param string aId
+>    * @returns void
+>    */
+>   unregisterDisplay: function HS_unregisterDisplay(aId)
+
+As this is called on each tabClose, and on shutdown for each open console as each tab is closed
+(In reply to comment #2)
+> Even with the patch in bug 574127, you can leak by opening a tab, navigating to
+> google.com, opening the console, reloading, closing the tab, and then closing
+> Firefox. The problem is that the "this" parameter in HUD_SERVICE.onTabClose()
+> is getting set to the global object whenever the event listener is called.
+
+I just did that exact test with the new patch, and there were no leaks
+(In reply to comment #3)
+> As this is called on each tabClose, and on shutdown for each open console as
+> each tab is closed
+
+That function is not called when each tab is closed, because the onTabClose() event handler cannot call it, since the "this" binding is not properly set.
+
+(In reply to comment #4)
+> I just did that exact test with the new patch, and there were no leaks
+
+So did I, and there were leaks:
+
+ => mAllocCount:          39680
+ => mReallocCount:         4137
+ => mFreeCount:           33379  --  LEAKED 6301 !!!
+ => mShareCount:          45300
+ => mAdoptCount:           3268
+ => mAdoptFreeCount:       3266  --  LEAKED 2 !!!
+Same thing happens with new windows.
+Created attachment 474311
+Proposed patch.
+
+The proposed patch fixes the leaks.
+Comment on attachment 474311
+Proposed patch.
+
+looks like this patch super cedes the patch in bug 574127
+
+I think you can use querySelector() instead of querySelectorAll("foo")[0]
+
+This is more elegant as it seems like we will not have to enumerate all windows and tabs on shutdown. 
+
+You should merge the patches, making sure we are only calling the shutdown method on "application-shutdown-granted" - then mark 574127 as a dupe.
+
+Try to get sdwilsh to review so we can land this asap.
+Created attachment 474825
+Proposed patch, version 1.1.
+
+Patch rebased to trunk and feedback addressed. Review requested.
+(In reply to comment #8)
+> You should merge the patches, making sure we are only calling the shutdown
+> method on "application-shutdown-granted" - then mark 574127 as a dupe.
+
+Do we still need to change xpcom-shutdown to application-shutdown-granted? I don't think there's any need to access the DOM anymore during the shutdown routine, since we now remove the DOM elements via the window unload events instead. Before xpcom-shutdown is fired, window unload events are dispatched for all the open browser windows.
+(In reply to comment #10)
+ 
+> Do we still need to change xpcom-shutdown to application-shutdown-granted? I
+> don't think there's any need to access the DOM anymore during the shutdown
+> routine, since we now remove the DOM elements via the window unload events
+> instead. Before xpcom-shutdown is fired, window unload events are dispatched
+> for all the open browser windows.
+
+If that is the case, perhaps we do not need a shutdown method at all? In which case we can remove all reverences to it in the observers, etc.
+(In reply to comment #11)
+> If that is the case, perhaps we do not need a shutdown method at all? In which
+> case we can remove all reverences to it in the observers, etc.
+
+I think that's probably true, once we get rid of the storage module. This snippet in the code made me not want to delete the shutdown method entirely:
+
+    // delete the storage as it holds onto channels
+    delete this.storage;
+(In reply to comment #12)
+> I think that's probably true, once we get rid of the storage module. This
+> snippet in the code made me not want to delete the shutdown method entirely:
+> 
+>     // delete the storage as it holds onto channels
+>     delete this.storage;
+
+ah yes, perhaps we need to keep it for things like that - that may creep up out of no where.
+It would be really helpful to figure out which reference is causing this leak, so that we can see if it should have been detected by the cycle collector.
+(In reply to comment #14)
+> It would be really helpful to figure out which reference is causing this leak,
+> so that we can see if it should have been detected by the cycle collector.
+
+I would imagine it's HUD_SERVICE._headsUpDisplay[id], which has a reference to a XUL DOM node. The HUD Service, as it's, well, a service, will persist until Firefox is quit.
+(In reply to comment #15)
+> (In reply to comment #14)
+> > It would be really helpful to figure out which reference is causing this leak,
+> > so that we can see if it should have been detected by the cycle collector.
+> 
+> I would imagine it's HUD_SERVICE._headsUpDisplay[id], which has a reference to
+> a XUL DOM node. The HUD Service, as it's, well, a service, will persist until
+> Firefox is quit.
+
+OK.  In that case, this doesn't have anything to do with the cycle collector!
+Comment on attachment 474825
+Proposed patch, version 1.1.
+
++++ b/toolkit/components/console/hudservice/HUDService.jsm
++  this.onTabClose = this.onTabClose.bind(this);
++  this.onWindowUnload = this.onWindowUnload.bind(this);
+Please add a comment as to why this is needed so if similar issues crop up folks will (ideally) see this and know what to do.
+
+-   * @param string aId
++   * @param {string|nsIDOMNode} aHUD Either the ID of a HUD or the DOM node
++   *        corresponding to an outer HUD box.
+the style of this file is to have the argument name, and then a newline, and then the description.  To be fair, most function documentations do not have descriptions so this may not have been obvious to you.
+
+In general (not related to this patch), it'd be greatly appreciated for the dev tools team to a bit more explicit about argument descriptions.  It may seem obvious to you when you write the code, but it isn't always for your reviewers, or someone new.
+
++  unregisterDisplay: function HS_unregisterDisplay(aHUD)
+[snip]
++    if (typeof(aHUD) === "string") {
++      id = aHUD;
++      outputNode = this.mixins.getOutputNodeById(aHUD);
++    } else {
+nit: this entire file has a newline after the closing brace before the else.  Please keep it consistent.
+
++  closeConsoleOnTab: function HS_closeConsoleOnTab(aTab)
++  {
++    let xulDocument = aTab.ownerDocument;
++    let xulWindow = xulDocument.defaultView;
++    let gBrowser = xulWindow.gBrowser;
++    let linkedBrowser = aTab.linkedBrowser;
++    let notificationBox = gBrowser.getNotificationBox(linkedBrowser);
++    let hudId = "hud_" + notificationBox.getAttribute("id");
++    dump("*** hudId: " + hudId + "\n");
++    let outputNode = xulDocument.getElementById(hudId);
++    if (outputNode != null) {
++      dump("*** unregistering display: " + outputNode + "\n");
++      this.unregisterDisplay(outputNode);
+remove these dump statements please
+
+   onTabClose: function HS_onTabClose(aEvent)
+   {
+-    var browser = aEvent.target;
+-    var tabId = gBrowser.getNotificationBox(browser).getAttribute("id");
+-    var hudId = "hud_" + tabId;
+-    this.unregisterDisplay(hudId);
++    dump("**** ONTABCLOSE\n");
+this dump statement too
+
+r=sdwilsh with these changes
+Created attachment 476455
+Proposed patch, version 1.2.
+
+> +  closeConsoleOnTab: function HS_closeConsoleOnTab(aTab)
+> +  {
+> +    let xulDocument = aTab.ownerDocument;
+> +    let xulWindow = xulDocument.defaultView;
+> +    let gBrowser = xulWindow.gBrowser;
+> +    let linkedBrowser = aTab.linkedBrowser;
+> +    let notificationBox = gBrowser.getNotificationBox(linkedBrowser);
+> +    let hudId = "hud_" + notificationBox.getAttribute("id");
+> +    dump("*** hudId: " + hudId + "\n");
+> +    let outputNode = xulDocument.getElementById(hudId);
+> +    if (outputNode != null) {
+> +      dump("*** unregistering display: " + outputNode + "\n");
+> +      this.unregisterDisplay(outputNode);
+> remove these dump statements please
+> 
+
+Sorry about those, my mistake.
+
+New patch posted addressing review comments.
+Comment on attachment 476455
+Proposed patch, version 1.2.
+
+Forgot to include the Makefile.in, rescinding patch.
+Created attachment 476456
+Proposed patch, version 1.3.
+
+New patch posted.
+http://hg.mozilla.org/mozilla-central/rev/b2cb6f8e4840
+*** Bug 574127 has been marked as a duplicate of this bug. ***
+
+
+Web Console leaks whenever a tab or window is closed with the Console still open
+
+mlk
+
+Bug 595350 - Fix leaks when closing windows or tabs with the Web Console still open. r=sdwilsh a=blocking-betaN+ 
+
+Bug 603211 - Fix test: browser_webconsole_bug_595350_multiple_windows_and_tabs.js, r+a=gavin 
+
+Bug 824016 - Intermittent devtools/webconsole/test/browser_webconsole_bug_595350_multiple_windows_and_tabs.js | Timed out while waiting for: 4 web consoles closed; r=past 
+
+Bug 908878 - Fix for intermittent browser_webconsole_bug_595350_multiple_windows_and_tabs.js | Timed out while waiting for: 4 web consoles {opened|closed}; r=me 

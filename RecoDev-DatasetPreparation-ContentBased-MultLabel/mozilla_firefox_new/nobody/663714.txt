@@ -1,0 +1,156 @@
+addSubscriber registers a callback for a given refObject and eventName. refObject is almost always the object that you're calling addSubscriber on, so it's not clear why that argument is needed. In the cases where it is different from the object you're calling addSubscriber on, it's not clear /why/ it's different. Presumably it's because you can only have one callback for a given refObject, but then refObject shouldn't exist in the first place... Why isn't this a simple eventName -> [callbacks] relation, pretty much like addEventListener / removeEventListener work?
+
+addSubscriber registers a callback for a given refObject and eventName. refObject is almost always the object that you're calling addSubscriber on, so it's not clear why that argument is needed. In the cases where it is different from the object you're calling addSubscriber on, it's not clear /why/ it's different. Presumably it's because you can only have one callback for a given refObject, but then refObject shouldn't exist in the first place... Why isn't this a simple eventName -> [callbacks] relation, pretty much like addEventListener / removeEventListener work?
+I think all these arguments are valid - I also had to get used to it when I joined the project. We shouldn't invent a new subscriber system - we should offer one similar to addEventListener() to make contributions and understanding the code somewhat easier.
+Created attachment 544664
+patch v1
+Comment on attachment 544664
+patch v1
+
+Looks good
+Comment on attachment 544664
+patch v1
+
+>     var subsCopy = this.subscribers[eventName].concat();
+>-    subsCopy.forEach(function(object) {
+>+    subsCopy.forEach(function(callback) {
+>       try {
+>-        object.callback(this, eventInfo);
+>+        callback(this, eventInfo);
+>       } catch(e) {
+>         Utils.log(e);
+>       }
+>     }, this);
+
+I think forEach already copies the array. I might be wrong.
+
+>--- a/browser/base/content/tabview/ui.js
+>+++ b/browser/base/content/tabview/ui.js
+>@@ -389,29 +389,32 @@ let UI = {
+>   // arrow keys lets you navigate between open tabs.
+>   //
+>   // Parameters:
+>   //  - Takes a <TabItem>
+>   _setActiveTab: function UI__setActiveTab(tabItem) {
+>     if (tabItem == this._activeTab)
+>       return;
+> 
+>+    let self = this;
+>+
+>+    function onActiveTabClosed(tabItem) {
+>+      if (self._activeTab == tabItem)
+>+        self._setActiveTab(null);
+>+    }
+>+
+>     if (this._activeTab) {
+>       this._activeTab.makeDeactive();
+>-      this._activeTab.removeSubscriber(this, "close");
+>+      this._activeTab.removeSubscriber("close", onActiveTabClosed);
+>     }
+>+
+>     this._activeTab = tabItem;
+> 
+>     if (this._activeTab) {
+>-      let self = this;
+>-      this._activeTab.addSubscriber(this, "close", function(closedTabItem) {
+>-        if (self._activeTab == closedTabItem)
+>-          self._setActiveTab(null);
+>-      });
+>-
+>+      this._activeTab.addSubscriber("close", onActiveTabClosed);
+>       this._activeTab.makeActive();
+>     }
+>   },
+
+removeSubscriber doesn't work here, as you're dealing with a different onActiveTabClosed instance. Maybe removeSubscriber should throw to prevent such mistakes.
+Created attachment 544787
+patch v2
+
+(In reply to comment #4)
+> I think forEach already copies the array. I might be wrong.
+
+"If existing elements of the array are changed, or deleted, their value as passed to callback will be the value at the time forEach visits them; elements that are deleted are not visited."
+
+I have some tests failing when removing the .concat() so I guess we still need this.
+
+> removeSubscriber doesn't work here, as you're dealing with a different
+> onActiveTabClosed instance.
+
+Fixed.
+
+> Maybe removeSubscriber should throw to prevent such mistakes.
+
+Done.
+Comment on attachment 544787
+patch v2
+
+>     if (shouldRemoveTabItems.length != toClose.length) {
+>       // remove children without the assiciated tab and show the group item
+>       shouldRemoveTabItems.forEach(function(child) {
+>-        self.remove(child, { dontArrange: true });
+>+        self.remove(child, {dontArrange: true, dontRemoveSubscriber: true});
+
+Why should it not be removed here?
+
+>+      if (!options && !options.dontRemoveSubscriber)
+>+        item.removeSubscriber("close", this._onChildClose);
+
+Looks like && should be ||.
+Created attachment 544817
+patch v3
+
+(In reply to comment #6)
+> >     if (shouldRemoveTabItems.length != toClose.length) {
+> >       // remove children without the assiciated tab and show the group item
+> >       shouldRemoveTabItems.forEach(function(child) {
+> >-        self.remove(child, { dontArrange: true });
+> >+        self.remove(child, {dontArrange: true, dontRemoveSubscriber: true});
+
+When calling GroupItem.destroy() it closes all children in the group. For every child it first removes the subscriber, then closes the tab and if that was successful calls groupItem.remove(child, {dontRemoveSubscriber: true}). child.removeSubscriber() would throw here because the subscriber isn't registered anymore.
+
+> Why should it not be removed here?
+> >+      if (!options && !options.dontRemoveSubscriber)
+> >+        item.removeSubscriber("close", this._onChildClose);
+> 
+> Looks like && should be ||.
+
+Oops :/
+> When calling GroupItem.destroy() it closes all children in the group. For
+> every child it first removes the subscriber, then closes the tab and if that
+> was successful [snip]
+
+Why would it not be successful?
+(In reply to comment #8)
+> > When calling GroupItem.destroy() it closes all children in the group. For
+> > every child it first removes the subscriber, then closes the tab and if that
+> > was successful [snip]
+> 
+> Why would it not be successful?
+
+Because the page could have an onbeforeunload handler registered and the user cancels the closing of that tab.
+Created attachment 545786
+patch v4
+
+When running the tests again I noticed lots of assertions fail because we seem to remove the "close" event listener from tabs in a lot more places. We would need to pass the dontRemoveSubscriber flag from destroy()->close()->removeAll()->remove() and I don't know whether that additional flag and noise in the code is really worth it.
+
+IMHO it's totally ok to not throw if you provide "invalid" arguments to .removeSubscriber() as we would behave like .removeEventListener() [1].
+
+[1] https://developer.mozilla.org/en/DOM/element.removeEventListener
+Comment on attachment 545786
+patch v4
+
+>-      item.removeSubscriber(this, "close");
+>+
+>+      if (!options || !options.dontRemoveSubscriber)
+>+        item.removeSubscriber("close", this._onChildClose);
+
+still need to revert this
+http://hg.mozilla.org/integration/fx-team/rev/6d45f8181b55
+http://hg.mozilla.org/mozilla-central/rev/6d45f8181b55
+
+
+Subscribable API doesn't seem sane
+
+
+
+Bug 663714 - Subscribable API doesn't seem sane; r=dao 

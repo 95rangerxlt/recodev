@@ -1,0 +1,271 @@
+This bug to be used to discuss and come up with changes that are required in Java model to support type annotations (JSR 308). At this point there is nothing critical or broken, but the requirement will be driven largely by the client.
+
+If needed, raise separate bugs to track individual requirements.
+
+Some of the things that may need correction are method signatures, type parameter signatures etc.
+
+This bug to be used to discuss and come up with changes that are required in Java model to support type annotations (JSR 308). At this point there is nothing critical or broken, but the requirement will be driven largely by the client.
+
+If needed, raise separate bugs to track individual requirements.
+
+Some of the things that may need correction are method signatures, type parameter signatures etc.
+From bug 403917 comment 4:
+
+> I'm not sure if it's worth adding special APIs to get the nested annotations
+> from the Java model at this point. To be useful, the API would have to work
+> for source and binary type roots, so it would probably look similar to the
+> annotation representation in the class file.
+
+The annotations cannot be embedded in a signature, so clients would need to do a lot of extra processing to read them everywhere and to insert them in the right places.
+(In reply to comment #1)
+> From bug 403917 comment 4:
+> 
+> > I'm not sure if it's worth adding special APIs to get the nested annotations
+> > from the Java model at this point. To be useful, the API would have to work
+> > for source and binary type roots, so it would probably look similar to the
+> > annotation representation in the class file.
+
+Does bug 407191 change anything?
+> Does bug 407191 change anything?
+
+Not for me.
+I came across some discrepancy when method parameter is qualified. Consider the below case where the parameter is not qualified and having an annotation:
+=> private IOException foo1(@NonNull FileNotFoundException arg)
+			throws EOFException {
+		try {
+		} catch (java.io.@NonNull IOError e) {
+		}
+		return null;
+	}
+
+The above method in JavaElement View shows SourceMethod> Parameters> LocalVariable> Annotations(1)> NonNull. 
+
+Now consider the case where the parameter is qualified with annotation as shown below:
+=> private void foo2(java.io.@NonNull FileNotFoundException arg)
+			throws EOFException {
+		try {
+		} catch (java.io.@NonNull IOError e) {
+		}
+	}
+	
+The JavaElement View shows SourceMethod> Parameters> Annotations> LocalVariable(0)> empty.
+
+When the parameter type is qualified the annotation is not loaded in to the Java model.
+(In reply to comment #4)
+The Java model (and hence the JavaElement view) currently only contain declaration (Java SE 7-style) annotations.
+
+In the qualified case, @NonNull is considered to be only a type-use annotation.
+In the unqualified case, it's both a type-use and a declaration annotation.
+
+This inconsistency is one reason why TYPE_USE annotations should not be allowed to also be declaration annotations. See http://mail.openjdk.java.net/pipermail/type-annotations-spec-observers/2013-April/000145.html and other mails with that subject. Unfortunately, it looks like the EG has not yet fully understood the problems created by this mix. ("@NonNull String[] s" is an even worse case.)
+Here's another client requesting type annotations from the Java model:
+the {Source,Binary}TypeConverters need to feed type annotations into
+the compiler AST they are creating. Otherwise, the reconciler will work
+on inconsistent / partially annotated sources, producing incorrect
+results during null analysis.
+Post ECE I'll be happy to discuss solution strategies :)
+(In reply to Stephan Herrmann from comment #6)
+
+> Post ECE I'll be happy to discuss solution strategies :)
+
+Sounds good.
+If you have an example scenario that is readily available, please attach - 
+even if not as a junit.
+
+I don't see any handling of annotations in binary type converter. So perhaps
+these were broken already with respect to SE7 annotations ?
+(In reply to Srikanth Sankaran from comment #8)
+
+> I don't see any handling of annotations in binary type converter. So perhaps
+> these were broken already with respect to SE7 annotations ?
+
+OK, I don't think BinaryTypeConverters are used in the reconciler path.
+Only completion engine and selection engine use them and annotations should
+be irrelevant for them.
+
+For STC, one short term strategy could be simply store a bit in the model
+to say type annotations are encountered/or not outside of code blocks and
+if this bit is set to simply parse the source file. We do this already if
+the number of declaration annotations is more than the hard coded number 10.
+
+See the block: 
+
+if (this.has1_5Compliance && ((CompilationUnitElementInfo) ((JavaElement) this.cu).getElementInfo()).annotationNumber > 10) {
+// ...
+}
+
+We need to understand the part about local types there.
+Created attachment 237132
+Example project
+
+Project with examples from my slides.
+
+See that the problems view only shows one warning (in ToStringInverse),
+whereas the editor for Collections.java shows three bogus warnings,
+all of which claim that we need an unchecked conversion, due to missing
+type annotations.
+(In reply to Stephan Herrmann from comment #10)
+> Created attachment 237132 [details]
+> Example project
+> 
+> Project with examples from my slides.
+> 
+> See that the problems view only shows one warning (in ToStringInverse),
+> whereas the editor for Collections.java shows three bogus warnings,
+> all of which claim that we need an unchecked conversion, due to missing
+> type annotations.
+
+In this particular case, the problem is caused by the fact that the SourceTypeConverter leaves out the (null) annotations on type parameter of super interface. I don't yet know what it takes to do this, but I believe we should at least start supporting/storing annotation on type parameters.
+
+I have tested that forcing diet parsing fixes this particular problem, but we know that we will loose out on anonymous type and all.
+
+I will spend a bit more time on the former approach and see what I can come up with.
+(In reply to Jayaprakash Arthanareeswaran from comment #11)
+> I will spend a bit more time on the former approach and see what I can come
+> up with.
+
+The approach of storing everything in string form is costing us dear here. Even if we do manage to encode the annotations in type references' signatures, decoding the type reference is not going to be easy. For e.g. the method TypeConverter#decodeType() doesn't support annotations and worse doesn't have the services of a scanner, which will make it even more complicated.
+(In reply to Jayaprakash Arthanareeswaran from comment #12)
+> (In reply to Jayaprakash Arthanareeswaran from comment #11)
+> > I will spend a bit more time on the former approach and see what I can come
+> > up with.
+> 
+> The approach of storing everything in string form is costing us dear here.
+> Even if we do manage to encode the annotations in type references'
+> signatures, decoding the type reference is not going to be easy. 
+
+That would be incorrect also as annotations are not part of the signatures.
+
+As a first cut, we can set a bit in the model that says type annotations were
+encountered outside code blocks i.e inside a method's {}' it does not matter
+and then do a full parse instead of a diet parse if local types were requested.
+Created attachment 238328
+Proposed fix
+
+Patch replaces CompilationUnitElementInfo#annotationNumber with just a boolean flag which gets set when there's at least one type annotation in the CU (outside the method body). And when this flag is set and when LOCAL_TYPE is notd requested by the clients of SourceTypeConverter, a diet parse is done. Presence of LOCAL_TYPE will do a full parse. I have verified that this addresses the problem Stephan reported and all model tests pass.
+
+I will run the full suite and also see if I can add more tests.
+Created attachment 238362
+Patch + Test
+
+Same patch with new test in NullAnnotationModelTests.
+
+Stephan, I have changed NullAnnotationModelTests to use the new annotation bundle. I verified that existing tests pass. Do you think it's alright to use the new bundle for BETA_JAVA8 ?
+Srikanth, please review.
+Here are the review comments: 
+
+1. I think the use of org.eclipse.jdt.internal.compiler.SourceElementNotifier.recordTypeAnnotations(TypeReference, TypeAnnotationInfo) is problematic. Type annotations can occur in
+different places in a type reference that catching them all here is tricky.
+
+e.g:
+
+The following test should fail. but passes instead: (a few other such
+examples could be constructed)
+
+	public void testBug405843a() throws CoreException, IOException, InterruptedException {
+		IJavaProject project = null;
+		try {
+			project = createJavaProject("Bug405843", new String[] {"src"}, new String[] {"JCL18_LIB", this.ANNOTATION_LIB}, "bin", "1.8");
+			createFolder("/Bug405843/src/p1");
+			createFile("/Bug405843/src/p1/Y.java",
+					"package p1;\n" +
+					"import org.eclipse.jdt.annotation.*;\n" +
+					"public class Y {\n" +
+					"    void foo(@NonNull String @NonNull [] array) {}\n" +
+					"}\n;");
+
+			project.setOption(JavaCore.COMPILER_ANNOTATION_NULL_ANALYSIS, JavaCore.ENABLED);
+
+			setUpWorkingCopy("/Bug405843/src/p1/X.java",
+					"package p1;\n" +
+					"public class X {\n" +
+					"	public void foo(Y y) {\n" +
+					"		y.foo(null);\n" +
+					"	}\n" +
+					"}\n");
+			assertProblems(
+					"Unexpected problems",
+					"----------\n" +
+					"----------\n"
+					);
+
+		} finally {
+			if (project != null)
+				deleteProject(project);
+		}
+	}
+
+I suggest we instead rely on TypeDeclaration, MethodDeclaration, FieldDeclaration's bits containing ASTNode.HasTypeAnnotations.
+
+2. It also seems prudent to not touch the existing behavior around
+declaration annotations (> 10). We don't know what potential performance
+trouble lurks here. Instead I suggest we use an encoding on the same
+field annotationNumber. We can turn the 10 into a symbolic constant and
+if we see a type annotation, bump up annotationNumber by that symbolic
+constant. 
+
+3. If we are going to rely on ASTNode.HasTypeAnnotations bit on type,
+field and method, then all the tunneling of TypeAnnotationInfo to
+various methods could (perhaps) be avoided.
+Created attachment 238423
+Updated patch
+
+(In reply to Srikanth Sankaran from comment #17)
+> 2. It also seems prudent to not touch the existing behavior around
+> declaration annotations (> 10). We don't know what potential performance
+> trouble lurks here. Instead I suggest we use an encoding on the same
+> field annotationNumber. We can turn the 10 into a symbolic constant and
+> if we see a type annotation, bump up annotationNumber by that symbolic
+> constant. 
+
+The updated patch does this and includes other suggestions. But there's still one scenario where we will deviate from the previous behavior. When the no of annotations are > 10 (and no type annotations) and LOCAL_TYPE is requested, we will be doing a full parse instead of reconstructing from model. If we want to keep the old behavior, we will need a separate flag instead of reusing annotationNumber.
+
+Srikanth, please let me know what you think. I also added your test in the patch.
+Thanks Jay, I made a couple of small changes:
+
+    - Renamed ANNOT_COUNT_FOR_DIET_PARSE to be ANNOTATION_THRESHOLD_FOR_DIET_PARSE
+    - Eliminated the new TypeAnnotationInfo class and pushed the sole field into
+      subtypes.
+
+and released here:  http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=9b825b2b97fc1913934f4045fd19eacdb55241ff
+
+(In reply to Jayaprakash Arthanareeswaran from comment #18)
+
+> The updated patch does this and includes other suggestions. But there's
+> still one scenario where we will deviate from the previous behavior. When
+> the no of annotations are > 10 (and no type annotations) and LOCAL_TYPE is
+> requested, we will be doing a full parse instead of reconstructing from
+> model. If we want to keep the old behavior, we will need a separate flag
+> instead of reusing annotationNumber.
+
+We will leave it like this for now and revisit if there are any issues. One way
+to handle this is to use encoding on annotationNumber. SE7 annotations count 
+could be accumulated here, while type annotation could set some high bit. But
+we can cross the bridge if/when we get to it.
+Summary for external clients (please correct me if this is wrong):
+
+The fix just added a JDT-Core-internal bit on {Type|Method|Field}Info, but no API or externally visible changes on IJavaElements.
+(In reply to Markus Keller from comment #20)
+> Summary for external clients (please correct me if this is wrong):
+> 
+> The fix just added a JDT-Core-internal bit on {Type|Method|Field}Info, but
+> no API or externally visible changes on IJavaElements.
+
+Correct. No externally visible structural changes.
+
+There is one internal behavior change - when local types are requested, STC
+would do a full parse if (a) either type annotations were seen on the contractual
+portion of the type 
+
+and/or 
+
+(b) if more than 10 annotations were seen in the file.
+
+For the latter scenario, we would reconstruct from the model earlier.If this
+manifests itself as a problem, then we could resort to the suggestion in
+comment#19 and restore old behavior for (b)
+It is not appropriate to say we support type annotations in the model since
+we don't. Changed the title to reflect that.
+
+An "optimization" we could do is to do the parse only if "someone" is "interested"
+in annotations a la the assignment to LookupEnvironment.typeSystem.

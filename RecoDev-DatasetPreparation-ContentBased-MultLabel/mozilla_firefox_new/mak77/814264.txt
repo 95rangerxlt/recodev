@@ -1,0 +1,210 @@
+See bug 795065 comment 51.
+
+See bug 795065 comment 51.
+Created attachment 684258
+patch
+Won't passing null cause an error when it eventually reaches:
+http://mxr.mozilla.org/comm-central/source/mozilla/toolkit/content/contentAreaUtils.js#339
+339     initiatingWindow  : aInitiatingDocument.defaultView
+One side I think it's bad to break compatibility. On the other side, if we keep accepting that, I fear add-ons will never handle privatebrowsing properly.
+Do we have an idea of how many add-ons are involved here?
+
+Btw, philip is right that this would fail down in contentAreaUtils, not just there but also internalPersist wants initiatingWindow to be non null and doesn't handle the other case.
+(In reply to Marco Bonardo [:mak] from comment #3)
+> One side I think it's bad to break compatibility. On the other side, if we
+> keep accepting that, I fear add-ons will never handle privatebrowsing
+> properly.
+> Do we have an idea of how many add-ons are involved here?
+
+https://mxr.mozilla.org/addons/search?string=openUILink%28&find=&findi=&filter=openUILink\%28[^%2C]%2B\%29%3B&hitlimit=&tree=addons
+
+shows 364 files affected, and that's a conservative search (I didn't spend much time trying to create a regex that would catch all possible cases).
+
+It's actually impossible for this code to ever reach the saveURL path that requires the document, right? whereToOpenLink won't return "save" if the event object is null. Given that, there should be no concern about people improperly handling PB mode.
+
+Clearly I didn't test the patch, sorry about that. Do one of you/Philip/jdm want to take this bug?
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #4)
+> https://mxr.mozilla.org/addons/
+> search?string=openUILink%28&find=&findi=&filter=openUILink\%28[^%2C]%2B\%29%3
+> B&hitlimit=&tree=addons
+> 
+> shows 364 files affected, and that's a conservative search (I didn't spend
+> much time trying to create a regex that would catch all possible cases).
+
+I see, it's the case where it's better to avoid breaking and do multiple call-to-action blog posts.
+
+> It's actually impossible for this code to ever reach the saveURL path that
+> requires the document, right? whereToOpenLink won't return "save" if the
+> event object is null. Given that, there should be no concern about people
+> improperly handling PB mode.
+
+Right, OpenLinkIn uses aInitiatingDoc only if where == "save" and whereToOpenLink doesn't return "save" without an event.
+This means your patch may actually just work, unless someone calls directly into openLinkIn. Though looks like weak protection, we may add some additional check in internalSave and internalPersist.
+
+May be worth adding a reportError to any call to OpenUILink that doesn't provide an event? Something like "An add-on is invoking OpenUILink without an event. This is deprecated cause doesn't allow to properly handle Private Browsing mode."? This may help detecting and fixing callers.
+Yes, adding a warning for cases that could be mishandled is a good idea.
+Philip do you want to take the bug? I may review then.
+> Philip do you want to take the bug? I may review then.
+I'm sorry but I can't at the moment as real life issues are taking up most of my time.
+Ok, I'm taking this
+This is a bit more complex than expected, since
+
+openLinkIn / saveURL / internalSave / internalPersist
+
+contains
+
+let privacyContext = persistArgs.initiatingWindow.QueryInterface(...)...;
+persist.saveURI(..., privacyContext);
+
+The nsIWebBrowserPersist idl states:
+
+@param aPrivacyContext A context from which the privacy status of this
+*                   save operation can be determined. Must only be null
+*                   in situations in which no such context is available
+*                   (eg. the operation has no logical association with any
+*                   window or document)
+
+So, while passing null here is supported, doing so cause of a missing argument is breaking the interface rules. And relaxing the interface doesn't sound like a good idea for future.
+
+In the end I think it's better to just keep the checks in utilityOverlay, without going down to toolkit.
+
+Just wondering if I should reportError for cases OpenLinkIn is invoked without an event, or just the specific case of OpenLinkIn with where == "save"  but no initiatind document provided, that is the specific case it may happen.
+I fear the former would be a bit too much verbose with so many add-ons misbehaving.
+Funny times, we had a bc test for this (browser_utilityOverlay.js) but it was never added to the makefile.
+Created attachment 685253
+patch v1.1
+
+I have revised the test while there... it is definitely incomplete compared to utilityOverlay, but making a complete test was out of the scope of this bug
+Comment on attachment 685253
+patch v1.1
+
+>diff --git a/browser/base/content/test/Makefile.in b/browser/base/content/test/Makefile.in
+
+>+                 browser_utilityOverlay.js \
+
+Doh! This one was my fault :)
+
+>diff --git a/browser/base/content/test/browser_utilityOverlay.js b/browser/base/content/test/browser_utilityOverlay.js
+
+>+function runNextTest() {
+>+  while (gBrowser.tabs.length > 1) {
+>+    gBrowser.removeCurrentTab();
+
+Can you remove this?
+
+> function test_openUILink() {
+
+... and instead have this test clean up its added tab specifically?
+
+I don't like taking the lazy approach to test cleanup, since it makes debugging failures when they occur more mysterious.
+
+>diff --git a/browser/base/content/utilityOverlay.js b/browser/base/content/utilityOverlay.js
+
+>   if (where == "save") {
+>-    saveURL(url, null, null, true, null, aReferrerURI, aInitiatingDoc);
+>+    if (aInitiatingDoc) {
+>+      saveURL(url, null, null, true, null, aReferrerURI, aInitiatingDoc);
+>+    } else {
+>+      Components.utils.reportError(
+>+        "OpenLinkIn has been invoked without an initiating document.\n" +
+>+        "This may be caused by an add-on miscalling into it, or overriding " +
+>+        "some utilityOverlay.js methods.  Please contact the add-on author."
+>+      );
+
+nit: I think I'd prefer:
+if (where == "save") {
+  if (!aInitiatingDoc) {
+    Components.utils.reportError("openUILink called with where=='save' without aInitiatingDoc - see https://bugzilla.mozilla.org/show_bug.cgi?id=814264.");
+    return;
+  }
+  saveURL(...);
+  return;
+}
+
+(bug link instead of the more generic "contact the author", whose identity is probably not obvious at all - people should be able to get the relevant info or contact the right people from this bug)
+
+thanks for taking this!
+Created attachment 685639
+patch v1.2
+https://hg.mozilla.org/integration/mozilla-inbound/rev/fae627fef335
+Comment on attachment 685639
+patch v1.2
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): bug 795065
+User impact if declined: lots of add-ons breakage
+Testing completed (on m-c, etc.): m-i
+Risk to taking this patch (and alternatives if risky): very low, it's a null check
+String or UUID changes made by this patch: none
+Backed out for browser_locationBarCommand.js timeouts:
+https://tbpl.mozilla.org/?tree=Mozilla-Inbound&rev=fae627fef335
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/00d402add716
+oops, that browser_locationBarCommand.js test must be updated, it is exactly hitting the dark side of privacy awareness.
+Created attachment 685764
+patch v1.3
+
+In the end, the reportError allowed me to find that we are not handling properly privacy context in urlbarBindings.xml::handleCommand.
+In addition I did a search of any 'LinkIn(' call in mxr and triaged all of them manually to check there were not more instances of the problem.
+
+The urlbarBindings.xml is the only interesting change in need of review, compared to previous version.
+
+Pushing this to try, just in case, but works fine locally.
+Created attachment 685766
+patch v1.3 (the real one)
+
+the right patch?
+Comment on attachment 685766
+patch v1.3 (the real one)
+
+r=me with the urlbarBindings caller changed to just use "document" all the time, per discussion on IRC.
+Created attachment 685771
+patch v1.4
+
+Thanks, pushing this to try.
+looks green
+https://tbpl.mozilla.org/?tree=Try&rev=ecef54363440
+https://hg.mozilla.org/integration/mozilla-inbound/rev/eb4eff0fc3d7
+Comment on attachment 685771
+patch v1.4
+
+OK, now it's sticking in the tree.
+
+[Approval Request Comment]
+Bug caused by (feature/regressing bug #): bug 795065
+User impact if declined: lots of add-ons breakage
+Testing completed (on m-c, etc.): m-i
+Risk to taking this patch (and alternatives if risky): very low, it's a null check
+String or UUID changes made by this patch: none
+Comment on attachment 685771
+patch v1.4
+
+I misread the nit in comment 13 and didn't notice it was also suggesting using a different error text, so I updated the text here
+
+https://hg.mozilla.org/integration/mozilla-inbound/rev/bae3069ca396
+
+Now merging patches and re-asking approval on the merge.
+Created attachment 686151
+coalesced patch for Aurora/Beta
+
+[Approval Request Comment]
+See comment 25
+Comment on attachment 686151
+coalesced patch for Aurora/Beta
+
+Low risk null check for a FF18 regression - approving for branches.
+https://hg.mozilla.org/mozilla-central/rev/eb4eff0fc3d7
+https://hg.mozilla.org/mozilla-central/rev/bae3069ca396
+https://hg.mozilla.org/releases/mozilla-aurora/rev/935abd776974
+https://hg.mozilla.org/releases/mozilla-beta/rev/714c52485f59
+
+
+bug 795065 broke calling openUILink without an event parameter
+
+
+
+Bug 814264 - bug 795065 broke calling openUILink without an event parameter.
+
+Bug 814264 - Restore the ability to call openUILink without an event parameter.
+
+Bug 814264 follow-up: change the error text. DONTBUILD

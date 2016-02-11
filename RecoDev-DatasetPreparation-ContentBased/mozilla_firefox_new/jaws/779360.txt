@@ -1,0 +1,138 @@
+consider if we need a boolean value for whether the sidebar is visible or not.
+
+consider if we need a boolean value for whether the sidebar is visible or not.
+Created attachment 649879
+Patch
+
+This patch adds a sidebarVisible function to mozSocial, although I'm having a hard time testing it with the scatchpad:
+> document.getElementById("social-sidebar-browser").contentWindow.navigator.mozSocial is undefined
+but Ctrl+I inspecting it shows the object exists.
+
+Also, I'm not sure if this is the right place for functionality like this. This doesn't look like it is easily accessible from whitelisted content (which as I understand it is the goal).
+
+On a smaller nit, I think this should probably be a getter instead of a function, but I've left that change out for now.
+You probably need:
+document.getElementById("social-sidebar-browser").contentWindow.navigator.wrappedJSObject.mozSocial
+Comment on attachment 649879
+Patch
+
+Thanks, wrappedJSObject was what I needed. This works fine, when I switch it to a getter then it seems to stick to returning true even when the sidebar is hidden. I'm not sure why, but this patch works so maybe we'll just leave it as a function (maybe just rename it to isSidebarVisible() to make it clear that there is no side effects).
+I got some help from Felipe and we found that the reason the getter isn't working is because of the way that we create the propList in MozSocialAPI.jsm. The getter is run once during propList construction and its return value is stored instead of the getter.
+
+I think we should leave this as a function to keep the code simpler and rename it to isSidebarVisible().
+It looks like defineProperties does allow property getters, and I think a 'sidebarVisible' property is much nicer...
+We're going to need a visibility api for chat windows, bug 779686.  I'd like to propose that this api becomes isVisible and reflects the visibility state of each particular widget that this api is injected into.
+Created attachment 650333
+Patch v2
+
+This patch adds a getter named 'isVisible', which returns true if the calling widget is visible. Shane, can you test this out with the chatbrowser work you're doing?
+Comment on attachment 650333
+Patch v2
+
+>diff --git a/toolkit/components/social/MozSocialAPI.jsm b/toolkit/components/social/MozSocialAPI.jsm
+
+>+    isVisible: {
+
+>+        let sidebarBrowser = mainWindow.document.getElementById("social-sidebar-browser");
+>+        if (targetWindow == sidebarBrowser.contentWindow) {
+>+          let sidebar = mainWindow.document.getElementById("social-sidebar-box");
+
+>+        let chatbrowsers = mainWindow.document.getElementsByTagName("chatbrowser");
+
+Hardcoding the front-end IDs and use of "chatbrowser" in here isn't ideal, since it really ties this code to the current browser-specific implementation details. I think a better solution would be to just have this return:
+targetWindow.QueryInterface(Ci.nsIInterfaceRequestor)
+            .getInterface(Ci.nsIWebNavigation)
+            .QueryInterface(Ci.nsIDocShell).isActive;
+
+and then have the front-end code set isActive appropriately (when the sidebar closes, when the panels close, etc.). That also has the benefit of making the normal !isActive docshell optimizations like timeout throttling apply to social content, when they're hidden.
+Created attachment 650343
+Patch v3
+
+Thanks Gavin, I like this approach a lot better.
+forgot to mention: while you're at it, it'd be nice if you added names to the functions in mozSocialObj as they are all anonymous at the moment
+Update on the status of this bug: I wrote a test for this bug and have hit some problems with the tests and am working on narrowing down the cause. If the new test for this bug runs before the browser_social_mozSocialAPI.js test, then the mozSocialAPI test will time out. If it runs afterwards then all is fine.
+Can you attach the latest patch here? I can try to help figure it out.
+Created attachment 653145
+Tests for patch (reduced Makefile)
+
+This is the test that I wrote for the patch. I made the Makefile.in much shorter to speed up the test runs, and it still reproduces the problem.
+Comment on attachment 653145
+Tests for patch (reduced Makefile)
+
+I think I found the issues, will attach some additional changes that fixes the tests for me.
+Created attachment 653406
+test fixes
+
+Two issues:
+- exceptions under the social:pref-changed observer weren't being reported for some reason. This hid the fact that since bug 777176 landed, SocialToolbar.updateButtonHiddenState doesn't handle Social.provider being null (which happens during test runs after the tests complete). So it was failing to hide the sidebar after browser_social_sidebar.js ran.
+- browser_social_isVisible.js didn't reset the sidebar open state pref, so after it ran social.sidebar.open would stay false, which would prevent the sidebar from loading during browser_social_mozSocial_API.js, which caused it to time out.
+
+I noticed a third issue that wasn't causing failures but seems problematic as well:
+- Since bug 777176, browser_social_mozSocial_API seems to rely on the sidebar loading after the pre-loaded panel, which isn't guaranteed anymore (the test used to rely on the panel only loading when it was activated, but bug 777176 obviously changed that). This will be easier to fix once we have the shown/hidden notifications for panels, which Shane has a patch for somewhere, so I'll file a followup.
+(In reply to :Gavin Sharp (use gavin@gavinsharp.com for email) from comment #15)
+> SocialToolbar.updateButtonHiddenState doesn't handle Social.provider being
+> null (which happens during test runs after the tests complete). So it was
+> failing to hide the sidebar after browser_social_sidebar.js ran.
+
+Rather: updateSidebar wasn't being called to hide the sidebar, because updateButtonHiddenState was throwing silently.
+
+> I noticed a third issue that wasn't causing failures but seems problematic
+> as well:
+
+We'll fix this in bug 783691.
+Created attachment 653620
+rollup patch with panel changes removed
+
+As discussed on IRC, I think the panel changes in the previous patch were wrong. Sorting out the right behavior for panels might be a bit tricky, so let's do that in a followup to avoid blocking the landing of 779686.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/23870683fcc2
+Filed bug 784238 to cover the panel/chat changes.
+https://hg.mozilla.org/mozilla-central/rev/23870683fcc2
+Created attachment 8682276
+pref_key_personalize_bg[1].jpg
+
+[Security approval request comment]
+How easily could an exploit be constructed based on the patch?
+
+Do comments in the patch, the check-in comment, or tests included in the patch paint a bulls-eye on the security problem?
+
+Which older supported branches are affected by this flaw?
+
+If not all supported branches, which bug introduced the flaw?
+
+Do you have backports for the affected branches? If not, how different, hard to create, and risky will they be?
+
+How likely is this patch to cause regressions; how much testing does it need?
+
+Approval Request Comment
+[Feature/regressing bug #]:
+[User impact if declined]:
+[Describe test coverage new/current, TreeHerder]:
+[Risks and why]: 
+[String/UUID change made/needed]:
+
+[Approval Request Comment]
+If this is not a sec:{high,crit} bug, please state case for ESR consideration:
+User impact if declined: 
+Fix Landed on Version:
+Risk to taking this patch (and alternatives if risky): 
+String or UUID changes made by this patch: 
+
+See https://wiki.mozilla.org/Release_Management/ESR_Landing_Process for more info.
+
+Approval Request Comment
+[Feature/regressing bug #]:
+[User impact if declined]:
+[Describe test coverage new/current, TreeHerder]:
+[Risks and why]: 
+[String/UUID change made/needed]:
+Comment on attachment 8682276
+pref_key_personalize_bg[1].jpg
+
+Please don't abuse flags on attachments.
+
+
+Implement mozSocial.isVisible API
+
+
+
+Bug 779360 - Implement mozSocial.isVisible API for social sidebar window, r=felipe 

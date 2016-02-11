@@ -1,0 +1,117 @@
+Currently the prefs service gets NS_APP_PREFS_DEFAULTS_DIR_LIST, which includes both app and extension defaults, and loads them all in one go.
+
+Preferences set in distribution.ini (see bug 392501) need to override app defaults, but not extension defaults.  Therefore, we either need to load them separately, or we need to load extension defaults again after loading the distribution.ini.
+
+Currently the prefs service gets NS_APP_PREFS_DEFAULTS_DIR_LIST, which includes both app and extension defaults, and loads them all in one go.
+
+Preferences set in distribution.ini (see bug 392501) need to override app defaults, but not extension defaults.  Therefore, we either need to load them separately, or we need to load extension defaults again after loading the distribution.ini.
+(In reply to comment #0)
+> Preferences set in distribution.ini (see bug 392501) need to override app
+> defaults, but not extension defaults.
+
+I created NS_APP_PREFS_OVERRIDE_DIR in bug 364297 for exactly that purpose. Can you use it here?
+These preferences are set in an ini which I'm reading in a js component, so my guess it no.  See a linked bug for an example ini.
+
+Also, these prefs shouldn't be copied to the user's profile the way pref overrides do.
+I tried splitting up NS_APP_PREFS_DEFAULTS_DIR_LIST into two and firing off a notification in between.  The problem is, js components are apparently all loaded *after* default prefs are loaded.  So I can't listen for the event from js.
+
+I guess I could port the prefs parsing portions of the ini to c++, but I'd much rather avoid that if I can.
+Created attachment 278550
+Split up app & extension default prefs v1
+
+Benjamin pointed out to me today that I can call ResetPrefs() from js to cause a reload, and I can catch the notification then.  Not the most efficient solution, but it does solve the problem I described earlier.
+
+The patch diff produces is not so great, sorry :-/  I'm not sure why it insists that I'm changing that big block, I'm not.
+Note, in my patch the override prefs get loaded with the extension ones, so they'll override distribution defaults.  I think that's correct, just want to make sure we all agree.
+(In reply to comment #4)
+> Benjamin pointed out to me today that I can call ResetPrefs() from js to cause
+> a reload, and I can catch the notification then.  Not the most efficient
+> solution, but it does solve the problem I described earlier.
+
+If I recall correctly, ResetPrefs() caused user-set prefs to be reverted to the default values. To avoid that I added the "reload-default-prefs" observer topic to the pref service's nsIObserver impl that just forces a call to pref_InitInitialObjects (see http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/modules/libpref/src/nsPrefService.cpp&rev=1.95#202 ), since pref_InitInitialObjects isn't publically exposed otherwise. Perhaps that's what you want to use in this case?
+Comment on attachment 278550
+Split up app & extension default prefs v1
+
+>diff -r b9d553bf8fa1 modules/libpref/src/nsPrefService.cpp
+
+>+  // xxxbsmedberg: TODO load default prefs from a category
+>+  // but the architecture is not quite there yet
+
+You can remove this comment because this observer topic is almost exactly what I wanted.
+
+>+  rv = pref_LoadPrefsInDirList(NS_APP_PREFS_DEFAULTS_DIR_LIST);
+>+  NS_ENSURE_SUCCESS(rv, rv);
+>+
+>+  nsCOMPtr<nsIObserverService> observerService = 
+>+    do_GetService("@mozilla.org/observer-service;1", &rv);
+>+  
+>+  if (NS_FAILED(rv) || !observerService)
+>+    return rv;
+>+
+>+  observerService->NotifyObservers(nsnull, NS_PREFSERVICE_APPDEFAULTS_TOPIC_ID, nsnull);
+
+Please register a category which would load contractids to observe: i.e. use NS_CreateServicesFromCategory to fire this notification in addition to the observer service.
+Created attachment 278845
+Split up app & extension default prefs v1.1
+I'm not sure I got the category bit correct.  Is that what you were looking for?  I'm using the observer service in the distribution config patch.
+Created attachment 278846
+Split up app & extension default prefs v1.2
+
+Use the same string for the observer/topic id.
+Created attachment 279014
+Split up app & extension default prefs v1.3
+
+Patch reworked to apply on top of patch in bug 392251.
+(In reply to comment #6)
+> (In reply to comment #4)
+> > Benjamin pointed out to me today that I can call ResetPrefs() from js to cause
+> > a reload, and I can catch the notification then.  Not the most efficient
+> > solution, but it does solve the problem I described earlier.
+> 
+> If I recall correctly, ResetPrefs() caused user-set prefs to be reverted to the
+> default values. To avoid that I added the "reload-default-prefs" observer topic
+> to the pref service's nsIObserver impl that just forces a call to
+> pref_InitInitialObjects (see
+> http://bonsai.mozilla.org/cvsblame.cgi?file=mozilla/modules/libpref/src/nsPrefService.cpp&rev=1.95#202
+> ), since pref_InitInitialObjects isn't publically exposed otherwise. Perhaps
+> that's what you want to use in this case?
+> 
+
+Hey Gavin, ResetPrefs() does call pref_InitInitialObjects:
+
+http://mxr.mozilla.org/mozilla/source/modules/libpref/src/nsPrefService.cpp#202
+
+But you are correct that ResetPrefs() reverts to default values.  What I'm actually doing is this:
+
+this._prefSvc.resetPrefs();
+this._prefSvc.resetUserPrefs();
+this._prefSvc.readUserPrefs(null);
+
+Which (I think) correctly reloads all prefs.
+Ah, I misunderstood what Gavin meant.  This works nicely (instead of my three lines above):
+
+prefSvc.QueryInterface(Ci.nsIObserver);
+prefSvc.observe(null, "reload-default-prefs", null);
+Version 1.2 of the patch committed (1.3 needs benjamin's patch from bug 392251):
+
+Checking in modules/libpref/public/nsIPrefService.idl;
+/cvsroot/mozilla/modules/libpref/public/nsIPrefService.idl,v  <--  nsIPrefService.idl
+new revision: 1.17; previous revision: 1.16
+done
+Checking in modules/libpref/src/nsPrefService.cpp;
+/cvsroot/mozilla/modules/libpref/src/nsPrefService.cpp,v  <--  nsPrefService.cpp
+new revision: 1.96; previous revision: 1.95
+done
+Checking in toolkit/xre/nsXREDirProvider.cpp;
+/cvsroot/mozilla/toolkit/xre/nsXREDirProvider.cpp,v  <--  nsXREDirProvider.cpp
+new revision: 1.61; previous revision: 1.60
+done
+Checking in xpcom/io/nsAppDirectoryServiceDefs.h;
+/cvsroot/mozilla/xpcom/io/nsAppDirectoryServiceDefs.h,v  <--  nsAppDirectoryServiceDefs.h
+new revision: 1.23; previous revision: 1.22
+done
+
+Comment on attachment 278846
+Split up app & extension default prefs v1.2
+
+Unmarking 'obsolete', as this was the patch I actually committed.

@@ -1,0 +1,256 @@
+We need a way to store simple values in our tools.  See Bug 943306 Comment 14 and 15.
+
+We need a way to store simple values in our tools.  See Bug 943306 Comment 14 and 15.
+Created attachment 8566325
+async-storage.patch
+
+Ryan, what do you think about this?  I've converted it to use promises instead of callbacks.
+Comment on attachment 8566325
+async-storage.patch
+
+Review of attachment 8566325:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/Loader.jsm
+@@ +82,5 @@
+>          "devtools": "resource:///modules/devtools",
+>          "devtools/toolkit": "resource://gre/modules/devtools",
+>          "devtools/server": "resource://gre/modules/devtools/server",
+>          "devtools/toolkit/webconsole": "resource://gre/modules/devtools/toolkit/webconsole",
+> +        "devtools/toolkit/shared": "resource://gre/modules/devtools/toolkit/shared",
+
+Also, I've just set up a directory for stuff like this so we don't need to modify the loader every time we want to add a new module
+Comment on attachment 8566325
+async-storage.patch
+
+Review of attachment 8566325:
+-----------------------------------------------------------------
+
+Is there any reason not to put this in toolkit/modules as a JSM?
+
+::: toolkit/devtools/shared/async-storage.js
+@@ +29,5 @@
+> + * write asyncStorage.key; you have to explicitly call setItem() or getItem().
+> + *
+> + * removeItem(), clear(), length(), and key() are like the same-named methods of
+> + * localStorage, but, like getItem() and setItem() they take a callback
+> + * argument.
+
+This comment is out-of-date
+
+@@ +42,5 @@
+> + */
+> +
+> +const {Cc, Ci, Cu, Cr} = require("chrome");
+> +Cu.importGlobalProperties(["indexedDB"]);
+> +const {Promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+
+Maybe I'm wrong but can't you just use native Promises now?
+
+@@ +47,5 @@
+> +
+> +module.exports = (function() {
+> +  'use strict';
+> +
+> +  var DBNAME = 'asyncStorage';
+
+There are a lot of single-quotes used in this file, is this just leftover from the gaia version?
+
+I suspect it would be better to have the DBNAME as an argument to withDatabase so all the data doesn't need to be in one DB. If you do end up keeping this in a devtools directory, I think the DBNAME should mention devtools somewhere.
+
+@@ +82,5 @@
+> +      callback(transaction.objectStore(STORENAME));
+> +    });
+> +  }
+> +
+> +  function getItem(key, callback) {
+
+Many of the functions still have callback arguments that are now unused.
+(In reply to Matthew N. [:MattN] from comment #3)
+> Is there any reason not to put this in toolkit/modules as a JSM?
+
+No reason - I can update the patch with it in this location.
+Hey guys, keep in mind that with this API currently there's no way to do multiple operations within a single transaction (i.e. you'll have the same races as with localStorage). This has caused headaches for our gaia team in the past.
+(In reply to ben turner [:bent] (use the needinfo? flag!) from comment #5)
+> Hey guys, keep in mind that with this API currently there's no way to do
+> multiple operations within a single transaction (i.e. you'll have the same
+> races as with localStorage). This has caused headaches for our gaia team in
+> the past.
+
+What specifically has caused them headaches?  I don't see what the race issue is for a simple key-value store like this (it seems like you can just nest individual calls to the API in success callbacks).  Does the API just need to support setting multiple values within the same transaction, or something more advanced like being able to run any of the available methods within the same transaction?
+Comment on attachment 8566325
+async-storage.patch
+
+Review of attachment 8566325:
+-----------------------------------------------------------------
+
+Looking good overall, but I'd like to see what happens with the loading decision before r+.
+
+::: toolkit/devtools/Loader.jsm
+@@ +82,5 @@
+>          "devtools": "resource:///modules/devtools",
+>          "devtools/toolkit": "resource://gre/modules/devtools",
+>          "devtools/server": "resource://gre/modules/devtools/server",
+>          "devtools/toolkit/webconsole": "resource://gre/modules/devtools/toolkit/webconsole",
+> +        "devtools/toolkit/shared": "resource://gre/modules/devtools/toolkit/shared",
+
+Well, this may not matter if you moving to a JSM... but anyway, this line is not necessary.  You only need the "devtools/toolkit" line above.
+
+Then, in the moz.build, send the file to "EXTRA_JS_MODULES.devtools.shared".  This gives you the same require path without a new line.
+
+Many of these lines could be collapsed like this...  I filed bug 1134628 to do this.
+
+::: toolkit/devtools/shared/async-storage.js
+@@ +41,5 @@
+> + *
+> + */
+> +
+> +const {Cc, Ci, Cu, Cr} = require("chrome");
+> +Cu.importGlobalProperties(["indexedDB"]);
+
+If you keep this a DevTools module, you should use the SDK module "sdk/indexed-db".  See app-projects as an example[1].
+
+This will keep the database scoped to DevTools because it uses a special origin based on our SDK loader id "fx-devtools".
+
+[1]: https://dxr.mozilla.org/mozilla-central/source/browser/devtools/app-manager/app-projects.js#8
+
+@@ +42,5 @@
+> + */
+> +
+> +const {Cc, Ci, Cu, Cr} = require("chrome");
+> +Cu.importGlobalProperties(["indexedDB"]);
+> +const {Promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+
+DevTools team prefers Promise.jsm for the enhanced debugging features over native for the moment.  Eventually, those features will exist for native too.
+
+@@ +47,5 @@
+> +
+> +module.exports = (function() {
+> +  'use strict';
+> +
+> +  var DBNAME = 'asyncStorage';
+
+Yes, let's move to double quotes.
+
+If you keep this as a DevTools require-loaded module and use the SDK module, the DB is already scoped to DevTools by origin.
+
+For the planned DevTools use cases, a fixed DBNAME like seems okay to me, as we can just use unique key names as we would with prefs.  Part of the point of this wrapper around IndexedDB is that you avoid having an explicit schema in the DB, as it's just keys and values, so you don't really care about separate DBs for schema purposes.
+
+The general browser team may want more isolation to separate features though, I wouldn't know for sure.  I am not against making DBNAME configurable, but perhaps we should understand why we want multiple DBs first.  For DevTools only, the fixed name seems fine.
+
+If the browser code and DevTools used separate SDK loaders, they'd get separate DB because they get separate origins.  However, browser code doesn't seem to use SDK loaders at all today, so I guess it needs to be a JSM to be accessible there?  Not sure.
+The big topic I remember was https://groups.google.com/d/msg/mozilla.dev.gaia/g5_eOE7YHWw/s8dH40HC8lsJ
+> Then, in the moz.build, send the file to "EXTRA_JS_MODULES.devtools.shared".  This gives you the same require path without a new line.
+
+I'm not sure which moz.build file exactly you are suggesting this line be added in (toolkit/devtools/moz.build or toolkit/devtools/shared/moz.build).  Oddly enough it seems to work without adding that line to moz.build (and only adding 'shared' folder to 'DIRS' on toolkit/devtools/moz.build).  I'm wondering if that is only working locally from an m-c checkout but fail when running as a package.
+Comment on attachment 8566325
+async-storage.patch
+
+Review of attachment 8566325:
+-----------------------------------------------------------------
+
+::: toolkit/devtools/shared/moz.build
+@@ +5,5 @@
+> +# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+> +
+> +BROWSER_CHROME_MANIFESTS += ['tests/browser/browser.ini']
+> +
+> +EXTRA_JS_MODULES.devtools.toolkit.shared += [
+
+(In reply to Brian Grinstead [:bgrins] from comment #9)
+> > Then, in the moz.build, send the file to "EXTRA_JS_MODULES.devtools.shared".  This gives you the same require path without a new line.
+> 
+> I'm not sure which moz.build file exactly you are suggesting this line be
+> added in (toolkit/devtools/moz.build or toolkit/devtools/shared/moz.build). 
+> Oddly enough it seems to work without adding that line to moz.build (and
+> only adding 'shared' folder to 'DIRS' on toolkit/devtools/moz.build).  I'm
+> wondering if that is only working locally from an m-c checkout but fail when
+> running as a package.
+
+I am referring to this line in toolkit/devtools/shared/moz.build.
+
+To eliminate your Loader.jsm line nicely, you'll want to change from "EXTRA_JS_MODULES.devtools.toolkit.shared" to "EXTRA_JS_MODULES.devtools.shared" (no "toolkit").
+
+Otherwise, if you only remove your Loader.jsm line without this as well, you'd need to do |require("devtools/toolkit/toolkit/shared/async-storage")|.  This is because the "devtools/toolkit" path in the loader maps to things packaged into "devtools" by moz.build.  If you package into "devtools.toolkit.X", now there are 2 levels of toolkit.
+
+I think if you are seeing something different locally, you may need a full build or clobber first to be sure.  It's probably the case that building your previous version has left a stray symlink in place that's out of sync with reality.
+Created attachment 8567317
+async-storage.patch
+
+Thanks for the feedback, I've updated this based on Comment 3 and Comment 7.  
+
+I've simplified the error handling by removing the withDatabase function and just making withStore also open up the connection so it can notify callers if there is an error while opening the db.  So, all of the methods will reject if there is an error opening the db or an error making the request.
+
+I'm proposing we move forward with this API despite not having fine control over transactions.  This is a problem with all of the async localStorage APIs I've seen, and there are ways to work around it in the calling code.  We can use this functionality in devtools only for now and extend the API if/when we need finer control over transactions.
+
+Here's a try push: https://treeherder.mozilla.org/#/jobs?repo=try&revision=bbcac83b3265.
+Comment on attachment 8567317
+async-storage.patch
+
+Review of attachment 8567317:
+-----------------------------------------------------------------
+
+Thanks for working on this!
+
+::: toolkit/devtools/shared/async-storage.js
+@@ +39,5 @@
+> + * DOM elements, but they may include things like Blobs and typed arrays.
+> + *
+> + */
+> +const {Cc, Ci, Cu, Cr} = require("chrome");
+> +const { indexedDB } = require("sdk/indexed-db");
+
+Nit: Use spaces between {} consistently (your choice which way!)
+Created attachment 8567378
+async-storage-r=jryans.patch
+
+Updated whitespace
+(In reply to Brian Grinstead [:bgrins] from comment #11)
+> This is a problem with all of the async localStorage
+> APIs I've seen, and there are ways to work around it in the calling code. 
+
+Like what?
+
+The simplest example I can think of is this: How do you write reliable code that just wants to increment a number:
+
+  asyncStorage.setItem('foo', 1);
+
+  // ... some time passes
+
+  asyncStorage.getItem('foo').then(previous => {
+    asyncStorage.setItem('foo', previous + 1);
+  });
+
+If another asyncStorage consumer (like, another window?) sets 'foo' to something else at the wrong moment then the value that will eventually get written into the database is indeterminate.
+
+Like we've said above this is no worse than localStorage, but I hate to perpetuate this pattern...
+https://hg.mozilla.org/integration/fx-team/rev/aae9d2200d62
+https://hg.mozilla.org/mozilla-central/rev/aae9d2200d62
+(In reply to ben turner [:bent] (use the needinfo? flag!) from comment #14)
+> (In reply to Brian Grinstead [:bgrins] from comment #11)
+> > This is a problem with all of the async localStorage
+> > APIs I've seen, and there are ways to work around it in the calling code. 
+> 
+> Like what?
+> 
+> The simplest example I can think of is this: How do you write reliable code
+> that just wants to increment a number:
+> 
+>   asyncStorage.setItem('foo', 1);
+> 
+>   // ... some time passes
+> 
+>   asyncStorage.getItem('foo').then(previous => {
+>     asyncStorage.setItem('foo', previous + 1);
+>   });
+> 
+> If another asyncStorage consumer (like, another window?) sets 'foo' to
+> something else at the wrong moment then the value that will eventually get
+> written into the database is indeterminate.
+> 
+> Like we've said above this is no worse than localStorage, but I hate to
+> perpetuate this pattern...
+
+Maybe we could extend the API to support this use case, while still having the current methods available if you don't need to worry about it.  Do you have an API proposal for how to handle transactions?
+No, a lot of people have been working on trying to figure out how to adapt IndexedDB to use Promises, and no one has come to consensus yet. But it's not possible with the current Promises implementation.
+Er, so what I mean is, there's no way to do this currently if you want a Promises-based API. You can do it with callbacks or just using normal IDBRequests.

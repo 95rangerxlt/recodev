@@ -1,0 +1,245 @@
+Created attachment 621476
+patch v1
+
+Boris did some profiling for tab switching:
+
+"Layout flushes(break in PresShell::FlushPendingNotifications) from getBoundingClientRect, via get_scrollClientRect called from ensureElementIsVisible called from _handleTabSelect called from onxblTabSelect called from updateCurrentBrowser called from onselect called from set_selectedIndex etc.  This is about 15% and includes restyling, reflow, plugin geometry updates(!!)."
+
+While we could implement something like a ensureElementIsVisible() cache in nsScrollBoxObject we should just not call tabstrip.ensureElementIsVisible(tab) if the tabbar doesn't overflow. This should probably be the case for the majority of users most of their browsing time and give us a little improvement.
+
+Created attachment 621476
+patch v1
+
+Boris did some profiling for tab switching:
+
+"Layout flushes(break in PresShell::FlushPendingNotifications) from getBoundingClientRect, via get_scrollClientRect called from ensureElementIsVisible called from _handleTabSelect called from onxblTabSelect called from updateCurrentBrowser called from onselect called from set_selectedIndex etc.  This is about 15% and includes restyling, reflow, plugin geometry updates(!!)."
+
+While we could implement something like a ensureElementIsVisible() cache in nsScrollBoxObject we should just not call tabstrip.ensureElementIsVisible(tab) if the tabbar doesn't overflow. This should probably be the case for the majority of users most of their browsing time and give us a little improvement.
+Comment on attachment 621476
+patch v1
+
+>diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrowser.xml
+>--- a/browser/base/content/tabbrowser.xml
+>+++ b/browser/base/content/tabbrowser.xml
+>@@ -1994,17 +1994,18 @@
+>         <![CDATA[
+>           Array.forEach(this.tabs, function(tab) {
+>             if (aTabs.indexOf(tab) == -1)
+>               this.hideTab(tab);
+>             else
+>               this.showTab(tab);
+>           }, this);
+> 
+>-          this.tabContainer.mTabstrip.ensureElementIsVisible(this.selectedTab, false);
+>+          if (this.getAttribute("overflow") == "true")
+>+            this.tabContainer.mTabstrip.ensureElementIsVisible(this.selectedTab, false);
+
+You're checking the attribute on the wrong element here.
+It actually looks like _handleTabSelect should just be called here.
+
+I assume you didn't make ensureElementIsVisible return early because it can't easily tell whether it's overflowing?
+Created attachment 621554
+patch v2
+
+(In reply to Dão Gottwald [:dao] from comment #1)
+> You're checking the attribute on the wrong element here.
+> It actually looks like _handleTabSelect should just be called here.
+
+Fixed.
+
+> I assume you didn't make ensureElementIsVisible return early because it
+> can't easily tell whether it's overflowing?
+
+Didn't think of that. Added it to the scrollbox widget.
+Comment on attachment 621554
+patch v2
+
+>         <![CDATA[
+>           Array.forEach(this.tabs, function(tab) {
+>             if (aTabs.indexOf(tab) == -1)
+>               this.hideTab(tab);
+>             else
+>               this.showTab(tab);
+>           }, this);
+> 
+>-          this.tabContainer.mTabstrip.ensureElementIsVisible(this.selectedTab, false);
+>+          this.tabContainer._handleTabSelect();
+
+I just realized that the old code disabled smooth scrolling. I'm not sure if we care about this.
+
+>+      <property name="_isOverflowing" readonly="true">
+>+        <getter><![CDATA[
+>+          return (this.scrollPosition > 0 ||
+>+                  this.scrollSize > this.scrollClientSize);
+>+        ]]></getter>
+>+      </property>
+
+This doesn't flush layout?
+(In reply to Dão Gottwald [:dao] from comment #3)
+> >-          this.tabContainer.mTabstrip.ensureElementIsVisible(this.selectedTab, false);
+> >+          this.tabContainer._handleTabSelect();
+> 
+> I just realized that the old code disabled smooth scrolling. I'm not sure if
+> we care about this.
+
+So should we revert this? We don't really need to touch it for this bug anyway.
+
+> >+      <property name="_isOverflowing" readonly="true">
+> >+        <getter><![CDATA[
+> >+          return (this.scrollPosition > 0 ||
+> >+                  this.scrollSize > this.scrollClientSize);
+> >+        ]]></getter>
+> >+      </property>
+> 
+> This doesn't flush layout?
+
+I set a breakpoint in PresShell::FlushPendingNotifications and the method wasn't called. So I'm pretty sure this doesn't flush layout but we should maybe ask bz if it does?
+Created attachment 621561
+patch v3
+
+(In reply to Tim Taubert [:ttaubert] from comment #4)
+> (In reply to Dão Gottwald [:dao] from comment #3)
+> > >-          this.tabContainer.mTabstrip.ensureElementIsVisible(this.selectedTab, false);
+> > >+          this.tabContainer._handleTabSelect();
+> > 
+> > I just realized that the old code disabled smooth scrolling. I'm not sure if
+> > we care about this.
+> 
+> So should we revert this? We don't really need to touch it for this bug
+> anyway.
+
+Reverted this change.
+> So I'm pretty sure this doesn't flush layout but we should maybe ask bz if it does?
+
+PresShell::FlushPendingNotifications is only reached if there are pending layout changes to flush.  Otherwise the flush attempt is short-circuited in nsDocument::FlushPendingNotifications.
+
+In this case .scrollPosition will certainly try to flush layout.  So will .scrollSize.  So will .scrollClientSize.
+I guess the question is whether the test in comment 4 was performed while doing a tab switch, or in some other way.
+No, I called scrollbox.ensureElementIsVisible() right away, didn't know about the short-circuit.
+Sounds like there isn't an easy solution for this. We can't even go back to checking the overflow=true attribute because I suppose the overflow event might not have been thrown yet for any unprocessed style changes. This could cause us to not make the element visible when we actually should.
+Well, you could do ensureElementIsVisible() off a refresh tick instead of synchronously.  that might help a good bit.
+Will not work on this anytime soon.
+Created attachment 646559
+Patch
+
+This patch adds two non-flushing properties to scrollboxes to check if the scrollbox is overflowing. One of these is then used to skip calling ensureElementIsVisible if not.
+Comment on attachment 646559
+Patch
+
+>+      <property name="overflowsHorizontally" readonly="true">
+>+        <getter><![CDATA[
+>+          return this.scrollBoxObject.overflowsHorizontally;
+>+        ]]></getter>
+>+      </property>
+>+
+>+      <property name="overflowsVertically" readonly="true">
+>+        <getter><![CDATA[
+>+          return this.scrollBoxObject.overflowsVertically;
+>+        ]]></getter>
+>+      </property>
+
+how about:
+
+      <property name="overflows" readonly="true">
+        <getter><![CDATA[
+          return this.orient == "vertical" ?
+                 this.scrollBoxObject.overflowsVertically :
+                 this.scrollBoxObject.overflowsHorizontally;
+        ]]></getter>
+      </property>
+Created attachment 646610
+Patch, addressing comments and add a test line
+Comment on attachment 646610
+Patch, addressing comments and add a test line
+
+>--- a/browser/base/content/tabbrowser.xml
+>+++ b/browser/base/content/tabbrowser.xml
+
+>       <method name="_handleTabSelect">
+>         <body><![CDATA[
+>-          this.mTabstrip.ensureElementIsVisible(this.selectedItem);
+>+          if (this.mTabstrip.overflowsHorizontally) {
+>+            this.mTabstrip.ensureElementIsVisible(this.selectedItem);
+>+          }
+
+s/overflowsHorizontally/overflows/
+
+I assume you're not checking 'overflows' early in ensureElementIsVisible because doing so wouldn't be safe without flushing layout?
+(In reply to Dão Gottwald [:dao] from comment #15)
+
+> 
+> I assume you're not checking 'overflows' early in ensureElementIsVisible
+> because doing so wouldn't be safe without flushing layout?
+
+I'm doing so as to not change the behaviour of ensureElementIsVisible, as the new overflow properties rely on unflushed state.
+So, what happens in the case where we're adding a tab which causes the tabstrip to overflow? Do we know that it's overflowing as we try to switch to the newly added tab yet?
+*** Bug 804948 has been marked as a duplicate of this bug. ***
+*** Bug 789575 has been marked as a duplicate of this bug. ***
+Created attachment 674636
+another patch
+
+(In reply to neil@parkwaycc.co.uk from comment #17)
+> So, what happens in the case where we're adding a tab which causes the
+> tabstrip to overflow? Do we know that it's overflowing as we try to switch
+> to the newly added tab yet?
+
+We need to call ensureElementIsVisible as soon as we know we're overflowing. We already do this via _positionPinnedTabs in the overflow handler, which is somewhat fragile. I made this more explicit.
+
+I don't think we need to extend nsIScrollBoxObject for this.
+Comment on attachment 674636
+another patch
+
+>         var tabs = document.getBindingParent(this);
+>         tabs.setAttribute("overflow", "true");
+>         tabs._positionPinnedTabs();
+>+        tabs._handleTabSelect(false);
+
+Since _positionPinnedTabs can also call _handleTabSelect doesn't this mean that _handleTabSelect can be called twice?
+
+>       <method name="_handleTabSelect">
+>+        <parameter name="aSmoothScroll"/>
+>         <body><![CDATA[
+>-          this.mTabstrip.ensureElementIsVisible(this.selectedItem);
+>+          if (this.getAttribute("overflow") == "true")
+>+            this.mTabstrip.ensureElementIsVisible(this.selectedItem, aSmoothScroll);
+
+_handleTabSelect is never called with aSmoothScroll = true
+(In reply to Neil Deakin from comment #21)
+> Comment on attachment 674636
+> another patch
+> 
+> >         var tabs = document.getBindingParent(this);
+> >         tabs.setAttribute("overflow", "true");
+> >         tabs._positionPinnedTabs();
+> >+        tabs._handleTabSelect(false);
+> 
+> Since _positionPinnedTabs can also call _handleTabSelect doesn't this mean
+> that _handleTabSelect can be called twice?
+
+The _lastNumPinned check protects against this.
+
+> >       <method name="_handleTabSelect">
+> >+        <parameter name="aSmoothScroll"/>
+> >         <body><![CDATA[
+> >-          this.mTabstrip.ensureElementIsVisible(this.selectedItem);
+> >+          if (this.getAttribute("overflow") == "true")
+> >+            this.mTabstrip.ensureElementIsVisible(this.selectedItem, aSmoothScroll);
+> 
+> _handleTabSelect is never called with aSmoothScroll = true
+
+It's called with the parameter omitted, which is different from false; the default value is true.
+Comment on attachment 674636
+another patch
+
+> The _lastNumPinned check protects against this.
+
+I see. From the "overflow" handler, the number of pinned tabs doesn't change.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/9379c0915c6a
+https://hg.mozilla.org/mozilla-central/rev/9379c0915c6a
+
+
+Avoid calling scrollbox.ensureElementIsVisible() if the tab strip doesn't overflow to prevent layout flushes
+
+perf
+
+Bug 752376 - Avoid calling scrollbox.ensureElementIsVisible() if the tab strip doesn't overflow to prevent layout flushes. r=enn 

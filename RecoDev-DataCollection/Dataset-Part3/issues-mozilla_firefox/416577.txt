@@ -1,0 +1,207 @@
+User-Agent:       Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.4; en-US; rv:1.9b4pre) Gecko/2008020504 Minefield/3.0b4pre
+Build Identifier: Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.4; en-US; rv:1.9b4pre) Gecko/2008020504 Minefield/3.0b4pre
+
+The main history autocomplete query can be tweaked to also return tag names, thus eliminating the need for a separate tag query. 
+ 
+Benefits: 
+
+* faster
+* less code 
+* better usability: tags matches are treated as like any other search results, so partial matches work and tag results don't always appear at beginning (which is annoying if you have a lot of bookmarks for a matching tag).
+
+Reproducible: Always
+
+Steps to Reproduce:
+1.
+2.
+3.
+
+User-Agent:       Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.4; en-US; rv:1.9b4pre) Gecko/2008020504 Minefield/3.0b4pre
+Build Identifier: Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.4; en-US; rv:1.9b4pre) Gecko/2008020504 Minefield/3.0b4pre
+
+The main history autocomplete query can be tweaked to also return tag names, thus eliminating the need for a separate tag query. 
+ 
+Benefits: 
+
+* faster
+* less code 
+* better usability: tags matches are treated as like any other search results, so partial matches work and tag results don't always appear at beginning (which is annoying if you have a lot of bookmarks for a matching tag).
+
+Reproducible: Always
+
+Steps to Reproduce:
+1.
+2.
+3.
+Created attachment 302320
+proof of concept
+
+Proof of concept. This patch comments out the tag query and selects tags by adding an outer join to the main query. Tag name matches follow the same logic as title and url matches. If a tag matches the tag icon is displayed in the result and the tag name is appended to the title (obviously this UI needs improvement).
+One thing this patch doesn't address is that it doesn't give extra weight to tag matches. I'm not sure if that is desirable, but it could be achieved by changing the ORDER BY clause to "ORDER BY t.title is not null, h.frecency"
+Comment on attachment 302320
+proof of concept
+
+marco, can you please evaluate this approach?
+Created attachment 302366
+optimize query
+
+updated patch with obvious query optimization: replace subquery with constant (using GetTagsFolder())
+i'm still evaluating this, but i like this approach, it looks cleaner than current, however here is some hint and change that is needed:
+
+AutoCompleteTagsSearch could be removed at all with this approach (do that in the next iteration and also remove commented out code)
+
++        tagsMatch = itemId && CaseInsensitiveFindInReadable(*token, entryTag);
++        
+
+you can't directly do this, see AutoCompleteTagsSearch:
+
+  nsStringArray terms;
+  CreateTermsFromTokens(mCurrentSearchTokens, terms);
+
+  for (PRInt32 i = 0; i < terms.Count(); i++) {
+    if (i)
+      sql += NS_LITERAL_CSTRING(" OR");
+
+    // +2 to skip over the "?1", which is the tag root parameter
+    sql += NS_LITERAL_CSTRING(" LOWER(t.title) = ") +
+           nsPrintfCString("LOWER(?%d)", i + 2);
+  }
+
+you should use CreateTermsFromTokens(mCurrentSearchTokens, terms) to generate all possible tags, and then match for them:
+
+nsNavHistory.cpp | CreateTermsFromTokens
+4708   // from our tokens, build up all possible tags
+4709   // for example:  ("a b c") -> ("a","b","c","a b","b c","a b c")
+
+so you should still search for tags in a loop different from the loop checking for the rest, using results from CreateTermsFromTokens(mCurrentSearchTokens, terms). You could do that into:
+
+      // Skip if we don't match all terms in the bookmark, title or url
+      if (!matchAll)
+        continue;
+
+if we don't match against title, url or b.title, AND that item is bookmarked we could then search into tags generated from CreateTermsFromTokens. If still not matching then continue.
+
+Notice that we have another bug report on tag query: Bug 414426, if we  want to remove that query at all, that bug will have to be marked invalid (i'm cc-ing Mardak since he really has good knowledge on AutoComplete, and he could be interested since he's working on that bug).
+
+I'm not to worried for perf when we join against bookmarks, since that table should never be huge (surely not like moz_historyvisits or moz_places). Probably the cost that we will spend with an additional join is <= than what we have with the overhead of an additional function call and query. 
+The only perf drawback would be the explosion that is caused by CreateTermsFromTokens, but since it's used only when nothing matches and we have a bookmark it should be quite mitigated. 
+
+I don't know instead what is the perf of CaseInsensitiveFindInReadable since here we will use that to match against tags, while in current approach we are using a big query made of "OR LOWER(title) =" (that Ed is changing into LOWER(title) IN (list_of_terms)), again that could be mitigated by the fact that here we don't need to check for duplicates.
+
+If Edward has nothing against that we could go on with this approach fixing those things.
+
+I'm confirming this report for now, then after taking a decision we should mark one of our bugs (this or Bug 414426 as invalid)
+So instead of querying for tags only once, we would query it for every chunk. If so, we wouldn't want to regenerate all the possible tokens every time.
+
+Also, we would need to do exact matches on the tags not partial matches. If not, we would be getting a ton more tag results when just searching for simple terms.
+
+Selecting just a single tag won't work because each tag for a bookmark is a separate entry.
+
+The idea is interesting though assuming we do want tags to mix in with regular results. Note bug 395739 will also be adding a search to the first chunk.
+(In reply to comment #5)
+> Selecting just a single tag won't work because each tag for a bookmark is a
+> separate entry.
+For the current attached patch, we'll be getting back a duplicate row for each tag which we'll be filtering out and not even seeing the extra tag. So we won't be seeing all the tags at once which is needed for the tag-matching logic which says we can have either "a", "b", "c", "a b", "a c", "b c", "a b c" for "a b c".
+
+Don't forget that this will affect performance of the common-case query of the full history search.
+(In reply to comment #5)
+> So instead of querying for tags only once, we would query it for every chunk.
+
+well not completely true, we mostly pay for an additional join
+
+> Selecting just a single tag won't work because each tag for a bookmark is a
+> separate entry.
+
+when you join you get different place entries, one for each tag
+
+> we'll be getting back a duplicate row for each
+> tag which we'll be filtering out and not even seeing the extra tag. 
+
+yes, that's true if we want to show matching tags, while it's not true if we want to only show a tag icon. However show matching tags could become a pain if we show "a b c" "a" "a b" "a c".
+We should state if we really want to always show all matching tags (or if show one of them is enough).
+For filtering out we are really already paying that price since we filter on each url before adding
+
+> Don't forget that this will affect performance of the common-case query of the
+> full history search.
+
+well, if the frecency algo is working fine we should not have to do many chunks, the real additional costs here are:
+
+for each chunk:
+- a join
+- discard duped entries tags
+
+while now our costs are:
+- one function call
+- one query (with many joins and ORs) (don't forget that OR is always slow in SQL, since AND is a filter while OR is an add of two results)
+- discard dupes
+and we have the disadvantage of having tags only in the first chunk
+
+Really we don't have numbers on how much one approach would be slower than the other.
+If I'm following all this, if we assume the following:
+
+* Its OK to have partial matches of tags  
+* Tag matches can follow the frecency order of the URL
+
+(And I explicitly created the patch to implement this behavior, performance wasn't motivating me, though more I understand the code the more I'm convinced that this change will be faster)
+
+Then the only problem discussed in the comments so far is that if an URL has multiple tags and more than one of those tags matches we'll only show the first tag that matches. This can be fixed in an efficient manner, if I can manipulate the nsAutoCompleteSimpleResult. This would requires adding methods to that class (or creating a subclass). Alternatively, I could copy the nsAutoCompleteSimpleResult when this happens -- less efficient but maybe not such a big deal since I'd imagine this case is fairly rare.
+
+If your interesting in pursuing this bug, I can update the patch with one of these approaches -- but maybe you want to confirm the performance win first?
+Created attachment 302980
+v2
+
+After I wrote the last comment a simpler solution occurred to me: if you change ORDER BY to "h.frecency, h.id" you just need to keep the last match around to handle duplicate URLs.
+
+Attached is a patch that does this. It:
+* eliminates the mCurrentResultURLs hashtable (probably a slice perf and memory fragmentation win)
+* if an URL has multiple tags, displays all the tags that match the current query
+* fixes bug 412736 along the way
+(In reply to comment #9)
+> * fixes bug 412736 along the way
+> 
+oops wrong bug -- this patches fixes bug 412734
+
+i've still to read it all. Duplicated urls are due to the following facts:
+- we do search in chunks, so a previous chunk could have already added an url
+- the same url could have different bookmarks (toolbar, menu, other)
+- the same bookmark could have different tags
+
+Have you covered all these cases?
+(In reply to comment #11)
+
+> Have you covered all these cases?
+> 
+> i've still to read it all. Duplicated urls are due to the following facts:
+> - we do search in chunks, so a previous chunk could have already added an url
+
+yes, the mLastMatch is a member of nsNavHistory so it survives across across chunks
+
+> - the same url could have different bookmarks (toolbar, menu, other)
+
+yes, that's why bug 412734 is fixed with this patch
+
+> - the same bookmark could have different tags
+> 
+
+Yes, that's why this patch will show more than one tag for an entry if they match the search.
+Have you run the unit tests and updated to latest trunk?
+Created attachment 303151
+update to tip
+
+merge with latest in cvs. deletes more lines than it adds :)
+(In reply to comment #13)
+> Have you run the unit tests and updated to latest trunk?
+> 
+
+ok, just did that. googling around led me to run "make check" in /toolkit/components/places -- is that enough? anyways, it fails 3 of the tests -- looks like it could be because those tests assume tag matches come first in the autocomplete results? I couldn't figure out which profile or places.sqlite the tests load or create -- if you could point me to how that works than I can try to understand the tests.
+
+Note that the AutoCompleteProcessSearch was added to be reused for bug 395739, so deleting it won't be useful.
+(In reply to comment #16)
+> Note that the AutoCompleteProcessSearch was added to be reused for bug 395739,
+> so deleting it won't be useful.
+> 
+
+OK, didn't realize this (but glad to see the adaptive stuff is happening!). I can re-merge it back in, but its non-trivial (e.g. what's the default case in switch (aType) used for?). So before I spend more time on this, it'd be good to know if you think the approach taken in the patch is worth pursuing?
+Thanks for bringing up the idea and taking a first stab at it adam. I've got a fix for this as well as some other stuff in bug 401660.
+Fixed by bug 401660.
+Testcase in bug 419068 for feature described in comment 0.

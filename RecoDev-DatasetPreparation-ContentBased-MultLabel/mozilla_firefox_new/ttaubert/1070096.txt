@@ -1,0 +1,580 @@
+The about:tabcrashed page is one where we're uninterested in sending session information about it back up to the parent. In fact, we explicitly do not want to record session information about it, because doing so might potentially overwrite useful session data that we'll want to restore from that tabcrashed page.
+
+The about:tabcrashed page is one where we're uninterested in sending session information about it back up to the parent. In fact, we explicitly do not want to record session information about it, because doing so might potentially overwrite useful session data that we'll want to restore from that tabcrashed page.
+Created attachment 8492351
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Comment on attachment 8492351
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+I felt like I wanted to use MessageQueue as the choke-point, instead of making every caller of MessageQueue check to ensure that we weren't on a blacklisted page before sending a push.
+
+I locally tested this with some logging, however, and it looks like we still send an initial burst of information to the parent after a tab crash. It looks like when the tab crashes, we get a new about:blank browser created, which starts to send state up, and then the browser tries to go to the crashing URI (I get a single pageStyle message for the crashing URI sent to the parent), and then we hit the about:tabcrashed page, which we ignore.
+
+So this isn't perfect - there's still some data leaking out, but it's a start.
+Created attachment 8492494
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Comment on attachment 8492494
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+Thoughts on this? I couldn't just stop the messages from being sent from content-sessionStore.js if we were at about:tabcrashed because we already send some as soon as the non-remote about:blank is appended to the tabbrowser.
+
+So I went with this approach instead - mark the browser so that we know it is in the crashed state, and ignore messages from crashed browsers. It makes it so that tabbrowser is responsible for marking browsers as crashed or not, but that might be OK.
+
+Totally open to feedback / suggestions / alternatives.
+Comment on attachment 8492494
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+Review of attachment 8492494:
+-----------------------------------------------------------------
+
+I like the overall approach. Wouldn't it be better if we listened for "oop-browser-crashed" in onTabAdd()? SessionStore could then maintain its own WeakSet of crashed browsers. We would then remove the browser from the set when the tab is revived or overriden. Navigating away manually should also do that.
+Created attachment 8493348
+try: -b do -p linux,linux64,macosx64,win32 -u mochitest-bc -t none
+Created attachment 8493352
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Comment on attachment 8493352
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+So I struggled to find a single common choke-point where I could catch all of the cases where we move away from a crashed tab. I thought I'd use updateBrowserRemotenessByURL as before, but we use that for a number of other things as well (generally moving between our blacklisted about: pages and other content), so I abandoned that idea after a while.
+
+The about:tabcrashed page ended up being that common choke-point - we know that if it unloads, then the tab is either:
+
+a) Being closed
+b) Being revived (by any means - either by clicking on the "Try again" button, or entering a URL into the AwesomeBar and pressing "Enter").
+
+So when that document unloads is when I have SessionStore remove the browser from the crashed browsers weak set. That's probably the most controversial part of the patch, as it means that SessionStore.jsm now knows / cares about the about:tabcrashed document, and listens for an event from it.
+
+What do you think, Tim?
+For testing, I'm thinking of doing the following:
+
+a) Open an e10s window (this test will get skipped if we're on Linux, since OMTC is required and not yet enabled by default on that platform)
+b) In the selected tab, browse to some local site A
+c) Load a framescript in the selected browser causing a crash. I'm sure we have code that does that somewhere, and I'll just mimic it.
+d) Send the crashed browser to another local site B
+e) Retrieve the tab state for the browser, and ensure that about:tabcrashed never appears in it.
+
+I think this test is independent of the approach for solving this bug, so I'll just start on it now while I wait on feedback for my solution.
+Comment on attachment 8493352
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+Review of attachment 8493352:
+-----------------------------------------------------------------
+
+::: browser/base/content/aboutTabCrashed.js
+@@ +14,5 @@
+>  
+> +addEventListener("unload", () => {
+> +  let event = new CustomEvent("AboutTabCrashedUnload", {bubbles: true});
+> +  document.dispatchEvent(event);
+> +});
+
+It seems rather weird that about:tabcrashed has to help sessionstore here. How about adding a pagehide listener to content-sessionStore.js that if (url == about:tabcrashed) sends a message to the parent saying it should revive/unignore the crashed browser? Would that work?
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +1421,5 @@
+>      // events due to changing groups in Panorama.
+>      this.saveStateDelayed(aWindow);
+>    },
+>  
+> +  onRemoteTabCrashed: function ssi_onRemoteTabCrashed(aBrowser) {
+
+Nit:
+
+onRemoteTabCrashed: function (aBrowser) {
+
+or fancier:
+
+onRemoteTabCrashed(aBrowser) {
+
+:)
+Created attachment 8494150
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Comment on attachment 8494150
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+(In reply to Tim Taubert [:ttaubert] from comment #10)
+> Comment on attachment 8493352
+> Collect no SessionStore information for about:tabcrashed pages. r=?
+> 
+> Review of attachment 8493352:
+> -----------------------------------------------------------------
+> 
+> ::: browser/base/content/aboutTabCrashed.js
+> @@ +14,5 @@
+> >  
+> > +addEventListener("unload", () => {
+> > +  let event = new CustomEvent("AboutTabCrashedUnload", {bubbles: true});
+> > +  document.dispatchEvent(event);
+> > +});
+> 
+> It seems rather weird that about:tabcrashed has to help sessionstore here.
+> How about adding a pagehide listener to content-sessionStore.js that if (url
+> == about:tabcrashed) sends a message to the parent saying it should
+> revive/unignore the crashed browser? Would that work?
+> 
+
+Strangely, I couldn't seem to get the message sent from the content script at the right time, or, the content script didn't seem to have access to the right about:tabcrashed URL. I do know that DocShell does some tricky things with URLs when we use displayLoadError, which might have something to do with it.
+
+How about this solution? When the browser crashes, we attach the pagehide listener in SessionStore.jsm, and revive when we see the about:tabcrashed URL go by there. For some reason, SessionStore.jsm can see the right URL just fine. :/
+
+Let me know if you'd really rather this be in a content script, and I can try to dig further.
+
+> ::: browser/components/sessionstore/SessionStore.jsm
+> @@ +1421,5 @@
+> >      // events due to changing groups in Panorama.
+> >      this.saveStateDelayed(aWindow);
+> >    },
+> >  
+> > +  onRemoteTabCrashed: function ssi_onRemoteTabCrashed(aBrowser) {
+> 
+> Nit:
+> 
+> onRemoteTabCrashed: function (aBrowser) {
+> 
+> or fancier:
+> 
+> onRemoteTabCrashed(aBrowser) {
+> 
+> :)
+
+Oooooh - fancy new ES6 stuff. I dig.
+When testing a few approaches here I found and filed bug 1072198. Turns out we currently can't track crashed browsers if we use browser.permanentKey as the key (which is one of my review comments ;).
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #12)
+> Strangely, I couldn't seem to get the message sent from the content script
+> at the right time, or, the content script didn't seem to have access to the
+> right about:tabcrashed URL. I do know that DocShell does some tricky things
+> with URLs when we use displayLoadError, which might have something to do
+> with it.
+
+Using |content.document.documentURI| to check for "about:tabcrashed" in a "pagehide" event listener works fine usually but I assume that |updateBrowserRemoteness| is messing with us here to switch to a remote browser again and we thus see "about:blank".
+
+In the future and when navigating to privileged pages currently, a "pagehide" listener will be sufficient. We can just do the following in the content script:
+
+addEventListener("pagehide", event => {
+  if (event.target == content.document &&
+      event.target.documentURI.startsWith("about:tabcrashed")) {
+    // Couldn't think of a better message name.
+    sendAsyncMessage("SessionStore:reviveTab");
+  }
+});
+
+For remote/unprivileged pages I thought of sending a message in "unload" but that doesn't work unfortunately. Those messages never arrive because it's probably too late. I have no good idea right now... Anyway, we should for now add a test with a remote and non-remote URL when navigating away from a crashed tab.
+
+Another thing that just occurred to me is that we need to clear the MessageQueue when sending the "revive" message. Adding a method MQ.clear() and calling that should be sufficient. Any messages still in transition will be ignored if we send "revive" asynchronously as that will be processed last.
+Comment on attachment 8494150
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+Review of attachment 8494150:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +568,5 @@
+>      }
+>  
+> +    if (this._crashedBrowsers.has(browser)) {
+> +      // Ignore messages from <browser> elements that have crashed
+> +      // and not yet been revived.
+
+The problem here is that we also ignore :setupSyncHandler messages which would leave us unable to flush the tab in case we re-used the browser for privileged content - e.g. navigating a crashed tab to about:crashes. We shouldn't receive message other than the first two types, so ignoring :update messages for crashed tabs sounds sufficient to me.
+
+@@ +1426,5 @@
+>      this.saveStateDelayed(aWindow);
+>    },
+>  
+> +  onRemoteTabCrashed(aBrowser) {
+> +    this._crashedBrowsers.add(aBrowser);
+
+We should actually use aBrowser.permanentKey here like we do already in other places. The permanentKey is swapped when docShells are swapped too so in case someone is crazy enough to swap a "crashed" docShell we at least report the right state for the right tab.
+Another thing I came across is this error:
+
+ContentRestore.jsm, line 170: TypeError: this._historyListener is null
+
+This happens when I select a tab that was pending and thus not fully restored yet when the content process crashed. Selecting it after the crash leads to sessionstore sending the "kick off restoration now" message but there is no info in the child anymore. I think we can handle this in a follow-up?
+Created attachment 8495453
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Comment on attachment 8495453
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+So Mossop, ttaubert and I batted this back in forth in IRC a bit, and here's what we came up with:
+
+The problem with _not_ using a message sent up from an unloading about:tabcrashed browser is that it makes us have to remove the event handler for pagehide in a number of edge cases, and that feels a bit sloppy. A message from unloading about:tabcrashed is nice an encapsulated.
+
+The problem is, however, that we can't use the frame message manager from the unload handler - messages sent at that point will not be received. Mossop noticed that we can use the child process message manager, so I've switched to that. I pass along the chromeEventHandler for the docShell (which is the <xul:browser>) as an object along with the message, and I use that to delete the entry from _crashedBrowsers.
+
+What do we think of this?
+Filed bug 1073165 for the this._historyListener bug that ttaubert spotted in comment 16.
+Created attachment 8497146
+WIP: Tests for crashed tabs
+Created attachment 8497244
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Created attachment 8497245
+[WIP] - Add SessionStore tests for crashed tabs. r=?
+Comment on attachment 8497244
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+I think we need to remove the pagehide handler in the if block of handleRevivedTab. I'll do that tomorrow. What do you think, ttaubert? Am I getting close?
+Comment on attachment 8497244
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+Also open to feedback from smacleod!
+Comment on attachment 8497244
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+Review of attachment 8497244:
+-----------------------------------------------------------------
+
+LGTM with a few style nits. Sorry for the delay!
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +401,5 @@
+>      OBSERVING.forEach(function(aTopic) {
+>        Services.obs.addObserver(this, aTopic, true);
+>      }, this);
+>  
+> +    [...PPMM_MESSAGES].forEach(msg => ppmm.addMessageListener(msg, this));
+
+Is it worth making the *_MESSAGES consts sets if we have to convert them to arrays to iterate in one line?
+
+@@ +576,5 @@
+> +   * SessionStore listens to both the Parent Process Message Manager and
+> +   * the Frame Message Manager, so receiveMessage decides which handler
+> +   * function to use.
+> +   */
+> +  receiveMessage(aMessage) {
+
+Can we just keep a single |receiveMessage| function? The message names are different after all and differentiating between the message managers doesn't seem too important to me.
+
+@@ +594,5 @@
+> +  PPMM_receiveMessage(aMessage) {
+> +    if (aMessage.name == "SessionStore:RemoteTabRevived") {
+> +      this.onRemoteTabRevived(aMessage.objects.browser);
+> +      // SessionStore:RemoteTabRevived is a synchronous message,
+> +      // so we have to return a value.
+
+We have to? The content script doesn't check the response though, so shouldn't |return| work?
+
+@@ +596,5 @@
+> +      this.onRemoteTabRevived(aMessage.objects.browser);
+> +      // SessionStore:RemoteTabRevived is a synchronous message,
+> +      // so we have to return a value.
+> +      return true;
+> +    } else {
+
+No else here please. If we return we'll not get here.
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +716,5 @@
+>  PrivacyListener.init();
+>  
+> +
+> +addEventListener("AboutTabCrashedLoad", function onAboutTabCrashedLoad() {
+> +  removeEventListener("AboutTabCrashedLoad", onAboutTabCrashedLoad, true);
+
+Instead of listening for that event, we could reuse the "unload" handler below and just add an additional "pagehide" handler? That seems more straightforward to me.
+
+@@ +724,5 @@
+> +    throw("We seemed to load about:tabcrashed in a non-remote browser. This " +
+> +          "should really never happen.");
+> +  }
+> +
+> +  let handleRevivedTab = (event) => {
+
+nit: function handleRevivedTab() {
+
+@@ +738,5 @@
+> +
+> +  // If we're browsing from the tab crashed UI to a URI that causes the tab
+> +  // to go remote again, we catch this in the unload event handler, because
+> +  // swapping out the non-remote browser for a remote one doesn't cause the
+> +  // pagehide event to be fired.
+
+Maybe mention updateBrowserRemoteness()?
+
+@@ +742,5 @@
+> +  // pagehide event to be fired.
+> +  addEventListener("unload", handleRevivedTab, true);
+> +  // ... whereas if we browse from the tab crashed UI to a page that keeps the
+> +  // browser remote, we will see a pagehide event instead of an unload.
+> +  addEventListener("pagehide", handleRevivedTab, true);
+
+Do we really need to handle those two events in the capturing phase?
+Created attachment 8498913
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Created attachment 8498914
+[e10s] Add SessionStore tests for crashed tabs. r=?
+Created attachment 8498922
+Collect no SessionStore information for about:tabcrashed pages. r=?
+Created attachment 8498928
+[e10s] Add SessionStore tests for crashed tabs. r=?
+Comment on attachment 8498922
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+(In reply to Tim Taubert [:ttaubert] (limited availability, work week) from comment #25)
+> Comment on attachment 8497244
+> Collect no SessionStore information for about:tabcrashed pages. r=?
+> 
+> Review of attachment 8497244:
+> -----------------------------------------------------------------
+> 
+> LGTM with a few style nits. Sorry for the delay!
+> 
+> ::: browser/components/sessionstore/SessionStore.jsm
+> @@ +401,5 @@
+> >      OBSERVING.forEach(function(aTopic) {
+> >        Services.obs.addObserver(this, aTopic, true);
+> >      }, this);
+> >  
+> > +    [...PPMM_MESSAGES].forEach(msg => ppmm.addMessageListener(msg, this));
+> 
+> Is it worth making the *_MESSAGES consts sets if we have to convert them to
+> arrays to iterate in one line?
+
+Good point. I guess someday, Array.prototype.contains will be useable. Until then, indexOf it is.
+
+> 
+> @@ +576,5 @@
+> > +   * SessionStore listens to both the Parent Process Message Manager and
+> > +   * the Frame Message Manager, so receiveMessage decides which handler
+> > +   * function to use.
+> > +   */
+> > +  receiveMessage(aMessage) {
+> 
+> Can we just keep a single |receiveMessage| function? The message names are
+> different after all and differentiating between the message managers doesn't
+> seem too important to me.
+> 
+
+Yeah, for just the single Parent Process Message Manager message, this is probably fine.
+
+> @@ +594,5 @@
+> > +  PPMM_receiveMessage(aMessage) {
+> > +    if (aMessage.name == "SessionStore:RemoteTabRevived") {
+> > +      this.onRemoteTabRevived(aMessage.objects.browser);
+> > +      // SessionStore:RemoteTabRevived is a synchronous message,
+> > +      // so we have to return a value.
+> 
+> We have to? The content script doesn't check the response though, so
+> shouldn't |return| work?
+> 
+
+Yeah, I was completely wrong on that. Good eye. :)
+
+> @@ +596,5 @@
+> > +      this.onRemoteTabRevived(aMessage.objects.browser);
+> > +      // SessionStore:RemoteTabRevived is a synchronous message,
+> > +      // so we have to return a value.
+> > +      return true;
+> > +    } else {
+> 
+> No else here please. If we return we'll not get here.
+> 
+
+Removed.
+
+> ::: browser/components/sessionstore/content/content-sessionStore.js
+> @@ +716,5 @@
+> >  PrivacyListener.init();
+> >  
+> > +
+> > +addEventListener("AboutTabCrashedLoad", function onAboutTabCrashedLoad() {
+> > +  removeEventListener("AboutTabCrashedLoad", onAboutTabCrashedLoad, true);
+> 
+> Instead of listening for that event, we could reuse the "unload" handler
+> below and just add an additional "pagehide" handler? That seems more
+> straightforward to me.
+> 
+
+Done.
+
+> @@ +724,5 @@
+> > +    throw("We seemed to load about:tabcrashed in a non-remote browser. This " +
+> > +          "should really never happen.");
+> > +  }
+> > +
+> > +  let handleRevivedTab = (event) => {
+> 
+> nit: function handleRevivedTab() {
+> 
+
+Done.
+
+> @@ +738,5 @@
+> > +
+> > +  // If we're browsing from the tab crashed UI to a URI that causes the tab
+> > +  // to go remote again, we catch this in the unload event handler, because
+> > +  // swapping out the non-remote browser for a remote one doesn't cause the
+> > +  // pagehide event to be fired.
+> 
+> Maybe mention updateBrowserRemoteness()?
+> 
+
+Done.
+
+> @@ +742,5 @@
+> > +  // pagehide event to be fired.
+> > +  addEventListener("unload", handleRevivedTab, true);
+> > +  // ... whereas if we browse from the tab crashed UI to a page that keeps the
+> > +  // browser remote, we will see a pagehide event instead of an unload.
+> > +  addEventListener("pagehide", handleRevivedTab, true);
+> 
+> Do we really need to handle those two events in the capturing phase?
+
+Nope - using bubbling phase now.
+Comment on attachment 8498928
+[e10s] Add SessionStore tests for crashed tabs. r=?
+
+Note that you'll need to run this test with the patch from bug 1074507 applied, and it'll only run with the --e10s mochitest-browser argument, naturally.
+Comment on attachment 8498922
+Collect no SessionStore information for about:tabcrashed pages. r=?
+
+Review of attachment 8498922:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/SessionStore.jsm
+@@ +686,5 @@
+>            }
+>          }
+>          break;
+>        default:
+> +        debug(`received unknown fmm message '${aMessage.name}'`);
+
+Nit: could also be an unknown ppmm message :)
+
+@@ +1436,5 @@
+> +  },
+> +
+> +  onRemoteTabRevived(aBrowser) {
+> +    this._crashedBrowsers.delete(aBrowser.permanentKey);
+> +  },
+
+receiveMessage() already accesses _crashedBrowsers directly... So maybe move those two calls into receiveMessage() or add another hasRemoteTabCrashed() function?
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +719,5 @@
+> +  if (content.document.documentURI.startsWith("about:tabcrashed")) {
+> +    if (Services.appinfo.processType != Services.appinfo.PROCESS_TYPE_DEFAULT) {
+> +      // Sanity check - we'd better be loading this in a non-remote browser.
+> +      throw("We seemed to load about:tabcrashed in a non-remote browser. This " +
+> +            "should really never happen.");
+
+This should probably not reference about:tabcrashed loading but navigating away from about:tabcrashed.
+Comment on attachment 8498928
+[e10s] Add SessionStore tests for crashed tabs. r=?
+
+Review of attachment 8498928:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_crashedTabs.js
+@@ +1,2 @@
+> +/* Any copyright is dedicated to the Public Domain.
+> + * http://creativecommons.org/publicdomain/zero/1.0/ */
+
+Add "use strict" please.
+
+@@ +2,5 @@
+> + * http://creativecommons.org/publicdomain/zero/1.0/ */
+> +
+> +const PAGE_ROOT = "http://mochi.test:8888/browser/browser/components/sessionstore/test/";
+> +const PAGE_1 = PAGE_ROOT + "normal_page.html";
+> +const PAGE_2 = PAGE_ROOT + "normal_page2.html";
+
+Could as well use data:,... URLs if the pages don't do anything interesting?
+
+@@ +20,5 @@
+> +    badptr.contents
+> +  };
+> +
+> +  addMessageListener("test:crash", () => {
+> +    dump("Et tu, Brute?");
+
+Instead of loading the frame script and then sending a message to crash it, couldn't you just make it so that the frame script immediately crashes upon loading and just call .loadFrameScript() exactly when you want the browser to crash? Seems like that would be less code and we don't need prepareBrowser().
+
+@@ +103,5 @@
+> + *
+> + * @return nsIFile
+> + */
+> +function getMinidumpDirectory() {
+> +  var dir = Services.dirsvc.get('ProfD', Ci.nsIFile);
+
+nit: let
+
+@@ +179,5 @@
+> +
+> +  // Browse to a new site that will cause the browser to
+> +  // become remote again.
+> +  yield loadPage(browser, PAGE_2);
+> +  TabState.flush(browser);
+
+Should check browser.isRemoteBrowser here.
+
+@@ +213,5 @@
+> +  // Crash the tab
+> +  let mm = browser.messageManager;
+> +  let waitForCrashPromise = waitForCrash(browser);
+> +  mm.sendAsyncMessage("test:crash");
+> +  yield waitForCrashPromise;
+
+Looks like a function called crashBrowser() that returns a promise and loads the frame script would remove some duplicate code.
+
+::: browser/components/sessionstore/test/head.js
+@@ +329,5 @@
+> + *
+> + * @return Promise
+> + */
+> +function loadPage(browser, uri) {
+> +  return new Promise((resolve, reject) => {
+
+Why are you rolling your own function here? Shouldn't browser.loadURI() and promiseBrowserLoaded() just work?
+
+Created attachment 8503260
+Collect no SessionStore information for about:tabcrashed pages. r=ttaubert
+Created attachment 8503262
+Add SessionStore tests for crashed tabs. r=ttaubert.
+Comment on attachment 8503260
+Collect no SessionStore information for about:tabcrashed pages. r=ttaubert
+
+De-bitrotted.
+Comment on attachment 8503262
+Add SessionStore tests for crashed tabs. r=ttaubert.
+
+De-bitrotted.
+Landed fix without test on fx-team:
+
+https://hg.mozilla.org/integration/fx-team/rev/74dc73d33c56
+
+I'll file a follow-up bug to land the test once it's unblocked.
+Created attachment 8508258
+Follow-up - Store browser permanent keys instead of the browsers themselves in SessionStore._crashedBrowsers. r=?
+Comment on attachment 8508258
+Follow-up - Store browser permanent keys instead of the browsers themselves in SessionStore._crashedBrowsers. r=?
+
+I'm an idiot - while addressing ttaubert's feedback, I reverted to storing the browsers themselves in _crashedBrowsers instead of the permanent keys. The patch for bug 1065785 assumes we store the keys. We should store the keys. Without this, restoring from session store for crashed tabs will not work.
+Thanks Gijs!
+
+remote:   https://hg.mozilla.org/integration/fx-team/rev/f2bdb912f72e
+Backed out in https://hg.mozilla.org/integration/fx-team/rev/06241bee9204 and https://hg.mozilla.org/integration/fx-team/rev/b898f3d5a35c because either this patch or bug 1065785 introduced a browser-chrome leak:
+https://treeherder.mozilla.org/ui/logviewer.html#?job_id=956143&repo=fx-team
+Thanks KWierso, investigating...
+It turns out I just needed to remove the pagehide event handler. Re-landed:
+
+https://hg.mozilla.org/integration/fx-team/rev/ffc5c6d4d889
+(I also folded the follow-up fix into that patch)
+Here's my green try push after removing the pagehide event listener:
+
+https://tbpl.mozilla.org/?tree=Try&rev=653a3443d6c2
+https://hg.mozilla.org/mozilla-central/rev/ffc5c6d4d889
+
+
+Collect no SessionStore information for about:tabcrashed pages
+
+
+
+Bug 1070096 - Collect no SessionStore information for about:tabcrashed pages. r=ttaubert. 
+
+Bug 1070096 - Follow-up - Store browser permanent keys instead of the browsers themselves in SessionStore._crashedBrowsers. r=Gijs. 
+
+Backed out changeset f2bdb912f72e (bug 1070096) 
+
+Backed out changeset 74dc73d33c56 (bug 1070096) for bustage on a CLOSED TREE 
+
+Bug 1070096 - Collect no SessionStore information for about:tabcrashed pages. r=ttaubert. 

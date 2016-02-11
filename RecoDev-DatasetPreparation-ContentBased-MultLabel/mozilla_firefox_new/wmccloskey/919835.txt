@@ -1,0 +1,411 @@
+We have bug 516755 for this, but it seems easier to me to start fresh. Tim did a lot of work in bug 894595 to move collection work into content scripts. However, we still need to move a few more pieces.
+
+I will file a separate bug for session restoration.
+
+We have bug 516755 for this, but it seems easier to me to start fresh. Tim did a lot of work in bug 894595 to move collection work into content scripts. However, we still need to move a few more pieces.
+
+I will file a separate bug for session restoration.
+Created attachment 808926
+session-save-cpows
+
+The patches in the dependent bugs take care of asynchronous session data collection, but they don't solve the problem of synchronously collecting session data across processes. This patch addresses that problem using cross-process object wrappers (CPOWs), described here:
+
+https://developer.mozilla.org/en-US/docs/Cross_Process_Object_Wrappers
+
+All the main collection code now runs from a content script. However, the content script exposes an object, SyncHandler, that is sent to the parent process as a CPOW. When the parent process wants to collect session data synchronously, it calls methods on this object. The content process synchronously runs these methods and returns their results. When using a single process, the SyncHandler object is just sent as a normal object and the method calls are normal method calls.
+
+I had to move the loading of content-sessionStore.js so that it happens after we register message listeners. Otherwise, the SyncHandler object gets sent before we've installed a listener for it.
+Comment on attachment 808926
+session-save-cpows
+
+Review of attachment 808926:
+-----------------------------------------------------------------
+
+This looks like a great approach to me until we figured out how to move to async collection, only. f+ for now until all the dependencies have been sorted out and this is ready for review. Thanks!
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +126,5 @@
+> + */
+> +let SyncHandler = {
+> +  init: function () {
+> +    // Send this object as a CPOW to chrome.
+> +    sendAsyncMessage("SessionStore:setupSyncHandler", {}, {handler: this});
+
+I wonder... should that be a sync message? It seems like there's a small time frame where we loaded the content script but didn't receive the 'setupSyncHandler' message yet so there would be nothing to collect data from.
+Created attachment 814007
+session-save-cpows v2
+
+Rebased.
+Comment on attachment 814007
+session-save-cpows v2
+
+Review of attachment 814007:
+-----------------------------------------------------------------
+
+That looks nice.
+
+::: browser/base/content/browser.js
+@@ -763,5 @@
+>  
+>      window.addEventListener("AppCommand", HandleAppCommandEvent, true);
+>  
+>      messageManager.loadFrameScript("chrome://browser/content/content.js", true);
+> -    messageManager.loadFrameScript("chrome://browser/content/content-sessionStore.js", true);
+
+Out of curiosity, why don't we need this anymore?
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +127,5 @@
+> + */
+> +let SyncHandler = {
+> +  init: function () {
+> +    // Send this object as a CPOW to chrome.
+> +    sendSyncMessage("SessionStore:setupSyncHandler", {}, {handler: this});
+
+Why does the message itself need to be synchronous?
+
+@@ +130,5 @@
+> +    // Send this object as a CPOW to chrome.
+> +    sendSyncMessage("SessionStore:setupSyncHandler", {}, {handler: this});
+> +  },
+> +
+> +  collectSessionHistory: function (includePrivateData) {
+
+Could we call Deprecated.warning here?
+
+@@ +137,5 @@
+> +      let tabIndex = history.index - 1;
+> +      TextAndScrollData.collectFrame(history.entries[tabIndex],
+> +                                     content,
+> +                                     docShell.isAppTab,
+> +                                     {includePrivateData: includePrivateData});
+
+I don't follow why we need this operation.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4205,5 @@
+>      // If the tab hasn't been restored yet, just return the data we
+>      // have saved for it.
+>      let browser = tab.linkedBrowser;
+> +    if (this._tabIsNotLoaded(tab)) {
+> +      let tabData = this._collectNotLoadedTabData(tab);
+
+I am not against removing the TabData constructor, but what's the rationale?
+
+@@ +4223,5 @@
+>  
+>        let pageStyle = yield Messenger.send(tab, "SessionStore:collectPageStyle");
+>  
+>        // Collect basic tab data, without session history and storage.
+> +      let tabData = this._collectBaseTabData(tab);
+
+I don't follow, why did you remove all the options?
+
+@@ +4281,5 @@
+>        return TabStateCache.get(tab);
+>      }
+>  
+> +    if (this._tabIsNotLoaded(tab)) {
+> +      let tabData = this._collectNotLoadedTabData(tab);
+
+Do I understand correctly that this data is not cached? What is the rationale?
+
+@@ +4317,5 @@
+>  
+>    /**
+> +   * This function returns true in two cases:
+> +   * 1. the tab is about:blank with no history, or
+> +   * 2. the tab is waiting to be restored.
+
+Please mention that the argument is the xul:tab itself.
+Also, negatives in method names are always weird. Why not a method |_tabIsLoaded|?
+
+@@ +4329,5 @@
+> +  /**
+> +   * Collect data for a tab that satisfies the preconditions listed in
+> +   * _tabIsNotLoaded.
+> +   */
+> +  _collectNotLoadedTabData: function (tab) {
+
+The name is a little ambiguous.
+Perhaps _collectDataForNotLoadedTab?
+
+Also, please document the return type and make it clear that this method can be called from both sync and async contexts.
+
+@@ +4372,5 @@
+>  
+> +    // Collect basic tab data, without session history and storage.
+> +    let tabData = this._collectBaseTabData(tab);
+> +
+> +    if (!this._syncHandlers.has(tab.linkedBrowser)) {
+
+What's the semantics of this?
+Is this a tab that is not completely loaded?
+This will need a little comment.
+
+@@ -4368,5 @@
+> -      if (disallow.length > 0)
+> -	tabData.disallow = disallow.join(",");
+> -      else if (tabData.disallow)
+> -	delete tabData.disallow;
+> -    }
+
+What's the rationale here?
+
+@@ -4385,5 @@
+>  
+> -    // Collect DOMSessionStorage data.
+> -    if (!options || !options.omitSessionStorage) {
+> -      this._collectTabSessionStorage(tab, tabData, options);
+> -    }
+
+What's the rationale here?
+Thanks David. I just wanted to make one thing clear, since it might not be obvious from the patch. This bug makes it so that all synchronous collections use CPOWs--even in normal, single-process Firefox. I think that might answer some of the questions you had. I'll go into more detail though.
+
+(In reply to David Rajchenbach Teller [:Yoric] from comment #4)
+> ::: browser/base/content/browser.js
+> @@ -763,5 @@
+> >  
+> >      window.addEventListener("AppCommand", HandleAppCommandEvent, true);
+> >  
+> >      messageManager.loadFrameScript("chrome://browser/content/content.js", true);
+> > -    messageManager.loadFrameScript("chrome://browser/content/content-sessionStore.js", true);
+> 
+> Out of curiosity, why don't we need this anymore?
+
+See the last paragraph of comment 2. Basically, we run the content script pretty early in browser startup, before we've registered any message listeners for it. This only applies to the "SessionStore:setupSyncHandler" message that gets sent right when the content script is loaded. So that's why I had to move it. The patch moves the loading so it happens right after the message listeners are registered.
+
+> ::: browser/components/sessionstore/content/content-sessionStore.js
+> @@ +127,5 @@
+> > + */
+> > +let SyncHandler = {
+> > +  init: function () {
+> > +    // Send this object as a CPOW to chrome.
+> > +    sendSyncMessage("SessionStore:setupSyncHandler", {}, {handler: this});
+> 
+> Why does the message itself need to be synchronous?
+
+Tim asked for this. The goal is to ensure that the sync handler gets set up as early as possible. When we're running in single-process mode (i.e., no electrolysis), then the content script is executed synchronously. So using a synchronous message here means that the CPOW object will be installed before the loadFrameScript of content-sessionStore.js finishes. That means that we'll always have a CPOW object available for any tab that session store knows about.
+
+When running with multiple processes, the sendSyncMessage call does no good because loadFrameScript happens asynchronously. I'll say more about this below.
+
+> @@ +130,5 @@
+> > +    // Send this object as a CPOW to chrome.
+> > +    sendSyncMessage("SessionStore:setupSyncHandler", {}, {handler: this});
+> > +  },
+> > +
+> > +  collectSessionHistory: function (includePrivateData) {
+> 
+> Could we call Deprecated.warning here?
+
+I think we'll probably be using CPOWs for a while. For example, I don't know how we would collect data during shutdown without CPOWs. The shutdown code currently only gives observers once chance to save data, so the code has to be synchronous as far as I can tell. We could fix how the shutdown code works, but it would be a great deal of work. Also, I don't think it would benefit us to do so: synchronous data collection is fine for shutdown.
+
+We'll probably want to design asynchronous APIs for addons to collect session data. In that case we can deprecate the synchronous APIs.
+
+> @@ +137,5 @@
+> > +      let tabIndex = history.index - 1;
+> > +      TextAndScrollData.collectFrame(history.entries[tabIndex],
+> > +                                     content,
+> > +                                     docShell.isAppTab,
+> > +                                     {includePrivateData: includePrivateData});
+> 
+> I don't follow why we need this operation.
+
+In bug 909048, I moved the collection of text and scroll data so that it happens at the same time we collect session history. That fixes bug 921762. The CPOW code is supposed to do the same thing as the asynchronous code, so that's why it works this way. The structure should be the same as in the handler for the "SessionStore:collectSessionHistory" message.
+
+> ::: browser/components/sessionstore/src/SessionStore.jsm
+> @@ +4205,5 @@
+> >      // If the tab hasn't been restored yet, just return the data we
+> >      // have saved for it.
+> >      let browser = tab.linkedBrowser;
+> > +    if (this._tabIsNotLoaded(tab)) {
+> > +      let tabData = this._collectNotLoadedTabData(tab);
+> 
+> I am not against removing the TabData constructor, but what's the rationale?
+
+Yikes! This points out an existing problem. It looks like you removed TabData entirely here:
+  https://bugzilla.mozilla.org/show_bug.cgi?id=911115#c21
+However, we're still using it in this one place. I'm guessing I broke this in bug 921310 when I rebased my patch. Anyway, this patch should fix the problem.
+
+> @@ +4223,5 @@
+> >  
+> >        let pageStyle = yield Messenger.send(tab, "SessionStore:collectPageStyle");
+> >  
+> >        // Collect basic tab data, without session history and storage.
+> > +      let tabData = this._collectBaseTabData(tab);
+> 
+> I don't follow, why did you remove all the options?
+
+The purpose of the options was to allow certain data (e.g., session history) to be collected by _collectBaseTabData only for synchronous collections. Asynchronous collections collect the data separately with messages. However, now synchronous collections collect that data using CPOWs, after _collectBaseTabData runs. So there's no need for _collectBaseTabData to collect it at all, and therefore no need for the options.
+
+> @@ +4281,5 @@
+> >        return TabStateCache.get(tab);
+> >      }
+> >  
+> > +    if (this._tabIsNotLoaded(tab)) {
+> > +      let tabData = this._collectNotLoadedTabData(tab);
+> 
+> Do I understand correctly that this data is not cached? What is the
+> rationale?
+
+Correct, it's not cached. I was following what you said in your second paragraph in https://bugzilla.mozilla.org/show_bug.cgi?id=909048#c13. Perhaps we could fix the tests so this isn't a problem, but it seems easier to avoid caching. This shouldn't be a very common case.
+
+> @@ +4317,5 @@
+> >  
+> >    /**
+> > +   * This function returns true in two cases:
+> > +   * 1. the tab is about:blank with no history, or
+> > +   * 2. the tab is waiting to be restored.
+> 
+> Please mention that the argument is the xul:tab itself.
+> Also, negatives in method names are always weird. Why not a method
+> |_tabIsLoaded|?
+
+I had trouble coming up with a good name. _tabIsLoaded suggests that we're just checking if the tab has gotten a "load" event, which isn't really right. Maybe _tabIsBeingRestored or something similar? That skips over the !browser.currentURI case, but I'm not sure that one is even important.
+
+> @@ +4329,5 @@
+> > +  /**
+> > +   * Collect data for a tab that satisfies the preconditions listed in
+> > +   * _tabIsNotLoaded.
+> > +   */
+> > +  _collectNotLoadedTabData: function (tab) {
+> 
+> The name is a little ambiguous.
+> Perhaps _collectDataForNotLoadedTab?
+> 
+> Also, please document the return type and make it clear that this method can
+> be called from both sync and async contexts.
+
+OK.
+
+> @@ +4372,5 @@
+> >  
+> > +    // Collect basic tab data, without session history and storage.
+> > +    let tabData = this._collectBaseTabData(tab);
+> > +
+> > +    if (!this._syncHandlers.has(tab.linkedBrowser)) {
+> 
+> What's the semantics of this?
+> Is this a tab that is not completely loaded?
+> This will need a little comment.
+
+It's a tab where we haven't gotten a SessionStore:setupSyncHandler message yet. That happens pretty early during tab initialization. I mentioned earlier that in single-process Firefox, we should always have a CPOW object, so this should never happen. In multiprocess Firefox, it could happen and I'm not entirely sure what to do about it. It will only happen in a tab that hasn't really done anything yet, since the tab needs to talk to the parent in order to do networking, and the setupSyncHandler message will be processed first. So I think it's probably okay to skip collection of all data that resides in the child process, since there probably isn't any. I might be wrong though, in which case we can fix it later. As I said, it only affects electrolysis.
+
+> 
+> @@ -4368,5 @@
+> > -      if (disallow.length > 0)
+> > -	tabData.disallow = disallow.join(",");
+> > -      else if (tabData.disallow)
+> > -	delete tabData.disallow;
+> > -    }
+> 
+> What's the rationale here?
+
+As I mentioned above, we now collect this data using CPOWs, so there's no need to do it here.
+
+> @@ -4385,5 @@
+> >  
+> > -    // Collect DOMSessionStorage data.
+> > -    if (!options || !options.omitSessionStorage) {
+> > -      this._collectTabSessionStorage(tab, tabData, options);
+> > -    }
+> 
+> What's the rationale here?
+
+Same as above.
+Created attachment 820749
+session-save-cpows v3
+
+I made some changes requested by Yoric to clear things up a bit, hopefully.
+Comment on attachment 820749
+session-save-cpows v3
+
+Review of attachment 820749:
+-----------------------------------------------------------------
+
+Beautiful.
+
+::: browser/components/sessionstore/content/content-sessionStore.js
+@@ +140,5 @@
+> +  collectSessionHistory: function (includePrivateData) {
+> +    let history = SessionHistory.read(docShell);
+> +    if ("index" in history) {
+> +      let tabIndex = history.index - 1;
+> +      TextAndScrollData.collectFrame(history.entries[tabIndex],
+
+Needs to be updateFrame().
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4363,5 @@
+> +    let syncHandler = this._syncHandlers.get(tab.linkedBrowser);
+> +
+> +    let includePrivateData = false;
+> +    if (options && options.includePrivateData)
+> +      includePrivateData = true;
+
+Why not just:
+
+let includePrivateData = options && options.includePrivateData;
+Comment on attachment 820749
+session-save-cpows v3
+
+Review of attachment 820749:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +4229,5 @@
+>        return Promise.resolve(TabStateCache.get(tab));
+>      }
+>  
+> +    // If the tab was recently added, or if it's being restored, we
+> +    // just collect basic data about it and skip the cache.
+
+Much nicer, thanks.
+
+@@ +4450,5 @@
+> +      return false;
+> +    }
+> +
+> +    return true;
+> +  },
+
+Thanks for these methods.
+By the way, bill, it should be possible to get rid of sync collection during shutdown, simply by adding a AsyncShutdown blocker to quit-application-granted (or whichever notification we are waiting for).
+(In reply to David Rajchenbach Teller [:Yoric] from comment #9)
+> By the way, bill, it should be possible to get rid of sync collection during
+> shutdown, simply by adding a AsyncShutdown blocker to
+> quit-application-granted (or whichever notification we are waiting for).
+
+That sounds like a great follow-up.
+Created attachment 823757
+last minute fixes
+
+My latest try run uncovered a problem. We have the _syncHandlers weakmap that maps from xul:browser elements to content script objects. The problem is that if swapDocShells is called, then the content script global that's associated with a given <browser> element changes (because the browser's frameloader changes, and the frameloader owns the nsInProcessTabChildGlobal object). Consequently, the _syncHandlers map now maps a <browser> element to a sync handler for a different tab.
+
+This patch adds an event that fires whenever we swap docshells. The session restore code listens for the event and swaps the sync handlers in this case.
+
+This is a pretty general problem that we should keep in mind in the future. In theory, any kind of per-browser data that we keep has a similar issue. As a follow-up, we might want to clear the TabStateCache for these browser elements whenever the SwapDocShells event fires, and maybe also cancel any async collections for the tab. It probably doesn't make too much of a difference because one of the docshells being swapped is usually newly created and so we haven't collected anything for it. And the other one usually gets destroyed pretty soon after the swap. For the sync handler objects it's more important because they get created right away.
+
+As a defensive measure, I also wrapped the calls to the CPOWs in exception handlers. Yoric pointed out a while back that the child could die. In that case, calls to the CPOWs will throw an exception.
+
+I'm not sure why this problem only started showing up now. I'm glad we caught it though. We may want to add some session store tests that involve docshell swapping. For now, though, the current tests seem to be enough to expose the problem.
+Yeah, thanks for adding an event when docShells are swapped, I think I wanted to do this for quite some time now but never hit a road block where we needed it. DocShell swapping is indeed a little tricky to handle, I remember a couple of problems with the click-to-play overlay when dragging a tab to a different window.
+
+(In reply to Bill McCloskey (:billm) from comment #11)
+> I'm not sure why this problem only started showing up now. I'm glad we
+> caught it though. We may want to add some session store tests that involve
+> docshell swapping. For now, though, the current tests seem to be enough to
+> expose the problem.
+
+Would be great to have a follow-up bug for this.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/8cf03e0f7672
+
+Thanks Tim. Filed bug 932336 for the docshell swapping tests.
+https://hg.mozilla.org/mozilla-central/rev/8cf03e0f7672
+
+
+Make session data collection work with multiple processes
+
+
+
+Bug 919835 - Make session data collection work with multiple processes (r=ttaubert,Yoric) 

@@ -1,0 +1,216 @@
+Currently, optimization strategies and outcomes are only associated with mainline Ion code.  This means that for sites with ICs, the PC sample might be within an IC stub, but the optimization strategy info sent to the profiler will end with some "InlineCache" success outcome.  The optimization information associated with a specific stub (for example, an optimized DOM access, or an optimized slot read), is not known.  All we know is that we recorded a sample within an IC, its stubs, or fallback.
+
+IC stubcode's JitcodeMap info should be updated to store an optimization outcome reflecting the stub's optimization strategy.
+
+Ideally, we should distinguish between samples occurring in guard code (the part of the stub that checks inputs for validity), and those occurring in action code (the part of the stub that performs the action after the guards succeed).
+
+So start with, assigning the entire stub's machine code to a single optimization outcome is a decent approximation.
+
+Currently, optimization strategies and outcomes are only associated with mainline Ion code.  This means that for sites with ICs, the PC sample might be within an IC stub, but the optimization strategy info sent to the profiler will end with some "InlineCache" success outcome.  The optimization information associated with a specific stub (for example, an optimized DOM access, or an optimized slot read), is not known.  All we know is that we recorded a sample within an IC, its stubs, or fallback.
+
+IC stubcode's JitcodeMap info should be updated to store an optimization outcome reflecting the stub's optimization strategy.
+
+Ideally, we should distinguish between samples occurring in guard code (the part of the stub that checks inputs for validity), and those occurring in action code (the part of the stub that performs the action after the guards succeed).
+
+So start with, assigning the entire stub's machine code to a single optimization outcome is a decent approximation.
+Created attachment 8630096
+track-ion-ic-stub-optimizations.patch
+
+This patch compiles.  Not tested yet.  Try run here: https://treeherder.mozilla.org/#/jobs?repo=try&revision=938ca324b98a
+Tested it.  Turns out that due to address canonicalization, the IonCache sites weren't actually being picked up.  Basically, addresses falling within Ion ICs were being canonicalized (normalized) to the start of the optimization region in the mainline code.
+Created attachment 8630659
+track-ion-ic-stub-optimizations.patch
+
+Updated patch.  Running in try now: https://treeherder.mozilla.org/#/jobs?repo=try&revision=cc39c91126ed
+BadIncludes errors fixed and new try: https://treeherder.mozilla.org/#/jobs?repo=try&revision=c2ac20b63eb9
+
+Some oranges, but looking mostly green.  Running a fresh try on rebased tip to test oranges for validity.
+
+In the meantime, this should be ready for review.
+Comment on attachment 8630659
+track-ion-ic-stub-optimizations.patch
+
+Review of attachment 8630659:
+-----------------------------------------------------------------
+
+This is pretty great.
+
+The main thing it lacks vs the mainline tracked opts is the history of failures.
+
+It's not obvious to me what the right thing here is. There is value in tracking frequent IC failures: if we keep failing to attach a stub due to a "near miss" of one of the preconditions, it would be helpful to know. We can be tracking failures and types during stub generation like anything else, but it could be too noisy.
+
+We should play with it in a subsequent bug and see.
+
+::: js/src/jit/IonCaches.cpp
+@@ +312,5 @@
+>  
+>  bool
+>  IonCache::linkAndAttachStub(JSContext* cx, MacroAssembler& masm, StubAttacher& attacher,
+> +                            IonScript* ion, const char* attachKind,
+> +                            JS::TrackedOutcome trackedOutcome)
+
+Since you're adding a TrackedOutcome to linkAndAttachStub, I wonder if we can remove attachKind, which is only used for spew, and just spew the outcome instead.
+
+Unfortunately on a quick glance the attachKind seems to still be more detailed than trackedOutcome. Maybe that's not a big deal though?
+
+@@ +1487,5 @@
+>  
+>      StubAttacher attacher(*this);
+>      GenerateUnboxedArrayLength(cx, masm, attacher, obj, object(), output());
+> +    return linkAndAttachStub(cx, masm, attacher, ion, "unboxed array length",
+> +                             JS::TrackedOutcome::ICGetPropStub_UnboxedArrayLength);
+
+Is this indented properly or is splinter messing up the display?
+
+@@ +1751,5 @@
+>      masm.bind(&failures);
+>      attacher.jumpNextStub(masm);
+>  
+> +    return linkAndAttachStub(cx, masm, attacher, ion, "unshadowed proxy get",
+> +                             JS::TrackedOutcome::ICGetPropStub_DOMProxyUnshadowed);
+
+Is this indented properly or is the line too long?
+
+::: js/src/jit/JitcodeMap.cpp
+@@ +228,5 @@
+>  
+>  void*
+>  JitcodeGlobalEntry::IonCacheEntry::canonicalNativeAddrFor(JSRuntime* rt, void* ptr) const
+>  {
+> +    return nativeStartAddr_;
+
+Ah, nice catch!
+
+::: js/src/jit/OptimizationTracking.cpp
+@@ +456,5 @@
+>  Maybe<uint8_t>
+> +JitcodeGlobalEntry::IonEntry::trackedOptimizationIndexAtAddr(
+> +        JSRuntime *rt,
+> +        void* ptr,
+> +        uint32_t* entryOffsetOut)
+
+I don't have anything against this style of laying out arguments, but is it used anywhere else in the engine? I feel like I mainly see
+
+foo(bar x,
+    baz y)
+Comment on attachment 8630659
+track-ion-ic-stub-optimizations.patch
+
+Review of attachment 8630659:
+-----------------------------------------------------------------
+
+Oops meant to r+.
+(In reply to Shu-yu Guo [:shu] from comment #5)
+> This is pretty great.
+> 
+> The main thing it lacks vs the mainline tracked opts is the history of
+> failures.
+
+We could look into emitting SPS markers at failure points when profiling is turned on.  There is work being done to surface marker events in the devtools.
+
+> It's not obvious to me what the right thing here is. There is value in
+> tracking frequent IC failures: if we keep failing to attach a stub due to a
+> "near miss" of one of the preconditions, it would be helpful to know. We can
+> be tracking failures and types during stub generation like anything else,
+> but it could be too noisy.
+
+So, a sample in the "fallback" path in Ion will occur in the mainline jitcode, and be associated directly with an InlineCache optimization strategy section in the main code.  We should probably interpret this as a sample within the fallback stub.  Recording every single IC chain failure will produce a lot of data.
+
+I'm more concerned about samples in the stub's guard code being interpreted as samples for that stub.  Strictly speaking, samples within the guard code of a stub should be interpreted under some general "IC Guard" optimization outcome.
+
+> 
+> We should play with it in a subsequent bug and see.
+
+Yeah
+
+
+> 
+> ::: js/src/jit/IonCaches.cpp
+> @@ +312,5 @@
+> >  
+> >  bool
+> >  IonCache::linkAndAttachStub(JSContext* cx, MacroAssembler& masm, StubAttacher& attacher,
+> > +                            IonScript* ion, const char* attachKind,
+> > +                            JS::TrackedOutcome trackedOutcome)
+> 
+> Since you're adding a TrackedOutcome to linkAndAttachStub, I wonder if we
+> can remove attachKind, which is only used for spew, and just spew the
+> outcome instead.
+> 
+> Unfortunately on a quick glance the attachKind seems to still be more
+> detailed than trackedOutcome. Maybe that's not a big deal though?
+
+Maybe.  If you don't mind I'll leave it as is for now.  Spew and opt tracking are two different kinds of info, and I don't want to throw off any people using the IC spew for diagnostics.  Any such unification IMHO should be in a dedicated bug.
+
+> 
+> @@ +1487,5 @@
+> >  
+> >      StubAttacher attacher(*this);
+> >      GenerateUnboxedArrayLength(cx, masm, attacher, obj, object(), output());
+> > +    return linkAndAttachStub(cx, masm, attacher, ion, "unboxed array length",
+> > +                             JS::TrackedOutcome::ICGetPropStub_UnboxedArrayLength);
+> 
+> Is this indented properly or is splinter messing up the display?
+> 
+> @@ +1751,5 @@
+> >      masm.bind(&failures);
+> >      attacher.jumpNextStub(masm);
+> >  
+> > +    return linkAndAttachStub(cx, masm, attacher, ion, "unshadowed proxy get",
+> > +                             JS::TrackedOutcome::ICGetPropStub_DOMProxyUnshadowed);
+> 
+> Is this indented properly or is the line too long?
+
+Both are indented properly.
+
+> 
+> ::: js/src/jit/JitcodeMap.cpp
+> @@ +228,5 @@
+> >  
+> >  void*
+> >  JitcodeGlobalEntry::IonCacheEntry::canonicalNativeAddrFor(JSRuntime* rt, void* ptr) const
+> >  {
+> > +    return nativeStartAddr_;
+> 
+> Ah, nice catch!
+> 
+> ::: js/src/jit/OptimizationTracking.cpp
+> @@ +456,5 @@
+> >  Maybe<uint8_t>
+> > +JitcodeGlobalEntry::IonEntry::trackedOptimizationIndexAtAddr(
+> > +        JSRuntime *rt,
+> > +        void* ptr,
+> > +        uint32_t* entryOffsetOut)
+> 
+> I don't have anything against this style of laying out arguments, but is it
+> used anywhere else in the engine? I feel like I mainly see
+
+Fixed.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/6a806beb053b
+Could this have caused?
+
+A regression/improvement was reported on AWFY:
+- slave: Mac OS X 10.10 32-bit (Mac Pro, shell)
+- mode: Ion
+
+Regression(s)/Improvement(s):
+- kraken: 1.07% (regression)
+- octane: -2.56% (regression)
+- asmjs-ubench: mandelbrot-polyfill: 8.82% (regression)
+- asmjs-ubench: fbirds-polyfill: 8.81% (regression)
+- ss: cube: -2.65% (improvement)
+- kraken: darkroom: 2.14% (regression)
+- kraken: crypto-aes: 2.91% (regression)
+- kraken: crypto-ccm: 2.59% (regression)
+- octane: RayTrace: -11.78% (regression)
+- octane: SplayLatency: -8.1% (regression)
+- dart: DeltaBlue: 2.7% (regression)
+- dart: Tracer: 8.12% (regression)
+
+Recorded range:
+- http://hg.mozilla.org/integration/mozilla-inbound/pushloghtml?fromchange=041c802f0b1f&tochange=9741eaecc886
+
+More details: http://arewefastyet.com/regressions/#/regression/1792073
+That's very strange. It's not doing that much more work, and what more work it does do is under |if (profilingEnabled)|. I imagine AWFY doesn't turn on profiling for its benchmarking?
+Found the real reason for this regression. It is not caused by this bug.
+https://hg.mozilla.org/mozilla-central/rev/6a806beb053b

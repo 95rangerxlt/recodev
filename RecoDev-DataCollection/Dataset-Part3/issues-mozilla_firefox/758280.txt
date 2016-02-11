@@ -1,0 +1,193 @@
+Created attachment 626865
+fxbutton image
+
+Strange side effect of using VS11 to build mc - the titlebar height is completely off. Not sure yet what the cause is.
+
+Created attachment 626865
+fxbutton image
+
+Strange side effect of using VS11 to build mc - the titlebar height is completely off. Not sure yet what the cause is.
+If I enabled Win7 compatibility mode, title bar height will become normal, but borders are thinner than VS10 builds.
+I've been looking at this today.  I haven't had any major breakthroughs, but I thought I'd jot down my notes so far.  I tested a local Nightly built with VS2012 against the latest Nightly (16.0a1 (2012-07-03)) on a Win7 x64 machine.
+
+I snapped each one to the right side of the screen, then used "Window Detective" to verify that the Window styles, position info, and sizes were all the same.
+
+The version built with VS2012 has extra NC area that is drawn above the reported top of the window.  At the right of this area are the minimize, maximize, and close buttons, which function properly.  Since these are drawn above the reported top of the window, snapping Firefox to the side of the screen causes the buttons to be off-screen (above the top of the screen).  The rest of the extra NC area does not respond to mouse interaction.  While hovering the mouse over this area, Firefox receives a barrage of `WM_NULL` window messages.  The all-in-one menu button that says "Nightly" is drawn slightly lower than it should be; it is partially obscured by the tab bar, as pictured in Jim's screenshot.
+
+When maximized, the NC area appears to be the correct dimensions but the minimize, maximize, and close buttons do not work.  Clicking them is the same as clicking anywhere else in the NC area.
+
+I tried manually changing a few values (`mCaptionHeight`, `mVertResizeMargin`, `mNonClientOffset.top`) in `nsWindow::UpdateClientMargins()` [1] which has been instructive but has not yet led to a solution.
+
+Based on this comment [2], I plan to check out `nsNativeThemeWin::GetWidgetPadding()` next.
+
+[1] https://mxr.mozilla.org/mozilla-central/source/widget/windows/nsWindow.cpp?rev=b405f493e834#1953
+[2] https://mxr.mozilla.org/mozilla-central/source/widget/windows/nsWindow.cpp?rev=b405f493e834#2041
+Processing the `WM_NCCALCSIZE` message [2] gives us the chance to tell Windows what our client area rectangle should be, based on the size and position that our window is being moved/resized to.  MSDN suggests processing this message if you want to draw in the title bar or frame of your window [1].  The idea is that you extend your client area into the frame (which has already been drawn) and draw in that area the way you would draw into any other part of the client area.
+
+`nsWindow::UpdateNonClientMargins` is called to calculate and store the widths of the left and right frames, and the heights of the top and bottom frames.  Additionally, it calculates offsets that are stored in `nsWindow::mNonClientOffsets`.  These offsets are the number of pixels *smaller than the default frame size* each frame should be.  For example, if `nsWindow::mNonClientOffsets.left == 3`, then the left frame should be 3 pixels thinner than its default size.  If we intend to draw in the title bar, we expect `nsWindow::mNonClientOffsets.top` to equal the height of the top nonclient area, since we want to draw in that entire area.
+
+When processing the `WM_NCCALCSIZE` message, `nsWindow` first passes the message and its arguments on to the default window procedure, then applies the offsets in `nsWindow::mNonClientOffsets` to the client area rectangle.
+
+This bug boils down to the following: When building with VS2012, the default window procedure is returning a client area rectangle that is 5 pixels lower than we expect it to be.  When we apply our `mNonClientOffset.top` value, we end up with a top frame that is 5 pixels tall.  Firefox draws its window expecting that the client area takes up the entire window, so the Firefox/Nightly button gets drawn 5 pixels below the top of the window.  Since 5 pixels isn't enough room for a proper caption, Windows apparently uses up the 5 pixels and enough space above the top of the window to draw the caption.
+
+We were calculating the caption height as [3]:
+  SM_CYCAPTION - "The height of a caption area, in pixels."
++ SM_CYFRAME   - "The thickness of the sizing border around the perimeter of a window that can be resized, in pixels."
+
+I believe that we need to additionally include:
+  SM_CXPADDEDBORDER - "The amount of border padding for captioned windows, in pixels."
+
+This nicely accounts for our missing 5 pixels.  However, I'm not yet sure how this will work on Windows XP since MSDN claims that `SM_CXPADDEDBORDER` is not supported on XP.
+
+I have 2 separate patches that I'm about to post.  One simply adds the `SM_CXPADDEDBORDER` to our calculations, the other refactors our border frame calculations so that we don't rely on the default window procedure anymore.  Both fix the titlebar height, but note that neither one fixes the height of the "Firefox" button, and that the client area still appears a few pixels too high.
+
+[1] http://msdn.microsoft.com/en-us/library/windows/desktop/bb688195%28v=vs.85%29.aspx#removing
+[2] http://msdn.microsoft.com/en-us/library/windows/desktop/ms632634%28v=vs.85%29.aspx
+[3] http://msdn.microsoft.com/en-us/library/windows/desktop/ms724385%28v=vs.85%29.aspx
+Created attachment 651488
+Simple patch
+
+This is the simpler of the 2 patches.  All it does is add `SM_CXPADDEDBORDER` to our calculations of `mVertResizeMargin` and `mHorResizeMargin`
+Created attachment 651492
+Refactoring patch
+
+This patch is more aggressive.  It refactors our processing of `WM_NCCALCSIZE` to avoid calling the previous window proc, and rearranges the logic in `nsWindow::UpdateNonClientMargins`.
+SM_CXPADDEDBORDER value will change depending on the subsystem version.
+http://support.microsoft.com/kb/2584604
+VS2012 changed the default subsystem version to 6.0 because it does no longer support Windows XP.
+This is consistent with Tim's observation.
+Comment on attachment 651488
+Simple patch
+
+> +        long windowTop = clientRect->top;
+Where windowTop is used?
+(In reply to Masatoshi Kimura [:emk] from comment #7)
+> Comment on attachment 651488
+> Simple patch
+> 
+> > +        long windowTop = clientRect->top;
+> Where windowTop is used?
+
+This is left over from debugging; I'll remove it.  Thanks for pointing this out!
+Comment on attachment 651492
+Refactoring patch
+
+Review of attachment 651492:
+-----------------------------------------------------------------
+
+::: widget/windows/nsNativeThemeWin.cpp
+@@ +1772,5 @@
+> +      // equal to the top of the scren, but that causes problems with hit
+> +      // testing the buttons in the caption.  Instead, we let the top of our
+> +      // client area be above the top of the screen, and we add padding equal
+> +      // to the size of the default frame.
+> +      aResult->top = GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(92);
+
+What's the hard coded 92? Is this a define in the sdk?
+
+::: widget/windows/nsWindow.cpp
+@@ +2001,5 @@
+> +  // Setting all of these values to 0 has the effect of removing the frame,
+> +  // which is what we want to do in full screen mode.  For minimized windows
+> +  // it probably doesn't matter what we do here.
+> +  if (aSizeMode == nsSizeMode_Minimized
+> +   || aSizeMode == nsSizeMode_Fullscreen) {
+
+This looks like it should fit on a single line, if not:
+if (aSize... ||
+--->aSize...
+
+@@ +2023,5 @@
+> +  // the top of the window. If the window has a caption,
+> +  // the size is calculated as the sum of:
+> +  //      SM_CYFRAME        - The thickness of the sizing border
+> +  //                          around a resizable window
+> +  // (92) SM_CXPADDEDBORDER - The amount of border padding
+
+ah, so add an 
+
+#ifndef SM_CXPADDEDBORDER
+#define SM_CXPADDEDBORDER 92
+#endif
+
+in nsWindowDefs.h and use it throughout.
+
+In all the arithmetic below, what does GetSystemMetrics(SM_CXPADDEDBORDER) return on XP? (Hopefully zero.)
+try builds plz!
+(In reply to Jim Mathies [:jimm] from comment #9)
+> In all the arithmetic below, what does GetSystemMetrics(SM_CXPADDEDBORDER)
+> return on XP? (Hopefully zero.)
+Zero per MSDN.
+http://msdn.microsoft.com/en-us/library/windows/desktop/ms724385%28v=vs.85%29.aspx
+BTW if the subsystem version is < 6.0, GetSystemMetrics(SM_CXPADDEDBORDER) will always return zero anyway. Therefore the patch will not be needed if we continue to support Windows XP.
+Created attachment 652513
+patch
+
+(In reply to Masatoshi Kimura [:emk] from comment #11)
+> (In reply to Jim Mathies [:jimm] from comment #9)
+> > In all the arithmetic below, what does GetSystemMetrics(SM_CXPADDEDBORDER)
+> > return on XP? (Hopefully zero.)
+> Zero per MSDN.
+> http://msdn.microsoft.com/en-us/library/windows/desktop/ms724385%28v=vs.
+> 85%29.aspx
+
+As Masatoshi points out, MSDN states that this value will be 0.  We should still test this patch on an XP machine; I'll get a VM up and running tomorrow.
+
+> BTW if the subsystem version is < 6.0, GetSystemMetrics(SM_CXPADDEDBORDER)
+> will always return zero anyway. Therefore the patch will not be needed if we
+> continue to support Windows XP.
+
+If we can come up with a solution now that works with subystem <= 6.0, I think it would be wise to use it immediately rather than wait for this issue to crop up again.
+
+
+(In reply to Jim Mathies [:jimm] from comment #10)
+> try builds plz!
+
+https://tbpl.mozilla.org/?tree=Try&rev=c3e04fa482f2
+
+
+(In reply to Jim Mathies [:jimm] from comment #9)
+> Comment on attachment 651492
+[...]
+> ::: widget/windows/nsWindow.cpp
+> @@ +2001,5 @@
+> > +  // Setting all of these values to 0 has the effect of removing the frame,
+> > +  // which is what we want to do in full screen mode.  For minimized windows
+> > +  // it probably doesn't matter what we do here.
+> > +  if (aSizeMode == nsSizeMode_Minimized
+> > +   || aSizeMode == nsSizeMode_Fullscreen) {
+> 
+> This looks like it should fit on a single line, if not:
+> if (aSize... ||
+> --->aSize...
+
+Refactored a little; this line no longer looks like this.
+
+> @@ +2023,5 @@
+> > +  // the top of the window. If the window has a caption,
+> > +  // the size is calculated as the sum of:
+> > +  //      SM_CYFRAME        - The thickness of the sizing border
+> > +  //                          around a resizable window
+> > +  // (92) SM_CXPADDEDBORDER - The amount of border padding
+> 
+> ah, so add an 
+> 
+> #ifndef SM_CXPADDEDBORDER
+> #define SM_CXPADDEDBORDER 92
+> #endif
+> 
+> in nsWindowDefs.h and use it throughout.
+
+Done
+
+
+The previous patch would have regressed bug 575245; it did not leave a row of pixels at the bottom of the screen to allow auto-hide taskbars to reappear.  For this updated patch, I added some code that leaves 1px on the side of the screen that has the taskbar on it (only if the taskbar is set to auto-hide and is on the same monitor as our window and our window is maximized).  This partially addresses bug 642851: The auto-hide taskbar should work properly if it is on the left, right, or bottom.  I tried various approaches for auto-hide taskbars at the top of the screen, but none seemed to work.  I think this may partly be due to our processing of certain window messages (see bug 783333), but that's out of scope for this bug so I'll investigate separately.
+
+Note that this patch does not fix the height of the "Firefox" button (bug 783338).
+Comment on attachment 652513
+patch
+
+took this for a spin on xp today, everything looks good. Overall looks good, nice commenting in the patch as well.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/27f8a4f62506
+https://hg.mozilla.org/mozilla-central/rev/27f8a4f62506
+*** Bug 791946 has been marked as a duplicate of this bug. ***

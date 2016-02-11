@@ -1,0 +1,498 @@
+Created attachment 8526449
+prefetch
+
+This patch prefetches data for add-on shims so that we use fewer CPOWs. The patch has a lot of comments, so I won't say too much here. I'll post performance numbers in a bit.
+
+Created attachment 8526449
+prefetch
+
+This patch prefetches data for add-on shims so that we use fewer CPOWs. The patch has a lot of comments, so I won't say too much here. I'll post performance numbers in a bit.
+Created attachment 8526452
+addon-tracking
+
+Oops, forgot about this patch. The other one depends on it. This one just allows us to keep track of which add-ons are listening for a particular event. That, in turn, determines how much we prefetch.
+I measured the load time for nytimes.com:
+
+                 e10s off        e10s on
+Lastpass off     2.9s            3.4s
+Lastpass on      4.0s            9.7s / 4.6s (with prefetching off/on)
+
+So we're still somewhat slower, but it's still a big improvement.
+Comment on attachment 8526452
+addon-tracking
+
+Review of attachment 8526452:
+-----------------------------------------------------------------
+
+This patch has bitrotted a little, but I was able to apply it. Tests pass, and the code makes sense.
+
+Thanks billm!
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +112,5 @@
+> +    let paths = this.findPaths(prefix);
+> +    return paths.map(([path, count]) => path[path.length - 1]);
+> +  },
+> +
+> +  watch: function(component1, watcher) {
+
+Remind me again why this is called component1 instead of component?
+Comment on attachment 8526449
+prefetch
+
+Review of attachment 8526449:
+-----------------------------------------------------------------
+
+First of all, this is really, really neat stuff. And I'm glad we're doing it, and I like how we're going to be able to tune this pre-fetching per add-on.
+
+To that end, I was wondering if we've got a way of programmatically determining what kind of prefetching rules to compose for each add-on?
+
+I mostly just have questions - see below.
+
+::: toolkit/components/addoncompat/Prefetcher.jsm
+@@ +69,5 @@
+> + * 3. MethodOp("FormCollection", "EventTarget", "getElementsByTagName", "form")
+> + * 4. CollectionOp("Form", "FormCollection")
+> + * 5. PropertyOp(null, "Form", "id")
+> + *
+> + * Rules are written in PrefetcherRules.jsm.
+
+Is there an advantage to having PrefetcherRules be in its own JSM? I remember hearing requests to cut down on the number of unnecessary JSM's in order to reduce the number of full-on compartments we create (see bug 986503 for example).
+
+We might just want to move those rules into this JSM - or include them with preprocessing if we want to keep them in seperate files for development.
+
+@@ +90,5 @@
+> +  }
+> +  return String(obj);
+> +}
+> +
+> +function log(...args)
+
+Instead of a homebrew logger that's perma-disabled here, how about Log.jsm?
+
+https://developer.mozilla.org/en-US/docs/Mozilla/JavaScript_code_modules/Log.jsm
+
+We can then set the level to Log.Level.Warn by default, and flip it to Log.Level.Debug either in-code when debugging, or have a pref observer flip it for some debugging pref.
+
+I know the logging isn't really something that you're focusing on here, but I would like to encourage more Log.jsm usage over homebrew dumping.
+
+@@ +138,5 @@
+> +      has = true;
+> +      propValue = obj[this.prop];
+> +    }
+> +  } catch (e) {
+> +    // Don't cache anything if we can't get the property.
+
+I think this should be "Don't cache anything if an exception is thrown", since if we can't get the property, it's probably because the property isn't there, which won't throw.
+
+@@ +144,5 @@
+> +  }
+> +
+> +  logPrefetch("prop", obj, this.prop, propValue);
+> +  database.cache(this.index, obj, has, propValue);
+> +  if (has && typeof(propValue) == "object" && propValue && this.outputTable) {
+
+I believe typeof(propValue) == "object" implies propValue is truthy. The propValue check might be superfluous with the typeof check.
+
+@@ +151,5 @@
+> +}
+> +
+> +PropertyOp.prototype.makeCacheEntry = function(item, cache)
+> +{
+> +  let [index, obj, has, propValue] = item;
+
+Why is "has" useful to pass here?
+
+@@ +201,5 @@
+> +  let method = this.method;
+> +  let selfArgs = this.args;
+> +  let methodImpl = function(...args) {
+> +    if (args.length == selfArgs.length && args.every((v, i) => v === selfArgs[i])) {
+> +      return result;
+
+What is result in this scope?
+
+@@ +283,5 @@
+> +    let rules = addonRules[trigger] || [];
+> +    for (let rule of rules) {
+> +      let inTable = rule.inputTable;
+> +      let set;
+> +      if (this.rules.has(inTable)) {
+
+this.rules vs rules in this scope is kind of confusing. Any way of make these more distinct?
+
+Also, I think this pattern is clearer:
+
+if (!this.rules.has(inTable)) {
+  this.rules.set(inTable, new Set());
+}
+let set = this.rules.get(inTable);
+
+@@ +307,5 @@
+> +
+> +Database.prototype = {
+> +  // Add an object to a table.
+> +  add: function(table, obj) {
+> +    let tableSet = this.tables.get(table);
+
+if (!this.tables.has(table)) {
+  this.tables.set(table, new Set());
+}
+let tableSet = this.tables.get(table);
+
+@@ +347,5 @@
+> +    // on the index. The index is used to serialize and deserialize
+> +    // data from content to chrome.
+> +    let counter = 0;
+> +    this.ruleMap = new Map();
+> +    for (let addon in PrefetcherRules) {
+
+Is there any benefit to having the PrefetcherRules instantiate lazily once triggered?
+
+@@ +397,5 @@
+> +    let prefetched = [];
+> +    let cpows = [];
+> +    for (let item of db.cached) {
+> +      item = item.map((elt) => {
+> +        if (elt && typeof(elt) == "object") {
+
+Are there not some objects that can be serialized properly? I'm thinking of nsIPrincipal's, for example. Arrays also have typeof equal to "object". Are there others in that group, and are they worth special-casing? Or am I misunderstanding what the contents of a db.cached item can be?
+
+@@ +454,5 @@
+> +      log("Prefetching on");
+> +      return func();
+> +    } finally {
+> +      log("Prefetching off");
+> +      this.cache = old;
+
+Can you supply some documentation here about why we're reverting to the old cache? It's not entirely clear to me why...
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +424,5 @@
+>                                       {type: event.type,
+>                                        capturing: capturing,
+> +                                      isTrusted: event.isTrusted,
+> +                                      prefetched: prefetched},
+> +                                     cpows);
+
+Alignment nit.
+I'm afraid these patches have bitrotted - can you please supply new ones, billm?
+Thanks for looking this over so thoroughly.
+
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #4)
+> Comment on attachment 8526449
+> prefetch
+> 
+> Review of attachment 8526449:
+> -----------------------------------------------------------------
+> 
+> To that end, I was wondering if we've got a way of programmatically
+> determining what kind of prefetching rules to compose for each add-on?
+
+I have some Python scripts to make it a little easier to generate rules, but it's not automated. If we have to do a lot more add-ons, then I guess it would make sense to use some sort of automated approach.
+
+> We might just want to move those rules into this JSM - or include them with
+> preprocessing if we want to keep them in seperate files for development.
+
+I hate preprocessed JS, so I moved this stuff to the main JSM.
+
+> Instead of a homebrew logger that's perma-disabled here, how about Log.jsm?
+> 
+> https://developer.mozilla.org/en-US/docs/Mozilla/JavaScript_code_modules/Log.
+> jsm
+> 
+> We can then set the level to Log.Level.Warn by default, and flip it to
+> Log.Level.Debug either in-code when debugging, or have a pref observer flip
+> it for some debugging pref.
+> 
+> I know the logging isn't really something that you're focusing on here, but
+> I would like to encourage more Log.jsm usage over homebrew dumping.
+
+To be honest, it's hard for me to see the advantages of that here. I don't expect we'll need to ask users to enable this logging; I only left it in for myself (and maybe whoever else needs to debug this code). It's a lot more work to remember how to use a generic Logger facility than to uncomment the return statement. I looked at the docs you posted and had a hard time understanding what I need to do. Do I need to call addAppender? What does it do?
+
+I'll change this if you feel strongly, but I'd rather leave the code the way it is.
+
+> @@ +144,5 @@
+> > +  }
+> > +
+> > +  logPrefetch("prop", obj, this.prop, propValue);
+> > +  database.cache(this.index, obj, has, propValue);
+> > +  if (has && typeof(propValue) == "object" && propValue && this.outputTable) {
+> 
+> I believe typeof(propValue) == "object" implies propValue is truthy. The
+> propValue check might be superfluous with the typeof check.
+> 
+
+typeof(null) == "object", so I think we need the propValue check.
+
+> Why is "has" useful to pass here?
+
+I guess it's not useful now. I'm kinda hoping to cache whether a property exists since this is important for adblock. However, our add-on shims don't support that right now, so that needs to be fixed first.
+
+If you prefer, I can remove this until that work is done though.
+
+> @@ +201,5 @@
+> > +  let method = this.method;
+> > +  let selfArgs = this.args;
+> > +  let methodImpl = function(...args) {
+> > +    if (args.length == selfArgs.length && args.every((v, i) => v === selfArgs[i])) {
+> > +      return result;
+> 
+> What is result in this scope?
+
+It's the third component of |item|, which ultimately comes from the database.cache(...) call in MethodOp.prototype.addObject. So it's the result of the method call.
+
+> this.rules vs rules in this scope is kind of confusing. Any way of make
+> these more distinct?
+
+OK, yeah, I changed the local version to triggerRules.
+
+> @@ +347,5 @@
+> > +    // on the index. The index is used to serialize and deserialize
+> > +    // data from content to chrome.
+> > +    let counter = 0;
+> > +    this.ruleMap = new Map();
+> > +    for (let addon in PrefetcherRules) {
+> 
+> Is there any benefit to having the PrefetcherRules instantiate lazily once
+> triggered?
+
+I'm afraid I don't understand what you mean.
+
+> @@ +397,5 @@
+> > +    let prefetched = [];
+> > +    let cpows = [];
+> > +    for (let item of db.cached) {
+> > +      item = item.map((elt) => {
+> > +        if (elt && typeof(elt) == "object") {
+> 
+> Are there not some objects that can be serialized properly? I'm thinking of
+> nsIPrincipal's, for example. Arrays also have typeof equal to "object". Are
+> there others in that group, and are they worth special-casing? Or am I
+> misunderstanding what the contents of a db.cached item can be?
+
+Yes, we could do that. However, the DOM stuff that we're caching right now isn't of type nsIPrincipals or array. Perhaps if we start caching that stuff we could do that. (One exception is that we cache the results of getElementsByTagName, which is sort of an array. However, it's actually a special DOM type, HTMLCollection, which does not satisfy |instanceof Array| and I don't think sending it via JSON would work.)
+
+> @@ +454,5 @@
+> > +      log("Prefetching on");
+> > +      return func();
+> > +    } finally {
+> > +      log("Prefetching off");
+> > +      this.cache = old;
+> 
+> Can you supply some documentation here about why we're reverting to the old
+> cache? It's not entirely clear to me why...
+
+I was thinking we might at some point call withPrefetching recursively. However, that's not used, so we might as well set it back to null.
+
+> ::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+> @@ +424,5 @@
+> >                                       {type: event.type,
+> >                                        capturing: capturing,
+> > +                                      isTrusted: event.isTrusted,
+> > +                                      prefetched: prefetched},
+> > +                                     cpows);
+> 
+> Alignment nit.
+
+This is aligned correctly. |cpows| is not part of the object literal. It's passed as a separate function argument.
+Created attachment 8533463
+prefetch v2
+*** Bug 1105516 has been marked as a duplicate of this bug. ***
+(In reply to Bill McCloskey (:billm) from comment #6)
+> Thanks for looking this over so thoroughly.
+> 
+> (In reply to Mike Conley (:mconley) - Needinfo me! from comment #4)
+> > Comment on attachment 8526449
+> > prefetch
+> > 
+> > Review of attachment 8526449:
+> > -----------------------------------------------------------------
+> > 
+> > To that end, I was wondering if we've got a way of programmatically
+> > determining what kind of prefetching rules to compose for each add-on?
+> 
+> I have some Python scripts to make it a little easier to generate rules, but
+> it's not automated. If we have to do a lot more add-ons, then I guess it
+> would make sense to use some sort of automated approach.
+> 
+> > We might just want to move those rules into this JSM - or include them with
+> > preprocessing if we want to keep them in seperate files for development.
+> 
+> I hate preprocessed JS, so I moved this stuff to the main JSM.
+> 
+> > Instead of a homebrew logger that's perma-disabled here, how about Log.jsm?
+> > 
+> > https://developer.mozilla.org/en-US/docs/Mozilla/JavaScript_code_modules/Log.
+> > jsm
+> > 
+> > We can then set the level to Log.Level.Warn by default, and flip it to
+> > Log.Level.Debug either in-code when debugging, or have a pref observer flip
+> > it for some debugging pref.
+> > 
+> > I know the logging isn't really something that you're focusing on here, but
+> > I would like to encourage more Log.jsm usage over homebrew dumping.
+> 
+> To be honest, it's hard for me to see the advantages of that here. I don't
+> expect we'll need to ask users to enable this logging; I only left it in for
+> myself (and maybe whoever else needs to debug this code). It's a lot more
+> work to remember how to use a generic Logger facility than to uncomment the
+> return statement. I looked at the docs you posted and had a hard time
+> understanding what I need to do. Do I need to call addAppender? What does it
+> do?
+> 
+> I'll change this if you feel strongly, but I'd rather leave the code the way
+> it is.
+
+Yeah, I won't harp on it.
+
+> 
+> > @@ +144,5 @@
+> > > +  }
+> > > +
+> > > +  logPrefetch("prop", obj, this.prop, propValue);
+> > > +  database.cache(this.index, obj, has, propValue);
+> > > +  if (has && typeof(propValue) == "object" && propValue && this.outputTable) {
+> > 
+> > I believe typeof(propValue) == "object" implies propValue is truthy. The
+> > propValue check might be superfluous with the typeof check.
+> > 
+> 
+> typeof(null) == "object", so I think we need the propValue check.
+> 
+
+Yep, you're right.
+
+> > Why is "has" useful to pass here?
+> 
+> I guess it's not useful now. I'm kinda hoping to cache whether a property
+> exists since this is important for adblock. However, our add-on shims don't
+> support that right now, so that needs to be fixed first.
+> 
+> If you prefer, I can remove this until that work is done though.
+> 
+
+Naw, no need to make you jump through that hoop.
+
+> > @@ +201,5 @@
+> > > +  let method = this.method;
+> > > +  let selfArgs = this.args;
+> > > +  let methodImpl = function(...args) {
+> > > +    if (args.length == selfArgs.length && args.every((v, i) => v === selfArgs[i])) {
+> > > +      return result;
+> > 
+> > What is result in this scope?
+> 
+> It's the third component of |item|, which ultimately comes from the
+> database.cache(...) call in MethodOp.prototype.addObject. So it's the result
+> of the method call.
+> 
+> > this.rules vs rules in this scope is kind of confusing. Any way of make
+> > these more distinct?
+> 
+> OK, yeah, I changed the local version to triggerRules.
+> 
+> > @@ +347,5 @@
+> > > +    // on the index. The index is used to serialize and deserialize
+> > > +    // data from content to chrome.
+> > > +    let counter = 0;
+> > > +    this.ruleMap = new Map();
+> > > +    for (let addon in PrefetcherRules) {
+> > 
+> > Is there any benefit to having the PrefetcherRules instantiate lazily once
+> > triggered?
+> 
+> I'm afraid I don't understand what you mean.
+
+I guess what I meant was: it seems kind of unnecessary to instantiate those rules for AdBlock, LastPass, etc, if none of those add-ons are installed for a particular user. Is it worth considering finding a way of only instantiating these rules if the add-on is installed and the rule is triggered?
+
+I wouldn't block on it, though.
+
+> 
+> > @@ +397,5 @@
+> > > +    let prefetched = [];
+> > > +    let cpows = [];
+> > > +    for (let item of db.cached) {
+> > > +      item = item.map((elt) => {
+> > > +        if (elt && typeof(elt) == "object") {
+> > 
+> > Are there not some objects that can be serialized properly? I'm thinking of
+> > nsIPrincipal's, for example. Arrays also have typeof equal to "object". Are
+> > there others in that group, and are they worth special-casing? Or am I
+> > misunderstanding what the contents of a db.cached item can be?
+> 
+> Yes, we could do that. However, the DOM stuff that we're caching right now
+> isn't of type nsIPrincipals or array. Perhaps if we start caching that stuff
+> we could do that. (One exception is that we cache the results of
+> getElementsByTagName, which is sort of an array. However, it's actually a
+> special DOM type, HTMLCollection, which does not satisfy |instanceof Array|
+> and I don't think sending it via JSON would work.)
+> 
+> > @@ +454,5 @@
+> > > +      log("Prefetching on");
+> > > +      return func();
+> > > +    } finally {
+> > > +      log("Prefetching off");
+> > > +      this.cache = old;
+> > 
+> > Can you supply some documentation here about why we're reverting to the old
+> > cache? It's not entirely clear to me why...
+> 
+> I was thinking we might at some point call withPrefetching recursively.
+> However, that's not used, so we might as well set it back to null.
+> 
+> > ::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+> > @@ +424,5 @@
+> > >                                       {type: event.type,
+> > >                                        capturing: capturing,
+> > > +                                      isTrusted: event.isTrusted,
+> > > +                                      prefetched: prefetched},
+> > > +                                     cpows);
+> > 
+> > Alignment nit.
+> 
+> This is aligned correctly. |cpows| is not part of the object literal. It's
+> passed as a separate function argument.
+
+Ah, right - my mistake.
+Comment on attachment 8533463
+prefetch v2
+
+Review of attachment 8533463:
+-----------------------------------------------------------------
+
+This is looking solid. I think we should do it. Thanks for your work on this, billm.
+
+::: toolkit/components/addoncompat/Prefetcher.jsm
+@@ +1,5 @@
+> +// This Source Code Form is subject to the terms of the Mozilla Public
+> +// License, v. 2.0. If a copy of the MPL was not distributed with this
+> +// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+> +
+> +this.EXPORTED_SYMBOLS = ["Prefetcher", "PropertyOp", "MethodOp", "CollectionOp", "CopyOp"];
+
+I don't think we need to export any of these except Prefetcher anymore.
+
+@@ +9,5 @@
+> +
+> +Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+> +Cu.import("resource://gre/modules/Services.jsm");
+> +
+> +XPCOMUtils.defineLazyModuleGetter(this, "Preferences",
+
+Might as well just use Services.prefs.
+
+::: toolkit/components/addoncompat/RemoteAddonsChild.jsm
+@@ +179,5 @@
+>        contentLocation: contentLocation.spec,
+>        requestOrigin: requestOrigin ? requestOrigin.spec : null,
+>        mimeTypeGuess: mimeTypeGuess,
+>        requestPrincipal: requestPrincipal,
+> +      prefetched: prefetched
+
+Nit - let's keep with the convention of putting trailing commas on these items.
+Landing part 1:
+https://hg.mozilla.org/integration/mozilla-inbound/rev/c3d759a3ba93
+https://hg.mozilla.org/mozilla-central/rev/c3d759a3ba93
+https://hg.mozilla.org/integration/mozilla-inbound/rev/78098039e9c1
+https://hg.mozilla.org/mozilla-central/rev/78098039e9c1

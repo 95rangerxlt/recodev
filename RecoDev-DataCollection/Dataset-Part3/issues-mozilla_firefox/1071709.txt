@@ -1,0 +1,136 @@
+here is a graph for all the platforms:
+http://graphs.mozilla.org/graph.html#tests=%5B%5B313,131,33%5D,%5B313,131,35%5D,%5B313,131,25%5D,%5B313,131,31%5D,%5B313,131,37%5D,%5B313,63,24%5D,%5B313,63,21%5D%5D&sel=1411320866000,1411493666000&displayrange=7&datatype=running
+
+when windows builds are completed, the graphs will point at revision d3a7f765152f instead of revision 15aebfcdbde5
+
+Here is a list of the failures we have so far:
+http://54.215.155.53:8080/alerts.html?rev=d3a7f765152f&showAll=1&testIndex=0&platIndex=0
+
+here is some documentation about session restore tests:
+https://wiki.mozilla.org/Buildbot/Talos/Tests#sessionrestore.2Fsessionrestore_no_auto_restore
+
+I am verifying the tart tests are related before adding them to this bug
+
+here is a graph for all the platforms:
+http://graphs.mozilla.org/graph.html#tests=%5B%5B313,131,33%5D,%5B313,131,35%5D,%5B313,131,25%5D,%5B313,131,31%5D,%5B313,131,37%5D,%5B313,63,24%5D,%5B313,63,21%5D%5D&sel=1411320866000,1411493666000&displayrange=7&datatype=running
+
+when windows builds are completed, the graphs will point at revision d3a7f765152f instead of revision 15aebfcdbde5
+
+Here is a list of the failures we have so far:
+http://54.215.155.53:8080/alerts.html?rev=d3a7f765152f&showAll=1&testIndex=0&platIndex=0
+
+here is some documentation about session restore tests:
+https://wiki.mozilla.org/Buildbot/Talos/Tests#sessionrestore.2Fsessionrestore_no_auto_restore
+
+I am verifying the tart tests are related before adding them to this bug
+the tart results are related as well, some l64 retriggers:
+https://tbpl.mozilla.org/?tree=Mozilla-Inbound&fromchange=b1d627e9bf5e&tochange=eb5bd78a635f&jobname=mozilla-inbound%20talos%20svg.*
+
+the graph looks like this:
+http://graphs.mozilla.org/graph.html#tests=%5B%5B293,131,33%5D,%5B293,131,35%5D%5D&sel=1411320868000,1411493668000&displayrange=7&datatype=running
+Hrm... I would wager this is because we're moving the PdfJS initialization and framescript injection to occur when browser-delayed-startup-finished fires... I'm not 100% familiar with what PdfJS.init or the framescript does, but if it kicks off a bunch of asynchronous activity, they might occur during the Talos tests in question here.
+We could try to move the initialization back to the earlier startup point.
+That might help - let's post a try push with that change to see if the regression goes away.
+
+In the mean time, I've pushed some try pushes to get some profiles.
+
+Baseline (no 942707): https://tbpl.mozilla.org/?tree=Try&rev=4a35ab45f328
+Patch (with 942707 applied): https://tbpl.mozilla.org/?tree=Try&rev=71632055f64e
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #2)
+> Hrm... I would wager this is because we're moving the PdfJS initialization
+> and framescript injection to occur when browser-delayed-startup-finished
+> fires... I'm not 100% familiar with what PdfJS.init or the framescript does,
+> but if it kicks off a bunch of asynchronous activity, they might occur
+> during the Talos tests in question here.
+
+That's a very possible startup scenario. Could this take place after Session Restore is complete>
+Grrr... my try pushes had some bad trychooser syntax, and did everything except what I wanted.
+
+Trying (ha) again,
+
+Baseline (no 942707): https://tbpl.mozilla.org/?tree=Try&rev=b54d9f4e2c93
+Patch (with 942707 applied): https://tbpl.mozilla.org/?tree=Try&rev=e011f8322209
+Thought I had a fix, but it didn't help. I pushed the Pdfjs.init call back to where it was. So now I'm wondering if the bootstrap frame script is causing a problem.
+
+https://tbpl.mozilla.org/?tree=Try&showall=0&rev=8b4d085c881c
+Linux Opt:
+ sessionrestore: 2231.33
+
+old mozilla-central:
+Linux Opt:
+ sessionrestore: 1677.22
+
+pdfjs patch on central:
+Linux Opt:
+ sessionrestore: 2220.44
+Here are some profiles that I extracted for the "sessionstore" test (not sessionstore_no_auto_restore).
+
+Baseline (no 942707): http://people.mozilla.org/~bgirard/cleopatra/#report=2e3826df301928d10237c3843ce9af62bc1b7b2d
+Patch (with 942707 applied): http://people.mozilla.org/~bgirard/cleopatra/#report=9fbeb488bbb28e111ede53d18044261a50724a0c
+I'm having trouble seeing anything useful in these profiles. The profiles are dominated with the shutdown of the browser - the interesting bits are all squashed at the beginning...
+
+I'm going to re-push for Linux, which has a more dramatic regression, to see if it's easier to see some signal in the noise.
+I think I have a lead here - 
+
+https://tbpl.mozilla.org/?tree=Try&rev=4547b7ede7e2
+sessionrestore: 1572.56
+
+pdfjs patch on central:
+sessionrestore: 2220.44
+
+I think the fix here is to wrap the registration code in a child process check. I think it gets executed twice in the parent.
+https://tbpl.mozilla.org/?tree=Try&rev=780a389bfc96
+(In reply to Jim Mathies [:jimm] from comment #11)
+> https://tbpl.mozilla.org/?tree=Try&rev=780a389bfc96
+
+I think that's a bingo right there!
+Created attachment 8494379
+fix v.1
+
+We have in-process child side frame script and out-of-process frame scripts, but we only want to update mime registration in the child process. Pdfjs.init() handles registration in the parent.
+Comment on attachment 8494379
+fix v.1
+
+Review of attachment 8494379:
+-----------------------------------------------------------------
+
+I'm not 100% familiar with PdfJs and friends, so you might want someone more familiar with that component to give this an r+ before landing.
+
+::: browser/extensions/pdfjs/content/pdfjschildbootstrap.js
+@@ +32,5 @@
+>  PdfjsContentUtils.init();
+>  
+> +if (Services.appinfo.processType == Services.appinfo.PROCESS_TYPE_CONTENT) {
+> +  // register various pdfjs factories that hook us into content loading.
+> +  PdfJs.updateRegistration();
+
+It looks like PdfJs.updateRegistration forces us to unregister if we've registered in the past.
+
+Is there a guarantee that this will only run once per process? If not, we might want to create a public accessor to _registered, and check if it's false before updating.
+(In reply to Mike Conley (:mconley) - Needinfo me! from comment #14)
+> It looks like PdfJs.updateRegistration forces us to unregister if we've
+> registered in the past.
+> 
+> Is there a guarantee that this will only run once per process? If not, we
+> might want to create a public accessor to _registered, and check if it's
+> false before updating.
+
+Hmm, I'm not seeing this - 
+
+http://mxr.mozilla.org/mozilla-central/source/browser/extensions/pdfjs/content/PdfJs.jsm#167
+http://mxr.mozilla.org/mozilla-central/source/browser/extensions/pdfjs/content/PdfJs.jsm#302
+
+updateRegistration checks to see if pdf.js is enabled via prefs, and if so calls _ensureRegistered/_ensureUnregistered. Both of those calls check to see if registration has already happened and react appropriately.
+
+Am I missing something here?
+Ah, my mistake - yes, I was under the impression that registration implied being enabled, which is not the case. Forget what I said. I told you that I wasn't too familiar with this code. :)
+https://tbpl.mozilla.org/?tree=Try&rev=780a389bfc96
+https://hg.mozilla.org/integration/fx-team/rev/97689ce53684
+
+Please make sure this gets upstreamed ASAP.
+https://hg.mozilla.org/mozilla-central/rev/97689ce53684
+verified the reported regressions are fixed via graph server.  Thanks for fixing these!
+yury, this needs an uplift to your git repo.
+yep, I'll do that
+Yeah, about that...
+Uplifted by Snuffleupagus at https://github.com/mozilla/pdf.js/pull/5396, thanks!

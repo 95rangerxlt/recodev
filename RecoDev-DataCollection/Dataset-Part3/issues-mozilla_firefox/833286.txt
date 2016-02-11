@@ -1,0 +1,749 @@
+At the moment, to create sessionstore.bak, we copy the old sessionstore.js on top of that file. For huge (50Mb+) sessionstore.js, this can be time-consuming.
+
+I have the feeling that we could do the same thing atomically:
+1. start backup of sessionstore.js lazily (not at startup but when we're about to overwrite it for the first time in the session);
+2. create a hardlink pointing to sessionstore.js, calling it sessionstore.bak;
+3. write data to sessionstore.js.tmp;
+4. finally, rename sessionstore.js.tmp to sessionstore.js.
+
+At the moment, to create sessionstore.bak, we copy the old sessionstore.js on top of that file. For huge (50Mb+) sessionstore.js, this can be time-consuming.
+
+I have the feeling that we could do the same thing atomically:
+1. start backup of sessionstore.js lazily (not at startup but when we're about to overwrite it for the first time in the session);
+2. create a hardlink pointing to sessionstore.js, calling it sessionstore.bak;
+3. write data to sessionstore.js.tmp;
+4. finally, rename sessionstore.js.tmp to sessionstore.js.
+Just a couple of questions:
+* By extending OS.File did you mean adding the ability to create hard links?
+* What happens with sessionstore.bak after step 4 (when sessionstore.js.tmp is renamed into sessionstore.js) ?
+Thanks
+(In reply to Yura Zenevich [:yzen] from comment #1)
+> Just a couple of questions:
+> * By extending OS.File did you mean adding the ability to create hard links?
+
+Yes, that's what I mean. By all means, please check the documentation of hard links before doing that, though. I don't know how hard links work under Windows.
+
+> * What happens with sessionstore.bak after step 4 (when sessionstore.js.tmp
+> is renamed into sessionstore.js) ?
+
+If hard links behave as I expect, sessionstore.bak still exists and contains the old contents of sessionstore.js.
+
+Note that hard links are not available on all file systems, so this will need a fallback in case hard links do not work.
+Created attachment 719323
+First sketch to get initial feedback.
+
+Hi David, this is a first patch with some thoughts about this bug.
+
+I added a link, unlink functionality to osfile for the unix platform (with tests, but you mentioned that this might not work on some posix platforms).
+
+I am now using link instead of copy when creating session backup and all tests seem to be passing (on mac at least, and I am going to write more). I still need to add telemetry and see if this approach speeds things up a bit.
+
+I was not sure what's the exact moment when the session state is being saved for the first time, so I went ahead and added a _lastBackupTime field similar to the _lastSaveTime (used to verify whether the session was backed up or not). I check for it inside _saveStateObject and if it was not backed up I do that first (via link) and then do the write.
+
+It seems like write is already done through the tmp file (Line 209 of _SessionFile.jsm). Oh and I am falling back onto copy if link is not available (via try/catch, so perhaps you have a more graceful idea).
+
+Thanks!
+Comment on attachment 719323
+First sketch to get initial feedback.
+
+Review of attachment 719323:
+-----------------------------------------------------------------
+
+I have a number of remarks, but this looks like a good start.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +247,5 @@
+>    // time in milliseconds (Date.now()) when the session was last written to file
+>    _lastSaveTime: 0,
+>  
+> +  // time in milliseconds (Date.now()) when the session was last backed up to file
+> +  _lastBackupTime: 0,
+
+You just need a boolean here, don't you?
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +219,5 @@
+>    createBackupCopy: function ssfi_createBackupCopy() {
+>      let self = this;
+>      return TaskUtils.spawn(function task() {
+>        try {
+> +        yield OS.File.link(self.path, self.backupPath);
+
+You should first detect whether |link| is available - and document this.
+
+::: toolkit/components/osfile/osfile_unix_front.jsm
+@@ +287,5 @@
+> +      * @param {string} newPath The path to the hardlink to be created.
+> +      *
+> +      * @throws {OS.File.Error} In case of I/O error.
+> +      */
+> +     File.link = function link(path, newPath) {
+
+Assuming that we only implement this for Unix, the function should be called |File.unixLink|.
+
+@@ +300,5 @@
+> +      * @param {string} path The path to a link to be removed.
+> +      *
+> +      * @throws {OS.File.Error} In case of I/O error.
+> +      */
+> +     File.unlink = function unlink(path) {
+
+I'm not sure which is best: calling this File.unixUnlink or just reusing File.remove.
+
+::: toolkit/components/osfile/tests/mochi/worker_test_osfile_unix.js
+@@ +37,5 @@
+>    is(file, -1, "test_open_close: opening of non-existing file failed");
+>    is(ctypes.errno, OS.Constants.libc.ENOENT, "test_open_close: error is ENOENT");
+>  }
+>  
+> +function checkFile(path, exists) {
+
+I am almost certain that we now have a function OS.File.exists.
+
+@@ +59,5 @@
+> +  checkFile(linkPath, false);
+> +  OS.Unix.File.link(
+> +    "chrome/toolkit/components/osfile/tests/mochi/worker_test_osfile_unix.js",
+> +    "chrome/toolkit/components/osfile/tests/mochi/worker_test_osfile_unix.bak");
+> +  checkFile(linkPath, true);
+
+You should probably write a new random file to OS.Constants.Path.tempDir. This will avoid accidents if for some reason we make something really awful with |link| or |unlink|.
+
+@@ +123,5 @@
+>    }
+>    is(path.readString(), path2.readString(), "test_get_cwd: getcwd and getwd return the same path");
+>  }
+>  
+> +function compareFiles(path1, path2) {
+
+Now that we are rather certain that |OS.File.read| works, you can probably simplify:
+- |OS.File.read| both files;
+- check that the typed arrays have the same size;
+- check that they have the same contents (preferably without logging the full contents).
+(In reply to David Rajchenbach Teller [:Yoric] from comment #4)
+> ::: toolkit/components/osfile/osfile_unix_front.jsm
+> @@ +287,5 @@
+> > +      * @param {string} newPath The path to the hardlink to be created.
+> > +      *
+> > +      * @throws {OS.File.Error} In case of I/O error.
+> > +      */
+> > +     File.link = function link(path, newPath) {
+> 
+> Assuming that we only implement this for Unix, the function should be called
+> |File.unixLink|.
+
+I was wondering if I should try implementing it on windows and push to try to run tests on different platforms. Unless I should assume that we use link only on posix. Also I was wondering if I should copy if link fails? Since it's working reliably on all platforms?
+
+> I'm not sure which is best: calling this File.unixUnlink or just reusing
+> File.remove.
+
+Perhaps it makes more sense to have unlink as well since remove would be confusing in case there are multiple hard links to the same data file. What do you think?
+Created attachment 720529
+A latest (not complete) version for reference.
+Created attachment 721072
+Latest patch (keeping it up to date with comments).
+
+This patch addresses all comments. Still need to add some test for backup method as well as verify telemetry.
+I realize that we can probably use an alternative strategy that should work on all platforms.
+
+* Upon backup:
+ 1a. rename sessionstore.js to sessionstore.bak (ignore errors if sessionstore.js doesn't exist);
+ 2a. write sessionstore.js atomically.
+* Upon initialization:
+ 1b. attempt to load sessionstore.js;
+ 2b. if it doesn't exist or if it is corrupted, load sessionstore.bak instead.
+
+I am going to assume that 1a. and 2a. are atomic. If we are interrupted between 1a. and 2a., then 2b. should get us back on track.
+
+This looks both simpler and more portable than the original idea. What do you think, yzen?
+Created attachment 734461
+Updated based on latest suggestions.
+
+Hi David, let me know if the changes look like what you had in mind (to get some early feedback). Tests are to follow shortly (but so far no failures).
+
+Note: when reading the sessionstore.js file asynchronously, we only get duration on success. So I am not sure it is possible to report a combined duration in case we defer to the back file (since if read was successful, we'll resolve the task).
+Comment on attachment 734461
+Updated based on latest suggestions.
+
+Review of attachment 734461:
+-----------------------------------------------------------------
+
+Note that bug 853860 has changed slightly the semantics of outExecutionDuration. This should do what you need.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +3738,4 @@
+>          self._lastSaveTime = Date.now();
+> +        Services.obs.notifyObservers(null, "sessionstore-state-write-complete",
+> +          "");
+> +      });
+
+I would avoid spaghetti-style async code.
+You could use Task.jsm. Alternatively, something along the lines of:
+
+let promise;
+if (...) {
+  promise = _Session.createBackupCopy();
+} else {
+  promise = Promise.resolve();
+}
+promise = promise.then(function onSuccess() {
+  return _SessionFile.write(...);
+});
+promise = promise.then(function onSuccess() {
+  self._lastSaveTime ...
+});
+
+@@ +3740,5 @@
+> +          "");
+> +      });
+> +    }
+> +
+> +    if (!this._sessionBackeUp && this._resume_from_crash) {
+
+Typo: |_sessionBackedUp|. However, I believe that you do not need that part of the check.
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +179,3 @@
+>      let self = this;
+>      return TaskUtils.spawn(function task() {
+> +      let readPaths = [self.path, self.backupPath];
+
+Nit: Rather than array + loop, I would have factored stuff in a function and done something around the lines of
+
+let bytes;
+try {
+  bytes = yield readAux(self.path, options);
+} catch (ex if ex.becauseNoSuchFile) {
+  bytes = yield readAux(self.backupPath, options);
+  // Since bug 853860, this will accumulate the duration of both calls.
+} catch (ex) {
+  Cu.reportError(ex);
+}
+Created attachment 736880
+Changes to sessionstore.js backup.
+Created attachment 736881
+Tests for the patch.
+Hi David, hopefully my changes look reasonable. Note, however, that the patch depends on bug 861264 - currently OS.File.read does not support options so we can not gather telemetry. All tests pass however.
+Comment on attachment 736880
+Changes to sessionstore.js backup.
+
+Review of attachment 736880:
+-----------------------------------------------------------------
+
+I'd like a little more documentation. After this, we'll need to ask ttaubert, who actually has reviewing rights on that file.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +3725,5 @@
+>        return;
+>      }
+>  
+> +    let promise;
+> +    if (this._resume_from_crash) {
+
+You should document the algorithm.
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +151,5 @@
+>     * between a synchronous usage of the API and asynchronous
+>     * initialization.
+>     */
+>    syncRead: function ssfi_syncRead() {
+> +    let readPaths = [this.path, this.backupPath];
+
+Could you replace this loop with just two function calls, as below?
+
+@@ +156,1 @@
+>      TelemetryStopwatch.start("FX_SESSION_RESTORE_SYNC_READ_FILE_MS");
+
+Also, it would be useful to document the algorithm and explain why it should work.
+
+@@ +182,5 @@
+> +      let histogram = Telemetry.getHistogramById(
+> +        "FX_SESSION_RESTORE_READ_FILE_MS");
+> +
+> +      // Safely read a file asynchronously.
+> +      function readAux(aPath, aReadOptions) {
+
+Nit: Generally, I suggest writing |let readAux = function readAux(...) {|
+
+@@ +200,4 @@
+>        }
+> +
+> +      let readOptions = {
+> +        outExecutionDuration: null
+
+Could you document what |outExecutionDuration| measures here?
+
+@@ +201,5 @@
+> +
+> +      let readOptions = {
+> +        outExecutionDuration: null
+> +      };
+> +
+
+Here also, please document why the algorithm should work.
+Created attachment 738345
+Updated changes to sessionstore.js backup.
+Created attachment 738346
+Tests for the patch.
+Comment on attachment 738345
+Updated changes to sessionstore.js backup.
+
+Review of attachment 738345:
+-----------------------------------------------------------------
+
+The patch looks good but we need to fix the backup behavior.
+
+::: browser/components/sessionstore/src/SessionStore.jsm
+@@ +3729,5 @@
+>  
+> +    let promise;
+> +    // If "sessionstore.resume_from_crash" is true, attempt to backup the
+> +    // session file first, before writing to it.
+> +    if (this._resume_from_crash) {
+
+The problem here is that with this patch we create a backup copy of the session file always when writing the session. We used to do this only once when sessionstore was initialized. We should keep the old behavior.
+
+@@ +3749,4 @@
+>      let self = this;
+> +    // Once the session file is successfully updated, save the time stamp of the
+> +    // last save and notify the observers.
+> +    promise = promise.then(function onSuccess() {
+
+We can remove |left self = this| if we do:
+promise = promise.then(() => {
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +157,4 @@
+>     */
+>    syncRead: function ssfi_syncRead() {
+> +    // Safely read a file synchronously.
+> +    let readAuxSync = function readAuxSync(aPath) {
+
+Just |function readAuxSync(aPath) {| is enough, we don't need to also put that in a variable. I'd actually like it more if we had a separate method for it. That should make the code a little more readable.
+
+@@ +178,4 @@
+>      TelemetryStopwatch.start("FX_SESSION_RESTORE_SYNC_READ_FILE_MS");
+> +    // First read the sessionstore.js.
+> +    let text = readAuxSync(this.path);
+> +    if (typeof text !== "undefined") {
+
+|if (text) {| is sufficient.
+
+@@ +183,4 @@
+>      }
+> +    // If sessionstore.js does not exist or is corrupted, read sessionstore.bak.
+> +    text = readAuxSync(this.backupPath);
+> +    if (typeof text !== "undefined") {
+
+if (text) {
+
+@@ +206,5 @@
+> +      let histogram = Telemetry.getHistogramById(
+> +        "FX_SESSION_RESTORE_READ_FILE_MS");
+> +
+> +      // Safely read a file asynchronously.
+> +      let readAux = function readAux(aPath, aReadOptions) {
+
+Moving this into a separate method would be great here, too.
+
+@@ +233,5 @@
+> +      };
+> +      // First read the sessionstore.js.
+> +      let text = yield readAux(self.path, readOptions);
+> +      // If sessionstore.js was read successfully, return its content.
+> +      if (typeof text !== "undefined") {
+
+if (text) {
+Comment on attachment 738346
+Tests for the patch.
+
+Review of attachment 738346:
+-----------------------------------------------------------------
+
+The test takes quite a long time. You should reduce 'browser.sessionstore.interval' to a second or less to make sure the test finishes in time.
+
+::: browser/components/sessionstore/test/browser_833286_atomic_backup.js
+@@ +53,5 @@
+> +  registerCleanupFunction(function() {
+> +    // Revert to the original state.
+> +    ss.setBrowserState(originalState);
+> +    // Reset PREF_SS_RESUME_FROM_CRASH to the original value.
+> +    SpecialPowers.clearUserPref(PREF_SS_RESUME_FROM_CRASH);
+
+Services.prefs.clearUserPref
+
+@@ +58,5 @@
+> +  });
+> +
+> +  // Initially setting PREF_SS_RESUME_FROM_CRASH to false to make sure that
+> +  // sessionstore.bak is not being created.
+> +  SpecialPowers.setBoolPref(PREF_SS_RESUME_FROM_CRASH, false);
+
+Services.prefs.setBoolPref
+
+@@ +94,5 @@
+> +  let array = yield OS.File.read(path);
+> +  gSSData = decoder.decode(array);
+> +
+> +  // Set PREF_SS_RESUME_FROM_CRASH to true.
+> +  SpecialPowers.setBoolPref(PREF_SS_RESUME_FROM_CRASH, true);
+
+Services.prefs.setBoolPref
+(In reply to Tim Taubert [:ttaubert] from comment #17)
+> Comment on attachment 738345
+> Updated changes to sessionstore.js backup.
+> 
+> Review of attachment 738345:
+> -----------------------------------------------------------------
+> 
+> The patch looks good but we need to fix the backup behavior.
+> 
+> ::: browser/components/sessionstore/src/SessionStore.jsm
+> @@ +3729,5 @@
+> >  
+> > +    let promise;
+> > +    // If "sessionstore.resume_from_crash" is true, attempt to backup the
+> > +    // session file first, before writing to it.
+> > +    if (this._resume_from_crash) {
+> 
+> The problem here is that with this patch we create a backup copy of the
+> session file always when writing the session. We used to do this only once
+> when sessionstore was initialized. We should keep the old behavior.
+
+Ah, good point.
+
+> Just |function readAuxSync(aPath) {| is enough, we don't need to also put
+> that in a variable. I'd actually like it more if we had a separate method
+> for it. That should make the code a little more readable.
+
+Ah, I'm the one who asked him to do it this way. Well, you're the boss of session restore :)
+
+> @@ +178,4 @@
+> >      TelemetryStopwatch.start("FX_SESSION_RESTORE_SYNC_READ_FILE_MS");
+> > +    // First read the sessionstore.js.
+> > +    let text = readAuxSync(this.path);
+> > +    if (typeof text !== "undefined") {
+> 
+> |if (text) {| is sufficient.
+
+Not in the (admittedly rather invariant-breaking) case in which |text == ""| :)
+Comment on attachment 738345
+Updated changes to sessionstore.js backup.
+
+Clearing review flag until ttaubert's comment have been applied.
+
+By the way, yzen, in the future, could you take the habit of adding "v2", "v3", etc. to your patches as you update them? This makes it easier to diff between successive versions of the patch.
+Comment on attachment 738346
+Tests for the patch.
+
+Review of attachment 738346:
+-----------------------------------------------------------------
+
+Looks good to me (with ttaubert's changes).
+
+::: browser/components/sessionstore/test/browser_833286_atomic_backup.js
+@@ +75,5 @@
+> +  // Ensure that sessionstore.js is created, but not sessionstore.bak.
+> +  let ssExists = yield OS.File.exists(path);
+> +  let ssBackupExists = yield OS.File.exists(backupPath);
+> +  ok(ssExists, "sessionstore.js should be created.");
+> +  ok(!ssBackupExists, "sessionstore.js.bak should never be created.");
+
+I would set gSSData here instead of in |testWriteNoBackup|.
+Created attachment 740292
+Patch for 833286 v3
+Created attachment 740293
+Tests for the patch v3
+Comment on attachment 740292
+Patch for 833286 v3
+
+Review of attachment 740292:
+-----------------------------------------------------------------
+
+Looks good to me but I think we can clean up the code a little. r=me with all issues addressed.
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +162,5 @@
+> +      let stream = chan.open();
+> +      let text = NetUtil.readInputStreamToString(stream, stream.available(),
+> +        {charset: "utf-8"});
+> +      // If read is successful, finish the telemetry probe.
+> +      TelemetryStopwatch.finish("FX_SESSION_RESTORE_SYNC_READ_FILE_MS");
+
+This seems too magic for me. syncRead() starts the measurement and should end it.
+
+@@ +169,5 @@
+> +      // Ignore exceptions about non-existent files.
+> +    } catch (ex) {
+> +      // Any other error.
+> +      Cu.reportError(ex);
+> +    }
+
+This function should have a finally-clause that returns |text| otherwhise we'll get warnings in strict mode about not always returning a value.
+
+@@ +199,1 @@
+>      }
+
+I'd rather do:
+
+let text = this.readAuxSync(this.path);
+
+if (typeof text === "undefined") {
+  text = this.readAuxSync(this.backupPath);
+}
+
+TelemetryStopwatch.finish("FX_SESSION_RESTORE_SYNC_READ_FILE_MS");
+return text || "";
+
+@@ +217,2 @@
+>      let self = this;
+> +    return TaskUtils.spawn(function () {
+
+Nit: We could use a fat arrow function here instead of self=this etc.
+
+@@ +242,5 @@
+> +   * instead.
+> +   */
+> +  read: function ssfi_read() {
+> +    let self = this;
+> +    return TaskUtils.spawn(function task() {
+
+Nit: We could use a fat arrow function here instead of self=this etc.
+
+@@ +248,5 @@
+> +      // the asynchronous reads off the main thread (of both sessionstore.js and
+> +      // sessionstore.bak, if necessary).
+> +      let readOptions = {
+> +        outExecutionDuration: null
+> +      };
+
+readOptions should just be defined in readAux() instead of being passed on every call.
+
+@@ +260,5 @@
+> +      // sessionstore.bak.
+> +      text = yield self.readAux(self.backupPath, readOptions);
+> +      // Return either the content of the sessionstore.bak if it was read
+> +      // successfully or an empty string otherwise.
+> +      throw new Task.Result(text || "");
+
+I'd rather write:
+
+if (typeof text === "undefined") {
+  text = yield self.readAux(self.backupPath, readOptions);
+}
+
+throw new Task.Result(text || "");
+Comment on attachment 740293
+Tests for the patch v3
+
+Review of attachment 740293:
+-----------------------------------------------------------------
+
+Running all sessionstore tests locally gives me the following failures:
+
+TEST-UNEXPECTED-FAIL| chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_833286_atomic_backup.js | sessionstore.bak should now be created.
+TEST-UNEXPECTED-FAIL| chrome://mochitests/content/browser/browser/components/sessionstore/test/browser_833286_atomic_backup.js | Test timed out
+
+The test passes when run in single mode.
+
+::: browser/components/sessionstore/test/browser_833286_atomic_backup.js
+@@ +10,5 @@
+> +Cu.import("resource:///modules/sessionstore/_SessionFile.jsm", tmp);
+> +
+> +const OS = tmp.OS;
+> +const Task = tmp.Task;
+> +const _SessionFile = tmp._SessionFile;
+
+const {OS, Task, _SessionFile} = tmp;
+(In reply to Tim Taubert [:ttaubert] from comment #25)
+> Comment on attachment 740293
+> Tests for the patch v3
+> 
+> Review of attachment 740293:
+> -----------------------------------------------------------------
+> 
+> Running all sessionstore tests locally gives me the following failures:
+> 
+> TEST-UNEXPECTED-FAIL|
+> chrome://mochitests/content/browser/browser/components/sessionstore/test/
+> browser_833286_atomic_backup.js | sessionstore.bak should now be created.
+> TEST-UNEXPECTED-FAIL|
+> chrome://mochitests/content/browser/browser/components/sessionstore/test/
+> browser_833286_atomic_backup.js | Test timed out
+> 
+> The test passes when run in single mode.
+> 
+> ::: browser/components/sessionstore/test/browser_833286_atomic_backup.js
+> @@ +10,5 @@
+> > +Cu.import("resource:///modules/sessionstore/_SessionFile.jsm", tmp);
+> > +
+> > +const OS = tmp.OS;
+> > +const Task = tmp.Task;
+> > +const _SessionFile = tmp._SessionFile;
+> 
+> const {OS, Task, _SessionFile} = tmp;
+
+Thanks and sorry, I'll look into it.
+Comment on attachment 740292
+Patch for 833286 v3
+
+Review of attachment 740292:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/src/_SessionFile.jsm
+@@ +217,2 @@
+>      let self = this;
+> +    return TaskUtils.spawn(function () {
+
+I actually thought of doing that and it turns out (I get an error) yield is disallowed in functions that are a fat arrow.
+(In reply to Yura Zenevich [:yzen] from comment #27)
+> I actually thought of doing that and it turns out (I get an error) yield is
+> disallowed in functions that are a fat arrow.
+
+Interesting, I didn't know that. I wonder if that's a bug or if there is a reason behind it but I couldn't find anything about that. In that case just nevermind :)
+(In reply to Tim Taubert [:ttaubert] from comment #24)
+> readOptions should just be defined in readAux() instead of being passed on
+> every call.
+We need to, if necessary, to measure the combined time it took to read both sessionstore.js and sessionstore.bak. It can only be achieved when we share the read options object since the outExecutionDuration would be incremented.
+(In reply to Yura Zenevich [:yzen] from comment #29)
+> (In reply to Tim Taubert [:ttaubert] from comment #24)
+> > readOptions should just be defined in readAux() instead of being passed on
+> > every call.
+> We need to, if necessary, to measure the combined time it took to read both
+> sessionstore.js and sessionstore.bak. It can only be achieved when we share
+> the read options object since the outExecutionDuration would be incremented.
+
+Oh, that might make sense. Is outExecutionDuration != 0 even if sessionstore.js does not exist? I for some reason expected it not to contain any useful value if we didn't really read anything at all.
+(In reply to Tim Taubert [:ttaubert] from comment #30)
+> (In reply to Yura Zenevich [:yzen] from comment #29)
+> > (In reply to Tim Taubert [:ttaubert] from comment #24)
+> > > readOptions should just be defined in readAux() instead of being passed on
+> > > every call.
+> > We need to, if necessary, to measure the combined time it took to read both
+> > sessionstore.js and sessionstore.bak. It can only be achieved when we share
+> > the read options object since the outExecutionDuration would be incremented.
+> 
+> Oh, that might make sense. Is outExecutionDuration != 0 even if
+> sessionstore.js does not exist? I for some reason expected it not to contain
+> any useful value if we didn't really read anything at all.
+
+Pretty much, it will contain the time it took the worker process to attempt to read the file. If it's not there it will be incremented by the subsequent read of the sessionstore.bak
+(In reply to Yura Zenevich [:yzen] from comment #31)
+> Pretty much, it will contain the time it took the worker process to attempt
+> to read the file. If it's not there it will be incremented by the subsequent
+> read of the sessionstore.bak
+
+Ok, gotcha. Thanks for enlightening me. Doesn't hurt to maybe add a comment right above the definition of readOptions and add this bit of information ;)
+(In reply to Tim Taubert [:ttaubert] from comment #32)
+> (In reply to Yura Zenevich [:yzen] from comment #31)
+> > Pretty much, it will contain the time it took the worker process to attempt
+> > to read the file. If it's not there it will be incremented by the subsequent
+> > read of the sessionstore.bak
+> 
+> Ok, gotcha. Thanks for enlightening me. Doesn't hurt to maybe add a comment
+> right above the definition of readOptions and add this bit of information ;)
+
+Sounds fair, will do.
+Created attachment 743073
+Patch for 833286 v4
+
+Comments addressed, carrying over the r+.
+Created attachment 743074
+Tests for the patch v4
+Comment on attachment 743074
+Tests for the patch v4
+
+Review of attachment 743074:
+-----------------------------------------------------------------
+
+::: browser/components/sessionstore/test/browser_833286_atomic_backup.js
+@@ +1,3 @@
+> +/* This Source Code Form is subject to the terms of the Mozilla Public
+> + * License, v. 2.0. If a copy of the MPL was not distributed with this
+> + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+Test files usually have a public domain header:
+
+/* Any copyright is dedicated to the Public Domain.
+ * http://creativecommons.org/publicdomain/zero/1.0/ */
+
+@@ +17,5 @@
+> +const path = OS.Path.join(OS.Constants.Path.profileDir, "sessionstore.js");
+> +const backupPath = OS.Path.join(OS.Constants.Path.profileDir,
+> +  "sessionstore.bak");
+> +// Save original browser state.
+> +const originalState = ss.getBrowserState();
+
+No need to backup or restore a state if all we do is play around with files (see below).
+
+@@ +21,5 @@
+> +const originalState = ss.getBrowserState();
+> +
+> +// Initially setting PREF_SS_RESUME_FROM_CRASH to false to make sure that
+> +// sessionstore.bak is not being created.
+> +Services.prefs.setBoolPref(PREF_SS_RESUME_FROM_CRASH, false);
+
+We can't really test the startup path as discussed on IRC so there's no point in touching the pref anymore, right?
+
+@@ +50,5 @@
+> +  waitForSaveState(function () {
+> +    waitForSaveStateComplete(testFunc);
+> +  });
+> +  // Adding a tab will trigger a state save.
+> +  gBrowser.addTab("about:mozilla");
+
+I just ran the test on my machine and it's way too slow. This is caused by too much waiting in this function. I just recalled an easier and faster way to implement this:
+
+function nextTest(testFunc) {
+  waitForSaveStateComplete(testFunc);
+  Services.prefs.setIntPref(PREF_SS_INTERVAL, 0);
+}
+
+Setting the pref to zero causes us to immediately save the state. waitForSaveStateComplete() should then just call clearUserPref() and everything's done. No need to modify the pref anywhere else. This brought the test run time from 8s down to 130ms on my machine.
+
+@@ +70,5 @@
+> +  Services.prefs.setIntPref(PREF_SS_INTERVAL, 500);
+> +
+> +  // Ensure that a sessionstore state write completes by pinning a tab.
+> +  let tabToPin = gBrowser.addTab("about:mozilla");
+> +  gBrowser.pinTab(tabToPin);
+
+We don't need this with the interval=0 code.
+
+@@ +80,5 @@
+> +  // Ensure that sessionstore.js is created, but not sessionstore.bak.
+> +  let ssExists = yield OS.File.exists(path);
+> +  let ssBackupExists = yield OS.File.exists(backupPath);
+> +  ok(ssExists, "sessionstore.js should be created.");
+> +  ok(!ssBackupExists, "sessionstore.js.bak should never be created.");
+
+It's not like it "should never be created" - more like "should not have been created, yet". And that's only because we run tests with a clean profile every time.
+
+@@ +162,5 @@
+> +  let ssBakData = gDecoder.decode(array);
+> +  // Ensure the sessionstore.bak did not change.
+> +  is(ssBakData, gSSBakData, "sessionstore.bak is unchanged.");
+> +
+> +  executeSoon(finish);
+
+I feel like we should restore our initial situation here i.e. we should remove sessionstore.bak when we're done.
+Created attachment 743184
+Tests for the patch v5
+Comment on attachment 743184
+Tests for the patch v5
+
+Review of attachment 743184:
+-----------------------------------------------------------------
+
+Thank you, this looks great now.
+Pushed to try:
+https://tbpl.mozilla.org/?tree=Try&rev=33383f95e918
+Cancelled https://tbpl.mozilla.org/?tree=Try&rev=33383f95e918
+
+Pushed to try again: https://tbpl.mozilla.org/?tree=Try&rev=334783fa4fbe
+https://hg.mozilla.org/integration/fx-team/rev/f76c76faf474
+https://hg.mozilla.org/integration/fx-team/rev/af86d146f476
+https://hg.mozilla.org/mozilla-central/rev/f76c76faf474
+https://hg.mozilla.org/mozilla-central/rev/af86d146f476
+*** Bug 847791 has been marked as a duplicate of this bug. ***

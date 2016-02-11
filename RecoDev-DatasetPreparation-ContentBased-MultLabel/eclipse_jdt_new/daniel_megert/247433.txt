@@ -1,0 +1,220 @@
+I20080915-1800
+
+To help solve performance problems that prevent to fix bug such as bug 6930, we should add some threshold support in code completion. This threshold support would guaranty that code completion returns in a reasonable amount of time.
+
+This threshold could be either a timeout, or a maximum number of potential matches (coming from the indexes) that need to be resolved. If code completion reaches this threshold, it would just give up and indicate to the client that not all proposals were returned.
+
+I20080915-1800
+
+To help solve performance problems that prevent to fix bug such as bug 6930, we should add some threshold support in code completion. This threshold support would guaranty that code completion returns in a reasonable amount of time.
+
+This threshold could be either a timeout, or a maximum number of potential matches (coming from the indexes) that need to be resolved. If code completion reaches this threshold, it would just give up and indicate to the client that not all proposals were returned.
+Targeting 3.5M3 for this support.
+Having a time limit sounds interesting but I think limiting the number of proposals will not work too well as it depends on how people use code assist: some type quite a long prefix before invoking code assist and some always only type the first letter. Also, a proposal can be accepted typing '.' in which case code assist automatically appears. The number of proposals might be long in such scenarios.
+
+Something to consider is an API (e.g. in the CompletionRequestor) to override that limit: assume we tell the user that not all proposals got fetched: he might have two choices:
+1) increase that limit via preference
+2) for this time accept that it's slow and request all proposals (e.g. by selecting a dummy 'not all proposals computed' proposal or via special key binding). i.e. we should not need to set the pref to -1 (or 0), call code assist and then restore the previous value.
+
+As API, clients need a way to set the timeout value, and a feedback that the timeout occurred.
+To propose the maximum of good proposals in a limited amount of time i suggest these API.
+
+/**
+
+ ...
+
+ * Since 3.5 the completion can abort before reporting all the possible proposals. 
+ * This event is notified by a call to {@link #aborting()}.
+ * Proposals proposed after this notification are not guarantee to be optimum (see {@link #aborting()}).
+ * In this case, the sequence of calls is:
+ * <pre>
+ * requestor.beginReporting();
+ * requestor.acceptContext(context);
+ * requestor.accept(proposal_1);
+ * requestor.accept(proposal_2);
+ * requestor.aborting();
+ * requestor.accept(proposal_3);
+ * requestor.endReporting();
+ * </pre>
+
+ ...
+
+ */
+public abstract class CompletionRequestor {
+
+	...
+
+	/**
+	 * Notify that the completion will abort as soon as possible.
+	 * <p>
+	 * Proposals proposed after this notification are not guarantee to be optimum:
+	 * <ul>
+	 * <li>Type references can be qualified even if it's not necessary.</li>
+	 * </ul>
+	 * The default implementation of this method does nothing.
+	 * Clients may override.
+	 * </p>
+	 * 
+	 * @since 3.5
+	 */
+	public void aborting() {
+		// do nothing 
+	}
+
+
+	/**
+	 * Returns the threshold in milliseconds beyond which the completion must abort as soon as possible,
+	 * or <code>-1</code> when there is no time limit to finish the completion process.
+	 * 
+	 * When this threshold is reached a notification will be send to the requestor by calling {@link #aborting()}
+	 * 
+	 * @since 3.5
+	 */
+	public long getThreshold() {
+		return this.threshold;
+	}
+
+	/**
+	 * Sets the threshold in milliseconds beyond which the completion must abort as soon as possible,
+	 * or <code>-1</code> if there is no time limit to finish the completion process;
+	 * 
+	 * @param threshold the threshold in milliseconds
+	 * 
+	 * @since 3.5
+	 */
+	public void setThreshold(long threshold) {
+		this.threshold = threshold;
+	}
+
+	...
+
+}
+
+
+Add only a time limit as threshold seems enough for me. The number of proposals is not important if there is enough time to compute them.
+The threshold can be change at each call of code completion because the threshold is not defined in a preference but is returned by 'CompletionRequestor#getThreshold()' 
+By default 'getThreshold()' must return -1 to be sure to not break existing clients.
+When the time limit is reached then code completion must abort as soon as possible.
+To be sure that most important proposals are always proposed they must be computed early in code completion process and other proposals can be compute after.
+The client would be notified when the code completion abort by a call to 'CompletionRequestor#aborting()'.
+When code completion abort we could propose some other important proposals after the notification if they can be computed fastly.
+eg. a type imported with an on demand import can be computed early but proposed only when all possible type references are known to be able to compute the qualification of this reference.
+So if the time limit is reached after the computation of this type but before the qualifications computation we could still propose this type.
+But as the qualification is unknown we should force the qualification of this proposal.
+
+What do you think about this API ?
+Instead of calling in sequence CompletionRequestor#aborting() and CompletionRequestor#accept(non_optimal_proposal), a method CompletionProposal#isOptimum() can be added.
+Created attachment 113714
+First proposal
+
+This patch contains the API described in comment 4 and a new CompletionFlags to identify non optimum proposal.
+Here's a summary from my discussion/feedback with David:
+- I like the new API except for the new complexity of optimal proposals. Those non-optimal proposals might be inserted differently than the user has set in his prefs or additional work for each of such proposal would be needed on the client side. So, please leave this away for now or hide it from the client i.e. set an internal flag and resolve the type when needed (i.e. when API is called on CompletionPropsal). This however means sort of working around the threshold.
+- -1 as default threshold is a must for backwards compatibility but the Javadoc
+  should also provide a reasonable threshold that clients could use.
+- I find "timeout" better than "threshold".
+
+
+Created attachment 114301
+Another proposal
+
+I propose another approach to solve this problem.
+Instead of adding a completely new API we could add only a IProgressMonitor (bug 247941) and the client would implement a monitor with a timeout.
+It will avoid to add a specific API which look like a progress monitor and it will allow to cancel code assist for another reason.
+
+I run jdtcore performance tests with the following IProgressMonitor (calling System.currentTimeMillis()) and the performance loss is less than 0.25%.
+
+new IProgressMonitor() {
+	private long timeEnd;
+	public void beginTask(String name, int totalWork) {
+		this.timeEnd = Long.MAX_VALUE;
+	}
+	public void done() {}
+	public void internalWorked(double work) {}
+	public boolean isCanceled() {
+		return this.timeEnd <= System.currentTimeMillis();
+	}
+	public void setCanceled(boolean value) {}
+	public void setTaskName(String name) {}
+	public void subTask(String name) {}
+	public void worked(int work) {}
+}
+
+To avoid performance loss when type reference proposals are computed, isCancel() is called every 50 proposed types.
+If isCancel() was called every types then the performance loss could reach 2.5%.
+
+
+The added API would be:
+	/**
+	 * Performs code completion at the given offset position in this compilation unit,
+	 * reporting results to the given completion requestor. The <code>offset</code>
+	 * is the 0-based index of the character, after which code assist is desired.
+	 * An <code>offset</code> of -1 indicates to code assist at the beginning of this
+	 * compilation unit.
+	 * <p>
+	 *
+	 * @param offset the given offset position
+	 * @param requestor the given completion requestor
+	 * @param monitor the progress monitor used to report progress
+	 * @exception JavaModelException if code assist could not be performed. Reasons include:<ul>
+	 *  <li>This Java element does not exist (ELEMENT_DOES_NOT_EXIST)</li>
+	 *  <li> The position specified is < -1 or is greater than this compilation unit's
+	 *      source length (INDEX_OUT_OF_BOUNDS)
+	 * </ul>
+	 *
+	 * @exception IllegalArgumentException if <code>requestor</code> is <code>null</code>
+	 * @since 3.5
+ 	 */
+	void codeComplete(int offset, CompletionRequestor requestor, IProgressMonitor monitor)
+		throws JavaModelException;
+
+public interface ICodeAssist {
+	/**
+	 * Performs code completion at the given offset position in this compilation unit,
+	 * reporting results to the given completion requestor. The <code>offset</code>
+	 * is the 0-based index of the character, after which code assist is desired.
+	 * An <code>offset</code> of -1 indicates to code assist at the beginning of this
+	 * compilation unit.
+	 * It considers types in the working copies with the given owner first. In other words,
+	 * the owner's working copies will take precedence over their original compilation units
+	 * in the workspace.
+	 * <p>
+	 * Note that if a working copy is empty, it will be as if the original compilation
+	 * unit had been deleted.
+	 * </p>
+	 *
+	 * @param offset the given offset position
+	 * @param requestor the given completion requestor
+	 * @param owner the owner of working copies that take precedence over their original compilation units
+	 * @param monitor the progress monitor used to report progress
+	 * @exception JavaModelException if code assist could not be performed. Reasons include:<ul>
+	 *  <li>This Java element does not exist (ELEMENT_DOES_NOT_EXIST)</li>
+	 *  <li> The position specified is < -1 or is greater than this compilation unit's
+	 *      source length (INDEX_OUT_OF_BOUNDS)
+	 * </ul>
+	 *
+	 * @exception IllegalArgumentException if <code>requestor</code> is <code>null</code>
+	 * @since 3.5
+	 */
+	void codeComplete(int offset, CompletionRequestor requestor, WorkingCopyOwner owner, IProgressMonitor monitor)
+		throws JavaModelException;
+}
+For me the second proposal looks better because it is more flexible and does not add a new very specific API.
+
+Daniel - If use a IProgessMonitor with a timeout in JDT/Text is good for you then i will fix the bug 247941 "Add progress monitor to code completion" and i will move this bug to JDT/Text.
+
+Yes, as discussed last week I also favor the second one.
+I fixed bug 247941.
+
+Move this bug to JDT/Text.
+Fixed in HEAD.
+Available in builds > N20081009-2000.
+
+
+[content assist] Add threshold support in code completion
+
+performance
+
+Fixed bug 247433: [content assist] Add threshold support in code completion 
+
+Fixed bug 247433: [content assist] Add threshold support in code completion 

@@ -1,0 +1,438 @@
+Consider the below method:
+public void foo(java.io.@TypeUse FileNotFoundException arg, A type){
+}
+When 'move' refactoring is invoked on #foo:
+ImportRewrite#addImport(ITypeBinding binding, AST ast, ImportRewriteContext context) is invoked with the VariableBinding corresponding to <java.io.@TypeUse FileNotFoundException arg>, where it is expected to return a PackageQualifiedType which contains the TYPE_USE annotation details as well. This is not currently handled in #addImport(...)and the method returns a SimpleType and the TYPE_USE annotation details are missing.
+
+Consider the below method:
+public void foo(java.io.@TypeUse FileNotFoundException arg, A type){
+}
+When 'move' refactoring is invoked on #foo:
+ImportRewrite#addImport(ITypeBinding binding, AST ast, ImportRewriteContext context) is invoked with the VariableBinding corresponding to <java.io.@TypeUse FileNotFoundException arg>, where it is expected to return a PackageQualifiedType which contains the TYPE_USE annotation details as well. This is not currently handled in #addImport(...)and the method returns a SimpleType and the TYPE_USE annotation details are missing.
+Created attachment 235789
+Test Data
+
+Attaching the test data zip to reproduce the issue. This bug depends on the fix from bug 409586.
+(In reply to Manju Mathew from comment #0)
+> ImportRewrite#addImport(ITypeBinding binding, AST ast, ImportRewriteContext
+> context) is invoked with the VariableBinding corresponding to
+> <java.io.@TypeUse FileNotFoundException arg>, where it is expected to return
+> a PackageQualifiedType which contains the TYPE_USE annotation details as
+> well. This is not currently handled in #addImport(...)and the method returns
+> a SimpleType and the TYPE_USE annotation details are missing.
+
+It is illegal to have  a TYPE_USE annotation in the import statement (Ref JSR 308 sec 2.1). So, from the import statement's perspective, this is the expected behavior.
+(In reply to Manoj Palat from comment #2)
+> (In reply to Manju Mathew from comment #0)
+the method returns
+> > a SimpleType and the TYPE_USE annotation details are missing.
+> 
+> It is illegal to have  a TYPE_USE annotation in the import statement (Ref
+> JSR 308 sec 2.1). So, from the import statement's perspective, this is the
+> expected behavior.
+
+I agree that the bug is that the return type should have the TYPE_USE annotation
+1) This issue is present in Qualified type TYPE_USE annotation as well.
+
+consider the following code:
+
+B1.java:
+package packUp;
+public class B1 {
+	public class B2 {
+		public class B3 {}
+	}
+}
+
+
+A.java:
+..
+	public void foo( packUp.B1.B2.@TypeUse B3 arg, A_test803 a)
+					throws java.io.@TypeUse EOFException {...}
+
+move foo to A_803[some place other than B3] - Annotation is lost.
+
+2) same code as above, but move to B3.
+Here the type annotation is lost (there is no parameter here).. However, I believe this should have resulted in a receiver parameter with the TYPE_USE annotation.
+Same issue with type arguments as well.
+
+package packUp;
+public class C1 <T> {
+	public class C2<P> {
+		public class C3<Q> {
+			
+		}
+	}
+}
+
+public void foo( packUp.C1<Integer>.C2<Float>.C3<String> arg, A a) {}
+
+click on foo -> refactor->move -> Choose A -> Preview/OK
+
+Result:
+import packUp.C1.C2.C3;
+
+public class A {
+
+	public void foo( C3<String> arg) {}}
+Creating Types from the Bindings may not be always accurate. In addition, these "manufactured" type would not be able answer resolve bindings. Proposal is to deprecate the current API
+(In reply to Manoj Palat from comment #6)
+> Creating Types from the Bindings may not be always accurate. In addition,
+> these "manufactured" type would not be able answer resolve bindings.
+> Proposal is to deprecate the current API
+
+And provide a new API that takes types (and not typeBindinds) as input for importRewrite(). 
+
+UI team: your feedback appreciated here.
+(In reply to Manoj Palat from comment #7)
+> (In reply to Manoj Palat from comment #6)
+> > Creating Types from the Bindings may not be always accurate. In addition,
+> > these "manufactured" type would not be able answer resolve bindings.
+> > Proposal is to deprecate the current API
+> 
+> And provide a new API that takes types (and not typeBindinds) as input for
+> importRewrite(). 
+
+Manoj, propose a new API with javadoc and let us bounce it across for opinions.
+(In reply to Manoj Palat from comment #6)
+> Creating Types from the Bindings may not be always accurate.
+
+Why not? Bindings are always accurate if the code compiles (and good enough if it doesn't). The cited API is the one we use everywhere, and that's the way to go. Definitely nothing to deprecate.
+
+I didn't investigate comment 5, but it sounds like that's a bug in the refactoring implementation. The addImport API clearly specifies that it adds type arguments for parameterized types, but ignores them for generic types. I would expect the same add/ignore behavior for type-use annotations.
+
+
+> In addition,
+> these "manufactured" type would not be able answer resolve bindings.
+
+Yes, like it is the case for all other AST nodes that are not created by an ASTParser.
+(In reply to Markus Keller from comment #9)
+
+> > In addition,
+> > these "manufactured" type would not be able answer resolve bindings.
+> 
+> Yes, like it is the case for all other AST nodes that are not created by an
+> ASTParser.
+
+So, this was the point that made us wonder if we should deprecate the old
+API and suggest a new one which would pass in the AST with which we could
+operate. If not being to answers bindings is not an issue, then the problem
+goes away.
+
+So Manoj, you are sure you can fabricate annotations from bindings so that
+they would look exactly the same as before ? i.e I want to make sure attributes
+which defaulted to their default values in the original program don't show up
+explicitly in the reconstructed AST.
+> So, this was the point that made us wonder if we should deprecate the old
+> API and suggest a new one which would pass in the AST with which we could
+> operate.
+
+Note that we don't always have an AST handy. E.g. for Extract Local Variable we resolve the binding from the selected expression, and then use addImport to create a type reference. The expression can be anything. And if we don't get a binding for the expression, we try to make a guess that is based on other AST nodes. See e.g. ASTResolving#getPossibleReferenceBinding(ASTNode).
+
+I think writing a new API that can support all these use cases is a lot more work than tweaking type bindings to include all relevant information. Furthermore, there are cases where types are inferred and there's no single AST node that carries all these annotations. Example:
+
+public class TypeInference {
+    @Target(ElementType.TYPE_USE)
+    @interface NonNull { }
+    
+    static <T> List<T> pass(List<T> l) {
+        return l;
+    }
+    
+    static <T> List<? extends T> combine(List<? extends T> a, List<? extends T> b) {
+        return new Random().nextBoolean() ? a : b;
+    }
+    
+    void foo() {
+        // type of pass(..) is List<@NonNull Integer>:
+        pass(new ArrayList<@NonNull Integer>());
+        
+        // type of combine(..) is hard to tell. Maybe this:
+        // List<@NonNull ? extends Number>
+        combine(new ArrayList<@NonNull Byte>(), new ArrayList<@NonNull Long>());
+    }
+}
+(In reply to Markus Keller from comment #9)
+> I didn't investigate comment 5, but it sounds like that's a bug in the
+> refactoring implementation.
+
+That guess was wrong (thanks Noopor for investigating this!).
+
+> The addImport API clearly specifies that it adds
+> type arguments for parameterized types, but ignores them for generic types.
+> I would expect the same add/ignore behavior for type-use annotations.
+
+For parameterized types, it only adds type arguments for the rightmost segment of a qualified type, but it misses type arguments in the qualifier. In that case, #addImport needs to be smarter and has to start the type reference with the first segment that has type arguments or type annotations.
+See bug 420579 as well (came up during testing)
+Created attachment 236989
+Work in Progress patch
+
+switching over for testing for M3, hence holding on to this bug until next week. Meanwhile, this is a wip patch to unblock for now.
+Created attachment 237709
+Proposed Patch
+(In reply to Manoj Palat from comment #4)
+> 2) same code as above, but move to B3.
+> Here the type annotation is lost (there is no parameter here).. However, I
+> believe this should have resulted in a receiver parameter with the TYPE_USE
+> annotation.
+
+In JLS7, we always removed the first parameter of the same type and treated that as implicit 'this'. While I am wondering what made us take this approach (we could have simply kept the parameter and the code that references the parameter name inside the method being moved), this won't work for JSL8, i.e. with type annotations.
+
+Going forward in JLS8, I think we should just retain the first parameter also (with the 'name') rather than making it an explicit 'this'. It's unnecessary to treat the first parameter of current type as implicit/explicit 'this' and touch all the code inside the method being moved. I might be missing something because I don't know the history behind this behavior.
+(In reply to Jayaprakash Arthanareeswaran from comment #16)
+> Going forward in JLS8, I think we should just retain the first parameter
+> also (with the 'name') rather than making it an explicit 'this'. It's
+> unnecessary to treat the first parameter of current type as
+> implicit/explicit 'this' and touch all the code inside the method being
+> moved. I might be missing something because I don't know the history behind
+> this behavior.
+
+First, the patch does not address this scenario as it still not clear as to what is the right approach. One extreme approach is not to allow the movement if there are annotations. 
+
+Second, on a general note, I think it would cause confusion if the behavior is different between >= JLS8 and < JLS8. Also, the current approach looks more intuitive since it equates (or implicitly takes) the enclosing type  as one of the parameters and removes the same from the function.
+(In reply to Jayaprakash Arthanareeswaran from comment #16)
+> (In reply to Manoj Palat from comment #4)
+> > 2) same code as above, but move to B3.
+> > Here the type annotation is lost (there is no parameter here).. However, I
+> > believe this should have resulted in a receiver parameter with the TYPE_USE
+> > annotation.
+> 
+> In JLS7, we always removed the first parameter of the same type and treated
+> that as implicit 'this'.
+
+In Move instance method refactoring, we do not remove the *first* parameter of the target type. We get the option to choose the receiver and the chosen parameter is made as the implicit receiver parameter in the target type.
+For example, you can move #foo to B3 by choosing arg1 or arg2 as the receiver and  check the corresponding #toString methods :
+--------------------------------------
+public class A {
+	public void foo(packUp.B1.B2.@TypeUse B3 arg1, packUp.B1.B2.@TypeUse B3 arg2, A_test803 a) throws java.io.@TypeUse EOFException {
+		this.toString();
+		arg1.toString();
+		arg2.toString();
+	}
+}
+-------------------------------------- 
+
+In my view, going forward in JLS8, in the move instance method refactoring, if the chosen receiver parameter has associated type use annotations, we can retain it as an explicit first parameter 'this' along with the type use annotations. 
+If the chosen receiver parameter has no type use annotation, the behavior can remain as before JLS8.
+(In reply to Noopur Gupta from comment #18)
+> In Move instance method refactoring, we do not remove the *first* parameter
+> of the target type. We get the option to choose the receiver and the chosen
+> parameter is made as the implicit receiver parameter in the target type.
+> For example, you can move #foo to B3 by choosing arg1 or arg2 as the
+> receiver and  check the corresponding #toString methods :
+
+I didn't know about this. Thanks. I should mention it though that looking at the UI it doesn't look very intuitive that there is a choice that the user is expected to make. Worse even when I was told that I can select one of the receiver, I was trying to move them up/down.
+
+> In my view, going forward in JLS8, in the move instance method refactoring,
+> if the chosen receiver parameter has associated type use annotations, we can
+> retain it as an explicit first parameter 'this' along with the type use
+> annotations. 
+> If the chosen receiver parameter has no type use annotation, the behavior
+> can remain as before JLS8.
+
+With my newly acquired knowledge, I agree this is the right approach.
+Just had a quick look and here are my observations.
+
+1. When I try to move a method with a parameter like below, I get a CCE:
+
+      B1<String>.B2<String>.@Marker(true) B3<String> arg
+
+2. I believe the addImport() methods which return a String should also be updated to produce similar result.
+
+3. The documentation of addImport needs update. Esp. we should mention that we would retain the qualifier types in case of annotation or type arguments.
+Couple more comments:
+
+1. The following code completely ignores the values array.
+
+  Object[] values= (Object[]) value;
+  ...
+  int size = expressions.size();
+  for (int i = 0; i < size; i++)
+    expressions.add(newAnnotationValue(ast, expressions.get(i)));
+  return initializer;
+
+This results in annotation value being dropped altogether in cases like this:
+
+  @Marker({"1", "2"})
+
+If you took this new code that create new annotations from the UI code, it may not be a bad idea to move that code to Core so both Core and UI could use that.
+
+2. In method checkAnnotationAndGenerics(), param binding itself could be used instead of a new variable typeBinding.
+Manoj, please handle this bug with priority. I expect this to solve many 308-related problems in refactorings.
+(In reply to Jayaprakash Arthanareeswaran from comment #20)
+> Just had a quick look and here are my observations.
+....
+> 2. I believe the addImport() methods which return a String should also be
+> updated to produce similar result.
+=> Does it require an update? The string that is returned by this method is either a simple name or a qualified name, can the annotation be part of this?
+
+=> The Javadoc of this method and other addImport() methods which return String needs an urgent update. Currently the Javadoc says it returns a type to which the type binding can be assigned to, which is wrong.
+Created attachment 239125
+Proposed Patch
+
+(In reply to Manju Mathew from comment #23)
+> (In reply to Jayaprakash Arthanareeswaran from comment #20)
+> > Just had a quick look and here are my observations.
+> ....
+
+Incorporated the review comments in the patch.
+
+> > 2. I believe the addImport() methods which return a String should also be
+> > updated to produce similar result.
+> => Does it require an update? The string that is returned by this method is
+> either a simple name or a qualified name, can the annotation be part of this?
+> 
+Updated the java doc to reflect name/qualified name. If it is decided that we require a type to be return by the String addImport(), that can be done independently (either via this bug or preferably by a follow up bug).  Committing the current patch to unblock .
+(In reply to Manoj Palat from comment #24)
+> Committing the current patch to unblock .
+commit via: http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=605f0ee93693a2c3a651d9c4f6ced8379d7a4fcc
+Moving to resolved post commit mentions in comment 25. Please raise follow up bugs for further issues
+[Ref comment 24]
+[ui - Ref bug 420116 comment 6]
+1.) These two methods in ImportRewrite are almost identical and should be merged back into one implementation:
+
+- addImport(ITypeBinding, AST, ImportRewriteContext)
+- createType(Type, ITypeBinding, AST, ImportRewriteContext)
+
+The main differences are the isTypeVariable() and isParameterizedType() cases.
+
+The code in isTypeVariable() looks wrong. Can you show an example where this is used? A type variable can only be referenced as a simple name; it can't be qualified.
+
+
+2.) The code in createType(ITypeBinding, ITypeBinding, AST, ImportRewriteContext) causes exceptions even without type annotations:
+
+package bug.imports;
+import java.util.Set;
+public class B {
+    class Date {}
+    Set<java.util.Date> s;
+    {
+        s2= s; // Quick Fix: Create local variable
+    }
+}
+
+Fix: Use "bindingPoint.getTypeDeclaration()". And please replace the part after "if (dotIndex != -1) {" with a simple 
+
+
+3.) The type of an annotation is not properly imported:
+
+package bug.qualified;
+import java.lang.annotation.*;
+@Target(ElementType.TYPE_USE)
+public @interface Date { }
+
+package bug.qualified;
+import java.util.Date;
+public class Clash {
+    Date d= new Date();
+    @bug.qualified.Date Object o;
+    {
+        o2= o; // Quick Fix: Create local variable
+    }
+}
+
+It looks like the code in createType(ITypeBinding, ITypeBinding, AST, ImportRewriteContext) should actually go to the end of the combined createType/addImport method from problem (1.)
+> 2.) The code in createType(ITypeBinding, ITypeBinding, AST,
+> ImportRewriteContext) causes exceptions even without type annotations:
+> [..]
+> And please replace the part after "if (dotIndex != -1) {" with a simple 
+
+Forgot the actual fix:
+
+    str = str.substring(0, dotIndex);
+
+
+> 3.) The type of an annotation is not properly imported:
+> [..]
+> It looks like the code in createType(ITypeBinding, ITypeBinding, AST,
+> ImportRewriteContext) should actually go to the end of the combined
+> createType/addImport method from problem (1.)
+
+And once that's fixed, you will see that the change you did in newAnnotation(AST, IAnnotationBinding, ImportRewriteContext) was not good, since the 'name' node can be a qualified name.
+
+Original code:
+	// pay ransom to allow reuse of 'name':
+	simpleType.setName(ast.newSimpleName("a")); //$NON-NLS-1$
+Your code:
+	[ useful comment removed ]
+	simpleType.setName(ast.newSimpleName(name.toString()));
+
+Maybe a better comment would be:
+	// cut 'name' loose from its parent, so that it can be reused
+
+And the else branch (which shouldn't ever happen) would better be:
+	name = ast.newSimpleName("invalid"); //$NON-NLS-1$
+Created attachment 239347
+Proposed Patch
+
+Thanks Markus for the review. Comments incorporated.
+Jay: Fix for bug 426094 is also combined in this patch.
+Patch looks good to me. Just a couple of observations:
+
+1. On cases where we have a wildcard import, it's left behind after the refactor even though it's no longer required.
+2. In the following case, both the HashMap and HashMap.Entry are added to the imports section in the destination class.
+
+    @Annot(0) HashMap.@Annot(1) Entry<String, @Annot(2) ? extends int @Annot(3) []> value
+
+Both these cases are just as they were before Java 8. So, no complaints there.
+(In reply to Jayaprakash Arthanareeswaran from comment #30)
+> Patch looks good to me. 
+
+Thanks Jay. Committed via http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?h=BETA_JAVA8&id=42a20f90363fe2e676c07d56364d6cc6b90a9458
+
+Markus: Leaving the bug open in case if there are further comments.
+
+> Just a couple of observations:
+> .
+> Both these cases are just as they were before Java 8. So, no complaints
+> there.
+
+These look like an issue wrt ui. However will investigate/triage further before raising the bug.
+(In reply to Manoj Palat from comment #31)
+> (In reply to Jayaprakash Arthanareeswaran from comment #30)
+> > Patch looks good to me. 
+> 
+> Thanks Jay. Committed via
+> http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/
+> ?h=BETA_JAVA8&id=42a20f90363fe2e676c07d56364d6cc6b90a9458
+> 
+> Markus: Leaving the bug open in case if there are further comments.
+
+Since a fix has been released, lowering from critical to normal. If more
+issues are discovered, adjust accordingly as required.
+Ref bug 426510 comment 1 - This is found to be a general issue and not annotation specific
+
+package pack1;
+public class X {
+    public void foo004(pack2.ClashMarker o2, A arg) {}
+}
+
+package pack1;
+public class A {}
+class ClashMarker{}
+
+package pack2;
+public class ClashMarker {}
+
+
+Move foo004 to A -> clash of ClashMarker with the type defined in A.java is not taken care and import inserted with a clash with the local type ClashMarker
+(In reply to Manoj Palat from comment #33)
+This was already raised (by me) in bug 420579 - sorry for the noise - blame it on my 1.8 filter :(.
+ImportRewrite#newAnnotationValue(..) had the problem from comment 28 as well, e.g for member value pair "state= Thread.State.BLOCKED".
+
+The new API ITypeBinding#getTypeAnnotationsOnDimensions() was unnecessary, and I've reverted those changes. Type annotations on dimensions can already be accessed via getComponentType().
+
+I've also reverted/fixed some of the Javadoc changes. The addImport methods can also produce parameterized types, array types, or annotated types, so it is wrong to just say they return either a simple name or a qualified name.
+
+Fixed with http://git.eclipse.org/c/jdt/eclipse.jdt.core.git/commit/?id=8771cbd26402d5e088df5bc8e18f1b0e8d601818
+
+
+[1.8] ImportRewrite#addImport(ITypeBinding, ...) drops TYPE_USE annotations
+
+
+
+Bug 417937: [1.8] ImportRewrite#addImport(ITypeBinding, ...) drops TYPE_USE annotations 
+
+Fix for Bug 417937 [1.8] ImportRewrite#addImport(ITypeBinding, ...) drops TYPE_USE annotations and bug 426094 [1.8] ImportRewrite#addImport(ITypeBinding, ...) drops TYPE_USE annotations in dimensions 
+
+Fix for Bug 417937 [1.8] ImportRewrite#addImport(ITypeBinding, ...) drops TYPE_USE annotations 

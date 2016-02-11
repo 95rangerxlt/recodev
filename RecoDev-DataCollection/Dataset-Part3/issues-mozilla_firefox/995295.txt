@@ -1,0 +1,106 @@
+We had bug 762995. With console API rewrite in c++ (bug 965860) the console.trace() performance improved (see bug 920116 comment 5 and subsequent comments). However, trace() is still slow compared to the same method in Chrome.
+
+We could make console.trace() faster by making the stacktrace property of ConsoleEvent objects a getter that is populated only the first time it is accessed.
+
+When devtools are not open there's no perf impact - the ConsoleEvent objects are not used at all.
+
+Instead of an array we could also make this property value an iterator object. Go through the nsIStackFrames linked-list only as far as the ConsoleEvent.stacktrace reader does. If we only read the first item, there's no point building the whole list.
+
+We had bug 762995. With console API rewrite in c++ (bug 965860) the console.trace() performance improved (see bug 920116 comment 5 and subsequent comments). However, trace() is still slow compared to the same method in Chrome.
+
+We could make console.trace() faster by making the stacktrace property of ConsoleEvent objects a getter that is populated only the first time it is accessed.
+
+When devtools are not open there's no perf impact - the ConsoleEvent objects are not used at all.
+
+Instead of an array we could also make this property value an iterator object. Go through the nsIStackFrames linked-list only as far as the ConsoleEvent.stacktrace reader does. If we only read the first item, there's no point building the whole list.
+> populated only the first time it is accessed
+
+So I poked around at doing that.
+
+The first issue is that nsIStackFrame is not threadsafe.  So we have to snapshot if we're in a worker....  I don't really see a way around that, since we have to deal with JSAPI to get info out of the stack and doing cross-thread JSAPI is not really workable.
+
+Subject to that constraint, this should be doable.
+Created attachment 8405612
+Make console.trace() faster when the console is closed by avoiding reification of the stack until someone actually asks for it.
+> Instead of an array we could also make this property value an iterator object.
+
+We could do that in a followup; this needs consumers to switch to iteration instead of walking the array, right?
+Note that the patch as written conflicts with bug 920116.  I'll merge once that lands.
+(In reply to Boris Zbarsky [:bz] from comment #3)
+> > Instead of an array we could also make this property value an iterator object.
+> 
+> We could do that in a followup; this needs consumers to switch to iteration
+> instead of walking the array, right?
+
+That is correct.
+
+(In reply to Boris Zbarsky [:bz] from comment #4)
+> Note that the patch as written conflicts with bug 920116.  I'll merge once
+> that lands.
+
+The patch from bug 920116 is ready to land, IIAMN. We dont have to wait for the UI work.
+> The patch from bug 920116 is ready to land, IIAMN.
+
+Right.  I'm just saying you should land it, and then I'll merge this patch on top.
+Comment on attachment 8405612
+Make console.trace() faster when the console is closed by avoiding reification of the stack until someone actually asks for it.
+
+Review of attachment 8405612:
+-----------------------------------------------------------------
+
+::: dom/base/Console.cpp
+@@ +785,5 @@
+> +
+> +    if (language == nsIProgrammingLanguage::JAVASCRIPT ||
+> +        language == nsIProgrammingLanguage::JAVASCRIPT2) {
+> +      ConsoleStackEntry& data = *aRefiedStack.AppendElement();
+> +      nsresult rv = StackFrameToStackEntry(stack, data, language);
+
+you don't need nsresult here. rv is already defined at line 784.
+
+@@ +902,5 @@
+> +  } else {
+> +    // nsIStackFrame is not threadsafe, so we need to snapshot it now,
+> +    // before we post our runnable to the main thread.
+> +    callData->mReifiedStack.construct();
+> +    nsresult rv = ReifyStack(stack, callData->mReifiedStack.ref());
+
+remove nsresult.
+
+@@ +903,5 @@
+> +    // nsIStackFrame is not threadsafe, so we need to snapshot it now,
+> +    // before we post our runnable to the main thread.
+> +    callData->mReifiedStack.construct();
+> +    nsresult rv = ReifyStack(stack, callData->mReifiedStack.ref());
+> +    if (NS_FAILED(rv)) {
+
+NS_WARN_IF
+I tried landing this, but it bounced because we can't WrapNative that object in an untrusted scope (and my testing was via file://, which in my case is trusted enough). 
+
+I talked to bholley and he OKed creating our event object in the junk scope, which is a trusted scope.  Going to post a patch that goes under the other one to do that.
+Created attachment 8407298
+part 1.  Create console events in the junk scope, not the untrusted content scope.
+> remove nsresult.
+
+Oh, and can't do that: there is no rv in scope there.
+Backed out for multi-platform bustage.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/8a13590ce482
+
+https://tbpl.mozilla.org/php/getParsedLog.php?id=37946421&tree=Mozilla-Inbound
+Because the changeset right before mine changed the signature of JS_DefineProperty, sigh.
+
+Pushed with that fixed up:
+
+   https://hg.mozilla.org/integration/mozilla-inbound/rev/0b3a14bbfd81
+   https://hg.mozilla.org/integration/mozilla-inbound/rev/c674dc13ef85
+Backed out for mochitest-2 crashes.
+https://hg.mozilla.org/integration/mozilla-inbound/rev/0d37b75f8cd3
+
+https://tbpl.mozilla.org/php/getParsedLog.php?id=37950058&tree=Mozilla-Inbound
+Gah.  We end up operating on the values we have stashed....  Looks like we need to keep around mGlobal to do that, then do the actual dictionary conversion in the junkscope compartment.
+Created attachment 8408041
+Part 1, scoped way down
+   https://hg.mozilla.org/integration/mozilla-inbound/rev/00e2d9fabb82
+   https://hg.mozilla.org/integration/mozilla-inbound/rev/e8fb458e5d0f
+https://hg.mozilla.org/mozilla-central/rev/00e2d9fabb82
+https://hg.mozilla.org/mozilla-central/rev/e8fb458e5d0f

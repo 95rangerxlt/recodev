@@ -1,0 +1,610 @@
+Created attachment 8549692
+Test case
+
+This regressed a few weeks ago (sorry for not filing earlier) and makes debugging Shumway quite painful.
+
+STR:
+1. open the attached test case
+2. open the debugger
+3. set a breakpoint in line 9
+4. reload
+
+Actual result: the breakpoint isn't triggered
+Expected result: the breakpoint is triggered
+
+A breakpoint on line 13 works just fine.
+
+The second IIFE in lines 15-19 seems to work sometimes, sometimes not.
+
+Created attachment 8549692
+Test case
+
+This regressed a few weeks ago (sorry for not filing earlier) and makes debugging Shumway quite painful.
+
+STR:
+1. open the attached test case
+2. open the debugger
+3. set a breakpoint in line 9
+4. reload
+
+Actual result: the breakpoint isn't triggered
+Expected result: the breakpoint is triggered
+
+A breakpoint on line 13 works just fine.
+
+The second IIFE in lines 15-19 seems to work sometimes, sometimes not.
+Created attachment 8549701
+Test case, for realz
+
+Ugh, I edited the file to test things before submitting. Here's the version I meant.
+Handler function threw an exception: TypeError: info is null
+Stack: _addBreakpoint@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/sourceeditor/debugger.js:138:5
+addBreakpoint/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource:///modules/devtools/sourceeditor/debugger.js:154:37
+makeInfallible/<@resource://gre/modules/commonjs/toolkit/loader.js -> resource://gre/modules/devtools/DevToolsUtils.js:82:14
+Line: 138, column: 4
+
+
+Ugh, looks like this might be our `info is null` editor race cropping up again :(
+(In reply to Nick Fitzgerald [:fitzgen] from comment #2)
+> 
+> Ugh, looks like this might be our `info is null` editor race cropping up
+> again :(
+
+Unfortunately, I tweaked the code with the same fix as bug 1057031, which does make the `info is null` message go away, but does not fix this bug. I think that error is harmless in a lot of situations, but that doesn't mean we shouldn't fix that.
+
+This is unrelated, I think, because the breakpoint still isn't hit. I will look into this later today.
+It seems that we expect getChildScripts to return *all* child scripts, when in fact it only returns one level of children (as documented).
+Looks like some refactoring inside the debugger server made it so that we don't fully recurse into all nested scripts. Should be a quick fix, but this has made it all the way to beta, so we will need to uplift.
+Created attachment 8550526
+1122064.patch
+
+This API is a little weird, but this is this most performant one I tried. I did 3 different ones:
+
+* A recursive generator (simple but slow)
+* An imperative `while` loop that recursively builds up a big array of scripts and returns the array (better)
+* A callback-based iterator that calls the callback for each child scripts array (fastest)
+
+I used this as the test case: http://jlongster.com/s/lots-of-scripts/ It has a huge amount of nested functions, and includes the same script several times (only 1 appears in the debugger because it's the same URL, but my perf output ran for all 8 script tags).
+
+The recursive generator took about 950ms-1s to load each script, the imperative loop took maybe 800-900ms, and the callback-based iterator brings it down to 600-700ms. This is the worst-case test case of course, so this should be the 99% outlier of performance. (I can't profile  what it was before, but it couldn't have been much faster)
+Comment on attachment 8550526
+1122064.patch
+
+Review of attachment 8550526:
+-----------------------------------------------------------------
+
+We need to have a regression test for this.
+
+I find iterAllChildScripts a little funky, and I'd prefer to just have the children returned as an array instead of the callback interface, but that isn't the biggest deal.
+
+We gotta have a regression test though.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +1987,5 @@
+>  
+>      // |onNewScript| is only fired for top level scripts (AKA staticLevel == 0),
+>      // so we have to make sure to call |_addScript| on every child script as
+>      // well to restore breakpoints in those scripts.
+> +    iterAllChildScripts(aScript, children => {
+
+Rather than doing two passes (and therefore crossing the JS <-> VM threshold twice as often as necessary) we could just do:
+
+    const children = []
+    iterAllChildScripts(aScript, [].push.bind(children));
+
+and then do our two passes over `children`. But at that point: why not just have our helper function return the children as an array itself, instead of taking a callback?
+(And if you tried returning an array and benchmarking showed it to be worse, then just tell me and I'll shut up)
+(In reply to Nick Fitzgerald [:fitzgen] from comment #8)
+> (And if you tried returning an array and benchmarking showed it to be worse,
+> then just tell me and I'll shut up)
+
+I did and I explained that in comment 6 :)
+
+I don't know how I missed the fact that it's doing twice the amount of work it needs to, and I should just recurse down it once. I think recursing once + using an array should definitely be fast enough (should beat what I currently do by quite a bit).
+
+I'll refactor and add a test. I need to leave soon so not sure I'll get the test done today, but I can git done and on try this weekend.
+Created attachment 8551368
+1122064.patch
+
+Here's the array-based approach, but I'm still seeing a significant slowdown from whatever Firefox 35 is doing (before eval & script store stuff), but it does recurse there. I'm going to look into what it did before. It takes ~800ms to process the large script at http://jlongster.com/s/lots-of-scripts/, and I see the debugger pause, but in Firefox 35 it feels more instant.
+Here's my analysis of the current situation:
+
+* When a new script is introduced in the system, we've actually never recursed through all child scripts, we only iterate through the children of the top-level via `getChildScripts()`. That only returns children 1-level deep though, it isn't recursive.
+
+* Previously, setting breakpoints on scripts nested deep worked because in `_addScript`, where it checks if a breakpoint exists for a script, it finds a breakpoint for any nested children within itself because the start/end line encompass all child scripts. We call `source.setBreakpoint` and it correctly finds the right active script to actually activate a breakpoint (not necessarily the same script passed to `_addScript`)
+
+* We broke this around the time we introduced the `ScriptStore`: we don't recursively add all child scripts to it (only children 1 level deep since `getAllChildren` does not recurse). `setBreakpoint` now queries this store to get scripts to find offsets, and deep nested scripts aren't there.
+
+* Additionally, `SourceActor.prototype.setBreakpoint` takes `aOnlyThisScript` parameter, which makes it *only* activate the breakpoint if it matches the passed in script. In `_addScript`, it passes in the parent script, so deeply nested breakpoints on children scripts wouldn't even be activated if the `ScriptStore` was working right. Eddy (maybe accidentally?) fixed this in yesterday's commit: https://github.com/mozilla/gecko-dev/commit/6267fd519de91e2a6025d082e1ee50884100c1e1. He cleans up the code and removes the strict `aOnlyThisScript` parameter, but the `ScriptStore` is still missing scripts.
+
+So the core issue is that the `ScriptStore` does not get all the scripts added to it, and we need to recursively call `getChildScripts` on all the returned scripts. Unfortunately, when I do this there is a significant performance hit. I thought that we used to be recursing, and that we had just broken that, but we've *never* recursed through all the child scripts, and adding that seems to really slow down extremely large code (think compile-to-js languages). I am working on benchmarking this to show hard numbers.
+
+fitzgen mentioned removing the `ScriptStore` if it's too much hassle. If I can't get good performance while adding all scripts to it, we may have to. However, one of the main points of `ScriptStore` was to hold a strong reference to each script, and thus avoiding garbage collection issues. It seems to me that we still *could* simply do this by holding on to all top-level scripts. That way, a breakpoint *will* always be properly set, even if nested scripts within the top-level script have been garbage collected, and any new scripts (either from reload or the script being run) generated will appropriately get the breakpoint set in `_addScript`.
+
+However, we might need to change all the script queries (like within `setBreakpoint`) to use the C++ API `findScripts` API again, so we appropriately get all the scripts we need. The `ScriptStore` (or something else) would only hold the top-level scripts for the whole devtools session.
+
+I'm going to play around with adding all the scripts to `ScriptStore` again and report back with some numbers.
+A little clarification: it worked before `ScriptStore` because, even though it was only called once from the top-level script, `setBreakpoint` used the C++ `findScripts` API and set breakpoints on *all* scripts it found at that location.
+
+Now I'm confused about something: `onNewScript` is only called for top-level scripts, but what about the following code:
+
+function baz() {
+  function biz() {
+    return 5;
+  }
+  return biz();
+}
+
+Won't the `biz` script not even exist when the `onNewScript` is fired for `baz`? It's only created when `baz` is fun.
+Here the benchmarks. These numbers we taken by timing the full execution of `onNewScript`, using the primitive `Date` timer (`performance.now` isn't available). Basically:
+
+onNewScript: function(aScript, aGlobal) {
+  let start = Date.now();
+  // ...
+  console.log(Date.now() - start);
+}
+
+What we are interested in is not async, so this works. My testing was to refresh the page a couple times to get the numbers, then set 3 breakpoints and refresh the page to see how much longer is takes with a few breakpoints.
+
+The test page is: http://jlongster.com/s/lots-of-scripts/
+
+First, an old version of Firefox before any of the `ScriptStore` or eval debugging landed (Oct 29, commit 675248424eb093f4b75c828bf894c3456d00216e):
+
+console.log: 33
+console.log: 36
+console.log: 34
+console.log: 36
+console.log: 33
+console.log: 38
+console.log: 41
+console.log: 36
+console.log: 35
+console.log: 43
+
+// set 3 breakpoints and reload
+
+console.log: 119
+console.log: 110
+console.log: 104
+console.log: 103
+console.log: 118
+console.log: 107
+console.log: 104
+console.log: 167
+
+Now, an up-to-date Firefox with *no* recursive behavior (behavior similar to above, just one initial call to `aScript.getChildScripts()`:
+
+console.log: 185
+console.log: 164
+console.log: 158
+console.log: 153
+console.log: 173
+console.log: 155
+console.log: 154
+console.log: 156
+
+// set 3 breakpoints and reload
+
+console.log: 276
+console.log: 256
+console.log: 263
+console.log: 257
+
+Finally, an up-to-date Firefox with the recursive behavior turned on. This is the exact same code in the attached patch (it recursively expands an array and return an array of all scripts).
+
+console.log: 551
+console.log: 616
+console.log: 627
+console.log: 629
+console.log: 561
+console.log: 629
+console.log: 626
+console.log: 621
+
+// set 3 breakpoints and reload
+
+console.log: 833
+console.log: 874
+console.log: 909
+console.log: 917
+console.log: 825
+console.log: 907
+console.log: 928
+console.log: 915
+
+I don't know the last case jumps a good bit more with more breakpoints. Some of this may be due to other changes within devtools. But it's clear, at least to me, that we can't do what my patch currently does, and I can't think of a way to populate the ScriptStore fully in an optimal way.
+
+Note that my test case is not really even close to what some compile-to-js languages output. If we aren't careful, we could make debugging those languages impossible if we get too slow here.
+
+My vote is to either make the Debugger somehow keep scripts alive permanently, or to hold a list of just the top-level scripts. I'm not entirely sure the latter works, but wouldn't that get rid of pending breakpoints still, and we could still appropriately set a breakpoint in all the child scripts using `findScripts` in `setBreakpoint`?
+Created attachment 8552204
+1122064.patch
+Haha, with all my gloom and doom talk, I think I actually found a freakishly simple solution to all of this. I did two things:
+
+1. Just bloody use `findScripts` to get ALL the scripts we need to add the the ScriptStore. I wonder if `getChildScripts` is just really slow or something, because doing a single `findScripts` call and dumping it all into the ScriptStore (which uses a `Set` internally so adding duplicate scripts is fine) is really, really fast. We do get all the script for the whole source on each `onNewScript`, but it's so fast who cares.
+
+2. Only call `_addScript` once with script passed in to `onNewScript`. This is a big optimization especially when there are lots of breakpoints. We don't care about calling it with each individual script. Just find breakpoints that are within the top-level script and set them, and `setBreakpoint` will make sure to set breakpoints on all the child/nested scripts.
+
+Here are the same benchmarks using my patch:
+
+console.log: 24
+console.log: 21
+console.log: 25
+console.log: 21
+console.log: 25
+console.log: 21
+console.log: 23
+console.log: 23
+
+// set 3 breakpoints, reload
+
+console.log: 30
+console.log: 30
+console.log: 37
+console.log: 36
+console.log: 30
+console.log: 31
+console.log: 35
+console.log: 41
+
+Lol. It's even faster than the old Firefox last Oct because we aren't calling `getChildScripts` at all or iterating.
+Ok, admittedly I should have run the tests first. According to the mochitests, evidently we DO have to iterate over `getChildScripts` once and call `_addScript` for each of them. However, I can still do the `findScripts` trick and populate the store correctly and get back to today's numbers:
+
+console.log: 186
+console.log: 175
+console.log: 180
+console.log: 184
+console.log: 176
+console.log: 173
+console.log: 174
+console.log: 174
+
+// set 3 breakpoints
+
+console.log: 271
+console.log: 262
+console.log: 272
+console.log: 273
+
+I still don't understand why we need to iterate only over the 1-level of nested children. It seems to me that if that works for arbitrarily nested children, we should be able to just call `_addScript` with the passed script. I must be misunderstanding something with how scripts are nested.
+
+It's getting far too late for me to be thinking about this. Sorry for the braindump. I need less coffee & booze and more sleep.
+Created attachment 8552215
+1122064-working.patch
+I also looked into why we need to iterate over `getChildScripts()` at all in `onNewScript`. We should be able to just have a single `this._addScript(aScript)` (which is *way* faster) which operates on the top-level script representing the whole source. If I do this, it works in all my manual (and let me repeat: it's waaay faster).
+
+However, the "breakpoints-break-on-last-line-of-script-on-reload.js" test fails. But it looks like it's actually a bug in Debugger.Script. It has the wrong `lineCount`, the filtering in `_addScript` isn't activating the breakpoint. I copied the same source used in the test here: http://jlongster.com/s/lots-of-scripts/index2.html
+
+In `onNewScript`, if you log the text of the script, like this:
+
+    console.log(
+      aScript.source.text.slice(aScript.sourceStart,
+                                aScript.sourceStart + aScript.sourceLength)
+    );
+
+You get:
+
+console.log: var a = (function(){
+  var b = 9;
+  console.log("x", b);
+  return b;
+})();
+
+as you should. But if you log `aScript.lineCount`, you get 1! Which is clearly wrong. The line count should be 5. I will file another bug about this.
+I think the path to move forward for this bug is to dump all the scripts into the `ScriptStore` using `findScripts`, which has zero perf hit, and I will file bugs for the rest of my discoveries and get those fixed.
+(In reply to James Long (:jlongster) from comment #12)
+> A little clarification: it worked before `ScriptStore` because, even though
+> it was only called once from the top-level script, `setBreakpoint` used the
+> C++ `findScripts` API and set breakpoints on *all* scripts it found at that
+> location.
+> 
+> Now I'm confused about something: `onNewScript` is only called for top-level
+> scripts, but what about the following code:
+> 
+> function baz() {
+>   function biz() {
+>     return 5;
+>   }
+>   return biz();
+> }
+> 
+> Won't the `biz` script not even exist when the `onNewScript` is fired for
+> `baz`? It's only created when `baz` is fun.
+
+1) Lazy scripts are disabled when a compartment is observed by the debugger, and
+
+2) Despite how many closures or function objects get created, there is only one JSScript/D.Script because of lambda lifting
+James, so the plan is:
+
+(1) Add all scripts to `ScriptStore` on startup (well when we ask for the source list) via the ThreadActor.prototype.scripts accessor
+
+(2) Maintain the contents of the `ScriptStore` via `this.scripts.addScripts(dbg.findScripts({ source: newScript.source }))` in the onNewScript hook
+
+(3) Use the parent script's range to find BPs we need to re-set: anything falling within [newScript.startLine, newScript.startLine + newScript.lineCount)
+
+Right?
+
+But there is a bug in lineCount (bug 979094) that we need to work around. I believe this is why we started considering every script, rather than using the parent range. I believe that fix was the one which added that test that started failing for you, too. Yay! Regression tests!
+
+So: either we don't do (3), and instead continue to consider every script, or we fix bug 979094 (which hopefully doesn't involve walking the script tree to find the greatest end line, in which case it might not provide the perf benefit you saw earlier...)
+(In reply to Nick Fitzgerald [:fitzgen] from comment #21)
+> James, so the plan is:
+> 
+> (1) Add all scripts to `ScriptStore` on startup (well when we ask for the
+> source list) via the ThreadActor.prototype.scripts accessor
+> 
+> (2) Maintain the contents of the `ScriptStore` via
+> `this.scripts.addScripts(dbg.findScripts({ source: newScript.source }))` in
+> the onNewScript hook
+> 
+> (3) Use the parent script's range to find BPs we need to re-set: anything
+> falling within [newScript.startLine, newScript.startLine +
+> newScript.lineCount)
+> 
+
+Yep, that's right. Just filed bug 1124258 for #3.
+
+> But there is a bug in lineCount (bug 979094) that we need to work around. I
+> believe this is why we started considering every script, rather than using
+> the parent range. I believe that fix was the one which added that test that
+> started failing for you, too. Yay! Regression tests!
+
+I debugged it down to that exact issue! Yeah, we'd need to fix that bug before we do #3.
+
+> So: either we don't do (3), and instead continue to consider every script,
+> or we fix bug 979094 (which hopefully doesn't involve walking the script
+> tree to find the greatest end line, in which case it might not provide the
+> perf benefit you saw earlier...)
+
+I agree with just delaying #3 (which is why I filed a new bug). Luckily, doing #1 and #2 is a very easy fix (almost a 1 line patch) so we can easily land that in this bug, and uplift to beta where we broke nested script breakpoints. We will work on #3 separately, which is basically just a perf optimization.
+Created attachment 8552556
+1122064.patch
+
+This patch makes sure the `ScriptStore` has all the scripts, fixing the breakpoint issues introduced in the original comment. There doesn't seem to be any perf regressions.
+Comment on attachment 8552556
+1122064.patch
+
+Shoot, I forgot to add a regression test. Will post another patch.
+Created attachment 8552607
+1122064.patch
+
+Ok, this now includes a mochitest to make sure that nested scripts introduced via onNewScripts properly works.
+Er, I mean an xpcshell test.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=89162e3f18e6
+Comment on attachment 8552607
+1122064.patch
+
+Review of attachment 8552607:
+-----------------------------------------------------------------
+
+r+ with comments addressed.
+
+::: toolkit/devtools/server/actors/script.js
+@@ +1993,2 @@
+>      for (let s of aScript.getChildScripts()) {
+>        this._addScript(s);
+
+Shouldn't we be calling `this._addScript` for every child script, not just the immediate children? This has the same range/lineCount problem mentioned in previous comments, just pushed down one level of scripts.
+
+Shouldn't it be more like:
+
+  const scripts = this.dbg.findScripts({ source: aScript.source });
+
+  // ... lol long comment ...
+  this.scripts.addScripts(scripts);
+
+  // ... lol moar commentz ...
+  for (let s of scripts) {
+    this._addScript(s);
+  }
+
+::: toolkit/devtools/server/tests/unit/test_breakpoint-21.js
+@@ +37,5 @@
+> +}
+> +
+> +function test()
+> +{
+> +  Task.spawn(function*() {
+
+Nit:
+
+  const test = Task.async(function* () {
+    ...
+  });
+
+@@ +38,5 @@
+> +
+> +function test()
+> +{
+> +  Task.spawn(function*() {
+> +    // Force an initial populate of the `ScriptStore`
+
+Nit: force an english ;)
+
+"Populate the ScriptStore."
+
+or
+
+"Force the initial population of the ScriptStore."
+
+or
+
+"Ensure the ScriptStore is populated."
+
+@@ +48,5 @@
+> +      let location = {
+> +        line: gDebuggee.line0 + 5
+> +      };
+> +
+> +      source.setBreakpoint(location, function (aResponse, bpClient) {
+
+Not going to r- over this, but it sure would be nice to not mix task and callbacks...
+
+Check out the setBreakpoint, waitForPause, resume, etc helpers in head_dbg.js. It would clean this test up a lot.
+
+@@ +72,5 @@
+> +      "var line0 = Error().lineNumber;\n(" + function() {
+> +        debugger;
+> +        var a = (function() {
+> +          return (function() {
+> +            var x = 10; // This line gets a breakpoint
+
+Can we do a ridiculous amount of IIFEs, like 6, just to be sure? I feel like this is falling under the "push down the range/lineCount issue one staticLevel" comment. Would be nice to be sure.
+Also, did you verify that the test does not pass before this patch? I ask because this bug is specifically about the way we re-set BPs after reload in onNewScript, and I don't think this test exercises onNewScript between setting the BP and hitting it.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #28)
+> Comment on attachment 8552607
+> 1122064.patch
+> 
+> Review of attachment 8552607:
+> -----------------------------------------------------------------
+> 
+> r+ with comments addressed.
+> 
+> ::: toolkit/devtools/server/actors/script.js
+> @@ +1993,2 @@
+> >      for (let s of aScript.getChildScripts()) {
+> >        this._addScript(s);
+> 
+> Shouldn't we be calling `this._addScript` for every child script, not just
+> the immediate children? This has the same range/lineCount problem mentioned
+> in previous comments, just pushed down one level of scripts.
+
+After all my benchmarking, I found `_addScripts` to be quite slow, honestly, and now I'm worried about invoking it for every single script on a page (which potentially could be *huge*).
+
+This gets us back to how we were doing it before, at least. We *never* did it correctly. I guess the cases where the line number is off tends to be rarer in the 1-level nested children? Not sure. Are you sure it's even possible in child scripts? I thought it had to do with the top-level script.
+
+Regardless, I think we should keep it the way it is since we've survived this far on it, and I'm worried about serious perf regressions. And bug 1124258 is a better way to move forward with this which avoids the whole lineCount thing altogether.
+
+I'll clean up the test some too.
+(In reply to Nick Fitzgerald [:fitzgen] from comment #29)
+> Also, did you verify that the test does not pass before this patch? I ask
+> because this bug is specifically about the way we re-set BPs after reload in
+> onNewScript, and I don't think this test exercises onNewScript between
+> setting the BP and hitting it.
+
+Yes, I got the test failing first. I had to add the `getSources` call to force an initial population of the `ScriptStore`. That happens before I do my script evaluation, so my eval comes in just on `onNewScript`, with the `ScriptStore` already created, so it triggered the bug.
+
+I can add some more nesting, and play around with the IIFE pattern to try to trigger more failures.
+(In reply to James Long (:jlongster) from comment #30)
+> This gets us back to how we were doing it before, at least. We *never* did
+> it correctly. I guess the cases where the line number is off tends to be
+> rarer in the 1-level nested children? Not sure. Are you sure it's even
+> possible in child scripts? I thought it had to do with the top-level script.
+
+Nothing to do with top level: the lineCount is the offset from the startLine of the last bytecode attributed to that JSScript. Here is an example that should trigger the bad behavior in nested scripts:
+
+  (function () {
+    var a = "whatever";
+
+    // Last line in this script is going to be reported as the location of the
+    // following function invocation, because that should be the last bytecode
+    // generated for this JSScript.
+    (function () {
+      var b = "more whatevs";
+
+      // ditto
+      (function () {
+        var c = "wha wha whateverrrrr";
+
+        (function () {
+          var d = "I think you get the point by now...";
+
+          // No more bytecodes, so nothing down here affects this script's
+          // linecount.
+        }());
+
+        // ditto
+      }());
+
+      // ditto
+    }());
+
+    // ditto
+  }());
+(In reply to Nick Fitzgerald [:fitzgen] from comment #32)
+> (In reply to James Long (:jlongster) from comment #30)
+> > This gets us back to how we were doing it before, at least. We *never* did
+> > it correctly. I guess the cases where the line number is off tends to be
+> > rarer in the 1-level nested children? Not sure. Are you sure it's even
+> > possible in child scripts? I thought it had to do with the top-level script.
+> 
+> Nothing to do with top level: the lineCount is the offset from the startLine
+> of the last bytecode attributed to that JSScript. Here is an example that
+> should trigger the bad behavior in nested scripts:
+> 
+>   (function () {
+>     var a = "whatever";
+> 
+>     // Last line in this script is going to be reported as the location of
+> the
+>     // following function invocation, because that should be the last
+> bytecode
+>     // generated for this JSScript.
+>     (function () {
+>       var b = "more whatevs";
+> 
+>       // ditto
+>       (function () {
+>         var c = "wha wha whateverrrrr";
+> 
+>         (function () {
+>           var d = "I think you get the point by now...";
+> 
+>           // No more bytecodes, so nothing down here affects this script's
+>           // linecount.
+>         }());
+> 
+>         // ditto
+>       }());
+> 
+>       // ditto
+>     }());
+> 
+>     // ditto
+>   }());
+
+Possible quick and dirty fix here: https://bugzilla.mozilla.org/show_bug.cgi?id=979094
+Err bug 979094 comment 6
+(Sorry for bug spam, meant to ni? in the other bug only).
+Created attachment 8552796
+1122064.patch
+
+Only responded to fitzgen's review, so no need to re-review I think. Also talked about this on IRC with him.
+https://treeherder.mozilla.org/#/jobs?repo=try&revision=ad23c388ca53
+The failures in try are an unrelated intermittent that has been fixed (bug 1001821). Everything else is green. In these cases should I do another push or are we ok?
+https://hg.mozilla.org/integration/fx-team/rev/70bbdfcebfa5
+https://hg.mozilla.org/mozilla-central/rev/70bbdfcebfa5
+Created attachment 8553849
+uplift-fix.patch
+
+Approval Request Comment
+[Feature/regressing bug #]: unknown
+[User impact if declined]: User can't set breakpoint on script nested 2 levels deep or higher. This is a serious regression that breaks many attempts to set breakpoints.
+[Describe test coverage new/current, TreeHerder]: new test has been added, landed on m-c
+[Risks and why]: This touches breakpoint code, might introduce new bugs, but it's already been tested on m-c and there's no risk to non-developers
+[String/UUID change made/needed]:
+https://hg.mozilla.org/releases/mozilla-aurora/rev/920056803536
+[Tracking Requested - why for this release]:  Should also fix this in Beta, tracking to be sure it's not lost.
+James, I think we want to see that bug fixed in 36 too. Could you fill the uplift request? Thanks
+Yep, I was letting it sit on Aurora for a few days. Will ask for uplift now!
+Comment on attachment 8553849
+uplift-fix.patch
+
+Approval Request Comment
+[Feature/regressing bug #]: unknown
+[User impact if declined]: User can't set breakpoint on script nested 2 levels deep or higher. This is a serious regression that breaks many attempts to set breakpoints.
+[Describe test coverage new/current, TreeHerder]: new test added, working on m-c and aurora
+[Risks and why]: This touches breakpoint code, might introduce new bugs, but it's already been tested on m-c and there's no risk to non-developers
+[String/UUID change made/needed]:
+This needs rebasing for beta.
+I've rebased, but there is a test failure that I'm trying to figure out. Will post a new patch asap.
+The breakpoint store did not actually make it out to beta. The thing that broke beta was changing `setBreakpoint` to take a Debugger.Script parameter and only setting breakpoints on that script. I don't know what bug that was in, but bug 1107682 accidentally fixed that so we just need to uplift that one.
+*** Bug 1124415 has been marked as a duplicate of this bug. ***
+*** Bug 1117354 has been marked as a duplicate of this bug. ***
+
+
+Breakpoints are ignored in nested IIFEs
+
+regression
+
+Bug 1122064 - add all scripts to ScriptStore, including all nested child scripts. r=fitzgen 

@@ -1,0 +1,187 @@
+
+
+
+2 things can be done here:
+- register layer transaction (main thread)
+- add a timeline for the compositing thread
+Moving into the Profiler component. Filter on GUTHRIE'S WAVY CAKES.
+Don't necessarily need bug 1183219 for recording compositing operations, since mozAfterPaints know about docshells and happen on the main thread, and are caused by a composite.
+Created attachment 8645352
+composite.patch
+
+No idea who to ask for review.
+Comment on attachment 8645352
+composite.patch
+
+Review of attachment 8645352:
+-----------------------------------------------------------------
+
+See the particular note for a suggestion on a different approach to the timeline change.
+
+I can't review the compositor bits.
+
+::: docshell/base/timeline/TimelineMarker.h
+@@ +60,5 @@
+>    TracingMetadata GetMetaData() const { return mMetaData; }
+>    DOMHighResTimeStamp GetTime() const { return mTime; }
+>    const nsString& GetCause() const { return mCause; }
+>  
+> +  void SetTime(const mozilla::TimeStamp& time) {
+
+I think it would be better to add an optional time argument to TimelineMarker constructors (and in its wrappers, like AddTimelineMarker).  This would have two benefits.
+
+First, the current TimelineMarker object is essentially readonly after construction.  This makes it simpler to reason about; and such a change would preserve this property.
+
+Second, this approach required a change to AddTimelineMarker to return a pointer to the newly constructed marker.  However, much of the API was designed to avoid passing around raw pointers; making it simpler to reason about lifetimes and harder to introduce bugs.  Changing the TimelineMarker constructor would preserve this property as well.
+Good suggestions, will make the fix.
+Created attachment 8648677
+v2
+
+Tom for the platform timeline/ method/constructors changes, Jordan for the very small frontend changes, Smaug for everything else.
+Comment on attachment 8648677
+v2
+
+Review of attachment 8648677:
+-----------------------------------------------------------------
+
+I think the markers should be green for this one -- if you strongly disagree, let's discuss. The name "Composite" as opposed to alternatives I don't feel strongly about, I think it's probably fine.
+
+::: browser/devtools/performance/modules/markers.js
+@@ +74,5 @@
+>      label: L10N.getStr("marker.label.paint"),
+>    },
+> +  "Composite": {
+> +    group: 0,
+> +    colorName: "graphs-blue",
+
+Should this be green as well, to match paint operations, and what chrome uses for this marker? I think sticking with green for graphics operations makes sense.
+
+::: browser/locales/en-US/chrome/browser/devtools/markers.properties
+@@ +16,5 @@
+>  # We want to use the same wording as Google Chrome when appropriate.
+>  marker.label.styles=Recalculate Style
+>  marker.label.reflow=Layout
+>  marker.label.paint=Paint
+> +marker.label.composite=Composite
+
+Wonder if there's a better name we can use -- chrome is "Composite Layers", not sure if this covers the same operation as them, though.
+Comment on attachment 8648677
+v2
+
+Review of attachment 8648677:
+-----------------------------------------------------------------
+
+Looks good, thanks.  I made a few comments but basically just trivia.
+
+::: docshell/base/timeline/TimelineConsumers.h
+@@ +71,5 @@
+>    static void AddMarkerForDocShellsList(Vector<nsRefPtr<nsDocShell>>& aDocShells,
+> +                                        const char* aName,
+> +                                        TracingMetadata aMetaData);
+> +
+> +  // This methodc creates custom markers, none of which have to be tied to a
+
+Typo, "methodc"
+
+::: view/nsView.cpp
+@@ +1082,5 @@
+> +    nsPresContext* context = presShell->GetPresContext();
+> +    context->GetDisplayRootPresContext()->GetRootPresContext()->NotifyDidPaintForSubtree(nsIPresShell::PAINT_COMPOSITE);
+> +
+> +    // If the two timestamps are identical, this was likely a fake composite
+> +    // event which wouldn't be terribly useful to display. XXX: Is this true?
+
+Probably should find out now, before landing; but it seems to me that a zero-duration marker isn't all that interesting in any case, so just removing the XXX bit would be appropriate.
+Comment on attachment 8648677
+v2
+
+>+  // Methods for adding markers relevant for particular docshells, or generic
+>+  // (meaning that they either can't be tied to a particular docshell, or one
+>+  // wasn't accessible in the part of the codebase where they're instantiated).
+
+I don't understand the comment inside ( ).
+>+  // This methodc creates custom markers, none of which have to be tied to a
+method
+
+> TimelineMarker::TimelineMarker(nsDocShell* aDocShell, const char* aName,
+>+                               const mozilla::TimeStamp& time,
+aTime
+
+>+                               TracingMetadata aMetaData)
+>+  : TimelineMarker(aDocShell, aName, aMetaData)
+>+{
+>+  bool isInconsistent = false;
+>+  mozilla::TimeStamp epoch = mozilla::TimeStamp::ProcessCreation(isInconsistent);
+Not sure I'd call this epoch 
+I'd just do
+  bool ignore;
+  mTime = (time - mozilla::TimeStamp::ProcessCreation(ignore)).ToMilliseconds();
+
+
+>   TimelineMarker(nsDocShell* aDocShell, const char* aName,
+>+                 const mozilla::TimeStamp& time,
+aTime
+
+> EXPORTS.mozilla += [
+>     'AutoGlobalTimelineMarker.h',
+>     'AutoTimelineMarker.h',
+>+    'ObservedDocShell.h',
+>     'TimelineConsumers.h',
+>+    'TimelineMarker.h',
+oh, do we have a mistake here. TimelineMarker should be in mozilla namespace.
+Please put the class to mozilla namespace and also ObservedDocShell.
+
+
+
+>+++ b/gfx/layers/client/ClientLayerManager.cpp
+Someone familiar with compositing should review this and other compositing specific stuff
+(I have no idea whether TimeStamp::Now() is too slow here, or whether we catch all the interesting cases)
+(In reply to Olli Pettay [:smaug] from comment #10)
+> Comment on attachment 8648677
+
+Thanks!
+
+> 
+> > EXPORTS.mozilla += [
+> >     'AutoGlobalTimelineMarker.h',
+> >     'AutoTimelineMarker.h',
+> >+    'ObservedDocShell.h',
+> >     'TimelineConsumers.h',
+> >+    'TimelineMarker.h',
+> oh, do we have a mistake here. TimelineMarker should be in mozilla namespace.
+> Please put the class to mozilla namespace and also ObservedDocShell.
+> 
+
+Changed this in bug 1195838.
+ 
+> 
+> >+++ b/gfx/layers/client/ClientLayerManager.cpp
+> Someone familiar with compositing should review this and other compositing
+> specific stuff
+> (I have no idea whether TimeStamp::Now() is too slow here, or whether we
+> catch all the interesting cases)
+
+Okay.
+Comment on attachment 8648677
+v2
+
+Matt, can you please check the compositor bits?
+Thanks Matt!
+https://hg.mozilla.org/integration/fx-team/rev/b9ae6b3addaf
+https://hg.mozilla.org/mozilla-central/rev/b9ae6b3addaf
+I reproduce this bug on firefox nightly windows 8.1 32bit
+
+BuildID	        20140807030202
+User Agent 	Mozilla/5.0 (Windows NT 6.3; rv:34.0) Gecko/20100101 Firefox/34.0
+
+It's oke on Latest Firefox Latest Nightly
+
+Build ID 	20150826030211
+User Agent 	Mozilla/5.0 (Windows NT 6.3; rv:43.0) Gecko/20100101 Firefox/43.0
+
+
+Record compositing operations
+
+
+
+Bug 1050498 - Record compositing operations, r=jsantell,smaug,tromey 
