@@ -23,8 +23,6 @@ project_name = sys.argv[2]
 print "#4. Evaluation of the *hybrid* recommendation engine using single-label (i.e., normal) classification ***PLUS web and social networks data***..."
 print "The similarity measure of the collaborative engines uses not only the Cosine similarity measure, but alos the information of the CC lists of bug reports..."
 
-print "Please note that for the sake of evaluation, the two engines (i.e., content-based and collaborative) work in series. However, in the recommender they always run in parallel (see RecoDev-Recommender)."
-
 print "Engine no. 1 (content-based) starts..."
 
 print "Loading text files..."
